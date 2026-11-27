@@ -49,7 +49,8 @@ The Sheet field counts every sheet in the file, reports included: `3 / 12`.
   tall enough for a card row.
 - A network topology gets the first page's size if the whole drawing fits, else the first ISO
   size that fits, else a custom sheet. A topology larger than 2000 mm is drawn on the largest
-  sheet with a warning.
+  sheet with a warning. [Fieldbus networks and topology pages](networks.md) says how it is
+  drawn.
 
 ## Frame and title block
 

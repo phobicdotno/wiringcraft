@@ -561,8 +561,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "number_wires",
-            "Give every connection without a number one. Existing numbers are kept.",
-            json!({"rule": {"type": "string", "enum": ["page_column", "sequential", "potential"], "description": "page_column (3.4: page and column, default), sequential (1, 2, 3) or potential (the potential's name)."}}),
+            "Give every connection without a number one. Existing numbers are kept, unless overwrite is true: then every connection is numbered again by the rule.",
+            json!({"rule": {"type": "string", "enum": ["page_column", "sequential", "potential"], "description": "page_column (3.4: page and column, default), sequential (1, 2, 3) or potential (the potential's name)."}, "overwrite": {"type": "boolean", "description": "Replace the numbers wires already have (default false: keep them)."}}),
             &[],
         ),
         tool(
@@ -2170,8 +2170,13 @@ impl App {
                         ));
                     }
                 };
+                let overwrite = match v.get("overwrite") {
+                    None => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err("`overwrite` must be true or false.".into()),
+                };
                 let open = need_open(self.open.as_mut())?;
-                Ok(open.number_wires(rule).report())
+                Ok(open.renumber_wires(rule, overwrite).report())
             }
             "run_check" => {
                 let open = need_open(self.open.as_mut())?;
@@ -5365,6 +5370,97 @@ mod tests {
         // The CLI's spelling works too.
         call(&mut a, "number_wires", json!({"rule": "page-column"})).unwrap();
         assert_eq!(numbered(&a), 1);
+    }
+
+    #[test]
+    fn number_wires_overwrite_replaces_existing_numbers() {
+        let (_tmp, mut a) = app(vec![]);
+        let place = |a: &mut App, symbol: &str, x: i32| -> String {
+            let placed = call(
+                a,
+                "place_symbol",
+                json!({"symbol": symbol, "x": x, "y": 60, "page": "2"}),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&placed).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (c, k) = (place(&mut a, "wc.coil", 50), place(&mut a, "wc.contact.no", 120));
+        call(
+            &mut a,
+            "add_wire",
+            json!({"page": "2", "from": {"item": c, "pin": "A1"}, "to": {"item": k, "pin": "13"}}),
+        )
+        .unwrap();
+        let number = |a: &App| page2(a).wires[0].number.clone();
+        call(&mut a, "number_wires", json!({"rule": "page_column"})).unwrap();
+        let first = number(&a);
+        assert!(first.as_deref().is_some_and(|n| n.contains('.')), "{first:?}");
+        // Without overwrite the number stays.
+        call(&mut a, "number_wires", json!({"rule": "sequential"})).unwrap();
+        assert_eq!(number(&a), first);
+        // A value that is not true or false is refused and changes nothing.
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        for bad in [json!("yes"), Value::Null, json!(1)] {
+            let err = call(&mut a, "number_wires", json!({"rule": "sequential", "overwrite": bad})).unwrap_err();
+            assert!(err.contains("true or false"), "{bad}: {err}");
+            assert_eq!(number(&a), first);
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark, "{bad}: no undo step");
+        }
+        let kept = call(&mut a, "number_wires", json!({"rule": "sequential"})).unwrap();
+        assert!(kept.contains("Existing numbers were kept"), "{kept}");
+        let done = call(&mut a, "number_wires", json!({"rule": "sequential", "overwrite": true})).unwrap();
+        assert_eq!(number(&a).as_deref(), Some("1"));
+        assert!(done.contains("Existing numbers were replaced"), "{done}");
+        assert!(!done.contains("were kept"), "{done}");
+    }
+
+    #[test]
+    fn number_wires_overwrite_gives_no_connection_a_number_a_held_page_keeps() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({})).unwrap();
+        let place = |a: &mut App, page: &str, symbol: &str, x: i32| -> String {
+            let placed = call(
+                a,
+                "place_symbol",
+                json!({"symbol": symbol, "x": x, "y": 60, "page": page}),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&placed).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let mut pages = Vec::new();
+        for page in ["2", "3"] {
+            let (c, k) = (
+                place(&mut a, page, "wc.coil", 50),
+                place(&mut a, page, "wc.contact.no", 120),
+            );
+            call(
+                &mut a,
+                "add_wire",
+                json!({"page": page, "from": {"item": c, "pin": "A1"}, "to": {"item": k, "pin": "13"}}),
+            )
+            .unwrap();
+            let open = a.open.as_ref().unwrap();
+            let i = open.project.pages.iter().position(|p| p.number == page).unwrap();
+            pages.push(i);
+        }
+        // Page 2's wire has number 2 and someone else has page 2 open.
+        let open = a.open.as_mut().unwrap();
+        open.project.pages[pages[0]].wires[0].number = Some("2".into());
+        let held = open.project.pages[pages[0]].id.clone();
+        open.held_by_others.insert(held, "Ola".into());
+        let done = call(&mut a, "number_wires", json!({"rule": "sequential", "overwrite": true})).unwrap();
+        // Its numbers stay as they were, but it is still reported as left out.
+        assert!(done.contains("Page 2 was left as it is"), "{done}");
+        let open = a.open.as_ref().unwrap();
+        let on = |i: usize| open.project.pages[i].wires[0].number.clone();
+        assert_eq!(on(pages[0]).as_deref(), Some("2"), "the held page is not changed");
+        assert_eq!(on(pages[1]).as_deref(), Some("1"), "and its number is not given again");
     }
 
     fn page2(app: &App) -> &Page {

@@ -194,8 +194,9 @@ pub fn nets(project: &Project) -> Vec<Net> {
 
 /// Like [`nets`], and also joins interruption points. `role(symbol id)` is the role of a placed
 /// symbol's library symbol (`None` when it is not known): every interruption point is connected
-/// to the others with the same device tag, and only terminals (or symbols of unknown role) take
-/// part in jumpers.
+/// to the others with the same device tag (one on an overview page, `Page::overview`, only to
+/// those on overview pages), and only terminals (or symbols of unknown role) take part in
+/// jumpers.
 pub fn nets_linked(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> Vec<Net> {
     wire_nets(project, role).0
 }
@@ -224,8 +225,52 @@ pub fn wire_nets_by_place(
     project: &Project,
     role: impl Fn(&str) -> Option<SymbolRole>,
 ) -> (Vec<Net>, BTreeMap<(usize, usize), usize>) {
+    let (mut g, wire_nodes) = linked_graph(project, role);
+    let mut index_of_root: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut nets = Vec::new();
+    for (root, net) in groups(&mut g) {
+        if !net.pins.is_empty() {
+            index_of_root.insert(root, nets.len());
+            nets.push(net);
+        }
+    }
+    let wires = wire_nodes
+        .into_iter()
+        .filter_map(|(w, node)| index_of_root.get(&g.dsu.find(node)).map(|n| (w, *n)))
+        .collect();
+    (nets, wires)
+}
+
+/// The nets of [`nets_linked`] that carry more than one potential name (a short, such as L1
+/// joined to L2), together with such groups that touch no pin: wires that meet only each other
+/// at junctions still short their potentials, though they make no net of their own.
+pub fn shorted_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> Vec<Net> {
+    let (mut g, _) = linked_graph(project, role);
+    groups(&mut g).into_values().filter(|n| n.names.len() > 1).collect()
+}
+
+/// Every connected group of `g`, by its root: its pins and potential names.
+fn groups(g: &mut Graph) -> BTreeMap<usize, Net> {
+    let mut groups: BTreeMap<usize, Net> = BTreeMap::new();
+    for (node, id) in &g.ids {
+        let root = g.dsu.find(*id);
+        let net = groups.entry(root).or_default();
+        match node {
+            Node::Pin(p) => net.pins.push(p.clone()),
+            Node::Potential(n) => net.names.push(n.clone()),
+            Node::Point(..) | Node::Link(_) => {}
+        }
+    }
+    groups
+}
+
+/// Each wire's `from` node, by its place: ((page index, wire index), node).
+type WireNodes = Vec<((usize, usize), usize)>;
+
+/// The connection graph of [`wire_nets_by_place`], with each wire's `from` node by its place.
+fn linked_graph(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> (Graph, WireNodes) {
     let mut g = Graph::default();
-    let mut wire_nodes: Vec<((usize, usize), usize)> = Vec::new();
+    let mut wire_nodes: WireNodes = Vec::new();
     for (pi, page) in project.pages.iter().enumerate() {
         let from = g.add_wires(page);
         wire_nodes.extend(from.into_iter().enumerate().map(|(wi, a)| ((pi, wi), a)));
@@ -235,7 +280,13 @@ pub fn wire_nets_by_place(
                 continue;
             }
             // Only interruption points that are wired take part; their pins join under the tag.
-            let link = Node::Link(tag.to_string());
+            // A copy on an overview page links nothing in the schematic (as the project check
+            // counts partners), so overview points join only each other.
+            let link = if page.overview {
+                Node::Link(format!("\u{0}overview\u{0}{tag}"))
+            } else {
+                Node::Link(tag.to_string())
+            };
             let wired: Vec<usize> = wired_pins(page, &s.id).map(|(_, n)| g.id_of(n)).collect();
             for n in wired {
                 let l = g.id_of(link.clone());
@@ -270,29 +321,7 @@ pub fn wire_nets_by_place(
             }
         }
     }
-    let mut groups: BTreeMap<usize, Net> = BTreeMap::new();
-    for (node, id) in &g.ids {
-        let root = g.dsu.find(*id);
-        let net = groups.entry(root).or_default();
-        match node {
-            Node::Pin(p) => net.pins.push(p.clone()),
-            Node::Potential(n) => net.names.push(n.clone()),
-            Node::Point(..) | Node::Link(_) => {}
-        }
-    }
-    let mut index_of_root: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut nets = Vec::new();
-    for (root, net) in groups {
-        if !net.pins.is_empty() {
-            index_of_root.insert(root, nets.len());
-            nets.push(net);
-        }
-    }
-    let wires = wire_nodes
-        .into_iter()
-        .filter_map(|(w, node)| index_of_root.get(&g.dsu.find(node)).map(|n| (w, *n)))
-        .collect();
-    (nets, wires)
+    (g, wire_nodes)
 }
 
 #[cfg(test)]
@@ -564,6 +593,30 @@ mod tests {
     }
 
     #[test]
+    fn potentials_joined_only_by_wires_are_a_short() {
+        let mut p = Project::new("t");
+        let mut a = Page::new("a", "1", "");
+        let free = |x: f64| Endpoint::Point {
+            at: Point::new(x, 10.0),
+        };
+        // An L1 wire and an L2 wire meet at a junction; no device pin anywhere.
+        a.wires = vec![
+            wire("w1", free(0.0), free(10.0), Some("L1")),
+            wire("w2", free(10.0), free(20.0), Some("L2")),
+            wire("w3", free(30.0), free(40.0), Some("L3")),
+        ];
+        p.pages = vec![a];
+        assert!(nets(&p).is_empty(), "no pin, no net");
+        let shorts = shorted_nets(&p, |_| None);
+        assert_eq!(shorts.len(), 1, "{shorts:?}");
+        assert_eq!(shorts[0].names, ["L1", "L2"]);
+        assert!(shorts[0].pins.is_empty());
+        // With a pin on it, the short is the net itself.
+        p.pages[0].wires.push(wire("w4", free(20.0), pin("k1", "A1"), None));
+        assert_eq!(shorted_nets(&p, |_| None), nets(&p));
+    }
+
+    #[test]
     fn interruption_points_with_the_same_tag_join() {
         use crate::project::PlacedSymbol;
         let arrow = |id: &str, tag: &str| PlacedSymbol {
@@ -586,5 +639,41 @@ mod tests {
         let linked = nets_linked(&p, |s| (s == "arrow").then_some(SymbolRole::Interruption));
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].pins.len(), 4);
+    }
+
+    #[test]
+    fn an_interruption_point_on_an_overview_joins_no_schematic_net() {
+        use crate::project::PlacedSymbol;
+        use std::collections::BTreeSet;
+        let arrow = |id: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "arrow".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: crate::DeviceTag::parse("-X1").ok(),
+        };
+        let page = |id: &str, from: &str, overview: bool| {
+            let mut pg = Page::new(id, id, "");
+            pg.overview = overview;
+            pg.symbols.push(arrow("s9"));
+            pg.wires.push(wire("w1", pin(from, "1"), pin("s9", "1"), None));
+            pg
+        };
+        let mut p = Project::new("t");
+        p.pages = vec![
+            page("a", "s1", false),
+            page("b", "s2", false),
+            page("o", "s3", true),
+            page("q", "s4", true),
+        ];
+        let linked = nets_linked(&p, |s| (s == "arrow").then_some(SymbolRole::Interruption));
+        let mut found: Vec<BTreeSet<&str>> = linked
+            .iter()
+            .map(|n| n.pins.iter().map(|(pg, _, _)| pg.as_str()).collect())
+            .collect();
+        found.sort();
+        // The schematic points join each other, the overview copies each other, never across.
+        assert_eq!(found, vec![BTreeSet::from(["a", "b"]), BTreeSet::from(["o", "q"])]);
     }
 }

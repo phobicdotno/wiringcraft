@@ -200,6 +200,8 @@ pub struct WireNumbering {
     pub done: wc_core::numbering::Numbered,
     /// Numbers of the pages left alone because someone else has them open.
     pub skipped: Vec<String>,
+    /// The numbers wires had were replaced (`overwrite`), not kept.
+    pub overwritten: bool,
 }
 
 impl WireNumbering {
@@ -207,9 +209,14 @@ impl WireNumbering {
     pub fn report(&self) -> String {
         let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let mut s = format!(
-            "Numbered {}; {} changed. Existing numbers were kept.",
+            "Numbered {}; {} changed. {}",
             count(self.done.connections, "connection", "connections"),
-            count(self.done.wires, "wire", "wires")
+            count(self.done.wires, "wire", "wires"),
+            if self.overwritten {
+                "Existing numbers were replaced."
+            } else {
+                "Existing numbers were kept."
+            }
         );
         match self.skipped.as_slice() {
             [] => {}
@@ -3082,11 +3089,9 @@ impl Open {
             .max_by_key(|(_, n)| *n)
             .map(|(k, _)| k)
             .unwrap_or_default();
-        let used: std::collections::BTreeSet<String> =
-            self.project.tag_index().keys().map(|t| t.product.join(".")).collect();
-        let product = (1..10_000)
-            .map(|n| format!("{letter}{n}"))
-            .find(|p| !used.contains(p))?;
+        // Device data counts too: a deleted symbol's device keeps its entry (and part), which a
+        // new device must not take over.
+        let product = wc_core::placement::free_product(&wc_core::placement::used_tags(&self.project), letter)?;
         let mut text = String::new();
         if !function.is_empty() {
             text.push_str(&format!("={}", function.join(".")));
@@ -4007,13 +4012,22 @@ impl Open {
     /// keep their wires as they are; their numbers are listed in `skipped`, and a later run
     /// gives their wires the numbers their connections got elsewhere.
     pub fn number_wires(&mut self, rule: wc_core::numbering::Rule) -> WireNumbering {
+        self.renumber_wires(rule, false)
+    }
+
+    /// [`Self::number_wires`], or with `overwrite` give every connection a new number by
+    /// `rule`, replacing the numbers wires already have (the CLI's `number-wires --overwrite`).
+    /// The numbers on pages someone else has open stay, and are given to no other connection.
+    pub fn renumber_wires(&mut self, rule: wc_core::numbering::Rule, overwrite: bool) -> WireNumbering {
         self.follow_terminals();
         let mut project = self.project.clone();
         let symbols = &self.symbols;
-        let done = wc_core::numbering::number_wires(
+        let held = &self.held_by_others;
+        let done = wc_core::numbering::number_wires_keeping(
             &mut project,
             rule,
-            false,
+            overwrite,
+            |page| held.contains_key(&page.id),
             |id| symbols.get(id).map(|s| s.role),
             |page, end| match end {
                 wc_core::Endpoint::Point { at } => Some(*at),
@@ -4027,7 +4041,14 @@ impl Open {
         let mut skipped = Vec::new();
         if !self.held_by_others.is_empty() {
             for (new, old) in project.pages.iter_mut().zip(&self.project.pages) {
-                if self.held_by_others.contains_key(&new.id) && new != old {
+                // With overwrite a held page with numbered wires is left out even when its
+                // numbers happen to stay: it is reported, as its numbers were not replaced.
+                let numbered = overwrite
+                    && old
+                        .wires
+                        .iter()
+                        .any(|w| w.number.as_deref().is_some_and(|n| !n.trim().is_empty()));
+                if self.held_by_others.contains_key(&new.id) && (new != old || numbered) {
                     skipped.push(old.number.clone());
                     *new = old.clone();
                 }
@@ -4051,7 +4072,11 @@ impl Open {
             self.checkpoint();
             self.project = project;
         }
-        WireNumbering { done, skipped }
+        WireNumbering {
+            done,
+            skipped,
+            overwritten: overwrite,
+        }
     }
 
     /// Replace `query` with `with` in the chosen find `hits`, as one undo step
@@ -7815,6 +7840,7 @@ pub(crate) mod tests {
         // A breaker, which the library has and the project doesn't yet: loaded before the coil
         // (ids are loaded in order), and taken back with it.
         let mut breaker = clip.symbols[0].clone();
+        breaker.id = format!("{}-breaker", breaker.id);
         breaker.symbol = "wc.breaker.1p".into();
         breaker.tag = None;
         clip.symbols.insert(0, breaker);
@@ -9609,6 +9635,24 @@ pub(crate) mod tests {
                 .to_string(),
             "=PUMP+CAB1-K2"
         );
+    }
+
+    #[test]
+    fn placing_skips_the_tag_of_a_deleted_symbols_device_data() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let id = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        o.project
+            .devices
+            .get_mut(&DeviceTag::parse("-K1").unwrap())
+            .unwrap()
+            .description = "old".into();
+        o.project.pages[page].remove_symbols_and_wires(&[id.as_str()], &[]);
+        let id2 = o.place(page, "wc.coil", Point::new(80.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&id2).unwrap().tag.clone().unwrap();
+        // -K1 keeps its device data, so the new coil does not take it over.
+        assert_eq!(tag.to_string(), "-K2");
+        assert_eq!(o.project.devices[&tag].description, "");
     }
 
     #[test]

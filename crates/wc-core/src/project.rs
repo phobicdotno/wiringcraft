@@ -38,7 +38,12 @@ pub struct ProjectMeta {
     #[serde(default, rename = "location", skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
     /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
-    #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "jumper",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "merged_jumpers"
+    )]
     pub jumpers: Vec<Jumper>,
     /// Terminal strips arranged in the terminal strip editor: their terminal order and spare
     /// terminals. A strip that is not listed keeps the usual order (by terminal number).
@@ -266,6 +271,28 @@ pub struct StripLayout {
     /// later is that drawn terminal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spares: Vec<String>,
+}
+
+/// Read the `[[jumper]]` list as [`ProjectMeta::add_jumper`] keeps it: jumpers of one strip
+/// that share a terminal are one jumper (the first part in file order counts), rather than two
+/// jumpers each counting its part and showing in the terminal plan and the configurator
+/// export. Each jumper was checked on its own when read (see [`StoredJumper`]).
+fn merged_jumpers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Jumper>, D::Error> {
+    let list = Vec::<Jumper>::deserialize(d)?;
+    let mut meta = ProjectMeta::new("");
+    for j in &list {
+        // Each jumper was checked when read, so this only merges.
+        let _ = meta.add_jumper_with(&j.strip, &j.terminals, None);
+    }
+    // Each entry ended up in exactly one merged jumper; its part is the first one in file order
+    // among them, however later entries joined the groups.
+    for m in &mut meta.jumpers {
+        m.part = list
+            .iter()
+            .filter(|j| j.strip == m.strip && j.terminals.iter().any(|t| m.terminals.iter().any(|u| u == t.trim())))
+            .find_map(|j| j.part.clone());
+    }
+    Ok(meta.jumpers)
 }
 
 /// Read the `[[strip]]` layouts, refusing two for the same strip: which one counts would
@@ -1148,7 +1175,8 @@ impl ProjectMeta {
 
     /// Add spare terminal `number` to `strip`, placed right after terminal `after` when given
     /// (`current` is the strip's rail order, see [`strip_terminals`]), else at the end. Refused
-    /// when the strip already has that terminal or the number cannot be a terminal of it.
+    /// when the strip already has that terminal or the number cannot be a terminal of it. A
+    /// spare that leaves the strip in number order sets no rail order.
     pub fn add_spare(
         &mut self,
         strip: &DeviceTag,
@@ -1179,7 +1207,35 @@ impl ProjectMeta {
             l.spares.push(number.to_owned());
             l.order = order;
         });
+        self.forget_usual_order(strip, current);
         Ok(())
+    }
+
+    /// Forget the rail order of `strip` when it is just the usual one for the terminals on its
+    /// rail (`current`, see [`strip_terminals`]): drawn terminals by number, then spares by
+    /// number. A spare added at the end, or a terminal moved back, then leaves the strip in
+    /// number order, so a terminal drawn later goes where its number puts it, not at the end.
+    fn forget_usual_order(&mut self, strip: &DeviceTag, current: &[(String, bool)]) {
+        let mut drawn: Vec<String> = current
+            .iter()
+            .filter(|(_, spare)| !spare)
+            .map(|(t, _)| t.clone())
+            .collect();
+        drawn.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+        let Some(l) = self.strips.iter_mut().find(|l| &l.strip == strip) else {
+            return;
+        };
+        let usual = StripLayout {
+            strip: strip.clone(),
+            order: Vec::new(),
+            spares: l.spares.clone(),
+        }
+        .arrange(&drawn);
+        // The rail as arranged, not the stored order: that can leave out terminals drawn since.
+        if !l.order.is_empty() && l.arrange(&drawn) == usual {
+            l.order.clear();
+            self.drop_empty_layouts();
+        }
     }
 
     /// Take spare terminal `number` off `strip`, and out of its jumper; `current` is the strip's
@@ -1199,6 +1255,7 @@ impl ProjectMeta {
         if !drawn {
             l.order.retain(|t| t != number);
         }
+        self.forget_usual_order(strip, current);
         self.drop_empty_layouts();
         if !drawn {
             self.remove_from_jumper(strip, number);
@@ -1207,7 +1264,8 @@ impl ProjectMeta {
     }
 
     /// Move terminal `number` of `strip` to `to` (0 is first) in its rail order; `current` is
-    /// the strip's rail order (see [`strip_terminals`]). Returns whether anything changed.
+    /// the strip's rail order (see [`strip_terminals`]). A move back into number order forgets
+    /// the rail order. Returns whether anything changed.
     pub fn move_terminal(
         &mut self,
         strip: &DeviceTag,
@@ -1225,7 +1283,10 @@ impl ProjectMeta {
         if order.iter().eq(current.iter().map(|(t, _)| t)) {
             return Ok(false);
         }
-        self.set_terminal_order(strip, &order)
+        let before = self.strips.clone();
+        self.set_terminal_order(strip, &order)?;
+        self.forget_usual_order(strip, current);
+        Ok(self.strips != before)
     }
 
     /// The jumper a terminal (`-X1.4`) is in, if any.
@@ -1464,8 +1525,8 @@ impl PageSize {
     }
 
     /// How many reference rows run down the sides of the frame, by the sheet's height: A to F
-    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to K up to A1
-    /// landscape (594 mm), A to M above. Fixed per sheet size, so a reference never moves.
+    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to J up to A1
+    /// landscape (594 mm), A to L above. Fixed per sheet size, so a reference never moves.
     pub fn frame_rows(self) -> usize {
         let (_, h) = self.mm();
         if h <= 297.0 {
@@ -1581,6 +1642,47 @@ impl WireSpec {
     /// A value as stored: trimmed, and `None` when empty.
     pub fn value(text: &str) -> Option<String> {
         Some(text.trim().to_owned()).filter(|s| !s.is_empty())
+    }
+
+    /// Whether the cross-section is clearly wrong: a size in mm² (or a plain number, mm² as in
+    /// EPLAN) that is not above 0, or a negative AWG gauge. AWG 0 and `1/0` are real gauges.
+    /// Other text is left alone.
+    pub fn section_is_bad(&self) -> bool {
+        let Some(s) = self.section.as_deref().map(str::trim) else {
+            return false;
+        };
+        let lower = s.to_lowercase();
+        if let Some(n) = lower.strip_suffix("awg").or_else(|| lower.strip_prefix("awg")) {
+            return n.trim().starts_with('-');
+        }
+        let n = ["mm²", "mm2", "mm"]
+            .iter()
+            .find_map(|u| lower.strip_suffix(u))
+            .unwrap_or(&lower);
+        n.trim()
+            .replace(',', ".")
+            .parse::<f64>()
+            .is_ok_and(|v| !(v.is_finite() && v > 0.0))
+    }
+
+    /// Whether the colour is made of IEC 60757 codes (`BU`, `GNYE`, `GN/YE`, any case), or
+    /// there is none.
+    pub fn colour_is_iec(&self) -> bool {
+        const CODES: [&str; 14] = [
+            "BK", "BN", "RD", "OG", "YE", "GN", "BU", "VT", "GY", "WH", "PK", "GD", "TQ", "SR",
+        ];
+        let Some(c) = &self.colour else { return true };
+        // Each part between separators is whole codes, so `B/K` is not read as `BK`.
+        let upper = c.to_uppercase();
+        let mut parts = upper.split(['/', '-', '+', ' ']).filter(|p| !p.is_empty()).peekable();
+        parts.peek().is_some()
+            && parts.all(|p| {
+                let letters: Vec<char> = p.chars().collect();
+                letters.len().is_multiple_of(2)
+                    && letters
+                        .chunks(2)
+                        .all(|l| CODES.contains(&l.iter().collect::<String>().as_str()))
+            })
     }
 }
 
@@ -1802,18 +1904,21 @@ fn is_one(n: &u32) -> bool {
 
 impl Device {
     /// Every part of the device with its quantity: the main part (once), then the accessories.
+    /// A blank part id is left out and a quantity of 0 is taken as 1, as the editor does, so a
+    /// hand-edited file cannot put an empty or zero line into the parts list.
     pub fn all_parts(&self) -> Vec<(&str, u32)> {
         self.part
             .as_deref()
             .map(|p| (p, 1))
             .into_iter()
-            .chain(self.accessories.iter().map(|a| (a.part.as_str(), a.qty)))
+            .chain(self.accessories.iter().map(|a| (a.part.as_str(), a.qty.max(1))))
+            .filter(|(p, _)| !p.trim().is_empty())
             .collect()
     }
 
     /// Whether the device uses part `id`, as its main part or as an accessory.
     pub fn uses_part(&self, id: &str) -> bool {
-        self.part.as_deref() == Some(id) || self.accessories.iter().any(|a| a.part == id)
+        self.all_parts().iter().any(|(p, _)| *p == id)
     }
 }
 
@@ -1961,7 +2066,8 @@ impl Project {
             .into_iter()
             .map(|(_, label)| label)
             .collect();
-        out.sort();
+        // Page 2 before page 10, -K2 before -K10, pin 2 before pin 13 (#1359).
+        out.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
         out.dedup();
         out
     }
@@ -2104,8 +2210,9 @@ impl Project {
     }
 
     /// Rename device `from` to `to` everywhere it appears: its device entry, the symbols that
-    /// carry its tag, the cable cores of a cable, panel items and terminal-strip jumpers.
-    /// Returns how many symbols were retagged. It does not check that `to` is free: callers do.
+    /// carry its tag, the cable cores of a cable, panel items, terminal-strip jumpers, fieldbus
+    /// networks, and the PLC racks and cards named by it. Returns how many symbols were
+    /// retagged. It does not check that `to` is free: callers do.
     pub fn rename_device(&mut self, from: &DeviceTag, to: &DeviceTag) -> usize {
         if from == to {
             return 0;
@@ -2172,6 +2279,19 @@ impl Project {
         for net in &mut self.meta.networks {
             net.rename_device(from, to);
         }
+        // A PLC rack named after its head and a card carrying its tag follow, so the PLC card
+        // overview does not show the old tag. A name that is not this tag is left as typed.
+        let is_from = |s: &str| DeviceTag::parse(s).ok().as_ref() == Some(from);
+        for rack in &mut self.meta.racks {
+            if is_from(&rack.name) {
+                rack.name = to.to_string();
+            }
+            for card in &mut rack.cards {
+                if is_from(&card.tag) {
+                    card.tag = to.to_string();
+                }
+            }
+        }
         n
     }
 
@@ -2220,6 +2340,44 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dangling_pins_sort_pages_tags_and_pins_by_number() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        for (n, tags) in [("10", ["-K1", "-K2"]), ("2", ["-K10", "-K2"])] {
+            let mut page = Page::new(format!("p{n}"), n, "");
+            for (i, tag) in tags.iter().enumerate() {
+                page.symbols.push(PlacedSymbol {
+                    id: format!("s{i}"),
+                    symbol: "k".into(),
+                    at: Point::default(),
+                    rotation: Rotation::default(),
+                    mirror: false,
+                    tag: Some(DeviceTag::parse(tag)?),
+                });
+            }
+            page.wires = serde_json::from_str(
+                r#"[{"id":"w1","from":{"item":"s0","pin":"13"},"to":{"item":"s0","pin":"2"}},
+                    {"id":"w2","from":{"item":"s1","pin":"13"},"to":{"item":"s1","pin":"2"}}]"#,
+            )?;
+            p.pages.push(page);
+        }
+        let symbol: crate::Symbol = serde_json::from_str(r#"{"id":"k","name":"K","graphics":[],"pins":[]}"#)?;
+        assert_eq!(
+            p.dangling_pins("k", &symbol),
+            [
+                "page 2 -K2:2",
+                "page 2 -K2:13",
+                "page 2 -K10:2",
+                "page 2 -K10:13",
+                "page 10 -K1:2",
+                "page 10 -K1:13",
+                "page 10 -K2:2",
+                "page 10 -K2:13",
+            ]
+        );
+        Ok(())
+    }
 
     #[test]
     fn removing_symbols_takes_the_wires_on_their_pins_too() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -2301,6 +2459,22 @@ mod tests {
         let mut p = Project::new("x");
         p.devices.insert(DeviceTag::parse("-K1")?, d);
         assert_eq!(p.used_parts().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_hand_edited_device_gives_no_blank_or_zero_part_line() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let text =
+            r#"{"part":" ","accessories":[{"part":"acme.block","qty":0},{"part":""},{"part":"acme.marker","qty":2}]}"#;
+        let d: Device = serde_json::from_str(text)?;
+        assert_eq!(d.all_parts(), [("acme.block", 1), ("acme.marker", 2)]);
+        assert!(!d.uses_part("") && !d.uses_part(" ") && d.uses_part("acme.block"));
+        let mut p = Project::new("x");
+        p.devices.insert(DeviceTag::parse("-K1")?, d);
+        assert_eq!(
+            p.used_parts().into_iter().collect::<Vec<_>>(),
+            ["acme.block", "acme.marker"]
+        );
         Ok(())
     }
 
@@ -2620,6 +2794,39 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_device_renames_the_plc_rack_and_card_it_names() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::plc_rack::{PlcCard, PlcRack};
+        let mut p = Project::new("t");
+        p.meta.racks.push(PlcRack {
+            name: " -A1 ".into(),
+            cards: vec![
+                PlcCard {
+                    slot: 1,
+                    tag: "-A1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 2,
+                    tag: "-A1.DI1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 3,
+                    tag: "Inputs".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        p.rename_device(&DeviceTag::parse("-A1")?, &DeviceTag::parse("+S2-A5")?);
+        let rack = &p.meta.racks[0];
+        assert_eq!(rack.name, "+S2-A5");
+        let tags: Vec<&str> = rack.cards.iter().map(|c| c.tag.as_str()).collect();
+        assert_eq!(tags, ["+S2-A5", "-A1.DI1", "Inputs"], "only the renamed tag follows");
+        Ok(())
+    }
+
+    #[test]
     fn jumper_edits_trim_the_terminal_number_like_adding_does() -> Result<(), Box<dyn std::error::Error>> {
         let x1 = DeviceTag::parse("-X1")?;
         let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
@@ -2652,6 +2859,45 @@ mod tests {
         let old: ProjectMeta =
             toml::from_str("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = [\"1\", \"2\"]\n")?;
         assert_eq!(old.jumpers[0].part, None);
+        // Hand-edited jumpers read as add_jumper keeps them: a two-level number or a jumper
+        // that joins nothing is refused, two sharing a terminal are one.
+        let read = |jumpers: &str| toml::from_str::<ProjectMeta>(&format!("name = \"t\"\n{jumpers}"));
+        let jumper = |strip: &str, t: &str| format!("[[jumper]]\nstrip = \"{strip}\"\nterminals = [{t}]\n");
+        let err = read(&jumper("-X1", "\"1\", \"2.3\"")).err().map(|e| e.to_string());
+        assert!(err.as_deref().is_some_and(|e| e.contains("one tag level")), "{err:?}");
+        let err = read(&jumper("-X1", "\"1\", \"1\"")).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("two different terminals")),
+            "{err:?}"
+        );
+        let shared = read(&format!(
+            "{}part = \"acme.bridge\"\n{}{}",
+            jumper("-X1", "\"3\", \"4\""),
+            jumper("-X1", "\"1\", \"3\""),
+            jumper("-X2", "\"1\", \"3\"")
+        ))?;
+        assert_eq!(shared.jumpers.len(), 2, "{:?}", shared.jumpers);
+        assert_eq!(shared.jumpers[0].terminals, s(&["1", "3", "4"]));
+        assert_eq!(shared.jumpers[0].part.as_deref(), Some("acme.bridge"));
+        // Conflicting parts: the first in the file counts, also when a later entry bridges two
+        // groups that were apart until then.
+        let conflict = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n",
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"3\"")
+        ))?;
+        assert_eq!(conflict.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert_eq!(conflict.jumpers[0].part.as_deref(), Some("first"));
+        let bridged = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n{}",
+            jumper("-X1", "\"8\", \"9\""),
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"8\"")
+        ))?;
+        assert_eq!(bridged.jumpers.len(), 1, "{:?}", bridged.jumpers);
+        assert_eq!(bridged.jumpers[0].terminals, s(&["1", "2", "8", "9"]));
+        assert_eq!(bridged.jumpers[0].part.as_deref(), Some("first"));
+        assert_eq!(shared.jumpers[1].strip, DeviceTag::parse("-X2")?);
         // Extended by another jumper: the part stays.
         m.add_jumper(&x1, &s(&["2", "3"]))?;
         assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-402"));
@@ -2769,6 +3015,38 @@ mod tests {
         assert_eq!(serde_json::from_str::<Wire>(&text)?, w);
         assert_eq!(WireSpec::value("  "), None);
         Ok(())
+    }
+
+    #[test]
+    fn a_wire_spec_knows_a_bad_section_and_a_colour_that_is_no_iec_code() {
+        let spec = |section: &str, colour: &str| WireSpec {
+            section: WireSpec::value(section),
+            colour: WireSpec::value(colour),
+            kind: None,
+        };
+        for bad in [
+            "0 mm²",
+            "-1.5 mm²",
+            "0",
+            "0,0 mm2",
+            "NaN",
+            "inf mm²",
+            "-2 AWG",
+            "AWG -1",
+        ] {
+            assert!(spec(bad, "").section_is_bad(), "{bad}");
+        }
+        for good in [
+            "", "1.5 mm²", "0,75mm²", "2.5", "18 AWG", "0 AWG", "1/0 AWG", "3x1.5", "LiYY",
+        ] {
+            assert!(!spec(good, "").section_is_bad(), "{good}");
+        }
+        for good in ["", "BU", "bu", "GNYE", "gn/ye", "GN-YE", "WH BK"] {
+            assert!(spec("", good).colour_is_iec(), "{good}");
+        }
+        for bad in ["XX", "BLUE", "B", "GNY", "sw", "1", "B/K", "G/N/YE", "/"] {
+            assert!(!spec("", bad).colour_is_iec(), "{bad}");
+        }
     }
 
     #[test]
@@ -3031,6 +3309,64 @@ mod tests {
         let err = toml::from_str::<ProjectMeta>(twice).err().ok_or("loaded")?.to_string();
         assert!(err.contains("-X1 is arranged twice"), "{err}");
         assert!(toml::from_str::<ProjectMeta>("name = \"t\"\n")?.strips.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_at_the_end_or_a_move_back_leaves_the_strip_in_number_order() -> Result<(), String> {
+        let x1 = DeviceTag::parse("-X1").map_err(|e| e.to_string())?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let drawn = s(&["1", "2", "4"]);
+        let rail = |m: &ProjectMeta, drawn: &[String]| -> Vec<String> {
+            let arranged = match m.strip_layout(&x1) {
+                Some(l) => l.arrange(drawn),
+                None => drawn.iter().map(|n| (n.clone(), false)).collect(),
+            };
+            arranged.into_iter().map(|(t, _)| t).collect()
+        };
+        let current = |m: &ProjectMeta| -> Vec<(String, bool)> {
+            let l = m.strip_layout(&x1).cloned();
+            l.map_or_else(
+                || drawn.iter().map(|n| (n.clone(), false)).collect(),
+                |l| l.arrange(&drawn),
+            )
+        };
+        let mut m = ProjectMeta::new("t");
+        // A spare at the end: the strip is still in number order, so no order is kept and a
+        // terminal 3 drawn later goes between 2 and 4, not after the spare.
+        m.add_spare(&x1, "S1", None, &current(&m))?;
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        assert_eq!(rail(&m, &s(&["1", "2", "3", "4"])), s(&["1", "2", "3", "4", "S1"]));
+        // A spare out of number order keeps the order.
+        m.add_spare(&x1, "S0", None, &current(&m))?;
+        assert_eq!(rail(&m, &drawn), s(&["1", "2", "4", "S1", "S0"]));
+        assert!(m.remove_spare(&x1, "S0", &current(&m)));
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        // Moved away and back: the order is forgotten again.
+        assert!(m.move_terminal(&x1, "4", 0, &current(&m))?);
+        assert_eq!(rail(&m, &drawn), s(&["4", "1", "2", "S1"]));
+        assert!(m.move_terminal(&x1, "4", 2, &current(&m))?);
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        // An order set before terminal 5 was drawn names only 1, 4 and the spare: with the
+        // spare off, the rail is in number order and the order goes, so 3 drawn later goes
+        // between 1 and 4.
+        let mut n = ProjectMeta::new("t");
+        let early = s(&["1", "4"]);
+        let rail_of = |m: &ProjectMeta, d: &[String]| m.strip_layout(&x1).map(|l| l.arrange(d)).unwrap_or_default();
+        n.add_spare(
+            &x1,
+            "S1",
+            Some("1"),
+            &early.iter().map(|t| (t.clone(), false)).collect::<Vec<_>>(),
+        )?;
+        let later = s(&["1", "4", "5"]);
+        assert!(n.remove_spare(&x1, "S1", &rail_of(&n, &later)));
+        assert!(n.strips.is_empty(), "{:?}", n.strips);
+        // Without spares nothing is left of the layout.
+        assert!(m.remove_spare(&x1, "S1", &current(&m)));
+        assert!(m.move_terminal(&x1, "2", 0, &current(&m))?);
+        assert!(m.move_terminal(&x1, "2", 1, &current(&m))?);
+        assert!(m.strips.is_empty());
         Ok(())
     }
 
