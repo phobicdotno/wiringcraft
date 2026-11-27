@@ -1739,3 +1739,187 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn part(id: &str, maker: &str, number: &str) -> (String, Part) {
+        (
+            id.to_owned(),
+            Part {
+                id: id.into(),
+                manufacturer: maker.into(),
+                order_number: number.into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_list_saved_with_tabs_and_german_headers_is_read() {
+        let text = "\u{feff}Index\tTyp\tKlemmenleiste\tKlemme\tArtikelnummer\tHersteller\tMenge\n\
+                    -X1/T:1\tTerminal\t-X1\t1\t 2002-1201 \tWAGO\t3\n\
+                    -X1/A1\tAccessory\t-X1\t\t2002-1291\tWAGO\t\n";
+        let (rows, warnings) = read_configured(text.as_bytes()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            rows,
+            vec![
+                ConfiguredRow {
+                    line: 2,
+                    index: "-X1/T:1".into(),
+                    kind: "Terminal".into(),
+                    strip: "-X1".into(),
+                    terminal: "1".into(),
+                    connects: None,
+                    article: "2002-1201".into(),
+                    manufacturer: "WAGO".into(),
+                    quantity: Some(3),
+                },
+                ConfiguredRow {
+                    line: 3,
+                    index: "-X1/A1".into(),
+                    kind: "Accessory".into(),
+                    strip: "-X1".into(),
+                    terminal: String::new(),
+                    connects: None,
+                    article: "2002-1291".into(),
+                    manufacturer: "WAGO".into(),
+                    quantity: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_comma_list_with_a_connects_column_reads_it_even_when_empty() {
+        let text = "Index,Article No.,Connects\n-X1/A1,249-116,\"1, 2\"\n-X1/A2,249-117,\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].article, "249-116");
+        assert_eq!(rows[0].connects.as_deref(), Some("1, 2"));
+        assert_eq!(rows[1].connects.as_deref(), Some(""));
+        // Columns the file does not have read empty.
+        assert_eq!(rows[0].kind, "");
+        assert_eq!(rows[0].manufacturer, "");
+    }
+
+    #[test]
+    fn a_quantity_that_is_not_a_whole_number_is_left_out_with_a_warning_naming_its_line() {
+        let text = "Index;Article;Qty\n-X1/A1;249-116;2\n-X1/A2;249-116;1.5\n-X1/A3;249-116;-1\n";
+        let (rows, warnings) = read_configured(text.as_bytes()).unwrap();
+        let quantities: Vec<Option<u32>> = rows.iter().map(|r| r.quantity).collect();
+        assert_eq!(quantities, vec![Some(2), None, None]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("line 3: quantity \"1.5\""), "{warnings:?}");
+        assert!(warnings[1].starts_with("line 4: quantity \"-1\""), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_latin1_list_is_read() {
+        let mut bytes = b"Index;Article;Hersteller\n-X1/T:1;2002-1201;M".to_vec();
+        bytes.push(0xFC); // u in Latin-1
+        bytes.extend_from_slice(b"ller\n");
+        let (rows, _) = read_configured(&bytes).unwrap();
+        assert_eq!(rows[0].manufacturer, "M\u{fc}ller");
+    }
+
+    #[test]
+    fn a_header_without_an_article_column_is_refused_naming_the_columns() {
+        let Err(Error::Format(why)) = read_configured(b"Index;Strip\n-X1/T:1;-X1\n") else {
+            unreachable!()
+        };
+        assert!(why.contains("Index") && why.contains("Strip"), "{why}");
+    }
+
+    #[test]
+    fn old_indexes_name_the_terminal_and_the_accessory() {
+        assert_eq!(old_index("-X1/T3"), Some(("-X1/T3", None)));
+        assert_eq!(old_index("-X1/T3/A12"), Some(("-X1/T3", Some("/A12"))));
+        assert_eq!(old_index("=A1+B-X1/T10"), Some(("=A1+B-X1/T10", None)));
+        // Today's indexes and broken ones are not old indexes.
+        assert_eq!(old_index("-X1/T:3"), None);
+        assert_eq!(old_index("-X1/A2"), None);
+        assert_eq!(old_index("/T3"), None);
+        assert_eq!(old_index("-X1/T"), None);
+        assert_eq!(old_index("-X1/T3/A"), None);
+        assert_eq!(old_index("-X1/T3/Ax"), None);
+        assert_eq!(old_index(""), None);
+    }
+
+    #[test]
+    fn connects_cells_compare_by_their_terminals_only() {
+        assert!(same_terminals("1, 2", "1,2"));
+        assert!(same_terminals(" 1 ,2, ", "1,2"));
+        assert!(same_terminals("", " , "));
+        assert!(!same_terminals("1,2", "2,1"));
+        assert!(!same_terminals("1,2", "1,2,3"));
+        assert!(!same_terminals("1", ""));
+    }
+
+    #[test]
+    fn control_characters_are_escaped_and_the_rest_is_kept() {
+        assert_eq!(escape_controls("-X1 \u{fc}"), "-X1 \u{fc}");
+        assert_eq!(escape_controls("a\u{1b}[31mb"), "a\\u{1b}[31mb");
+        assert_eq!(escape_controls("a\tb\n"), "a\\tb\\n");
+    }
+
+    #[test]
+    fn a_part_is_found_by_id_or_order_number_the_projects_own_first() {
+        let c = Candidates {
+            project: [part("own.1", "WAGO", "2002-1201")].into_iter().collect(),
+            library: [part("lib.1", "WAGO", "2002-1201"), part("lib.2", "WAGO", "249-116")]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(find_part(&c, "lib.1", ""), Ok("lib.1".into()));
+        assert_eq!(find_part(&c, "2002-1201", ""), Ok("own.1".into()));
+        assert_eq!(find_part(&c, "249-116", "Someone"), Ok("lib.2".into()));
+        let Err(why) = find_part(&c, "nothing", "") else {
+            unreachable!()
+        };
+        assert!(why.starts_with("no part of the project or its libraries"), "{why}");
+    }
+
+    #[test]
+    fn several_matches_are_told_apart_by_the_manufacturer_or_all_listed() {
+        let c = Candidates {
+            library: [
+                part("acme.dup", "Acme", "DUP-1"),
+                part("phoenix.dup", "Phoenix", "dup-1 "),
+                part("other.dup", "Phoenix", "DUP-1"),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(find_part(&c, "dup-1", "acme"), Ok("acme.dup".into()));
+        let Err(why) = find_part(&c, "DUP-1", "phoenix") else {
+            unreachable!()
+        };
+        assert_eq!(why, "several parts have this article number (other.dup, phoenix.dup)");
+        let Err(why) = find_part(&c, "DUP-1", "Nobody") else {
+            unreachable!()
+        };
+        assert_eq!(
+            why,
+            "several parts have this article number (acme.dup, other.dup, phoenix.dup)"
+        );
+    }
+
+    #[test]
+    fn a_part_the_project_cannot_read_is_never_taken() {
+        let c = Candidates {
+            library: [part("wago.1", "WAGO", "2002-1201")].into_iter().collect(),
+            unreadable: [("wago.1".to_owned(), "file missing".to_owned())].into_iter().collect(),
+            ..Default::default()
+        };
+        let msg = "the project has part wago.1, but its copy cannot be read (file missing)";
+        assert_eq!(find_part(&c, "wago.1", ""), Err(msg.to_owned()));
+        assert_eq!(find_part(&c, "2002-1201", ""), Err(msg.to_owned()));
+    }
+}
