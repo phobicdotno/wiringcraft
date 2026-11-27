@@ -355,6 +355,97 @@ fn cable_list_groups_cores_by_cable() {
 }
 
 #[test]
+fn cable_list_names_a_part_missing_from_the_library_copy_by_its_id() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    p.devices.insert(
+        w1.clone(),
+        Device {
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    assert!(!parts.contains_key("LAPP.1119203"));
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][..2], ["-W1", "LAPP.1119203"]);
+}
+
+#[test]
+fn cable_list_lists_a_cable_of_the_devices_file_without_drawn_cores() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w5 = DeviceTag::parse("-W5").unwrap();
+    p.devices.insert(
+        w5.clone(),
+        Device {
+            description: "Pump cable".into(),
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    // A terminal named like a cable is no cable.
+    p.devices.insert(DeviceTag::parse("-X1.W1").unwrap(), Device::default());
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows.len(), 2);
+    assert_eq!(t.rows[0][..4], ["-W1", "", "", "1"]);
+    assert_eq!(t.rows[1], ["-W5", "LAPP.1119203", "Pump cable", "", "", "", ""]);
+    assert!(t.row_pages.get(1).is_none_or(String::is_empty));
+}
+
+#[test]
+fn cable_list_lists_a_hierarchical_cable_drawn_as_no_terminal() {
+    let (mut p, s, parts) = fixture();
+    // -A1.WD3 is drawn with a standalone symbol and has no cores yet; the marking list lists
+    // it as a cable, and so does the cable list. -X1.W1 is drawn as a terminal.
+    let wd3 = DeviceTag::parse("-A1.WD3").unwrap();
+    p.devices.insert(
+        wd3.clone(),
+        Device {
+            description: "Sensor cable".into(),
+            ..Default::default()
+        },
+    );
+    p.devices.insert(DeviceTag::parse("-X1.W1").unwrap(), Device::default());
+    p.pages[0].symbols.push(place("s9", "lamp", 200.0, Some("-A1.WD3")));
+    p.pages[0].symbols.push(place("t9", "term", 210.0, Some("-X1.W1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = cable_list(&i);
+    let cables: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).filter(|c| !c.is_empty()).collect();
+    assert_eq!(cables, ["-A1.WD3"]);
+    assert_eq!(t.rows[0], ["-A1.WD3", "", "Sensor cable", "", "", "", ""]);
+    let marked: Vec<String> = marking_list(&i, &[MarkerKind::Cables])
+        .rows
+        .iter()
+        .map(|r| r[2].clone())
+        .collect();
+    assert_eq!(marked, ["-A1.WD3"]);
+}
+
+#[test]
 fn check_names_a_cable_core_on_two_connections() {
     let (mut p, s, parts) = fixture();
     let found = |p: &Project| {
@@ -496,6 +587,99 @@ fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
 }
 
 #[test]
+fn wires_on_an_overview_page_are_not_listed_twice() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1,
+            core: "1".into(),
+        });
+    }
+    let lists = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        (wire_list(&i).rows, cable_list(&i).rows)
+    };
+    let schematic = p.pages[0].number.clone();
+    let (wires, cables) = lists(&p);
+    // The baseline lists the schematic's cable core, so the checks below compare real rows.
+    assert_eq!(cables.len(), 1);
+    assert_eq!(cables[0][0], "-W1");
+    assert_eq!(cables[0][3], "1");
+    assert_eq!(cables[0][4], schematic);
+    // The same schematic again, drawn on a line diagram.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    let (same_wires, same_cables) = lists(&p);
+    assert_eq!(same_wires.len(), wires.len(), "an overview page adds no wire rows");
+    assert_eq!(same_cables, cables, "an overview page adds no cable rows");
+    p.pages.last_mut().unwrap().overview = false;
+    let (more_wires, more_cables) = lists(&p);
+    assert!(more_wires.len() > wires.len(), "a normal page does");
+    assert_eq!(more_cables.len(), cables.len() + 1, "one more core row");
+    assert_eq!(more_cables[0], cables[0]);
+    assert_eq!(more_cables[1][..5], ["", "", "", "1", "9"], "the copied page's core");
+}
+
+#[test]
+fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
+    let (mut p, s, parts) = fixture();
+    let rows = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        wire_list(&i).rows
+    };
+    // The generated name of the net list row with these connections.
+    let net_name = |p: &Project, connections: &str| {
+        let t = net_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        });
+        let Some(row) = t.rows.iter().find(|r| r[2] == connections) else {
+            unreachable!("no net with {connections}")
+        };
+        row[0].clone()
+    };
+    let schematic_net = "-X1.1:1, =A+C1-K1:14";
+    let before = rows(&p);
+    let before_name = net_name(&p, schematic_net);
+    assert!(before_name.starts_with('N'), "{before_name} is a generated name");
+    assert!(
+        before.iter().any(|r| r[2].starts_with('N')),
+        "the fixture has a net with a generated name"
+    );
+    // The same schematic again, drawn on a line diagram placed before it.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p0".into();
+    overview.number = "0".into();
+    overview.overview = true;
+    // Untagged, so the net list tells the overview's own nets from the schematic's by their pins.
+    for sym in &mut overview.symbols {
+        sym.tag = None;
+    }
+    p.pages.insert(0, overview.clone());
+    assert_eq!(rows(&p), before, "an overview page before the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview before");
+    p.pages.remove(0);
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    p.pages.push(overview);
+    assert_eq!(rows(&p), before, "an overview page after the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview after");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
@@ -540,6 +724,124 @@ fn project_check_finds_the_usual_mistakes() {
 }
 
 #[test]
+fn project_check_warns_about_parts_missing_from_the_library_copy() {
+    let (mut p, s, parts) = fixture();
+    // -P1 names a part the library copy lacks, as its main part and twice as an accessory;
+    // -K1's part is there, its accessory is not.
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some("acme.gone".into()),
+            accessories: vec![wc_core::DevicePart {
+                part: "acme.gone".into(),
+                qty: 2,
+            }],
+            ..Default::default()
+        },
+    );
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    p.devices.get_mut(&k1).unwrap().accessories.push(wc_core::DevicePart {
+        part: "acme.socket".into(),
+        qty: 1,
+    });
+    // A jumper whose part is missing.
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).unwrap();
+    p.meta.jumpers[0].part = Some("acme.bridge".into());
+    let found = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let missing: Vec<&str> = found
+        .iter()
+        .filter(|f| f.message.contains("missing from the project's library copy"))
+        .inspect(|f| assert_eq!(f.severity, Severity::Warning))
+        .map(|f| f.message.as_str())
+        .collect();
+    assert_eq!(
+        missing,
+        [
+            "-P1: part acme.gone is missing from the project's library copy",
+            "=A+C1-K1: part acme.socket is missing from the project's library copy",
+            "jumper of -X1: part acme.bridge is missing from the project's library copy",
+        ]
+    );
+    // -P1 has a part now, even if it is missing, so no "has no part" note.
+    assert!(!found.iter().any(|f| f.message == "-P1 has no part"), "{found:?}");
+}
+
+#[test]
+fn project_check_warns_about_a_missing_part_of_a_device_drawn_only_as_interruption_points() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let Ok(l1) = DeviceTag::parse("-L1") else {
+        unreachable!()
+    };
+    p.devices.insert(
+        l1,
+        Device {
+            part: Some("acme.gone".into()),
+            ..Default::default()
+        },
+    );
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    assert!(
+        found.contains(&"-L1: part acme.gone is missing from the project's library copy".to_owned()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn project_check_names_an_unreadable_part_copy_with_its_reason() {
+    let (mut p, s, parts) = fixture();
+    let Ok(p1) = DeviceTag::parse("-P1") else {
+        unreachable!()
+    };
+    p.devices.insert(
+        p1,
+        Device {
+            part: Some("acme.broken".into()),
+            ..Default::default()
+        },
+    );
+    let unreadable = [("acme.broken".to_owned(), "expected value at line 1".to_owned())]
+        .into_iter()
+        .collect();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check_with_unreadable(&i, &[], &unreadable)
+        .into_iter()
+        .map(|f| f.message)
+        .collect();
+    assert!(
+        found.contains(
+            &"-P1: part acme.broken in the project's library copy cannot be read: expected value at line 1".to_owned()
+        ),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|m| m.contains("acme.broken is missing")), "{found:?}");
+    // Without the reason it is reported as missing.
+    assert!(
+        check(&i)
+            .iter()
+            .any(|f| f.message == "-P1: part acme.broken is missing from the project's library copy")
+    );
+}
+
+#[test]
 fn a_device_repeated_on_an_overview_page_is_not_drawn_twice() {
     let (mut p, s, parts) = fixture();
     // The coil -K1 again, on a line diagram.
@@ -578,6 +880,52 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
 }
 
 #[test]
+fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    // The same point again, on a line diagram.
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.symbols.push(place("s20", "arrow", 100.0, Some("-L1")));
+    p.pages.push(overview);
+    let lonely = |p: &Project| -> Vec<Option<String>> {
+        check(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .into_iter()
+        .filter(|f| f.message == "interruption point -L1 has no partner")
+        .map(|f| f.page_id)
+        .collect()
+    };
+    assert!(lonely(&p).is_empty(), "on a normal page the two points are partners");
+    p.pages[1].overview = true;
+    assert_eq!(
+        lonely(&p),
+        vec![Some(p.pages[0].id.clone())],
+        "the schematic point has no partner; the overview copy still has the schematic one"
+    );
+}
+
+/// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
+fn caex_file_name(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"CAEXFile" => {
+                let attr = e.try_get_attribute("FileName").ok()??;
+                return Some(attr.unescape_value().ok()?.into_owned());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+#[test]
 fn automationml_has_devices_pins_and_one_link_per_join() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
@@ -598,7 +946,7 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
         symbols: &s,
         parts: &parts,
     };
-    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z");
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml");
     // K1, -P1, -X1.1, -X1.2, -X2; not the interruption point.
     assert_eq!(counts.devices, 5, "{xml}");
     assert!(!xml.contains("-L1"));
@@ -609,12 +957,31 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert!(xml.contains("<Value>R-24, DC</Value>") && xml.contains("<Value>Acme</Value>"));
     assert!(xml.contains("Name=\"Coil &lt;voltage&gt;\"") && xml.contains("<Value>24 V &amp; more</Value>"));
     assert!(xml.contains("LastWritingDateTime=\"2026-11-16T22:00:00Z\""));
+    // FileName names the file written, not the project.
+    assert!(xml.contains("<CAEXFile FileName=\"plant-v2.aml\""), "{xml}");
+    // Without a file name, the project name stands in.
+    let fallback = automationml(&i, "2026-11-16T22:00:00Z", "").0;
+    assert!(fallback.contains("<CAEXFile FileName=\"Test.aml\""), "{fallback}");
+    // A file name is kept exactly as given, spaces included.
+    let spaced = automationml(&i, "2026-11-16T22:00:00Z", " plant-v2.aml").0;
+    assert!(spaced.contains("<CAEXFile FileName=\" plant-v2.aml\""), "{spaced}");
+    // Tab, line feed and carriage return survive attribute normalisation as character
+    // references; U+0085 is allowed in XML 1.0 and kept, U+FFFE is not and is dropped.
+    let odd = automationml(&i, "2026-11-16T22:00:00Z", "a\tb\nc\rd\u{85}e\u{FFFE}f.aml").0;
+    assert!(
+        odd.contains("<CAEXFile FileName=\"a&#9;b&#10;c&#13;d\u{85}ef.aml\""),
+        "{odd}"
+    );
+    // An XML reader gets the file name back exactly, tab, line feed and carriage return included.
+    let name = "a\tb\nc\rd.aml";
+    let xml_name = automationml(&i, "2026-11-16T22:00:00Z", name).0;
+    assert_eq!(caex_file_name(&xml_name).as_deref(), Some(name), "{xml_name}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
-    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z").0, xml);
+    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
 #[test]
@@ -672,6 +1039,44 @@ fn plc_io_list_and_contents() {
     assert!(lines[4].starts_with("    A1_Q1 AT %QX0.0 : BOOL; (* -A1.Q1, point -A1.Q1, address %Q0.0, to -P1:X2"));
     assert!(lines[5].starts_with("    u1 AT %I* : BOOL;"));
     assert_eq!(lines[6], "END_VAR");
+}
+
+#[test]
+fn plc_points_repeated_on_an_overview_page_are_listed_once() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    s.insert(input.id.clone(), input);
+    p.pages[0]
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    overview
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    p.pages.insert(0, overview);
+    p.devices.insert(
+        DeviceTag::parse("-A1.I1").unwrap(),
+        Device {
+            properties: [("Address".to_string(), "%I0.2".to_string())].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // Listed once, linked to the schematic page, and declared once.
+    let t = build(Kind::Plc, &i);
+    assert_eq!(t.rows.len(), 1);
+    assert_eq!(t.rows[0][2], "-A1.I1");
+    assert_eq!(t.rows[0][5], "2");
+    assert_eq!(t.row_pages, [p.pages[1].id.clone()]);
+    let v = plc_variables(&i);
+    assert_eq!(v.variables, 1);
+    assert!(!v.text.contains("A1_I1_2"));
 }
 
 #[test]
@@ -1063,6 +1468,24 @@ fn marker_list_headers_and_types_follow_the_language_and_warnings_still_find_wir
     assert!(nb.rows.iter().any(|r| r[0] == "Komponent"));
     assert_eq!(Language::parse("NO"), Some(Language::Nb));
     assert_eq!(Language::parse("fr"), None);
+}
+
+#[test]
+fn a_numbered_wire_repeated_on_an_overview_gets_no_extra_markers() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].wires[0].number = Some("7".into());
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Wires]);
+    let rows: Vec<String> = t.rows.iter().map(|r| r.join("|")).collect();
+    assert!(rows.contains(&"Wire||7|2".to_owned()), "{rows:?}");
 }
 
 #[test]
@@ -3382,5 +3805,104 @@ fn markdown_cells_with_a_backslash_keep_their_columns() {
     assert_eq!(
         t.to_markdown(),
         "## Paths\n\n| Path | Text | Next |\n|---|---|---|\n| C:\\\\ | a\\\\\\|b | next |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_show_markdown_characters_as_typed() {
+    let mut t = Table::new("Notes", &["*Tag*", "Text"]);
+    t.rows
+        .push(vec!["*a*".into(), "b_c_d `x` <tag> [l](u) ~s~ & ![i](p)".into()]);
+    t.rows.push(vec!["#1".into(), "-K1 2.5 mm² plain".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Notes\n\n| \\*Tag\\* | Text |\n|---|---|\n\
+         | \\*a\\* | b\\_c\\_d \\`x\\` &lt;tag&gt; \\[l\\](u) \\~s\\~ \\& \\!\\[i\\](p) |\n\
+         | \\#1 | -K1 2.5 mm² plain |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["see https://example.com/a_b *x*".into()]);
+    t.rows.push(vec!["(www.x.no/a_b|c), mail a_b@x.no or a_b@c".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | see https://example.com/a_b \\*x\\* |\n\
+         | (www\\.x.no/a\\_b\\|c), mail a_b@x.no or a\\_b@c |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_words_that_only_look_like_links() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://*spare*/path".into()]);
+    t.rows.push(vec!["https://example.com/&copy;".into()]);
+    t.rows.push(vec!["https://example.com/a_b. www.a_b.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://\\*spare\\*/path |\n\
+         | https\\://example.com/\\&copy; |\n\
+         | https://example.com/a_b. www.a\\_b.no |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_backslashes_in_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://example.com/a\\b".into()]);
+    t.rows
+        .push(vec!["https://example.com/a\\|b https://example.com/c\\".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a\\b |\n\
+         | https\\://example.com/a\\\\\\|b https\\://example.com/c\\\\ |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_an_uppercase_www_word() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["WWW.example.com/*spare*/path HTTPS://example.com/a_b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | WWW.example.com/\\*spare\\*/path HTTPS://example.com/a_b |\n"
+    );
+}
+
+#[test]
+fn markdown_links_with_text_that_needs_a_backslash_are_written_as_text() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["https://example.com/a_b, https://example.com/a_b*".into()]);
+    t.rows
+        .push(vec!["a_b@x.no&amp; www.x.no/a_b&copy; www.x.no/a_b.".into()]);
+    t.rows
+        .push(vec!["https://example.com/a|b https://example.com/a\\".into()]);
+    t.rows.push(vec!["HTTP://example.com/a\\|b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a_b, https\\://example.com/a\\_b\\* |\n\
+         | <a_b@x.no>\\&amp; www\\.x.no/a\\_b\\&copy; www.x.no/a_b. |\n\
+         | https\\://example.com/a\\|b https\\://example.com/a\\\\ |\n\
+         | HTTP\\://example.com/a\\\\\\|b |\n"
+    );
+}
+
+#[test]
+fn markdown_email_with_text_after_it_is_bracketed_only_when_commonmark_takes_it() {
+    let mut t = Table::new("Mail", &["Text"]);
+    t.rows.push(vec!["a@x_y.no* a_b@x.no&amp; a@-x.no_ a@x.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Mail\n\n| Text |\n|---|\n\
+         | a\\@x\\_y.no\\* <a_b@x.no>\\&amp; a\\@-x.no\\_ a@x.no |\n"
     );
 }

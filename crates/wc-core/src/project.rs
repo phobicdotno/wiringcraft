@@ -721,9 +721,16 @@ impl ProjectMeta {
     }
 
     /// Add a location, or fill in the description of one the project already has. A description
-    /// already there is kept. Returns whether anything changed.
-    pub fn merge_location(&mut self, loc: Location) -> bool {
-        match self.locations.iter_mut().find(|l| l.path == loc.path) {
+    /// already there is kept. Paths match by their normal form, so a location stored as typed
+    /// (`+L1`) is found by `L1`. Returns whether anything changed.
+    pub fn merge_location(&mut self, mut loc: Location) -> bool {
+        let key = location_path(&loc.path).unwrap_or_else(|_| loc.path.clone());
+        let found = self
+            .locations
+            .iter_mut()
+            .find(|l| l.path == loc.path || location_path(&l.path).is_ok_and(|p| p == key));
+        loc.path = key;
+        match found {
             Some(have) if have.description.is_empty() && !loc.description.is_empty() => {
                 have.description = loc.description;
                 true
@@ -1349,10 +1356,13 @@ impl PageSize {
                 "size {text:?} is not A4, A3, A2, A1 or A0 (add \"portrait\" for an upright sheet) or a custom WIDTHxHEIGHT in millimetres"
             )
         };
-        // Spaces around `x` and before `mm` are fine; inside a number they are not.
-        let dims = lower.strip_suffix("mm").unwrap_or(&lower);
+        // Spaces around `x` (or `×`) and before `mm` are fine, and each side may carry its own
+        // `mm` (`500mm x 700mm`); spaces inside a number are not.
+        let dims = lower.replace('×', "x");
         let (w, h) = dims.split_once('x').ok_or_else(bad)?;
         let side = |name: &str, v: &str| {
+            let v = v.trim();
+            let v = v.strip_suffix("mm").unwrap_or(v);
             v.trim().parse::<u32>().map_err(|e| {
                 format!(
                     "size {text:?}: the {name} {:?} is not a whole number of millimetres ({e}); each side is {} to {} mm",
@@ -1649,6 +1659,32 @@ impl Page {
 
     pub fn symbol(&self, id: &str) -> Option<&PlacedSymbol> {
         self.symbols.iter().find(|s| s.id == id)
+    }
+
+    /// Take the symbols named in `symbols` and the wires named in `wires` off this page, and
+    /// with them every wire that ends on a pin of one of those symbols. Returns the removed ids:
+    /// symbols first, then wires, each in page order. Ids not on the page are skipped.
+    pub fn remove_symbols_and_wires(&mut self, symbols: &[&str], wires: &[&str]) -> Vec<String> {
+        let gone_symbols: Vec<String> = self
+            .symbols
+            .iter()
+            .filter(|s| symbols.contains(&s.id.as_str()))
+            .map(|s| s.id.clone())
+            .collect();
+        // Only symbols that are on the page take their wires along: a wire that ends on a
+        // missing id stays.
+        let on_removed = |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if gone_symbols.contains(item));
+        // Each wire is judged on its own ends, so a second wire that only shares an id stays.
+        let mut gone_wires = Vec::new();
+        self.wires.retain(|w| {
+            let gone = wires.contains(&w.id.as_str()) || on_removed(&w.from) || on_removed(&w.to);
+            if gone {
+                gone_wires.push(w.id.clone());
+            }
+            !gone
+        });
+        self.symbols.retain(|s| !gone_symbols.contains(&s.id));
+        gone_symbols.into_iter().chain(gone_wires).collect()
     }
 
     /// Next free id with the given prefix (`s1`, `s2`, ...).
@@ -2051,6 +2087,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn removing_symbols_takes_the_wires_on_their_pins_too() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut page = Page::new("p1", "1", "P");
+        for id in ["s1", "s2"] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "k".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: None,
+            });
+        }
+        page.wires = serde_json::from_str(
+            r#"[{"id":"w1","from":{"item":"s1","pin":"1"},"to":{"at":{"x":0.0,"y":0.0}}},
+                {"id":"w2","from":{"at":{"x":0.0,"y":0.0}},"to":{"item":"s2","pin":"1"}},
+                {"id":"w3","from":{"at":{"x":0.0,"y":0.0}},"to":{"at":{"x":5.0,"y":0.0}}},
+                {"id":"w4","from":{"item":"s1","pin":"2"},"to":{"item":"s2","pin":"2"}}]"#,
+        )?;
+        let removed = page.remove_symbols_and_wires(&["s2", "nope"], &["w3"]);
+        assert_eq!(removed, ["s2", "w2", "w3", "w4"]);
+        assert_eq!(page.symbols.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1"]);
+        assert_eq!(page.wires.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["w1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn removing_symbols_judges_each_wire_by_its_own_ends() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut page = Page::new("p1", "1", "P");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "k".into(),
+            at: Point::default(),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: None,
+        });
+        // Two wires share the id w1 (a replaced page can hold that); only the first is on s1.
+        // w2 ends on `gone`, which is not on the page.
+        page.wires = serde_json::from_str(
+            r#"[{"id":"w1","from":{"item":"s1","pin":"1"},"to":{"at":{"x":0.0,"y":0.0}}},
+                {"id":"w1","from":{"at":{"x":0.0,"y":0.0}},"to":{"at":{"x":5.0,"y":0.0}}},
+                {"id":"w2","from":{"item":"gone","pin":"1"},"to":{"at":{"x":5.0,"y":0.0}}}]"#,
+        )?;
+        let removed = page.remove_symbols_and_wires(&["s1", "gone"], &[]);
+        assert_eq!(removed, ["s1", "w1"]);
+        assert_eq!(
+            page.wires.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            ["w1", "w2"]
+        );
+        assert!(matches!(page.wires[0].from, Endpoint::Point { .. }));
+        Ok(())
+    }
+
+    #[test]
     fn a_device_with_one_part_reads_and_writes_as_before() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let old = r#"{"part":"acme.relay","description":"Relay"}"#;
         let d: Device = serde_json::from_str(old)?;
@@ -2126,6 +2216,27 @@ mod tests {
                     height: 700,
                 },
             ),
+            (
+                "500mm x 700mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 mm x 700 mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 × 700",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
         ] {
             assert_eq!(PageSize::parse(text), Ok(want), "{text}");
         }
@@ -2142,6 +2253,8 @@ mod tests {
             "ap",
             "a4pp",
             "50 0 x 700 mm",
+            "500mmmm x 700",
+            "500 x 700 mm mm",
         ] {
             assert!(PageSize::parse(bad).is_err(), "{bad}");
         }
@@ -2257,6 +2370,15 @@ mod tests {
         );
         let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, ["L1.L3", "L2"]);
+        // A location stored as typed is found by its normal form, and the other way round.
+        m.locations.push(loc("+L4", ""));
+        assert!(m.merge_location(loc("L4", "Deck")), "the stored +L4 is filled in");
+        assert!(!m.merge_location(loc("+L2", "Other")));
+        assert!(m.merge_location(loc("+L5", "")));
+        let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["+L4", "L1.L3", "L2", "L5"]);
+        assert_eq!(m.locations[0].description, "Deck");
+        m.locations.retain(|l| l.path != "+L4" && l.path != "L5");
         let text = toml::to_string(&m).unwrap_or_default();
         assert!(text.contains("[[location]]"), "{text}");
         let back: ProjectMeta = toml::from_str(&text)?;

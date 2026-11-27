@@ -388,10 +388,13 @@ fn write_staging(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
 
 /// Load a whole project folder.
 pub fn load(dir: &Path) -> Result<Project> {
-    let meta: ProjectMeta = read_toml(&dir.join(PROJECT_FILE))?;
+    let meta_path = dir.join(PROJECT_FILE);
+    let meta: ProjectMeta = read_toml(&meta_path)?;
     if meta.format_version > ProjectMeta::FORMAT_VERSION {
         return Err(Error::Invalid(format!(
-            "project format {} is newer than this WiringCraft understands ({})",
+            "{} is project format {}, newer than this WiringCraft reads (format {}): update \
+             WiringCraft to open it",
+            meta_path.display(),
             meta.format_version,
             ProjectMeta::FORMAT_VERSION
         )));
@@ -1161,6 +1164,63 @@ mod tests {
         Ok(())
     }
 
+    /// The message of the error `load` gave, or an error when it loaded.
+    fn load_refused(dir: &Path) -> Result<String> {
+        match load(dir) {
+            Ok(_) => Err(Error::Invalid(format!("{} loaded", dir.display()))),
+            Err(e) => Ok(e.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_project_from_a_newer_format_is_refused_naming_its_file_and_the_remedy() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        p.meta.format_version = ProjectMeta::FORMAT_VERSION + 1;
+        save(dir.path(), &p)?;
+        let msg = load_refused(dir.path())?;
+        let file = dir.path().join(PROJECT_FILE);
+        assert!(msg.contains(&file.display().to_string()), "{msg}");
+        assert!(
+            msg.contains(&format!(
+                "project format {}, newer than this WiringCraft reads (format {})",
+                ProjectMeta::FORMAT_VERSION + 1,
+                ProjectMeta::FORMAT_VERSION
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains("update WiringCraft to open it"), "{msg}");
+        // The format this build writes loads.
+        p.meta.format_version = ProjectMeta::FORMAT_VERSION;
+        save(dir.path(), &p)?;
+        assert_eq!(load(dir.path())?, p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_or_panel_file_whose_id_differs_from_its_name_is_refused() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        p.panels.push(crate::panel::Panel::new("main", "Main", 600.0, 800.0));
+        save(dir.path(), &p)?;
+        let page = p.pages[0].id.clone();
+        let pages = dir.path().join(PAGES_DIR);
+        let copy = pages.join(format!("copy{PAGE_SUFFIX}"));
+        fs::copy(pages.join(format!("{page}{PAGE_SUFFIX}")), &copy).map_err(|e| Error::io(&copy, e))?;
+        let msg = load_refused(dir.path())?;
+        assert!(msg.contains(&copy.display().to_string()), "{msg}");
+        assert!(msg.contains(&format!("holds page id {page:?}")), "{msg}");
+        fs::remove_file(&copy).map_err(|e| Error::io(&copy, e))?;
+
+        let panels = dir.path().join(PANELS_DIR);
+        let moved = panels.join(format!("other{PANEL_SUFFIX}"));
+        fs::rename(panels.join(format!("main{PANEL_SUFFIX}")), &moved).map_err(|e| Error::io(&moved, e))?;
+        let msg = load_refused(dir.path())?;
+        assert!(msg.contains(&moved.display().to_string()), "{msg}");
+        assert!(msg.contains("holds panel id \"main\""), "{msg}");
+        Ok(())
+    }
+
     fn refused<T>(r: Result<T>) -> Result<String> {
         match r {
             Ok(_) => Err(Error::Invalid("saved ids that differ only in case".into())),
@@ -1643,7 +1703,11 @@ mod staging_tests {
         let (_watch, seen) = watch(|what, _| what == Synced::Folder);
 
         let failed = save(&root, &p);
-        assert!(matches!(&failed, Err(Error::Io { .. })), "{failed:?}");
+        // The page write failure is the one reported, not the folder sync failure after it.
+        assert!(
+            matches!(&failed, Err(Error::Io { path, .. }) if *path == blocker),
+            "{failed:?}"
+        );
         // Both folders with a file in place were still synced, failing or not.
         assert_eq!(folders_of(&seen), [root.clone(), pages.clone()]);
         assert!(pages.join(format!("p0000{PAGE_SUFFIX}")).exists());

@@ -28,6 +28,10 @@ pub enum Error {
     Source { name: String, message: String },
     #[error("{kind:?} {id:?} is not in any library source")]
     NotFound { kind: ItemKind, id: String },
+    /// An update named ids the project neither uses nor pins. `ids` are the unknown ones,
+    /// `known` the ids it does use or pin (as listed by `lib status`).
+    #[error("{}", unknown_message(ids, known))]
+    NotInProject { ids: Vec<String>, known: Vec<String> },
     /// An update failed and could not put back every file it had changed. `written` is how
     /// many of the items, in the order given, it had started to write.
     #[error("{error}; putting back the files the update changed failed too: {failed}")]
@@ -600,10 +604,48 @@ pub fn update(
     only: Option<&[String]>,
 ) -> Result<Vec<(ItemKind, String)>> {
     let all = status(project_dir, project, lib);
-    if let Some(bad) = wrong_named(&all, only) {
+    if let Some(bad) = unknown_named(&all, only).or_else(|| wrong_named(&all, only)) {
         return Err(bad);
     }
     update_items(project_dir, project, lib, &changed(&all, only))
+}
+
+/// Of `all` (from [`status`]), the ids named on purpose (`only`) that the project neither uses
+/// nor pins, as the error an update stops with before anything is taken: a typo would
+/// otherwise look like "nothing to update".
+pub fn unknown_named(all: &[ItemStatus], only: Option<&[String]>) -> Option<Error> {
+    let mut ids: Vec<String> = only?
+        .iter()
+        .filter(|id| !all.iter().any(|s| &s.id == *id))
+        .cloned()
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    ids.sort();
+    ids.dedup();
+    let mut known: Vec<String> = all.iter().map(|s| s.id.clone()).collect();
+    known.sort();
+    known.dedup();
+    Some(Error::NotInProject { ids, known })
+}
+
+fn unknown_message(ids: &[String], known: &[String]) -> String {
+    const SHOWN: usize = 20;
+    let quoted = |ids: &[String]| ids.iter().map(|id| format!("{id:?}")).collect::<Vec<_>>().join(", ");
+    let known = match known.len() {
+        0 => "it uses or pins no symbols or parts".to_owned(),
+        n if n <= SHOWN => format!("its symbols and parts are {}", quoted(known)),
+        n => format!(
+            "its symbols and parts include {} and {} more",
+            quoted(&known[..SHOWN]),
+            n - SHOWN
+        ),
+    };
+    format!(
+        "the project does not use or pin {}; {known} (see `wiringcraft lib status`)",
+        quoted(ids)
+    )
 }
 
 /// Of `all` (from [`status`]), an item named on purpose (`only`) whose library file declares

@@ -388,8 +388,18 @@ impl Action {
                 "",
             ),
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
-            Action::Rotate => i("Rotate", "Rotate the selected symbols 90°", Icon::Rotate, "R"),
-            Action::Mirror => i("Mirror", "Mirror the selected symbols left to right", Icon::Mirror, "M"),
+            Action::Rotate => i(
+                "Rotate",
+                "Rotate the selected symbols 90°, or the symbol being placed",
+                Icon::Rotate,
+                "R",
+            ),
+            Action::Mirror => i(
+                "Mirror",
+                "Mirror the selected symbols left to right, or the symbol being placed",
+                Icon::Mirror,
+                "M",
+            ),
             Action::Copy => i("Copy", "Copy the selection", Icon::Copy, "Ctrl+C"),
             Action::Cut => i("Cut", "Cut the selection", Icon::Cut, "Ctrl+X"),
             Action::Paste => i(

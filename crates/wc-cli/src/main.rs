@@ -80,6 +80,21 @@ where
     r
 }
 
+/// Print `warnings` on standard error, one `warning:` line each, with [`escape_field`].
+fn warn<W: AsRef<str>>(warnings: impl IntoIterator<Item = W>) {
+    warn_to(&mut std::io::stderr(), warnings);
+}
+
+/// [`warn`] onto `err`. A line that cannot be written (a closed pipe) is dropped with the ones
+/// after it instead of panicking as `eprintln!` does, so the command still prints its result.
+fn warn_to<W: AsRef<str>>(err: &mut impl std::io::Write, warnings: impl IntoIterator<Item = W>) {
+    for w in warnings {
+        if writeln!(err, "warning: {}", escape_field(w.as_ref())).is_err() {
+            return;
+        }
+    }
+}
+
 /// `import page-dwg`: [`run::import_page_dwg`], printing what it said.
 fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
     logged(|log| run::import_page_dwg(dir, file, &page, scale, template, log))
@@ -243,7 +258,7 @@ enum Cmd {
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
     NumberWires {
-        /// `sequential`, `page-column` or `potential`.
+        /// `sequential`, `page-column` or `potential` (any case; `page_column` works too).
         #[arg(long, default_value = "page-column")]
         rule: String,
         /// Renumber connections that already have a number too.
@@ -340,6 +355,7 @@ enum Cmd {
         #[arg(allow_hyphen_values = true)]
         tag: String,
         /// The part's library id; it is taken from the libraries when the project lacks it.
+        /// An empty id (`--part ""`) takes the device's part off.
         #[arg(long)]
         part: Option<String>,
         /// What the device does, e.g. `Pump motor`.
@@ -437,13 +453,20 @@ enum Cmd {
         /// The structured text file to write, e.g. `GVL_IO.st`.
         out: PathBuf,
     },
-    /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, wires with both ends on one pin, wire
-    /// numbers that do not name one connection each, devices without a part, plus the
-    /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
-    /// pattern, at most N wires on a terminal) and the house rules in each library source's
-    /// `rules.toml`, less the ones `rules_off` turns off. Exits with an error when an error is
-    /// found, so it can guard a commit or a CI job.
+    /// Check the project for mistakes: revision clouds whose revision the project does not
+    /// list, revision letters the PDF cannot print, symbols missing from the project's library
+    /// copy and wires on pins that do not exist, devices drawn twice, more contacts than a
+    /// device's parts have, contacts without a coil, interruption points without a partner,
+    /// open pins, wires ending in the air, wires with both ends on one pin, jumpers naming a
+    /// terminal drawn nowhere, one cable core on two connections, shorted potentials, a wire
+    /// number used on more than one connection or one connection carrying several wire
+    /// numbers, panel layouts with overlapping devices, devices sticking out of the plate or no
+    /// longer in the project, parts missing from the project's library copy, devices without a
+    /// part, then the house rules in each library source's `rules.toml`, less the ones
+    /// `rules_off` turns off, and last the project's own
+    /// `[[rule]]` tables in `project.toml` (a cable on every motor, a tag pattern, at most N
+    /// wires on a terminal).
+    /// Exits with an error when an error is found, so it can guard a commit or a CI job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
@@ -454,10 +477,13 @@ enum Cmd {
     /// hit (a device tag renames the device everywhere it appears). Status lines go to stderr,
     /// so stdout holds only hits.
     Find {
-        /// The text to find; upper and lower case are alike unless --match-case.
+        /// The text to find; upper and lower case are alike unless --match-case. A device tag
+        /// such as `-K1` is taken as the text, though it starts with `-`.
+        #[arg(allow_hyphen_values = true)]
         query: String,
-        /// Replace the found text with this, in every hit.
-        #[arg(long)]
+        /// Replace the found text with this, in every hit (taken as a value, though it starts
+        /// with `-`, e.g. `-K2`).
+        #[arg(long, allow_hyphen_values = true)]
         replace: Option<String>,
         /// Upper and lower case must match.
         #[arg(long)]
@@ -1095,7 +1121,8 @@ enum StripCmd {
         strip: Option<String>,
     },
     /// Put a strip's terminals in this rail order, e.g. `strip order -X1 3 1 2`. Terminals
-    /// left out follow at the end; no terminals goes back to the order by number.
+    /// left out follow at the end; no terminals goes back to the order by number. Every
+    /// terminal given must be on the strip, drawn or spare.
     Order {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -1620,24 +1647,13 @@ fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
     if !missing.is_empty() {
         return Err(format!("no symbol or wire {} on page {}", missing.join(", "), page.id));
     }
-    let named = |id: &str| ids.iter().any(|x| x == id);
-    let on_deleted =
-        |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if page.symbol(item).is_some() && named(item));
-    let gone_wires: Vec<String> = page
-        .wires
+    let symbols: Vec<&str> = ids
         .iter()
-        .filter(|w| named(&w.id) || on_deleted(&w.from) || on_deleted(&w.to))
-        .map(|w| w.id.clone())
+        .map(String::as_str)
+        .filter(|id| page.symbol(id).is_some())
         .collect();
-    let gone_symbols: Vec<String> = page
-        .symbols
-        .iter()
-        .filter(|s| named(&s.id))
-        .map(|s| s.id.clone())
-        .collect();
-    page.symbols.retain(|s| !gone_symbols.contains(&s.id));
-    page.wires.retain(|w| !gone_wires.contains(&w.id));
-    Ok(gone_symbols.into_iter().chain(gone_wires).collect())
+    let wires: Vec<&str> = ids.iter().map(String::as_str).collect();
+    Ok(page.remove_symbols_and_wires(&symbols, &wires))
 }
 
 /// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
@@ -3638,6 +3654,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
                 StripCmd::Order { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    // A strip or terminal the project does not have is refused, as `jumper add`
+                    // does; no terminals (back to the order by number) needs no check.
+                    if !terminals.is_empty() {
+                        let current = rail(&p, &strip);
+                        if current.is_empty() {
+                            return Err(no_strip(&strip, &unreadable));
+                        }
+                        for t in terminals.iter().map(|t| t.trim()) {
+                            if !current.iter().any(|(n, _)| n == t) {
+                                return Err(format!("{strip} has no terminal {}", escape_field(t)));
+                            }
+                        }
+                    }
                     if p.meta.set_terminal_order(&strip, &terminals)? {
                         save(dir, &p)?;
                     }
@@ -3710,15 +3739,17 @@ fn run(mut cli: Cli) -> Res<()> {
                 print!("{info}");
                 return Ok(());
             }
-            if let Some(part) = &part
+            // An empty id takes the part off, as the assistant's `set_device` does.
+            let part = part.map(|id| id.trim().to_owned());
+            if let Some(part) = part.as_deref().filter(|id| !id.is_empty())
                 && store::read_vendored_part(dir, part).is_err()
             {
                 let lib = wc_library::Library::open(dir, &p).map_err(e)?;
                 wc_library::take(dir, &mut p, &lib, ItemKind::Part, part).map_err(e)?;
             }
             let d = p.devices.entry(t).or_default();
-            if part.is_some() {
-                d.part = part;
+            if let Some(part) = part {
+                d.part = (!part.is_empty()).then_some(part);
             }
             if let Some(desc) = description {
                 d.description = desc;
@@ -3804,6 +3835,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     plc_cards,
                 },
             );
+            if report.pages == 0 {
+                return Err(wc_pdf::NOTHING_TO_EXPORT.into());
+            }
             write_out(&out, bytes).map_err(e)?;
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -3896,7 +3930,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 let mut stem = if d.panel {
                     wc_pdf::panel_file_stem(d)
                 } else {
-                    file_stem(&d.number, &d.id)
+                    wc_pdf::page_file_stem(d)
                 };
                 // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
                 while !used.insert(stem.to_lowercase()) {
@@ -3955,13 +3989,13 @@ fn run(mut cli: Cli) -> Res<()> {
         Cmd::Check { all } => {
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
-            let parts = vendored_parts(dir, &p);
+            let (parts, unreadable) = vendored_parts_and_unreadable(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
                 symbols: &symbols,
                 parts: &parts,
             };
-            let found = wc_report::check_with(&inputs, &wc_library::library_rules(dir, &p));
+            let found = wc_report::check_with_unreadable(&inputs, &wc_library::library_rules(dir, &p), &unreadable);
             let count = |s: wc_report::Severity| found.iter().filter(|f| f.severity == s).count();
             for f in found.iter().filter(|f| all || f.severity != wc_report::Severity::Note) {
                 let page = f
@@ -4072,7 +4106,11 @@ fn run(mut cli: Cli) -> Res<()> {
                 symbols: &symbols,
                 parts: &parts,
             };
-            let (text, counts) = wc_report::automationml(&inputs, &utc_now());
+            let file_name = out
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (text, counts) = wc_report::automationml(&inputs, &utc_now(), &file_name);
             write_out(&out, text).map_err(e)?;
             if counts.untagged_pins > 0 {
                 eprintln!(
@@ -4266,9 +4304,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             let text = read_file(&file)?;
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             s.category = category;
             s.letter_code = letter_code;
             let path = wc_library::write_symbol(&lib, &s).map_err(e)?;
@@ -4282,9 +4318,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         ImportCmd::FootprintDxf { file, part, lib } => {
             let text = read_file(&file)?;
             let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text)).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             update_library_part(
                 dir,
                 &part,
@@ -4306,9 +4340,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         ImportCmd::ModelStep { file, part, lib } => {
             let text = read_file(&file)?;
             let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text)).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             update_library_part(
                 dir,
                 &part,
@@ -4335,7 +4367,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             letter_code,
         } => {
             let text = read_text(&file)?;
-            let mut s = wc_import::svg::symbol(&text, &id, &name).map_err(e)?;
+            let (mut s, warnings) = wc_import::svg::symbol_with_warnings(&text, &id, &name).map_err(e)?;
+            warn(&warnings);
             s.category = category;
             s.letter_code = letter_code;
             let path = wc_library::write_symbol(&lib, &s).map_err(e)?;
@@ -4378,9 +4411,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
                 Some(bytes) => import_wago_bytes(dir, &bytes)?,
                 None => import_wago(dir, &file)?,
             };
-            for w in &done.warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&done.warnings);
             println!(
                 "WAGO configurator: {} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched",
                 done.changed,
@@ -4458,10 +4489,9 @@ fn update_library_part(
         && dir.join(store::PROJECT_FILE).exists()
         && let Err(err) = &project
     {
-        eprintln!(
-            "warning: the project could not be read, so its copy of {part} is not updated: {}",
-            escape_field(err)
-        );
+        warn([format!(
+            "the project could not be read, so its copy of {part} is not updated: {err}"
+        )]);
     }
     let path = match &lib {
         Some(root) => {
@@ -4620,10 +4650,7 @@ fn update_library_part(
                     Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
                     Err(_) => Ok(()),
                 };
-                eprintln!(
-                    "warning: the project's copy of {part} was not updated: {}",
-                    escape_field(&why)
-                );
+                warn([format!("the project's copy of {part} was not updated: {why}")]);
                 if let Err(err) = restored {
                     return Err(format!(
                         "the project's copy of {part} could not be put back: {err}; run `lib status`"
@@ -4928,13 +4955,13 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
         }
         VcsCmd::PageLog { page, limit } => {
             let p = load(dir)?;
-            let page_id = p
-                .pages
-                .iter()
-                .find(|pg| pg.id == page || pg.number == page)
-                .map(|pg| pg.id.clone())
-                .unwrap_or(page);
+            let known = p.pages.iter().find(|pg| pg.id == page || pg.number == page);
+            let page_id = known.map(|pg| pg.id.clone()).unwrap_or(page);
             let versions = wc_vcs::page_history(&git, &page_id, limit).map_err(e)?;
+            // A removed page keeps its recorded history; a page neither here nor recorded is a typo.
+            if known.is_none() && versions.is_empty() {
+                check_pages(&p, std::slice::from_ref(&page_id))?;
+            }
             if versions.is_empty() {
                 println!("no recorded versions of page {page_id}");
             }
@@ -6046,12 +6073,20 @@ fn import_qet(
     let (mut written, mut failed) = (0, 0);
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
+    // The first operand with each id, whether it was imported or not.
+    let mut named: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
         let id = qet_id(file, prefix);
-        let read = match ids.get(&id) {
+        // A stream left as it is (not a copy) whose id an earlier operand has is one
+        // `spool_inputs` left unread for that id. It is refused for it here too, without being
+        // opened, whatever the earlier operand reads as now: a FIFO without a writer would
+        // otherwise hold the command, and the project lock, up (#700).
+        let unread = std::fs::metadata(file).is_ok_and(|m| !m.is_file() && !m.is_dir());
+        let read = match ids.get(&id).or(named.get(&id).filter(|_| unread)) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
             None => qet_element(file, &id, scale),
         };
+        named.entry(id.clone()).or_insert_with(|| file.clone());
         let (mut imp, warnings) = match read {
             Ok(r) => r,
             Err(err) => {
@@ -6061,9 +6096,7 @@ fn import_qet(
             }
         };
         ids.insert(id, file.clone());
-        for w in warnings {
-            eprintln!("warning: {}: {w}", file.display());
-        }
+        warn(warnings.iter().map(|w| format!("{}: {w}", file.display())));
         imp.symbol.category = category.to_owned();
         imp.symbol.letter_code = letter_code.to_owned();
         let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
@@ -6097,6 +6130,33 @@ fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMa
         .into_iter()
         .filter_map(|id| store::read_vendored_part(dir, &id).ok().map(|part| (id, part)))
         .collect()
+}
+
+/// [`vendored_parts`], and the used parts whose copy is there but cannot be read, by id with the
+/// reason: the project check reports those as unreadable, not as missing.
+fn vendored_parts_and_unreadable(
+    dir: &Path,
+    p: &wc_core::Project,
+) -> (
+    std::collections::BTreeMap<String, wc_core::Part>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut parts = std::collections::BTreeMap::new();
+    let mut unreadable = std::collections::BTreeMap::new();
+    for id in p.used_parts() {
+        match store::read_vendored_part(dir, &id) {
+            Ok(part) => {
+                parts.insert(id, part);
+            }
+            Err(err) => {
+                let there = store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|f| f.exists());
+                if there {
+                    unreadable.insert(id, err.to_string());
+                }
+            }
+        }
+    }
+    (parts, unreadable)
 }
 
 /// [`vendored_parts`], with a warning naming each used part that cannot be read and why, so
@@ -6358,24 +6418,6 @@ fn utc_date(secs: i64) -> String {
     )
 }
 
-/// A file name for a page: its number, or its id when the number is empty, with anything a file
-/// system might refuse replaced.
-fn file_stem(number: &str, id: &str) -> String {
-    let base = if number.trim().is_empty() { id } else { number.trim() };
-    let stem: String = base
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let stem = stem.trim_start_matches('.').to_owned();
-    if stem.is_empty() { "page".into() } else { stem }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -6540,6 +6582,18 @@ mod tests {
             "{shown}"
         );
         assert_eq!(shown.matches("could not be printed").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn an_import_warning_that_cannot_be_written_does_not_panic() {
+        // A closed standard error: every warning is dropped, and the caller goes on.
+        warn_to(&mut Closed, ["no pins", "a second one"]);
+        let mut err = Vec::new();
+        warn_to(&mut err, vec!["line\nbreak".to_string()]);
+        let Ok(shown) = String::from_utf8(err) else {
+            unreachable!("the warning is UTF-8")
+        };
+        assert_eq!(shown, format!("warning: {}\n", escape_field("line\nbreak")));
     }
 
     #[cfg(unix)]
@@ -7000,6 +7054,52 @@ mod tests {
         cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
+    }
+
+    #[test]
+    fn an_empty_part_takes_the_part_off_a_device() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("p");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let lib = tmp.path().join("lib");
+        let part = wc_core::Part {
+            id: "maker.contactor".into(),
+            ..wc_core::Part::default()
+        };
+        assert!(wc_library::write_part(&lib, &part).is_ok());
+        let Some(lib) = lib.to_str() else { unreachable!() };
+        assert!(cli(&dir, &["lib", "add", "shop", "folder", lib]).is_ok());
+        let set = cli(
+            &dir,
+            &["device", "-K1", "--part", "maker.contactor", "--description", "Pump"],
+        );
+        assert!(set.is_ok(), "{set:?}");
+        let Ok(k1) = DeviceTag::parse("-K1") else {
+            unreachable!()
+        };
+        let info = |dir: &Path| load(dir).and_then(|p| device_info(&p, &k1));
+        assert_eq!(
+            info(&dir),
+            Ok("part         maker.contactor\ndescription  Pump\n".to_owned())
+        );
+
+        // Empty or blank, the part goes and the description stays.
+        let off = cli(&dir, &["device", "-K1", "--part", ""]);
+        assert!(off.is_ok(), "{off:?}");
+        assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
+        let reset = cli(&dir, &["device", "-K1", "--part", " maker.contactor "]);
+        assert!(reset.is_ok(), "{reset:?}");
+        assert_eq!(
+            info(&dir),
+            Ok("part         maker.contactor\ndescription  Pump\n".to_owned())
+        );
+        let again = cli(&dir, &["device", "-K1", "--part", " "]);
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
     }
 
     #[test]
@@ -7761,7 +7861,7 @@ mod tests {
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             names.sort();
-            let page = format!("{}.{ext}", file_stem(&number, ""));
+            let page = format!("{number}.{ext}");
             let mut want = [format!("panel-Main_cabinet_A.{ext}"), page];
             want.sort();
             assert_eq!(names, want, "{ext}");
@@ -7809,6 +7909,44 @@ mod tests {
         assert_eq!(p.pages[0].symbols[0].tag.as_ref(), Some(&k2));
         assert!(p.devices.contains_key(&k2));
         assert!(cli(&dir, &["find", "K2", "--replace", "?"]).is_err(), "not a tag");
+    }
+
+    #[test]
+    fn find_takes_a_tag_and_a_replacement_that_start_with_a_dash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let tag = wc_core::DeviceTag::parse("-K1").unwrap();
+        p.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "wc.coil".into(),
+            at: wc_core::Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag.clone()),
+        });
+        p.devices.insert(tag, wc_core::Device::default());
+        save(&dir, &p).unwrap();
+        let parsed = Cli::try_parse_from(["wiringcraft", "find", "-K1", "--replace", "-K2", "--match-case"]).unwrap();
+        let Cmd::Find {
+            query,
+            replace,
+            match_case,
+        } = parsed.cmd
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (query.as_str(), replace.as_deref(), match_case),
+            ("-K1", Some("-K2"), true)
+        );
+        cli(&dir, &["find", "-K1"]).unwrap();
+        cli(&dir, &["find", "--replace", "-K2", "-K1"]).unwrap();
+        let p = load(&dir).unwrap();
+        let k2 = wc_core::DeviceTag::parse("-K2").unwrap();
+        assert_eq!(p.pages[0].symbols[0].tag.as_ref(), Some(&k2));
+        assert!(p.devices.contains_key(&k2));
     }
 
     #[test]
@@ -8588,6 +8726,25 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn strip_order_refuses_a_strip_or_terminal_the_project_does_not_have() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap_err();
+        assert_eq!(err, "no terminal strip -X1");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        draw_x1_terminals(&dir);
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "99"]).unwrap_err();
+        assert_eq!(err, "-X1 has no terminal 99");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.strips.len(), 1);
+        // No terminals still goes back to the order by number.
+        cli(&dir, &["strip", "order", "--", "-X1"]).unwrap();
+        assert!(load(&dir).unwrap().meta.strips.is_empty());
     }
 
     #[test]
@@ -12536,6 +12693,48 @@ mod input_tests {
         let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (1, 1));
         assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// The earlier element is changed between `spool_inputs` and the import so that it no
+    /// longer reads as one: the FIFO `spool_inputs` left unread for its id is still refused
+    /// without being opened, and the command ends (#700).
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_left_unread_stays_unread_when_the_earlier_element_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (file, fifo) = (a.join("lamp.elmt"), b.join("lamp.elmt"));
+        mkfifo(&fifo);
+        std::fs::write(&file, ELEMENT).unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            file.as_os_str(),
+            fifo.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_none());
+        assert_eq!(inputs, [file.clone(), fifo.clone()]);
+        // Between preparation and import, the earlier file stops being an element.
+        std::fs::write(&file, "no element").unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(import_qet(&inputs, &lib, "qet.", 0.5, "", ""));
+        });
+        // The FIFO has no writer: opening it would never return.
+        let imported = result.recv_timeout(std::time::Duration::from_secs(20)).ok();
+        assert_eq!(
+            imported.map(|r| r.unwrap()),
+            Some((0, 2)),
+            "the import opened the FIFO left unread"
+        );
     }
 
     /// A stream that cannot be opened (a socket) is left to the import, which counts it as

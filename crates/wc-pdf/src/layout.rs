@@ -162,7 +162,9 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
-                    SymbolRole::Auxiliary => x.auxes.entry(tag.clone()).or_default().push(a),
+                    // A contact repeated on an overview page (line diagram) is not listed
+                    // under its coil again: the schematic page draws it in detail (#1076).
+                    SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),
                     SymbolRole::Interruption => x.links.entry(tag.clone()).or_default().push(a),
                     _ => {}
                 }
@@ -883,14 +885,13 @@ pub fn draw_page(
         pen.circle((x, y), 0.6, true);
     }
 
-    // Symbols.
+    // Symbols. A symbol missing from the library copy is warned about once per page, with
+    // how many placements it has there, however often it is placed.
     pen.width(0.3);
+    let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
     for s in &page.symbols {
         let Some(sym) = symbols.get(&s.symbol) else {
-            warnings.push(format!(
-                "page {}: symbol {:?} is not in the project's library copy",
-                page.number, s.symbol
-            ));
+            *missing.entry(s.symbol.as_str()).or_insert(0) += 1;
             pen.colour(0.85, 0.1, 0.1);
             pen.rect((s.at.x - 4.0, s.at.y - 4.0), (s.at.x + 4.0, s.at.y + 4.0));
             pen.text((s.at.x, s.at.y + 1.0), 2.5, 1, "?");
@@ -915,6 +916,18 @@ pub fn draw_page(
         for (i, l) in lines.iter().enumerate() {
             pen.text((ta.x, top + 3.0 * i as f64), 2.5, 2, l);
         }
+    }
+
+    for (symbol, n) in missing {
+        let placements = if n > 1 {
+            format!(" ({n} placements)")
+        } else {
+            String::new()
+        };
+        warnings.push(format!(
+            "page {}: symbol {symbol:?} is not in the project's library copy{placements}",
+            page.number
+        ));
     }
 
     // Cross-references, as links to the page they point at.

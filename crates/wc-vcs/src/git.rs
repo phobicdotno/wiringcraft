@@ -496,7 +496,9 @@ impl Git {
             .collect())
     }
 
-    /// Create a branch at the current version and switch to it.
+    /// Create a branch at the current version and switch to it. Changes not yet recorded come
+    /// along unchanged, so there is no need (and, with such changes, no way) to [`Git::switch`]
+    /// to it afterwards.
     pub fn create_branch(&self, name: &str) -> Result<()> {
         self.run(&["check-ref-format", "--branch", name])?;
         self.run(&["switch", "-q", "-c", name])?;
@@ -515,8 +517,24 @@ impl Git {
         Ok(())
     }
 
-    /// Merge another branch into the current one.
+    /// Merge another branch into the current one. Refuses while an earlier merge is still
+    /// being finished, so that merge's conflicts are never reported as this one's. Refuses too
+    /// when there are unrecorded changes, like [`Git::switch`]: committing a merge that stopped
+    /// on conflicts records every change, so they would end up inside the merge, and aborting
+    /// it cannot always bring them back.
     pub fn merge(&self, other: &str) -> Result<MergeOutcome> {
+        if self.git_path("MERGE_HEAD")?.exists() {
+            return Err(Error::Git {
+                args: format!("merge {other}"),
+                message: "another merge is in progress; resolve its conflicts and commit, or abort it first".into(),
+            });
+        }
+        if !self.run(&["status", "--porcelain"])?.trim().is_empty() {
+            return Err(Error::Git {
+                args: format!("merge {other}"),
+                message: "record or discard your changes first (commit)".into(),
+            });
+        }
         let before = self.head();
         let msg = format!("Merge {other}");
         let mut args = vec!["merge", "--no-ff", "-m", msg.as_str(), END_OF_OPTIONS, other];

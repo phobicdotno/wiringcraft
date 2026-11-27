@@ -224,6 +224,37 @@ fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
 }
 
 #[test]
+fn page_files_are_named_after_the_page_number() {
+    let page = |number: &str| PageDrawing {
+        id: "p-7".into(),
+        number: number.into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: Vec::new(),
+        pictures: Vec::new(),
+        panel: false,
+    };
+    // The app and the command line name page files the same way: `1.2` keeps its dot.
+    assert_eq!(crate::page_file_stem(&page("1.2")), "1.2");
+    assert_eq!(crate::page_file_stem(&page(" A/1 ")), "A_1");
+    // Without a number, the page's id names the file.
+    assert_eq!(crate::page_file_stem(&page("  ")), "p-7");
+    // Leading dots are left out, and a name of only dots falls back to `page`.
+    assert_eq!(crate::page_file_stem(&page(".hidden")), "hidden");
+    assert_eq!(crate::page_file_stem(&page("..")), "page");
+    // A name Windows keeps for a device, in any case and also before a dot, gets a `_` in front.
+    assert_eq!(crate::page_file_stem(&page(".NUL")), "_NUL");
+    assert_eq!(crate::page_file_stem(&page("con")), "_con");
+    assert_eq!(crate::page_file_stem(&page("com1")), "_com1");
+    assert_eq!(crate::page_file_stem(&page("Aux.2")), "_Aux.2");
+    assert_eq!(crate::page_file_stem(&page("LPT9")), "_LPT9");
+    // Names that only start like a device stay as they are.
+    assert_eq!(crate::page_file_stem(&page("CONSOLE")), "CONSOLE");
+    assert_eq!(crate::page_file_stem(&page("COM10")), "COM10");
+    assert_eq!(crate::page_file_stem(&page("COM0")), "COM0");
+}
+
+#[test]
 fn arcs_keep_their_side_in_svg_and_dxf() {
     // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
     // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.
@@ -1388,6 +1419,40 @@ fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
         .unwrap_or(&[]);
     let pages: Vec<&str> = mains.iter().map(|a| a.page_id.as_str()).collect();
     assert_eq!(pages, ["p2", "p1"], "the schematic first, the overview still listed");
+}
+
+#[test]
+fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p1", "1", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "no", 50.0, "-K1"));
+    let mut schematic = Page::new("p2", "2", "Control");
+    schematic.symbols.push(place("s2", "coil", 50.0, "-K1"));
+    schematic.symbols.push(place("s3", "no", 150.0, "-K1"));
+    project.pages = vec![overview, schematic];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let listed: Vec<&str> = marks
+        .iter()
+        .filter(|m| m.text.starts_with("13-14"))
+        .map(|m| m.target_page_id.as_str())
+        .collect();
+    assert_eq!(listed, ["p2"], "the contact is listed once, on its schematic page");
+    // The repeat on the overview still points back to its coil.
+    let Some(overview) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let back = layout::xref_marks(overview, &symbols, &x, &mut warnings);
+    assert!(back.iter().any(|m| m.target_page_id == "p2"), "{back:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 #[test]
@@ -2902,6 +2967,72 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
 }
 
 #[test]
+fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
+    // One page, so there is a sheet to print (#833).
+    let mut project = Project::new("Pump station");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
+        unreachable!("no catalog in {text}");
+    };
+    assert!(
+        catalog.contains("/ViewerPreferences << /DisplayDocTitle true >>"),
+        "{catalog}"
+    );
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("Pump station"))));
+
+    // The file still opens: the trailer points at the xref table, and every object it lists
+    // starts where the table says, so the added catalog entry did not shift any offset.
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).rposition(|w| w == needle);
+    let Some(sx) = find(&pdf, b"startxref\n") else {
+        unreachable!("no startxref");
+    };
+    let start: usize = std::str::from_utf8(&pdf[sx + 10..])
+        .ok()
+        .and_then(|s| s.lines().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    assert!(pdf.get(start..).is_some_and(|t| t.starts_with(b"xref")));
+    let table = std::str::from_utf8(&pdf[start..]).unwrap_or("");
+    let mut lines = table.lines().skip(1);
+    let count: usize = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(count > 1, "{table}");
+    for (n, line) in lines.take(count).enumerate().skip(1) {
+        let offset: usize = line.split(' ').next().and_then(|o| o.parse().ok()).unwrap_or(0);
+        let head = format!("{n} 0 obj");
+        assert!(
+            pdf.get(offset..).is_some_and(|o| o.starts_with(head.as_bytes())),
+            "object {n} is not at {offset}"
+        );
+    }
+}
+
+#[test]
+fn a_project_with_nothing_to_print_says_so() {
+    // No pages and no report tables: no sheet, so the caller is told instead of being handed a
+    // PDF no reader opens (#833).
+    let (_, report) = export(&Project::new("x"), &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 0);
+    assert_eq!(report.warnings, vec![NOTHING_TO_EXPORT.to_string()]);
+
+    // One page: no such warning.
+    let mut project = Project::new("x");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 1);
+    assert!(
+        !report.warnings.iter().any(|w| w == NOTHING_TO_EXPORT),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
 fn page_text_writes_the_rest_of_winansi() {
     // Euro, curly quotes and ellipsis have WinAnsi codes in the built-in font: no '?'.
     assert_eq!(writer::pdf_text("€ “x” …"), "<80209378942085>");
@@ -3009,4 +3140,48 @@ fn layer_names_are_text_strings() {
         unreachable!("non-ASCII names are written as UTF-16")
     };
     assert_eq!(name, "Leitungen → Ω 日本");
+}
+
+#[test]
+fn a_missing_symbol_is_warned_about_once_per_page_with_its_placements() {
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "A");
+    for (k, x) in [40.0, 80.0, 120.0].into_iter().enumerate() {
+        p1.symbols.push(place(&format!("r{k}"), "relay", x, &format!("-K{k}")));
+    }
+    p1.symbols.push(place("t1", "lamp", 160.0, "-P1"));
+    let mut p2 = Page::new("p2", "2", "B");
+    p2.symbols.push(place("r9", "relay", 40.0, "-K9"));
+    project.pages = vec![p1, p2];
+    let (pdf, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: symbol \"lamp\" is not in the project's library copy".to_string(),
+            "page 1: symbol \"relay\" is not in the project's library copy (3 placements)".to_string(),
+            "page 2: symbol \"relay\" is not in the project's library copy".to_string(),
+        ]
+    );
+    // Every placement is still drawn as a box with a question mark.
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(text.matches(&format!("{} Tj", writer::pdf_text("?"))).count(), 5);
+    // The SVG and DXF exports warn the same way.
+    let (_, lines) = page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(lines.warnings, report.warnings);
+}
+
+#[test]
+fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
+    // Helvetica's WinAnsi has no Ω or Cyrillic: they print as '?', so say so (Latin-1, the
+    // euro and dashes print, and an arrow prints as '>' on purpose).
+    let mut project = Project::new("Demo");
+    project.pages = vec![
+        Page::new("p1", "1", "Motor 10 kΩ Ω Жар"),
+        Page::new("p2", "2", "Pumpe – Ålesund 200 € → B"),
+    ];
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec!["page 1: the PDF cannot print Ω Ж а р in its text; they show as ?".to_string()]
+    );
 }
