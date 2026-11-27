@@ -4488,3 +4488,24 @@ fn an_overview_page_adds_no_net_list_rows() {
     p.pages.last_mut().unwrap().overview = false;
     assert_ne!(nets(&p), before);
 }
+
+#[test]
+fn a_device_drawn_twice_lists_its_pages_in_page_order() {
+    let (mut p, s, parts) = fixture();
+    // The coil -K1 again on page 10, after page 2; the lamp -P1 twice on page 2.
+    let mut later = Page::new("p10", "10", "More control");
+    later.symbols.push(place("s20", "coil", 100.0, Some("=A+C1-K1")));
+    p.pages.push(later);
+    p.pages[0].symbols.push(place("s21", "lamp", 300.0, Some("-P1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check(&i).into_iter().map(|f| f.message).collect();
+    assert!(
+        found.iter().any(|m| m == "=A+C1-K1 is drawn 2 times (pages 2, 10)"),
+        "{found:?}"
+    );
+    assert!(found.iter().any(|m| m == "-P1 is drawn 2 times (page 2)"), "{found:?}");
+}
