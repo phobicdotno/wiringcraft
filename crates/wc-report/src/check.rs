@@ -342,6 +342,20 @@ pub fn check_with_unreadable(
         }
     }
 
+    // Coils and contacts without a tag: a contact finds its coil, and a coil its contacts, only
+    // by tag, so an untagged one shows up in no cross-reference.
+    for page in &p.pages {
+        for s in page.symbols.iter().filter(|s| s.tag.is_none()) {
+            let what = match role(&s.symbol) {
+                Some(SymbolRole::Main) => "coil",
+                Some(SymbolRole::Auxiliary) => "contact",
+                _ => continue,
+            };
+            let message = format!("{what} has no tag, so it links nothing in cross-references");
+            out.push(at(page, &s.id, Severity::Warning, message));
+        }
+    }
+
     // Open pins: a pin no wire reaches.
     for page in &p.pages {
         let wired: BTreeSet<(&str, &str)> = page
