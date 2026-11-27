@@ -105,8 +105,8 @@ pub fn tag_lines(placed: &PlacedSymbol, symbol: &Symbol, tag: &DeviceTag) -> (Al
     (align, lines)
 }
 
-/// Cross-reference texts for a page: a coil lists its contacts with their pins and locations,
-/// a contact points back to its coil, an interruption point lists where the wire continues.
+/// Cross-reference texts for a page: a coil (or a breaker with aux contacts) lists its contacts
+/// with their pins and locations, a contact points back to it, an interruption point lists where the wire continues.
 /// Problems (a contact without a coil, an interruption point without a partner) go to `warnings`.
 pub fn xref_marks(
     page: &Page,
@@ -129,7 +129,11 @@ pub fn xref_marks(
         let right = placed.iter().map(|g| g.bounds().1.x).fold(s.at.x, f64::max);
         let (tag_align, tag_at) = tag_lines(s, sym, tag);
         match sym.role {
-            SymbolRole::Main => {
+            // A breaker or MPCB lists its aux contacts as a coil does, unless a coil of its
+            // tag lists them already (#1467).
+            SymbolRole::Main | SymbolRole::Standalone
+                if sym.role == SymbolRole::Main || !xref.mains.contains_key(tag) =>
+            {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
                     out.push(XrefMark {
                         at: Point::new(s.at.x + 5.0, below + 3.5 + line_h * i as f64),
