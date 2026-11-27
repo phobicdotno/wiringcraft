@@ -1357,6 +1357,72 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
 }
 
 #[test]
+fn automationml_link_names_never_repeat() {
+    let (mut p, s, parts) = fixture();
+    // Potential `A` joins three terminals (links `A` and `A#2`); another potential is really
+    // named `A#2`.
+    let page = &mut p.pages[0];
+    for (n, x) in [(1, 300.0), (2, 310.0), (3, 320.0), (4, 330.0), (5, 340.0)] {
+        page.symbols
+            .push(place(&format!("t{n}"), "term", x, Some(&format!("-X9.{n}"))));
+    }
+    page.wires
+        .push(wire("a1", pin("t1", "1"), pin("t2", "1"), None, Some("A")));
+    page.wires
+        .push(wire("a2", pin("t2", "1"), pin("t3", "1"), None, Some("A")));
+    page.wires
+        .push(wire("b1", pin("t4", "1"), pin("t5", "1"), None, Some("A#2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let mut names: Vec<&str> = xml
+        .split("<InternalLink Name=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(names.contains(&"A") && names.contains(&"A#2"), "{xml}");
+    let all = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all, "{xml}");
+}
+
+#[test]
+fn automationml_link_names_differ_once_written() {
+    let (mut p, s, parts) = fixture();
+    // `A` and `A\u{FFFE}` differ, but the character XML cannot hold is left out when written,
+    // so both would be written as `A`.
+    let page = &mut p.pages[0];
+    for (n, x) in [(1, 300.0), (2, 310.0), (3, 320.0), (4, 330.0)] {
+        page.symbols
+            .push(place(&format!("t{n}"), "term", x, Some(&format!("-X9.{n}"))));
+    }
+    page.wires
+        .push(wire("a1", pin("t1", "1"), pin("t2", "1"), None, Some("A")));
+    page.wires
+        .push(wire("b1", pin("t3", "1"), pin("t4", "1"), None, Some("A\u{FFFE}")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let mut names: Vec<&str> = xml
+        .split("<InternalLink Name=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(names.contains(&"A") && names.contains(&"A#2"), "{xml}");
+    let all = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all, "{xml}");
+}
+
+#[test]
 fn plc_io_list_and_contents() {
     let (mut p, mut s, parts) = fixture();
     let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);

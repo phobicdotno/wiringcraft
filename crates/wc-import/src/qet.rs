@@ -265,6 +265,10 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Open elements, to know where a `<name>` text or a dynamic text's `<info_name>` belongs.
     let mut path: Vec<String> = Vec::new();
     let mut name_lang: Option<String> = None;
+    // Set once a name's text could not be read, so that is said only once.
+    let mut name_unreadable = false;
+    // The open name's text, kept whole (text around a comment, CDATA) and trimmed at `</name>`.
+    let mut name_text = String::new();
     // The element's `<elementInformation>` texts named `description` and `label`, and which one is open.
     let mut description = String::new();
     let mut label = String::new();
@@ -333,7 +337,15 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                 if let Some(tag) = path.pop() {
                     match tag.as_str() {
                         "description" => in_description = false,
-                        "name" => name_lang = None,
+                        "name" => {
+                            if let Some(lang) = name_lang.take() {
+                                let v = name_text.trim();
+                                if !v.is_empty() {
+                                    names.push((lang, v.to_owned()));
+                                }
+                            }
+                            name_text.clear();
+                        }
                         "elementInformation" => in_info = None,
                         "dynamic_text" => dynamic_at = None,
                         _ => {}
@@ -357,11 +369,21 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                 Some("label") => label.push_str(&String::from_utf8_lossy(&t)),
                 _ => description.push_str(&String::from_utf8_lossy(&t)),
             },
+            Event::CData(t) if name_lang.is_some() => name_text.push_str(&String::from_utf8_lossy(&t)),
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                if let Some(lang) = &name_lang {
-                    if !v.is_empty() {
-                        names.push((lang.clone(), v));
+                if name_lang.is_some() {
+                    match t.unescape() {
+                        Ok(v) => name_text.push_str(&v),
+                        // Said once per file, without the language the file gives: a file of many
+                        // bad names (or one long language) cannot fill memory with warnings.
+                        Err(e) if !name_unreadable => {
+                            name_unreadable = true;
+                            warnings.push(format!(
+                                "an element name has text that cannot be read ({e}); it is left out"
+                            ));
+                        }
+                        Err(_) => {}
                     }
                 } else if path.last().map(String::as_str) == Some("info_name")
                     && v == "label"
@@ -669,13 +691,29 @@ fn shape(
         "dynamic_text" => *dynamic_at = n("x").zip(n("y")).map(|(x, y)| pt(x, y)),
         "terminal" => match (n("x"), n("y")) {
             (Some(x), Some(y)) => {
-                let dir = match attr(e, "orientation").as_deref() {
+                let name = attr(e, "name").unwrap_or_default();
+                let orientation = attr(e, "orientation");
+                let dir = match orientation.as_deref().map(str::trim) {
                     Some("n") => PinDir::Up,
                     Some("e") => PinDir::Right,
                     Some("w") => PinDir::Left,
-                    _ => PinDir::Down,
+                    Some("s") => PinDir::Down,
+                    // Anything else still imports, pointing down, but the user is told.
+                    other => {
+                        let which = match name.trim() {
+                            "" => format!("at {x}, {y}"),
+                            named => format!("{named:?}"),
+                        };
+                        let why = match other {
+                            None => "has no orientation".to_owned(),
+                            Some(v) => format!("has an unknown orientation {v:?}"),
+                        };
+                        bad.borrow_mut()
+                            .push(format!("<terminal> {which} {why}; it points down"));
+                        PinDir::Down
+                    }
                 };
-                pins.push((attr(e, "name").unwrap_or_default(), pt(x, y), dir));
+                pins.push((name, pt(x, y), dir));
             }
             _ => skip(),
         },
@@ -1193,6 +1231,44 @@ mod tests {
     }
 
     #[test]
+    fn a_name_in_cdata_or_around_a_comment_comes_in_whole() -> Result<()> {
+        let el = |name: &str| {
+            format!(
+                r#"<definition type="element"><names><name lang="fr">Contact</name>{name}</names>
+<description><line x1="0" y1="0" x2="10" y2="0"/></description></definition>"#
+            )
+        };
+        for name in [
+            r#"<name lang="en"><![CDATA[NO contact]]></name>"#,
+            r#"<name lang="en"> NO <!-- old -->contact </name>"#,
+            r#"<name lang="en">NO <![CDATA[contact]]></name>"#,
+        ] {
+            let (imp, _) = element(&el(name), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.qet_name, "NO contact", "{name}");
+        }
+        // Name text that cannot be decoded is left out with a warning that says why.
+        let (imp, warnings) = element(
+            &el(r#"<name lang="en"><![CDATA[NO]]> &bogus; contact</name>"#),
+            "q.k",
+            DEFAULT_SCALE,
+        )?;
+        assert_eq!(imp.qet_name, "NO");
+        assert!(
+            warnings.iter().any(|w| w.contains("name") && w.contains("bogus")),
+            "{warnings:?}"
+        );
+        // Many unreadable parts of a name are said once.
+        let many = format!(r#"<name lang="en">{}</name>"#, "&bogus;<!-- x -->".repeat(50));
+        let (_, warnings) = element(&el(&many), "q.k", DEFAULT_SCALE)?;
+        assert_eq!(
+            warnings.iter().filter(|w| w.contains("bogus")).count(),
+            1,
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_bad_value_keeps_its_reason_and_repeated_names_stay_short() -> Result<()> {
         let el = r#"<definition type="element"><description>
 <circle x="-5" y="-5" diameter="10"/>
@@ -1271,5 +1347,37 @@ mod tests {
             1.0,
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_terminal_without_a_known_orientation_points_down_with_a_warning() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<terminal x="0" y="0" orientation="s" name="1"/>
+<terminal x="0" y="10" name="2"/>
+<terminal x="5" y="10" orientation="up"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.x", 1.0)?;
+        let dirs: Vec<PinDir> = imp.symbol.pins.iter().map(|p| p.dir).collect();
+        assert_eq!(dirs, vec![PinDir::Down; 3]);
+        assert_eq!(
+            warnings,
+            vec![
+                "<terminal> \"2\" has no orientation; it points down".to_owned(),
+                "<terminal> at 5, 10 has an unknown orientation \"up\"; it points down".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_orientation_with_spaces_around_it_is_still_read() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<terminal x="0" y="0" orientation=" n " name="1"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.x", 1.0)?;
+        let dirs: Vec<PinDir> = imp.symbol.pins.iter().map(|p| p.dir).collect();
+        assert_eq!(dirs, vec![PinDir::Up]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Ok(())
     }
 }
