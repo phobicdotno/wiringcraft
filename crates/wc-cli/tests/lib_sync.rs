@@ -60,3 +60,27 @@ fn lib_sync_goes_on_past_failing_sources_and_reports_them() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn lib_add_refuses_a_name_that_differs_only_in_case() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let cache = tmp.path().join("cache");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+
+    let out = wiringcraft(&dir, &cache, &["lib", "add", "lib", "folder", "a"])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // `lib sync` refuses two names that match ignoring case, so `lib add` must not save one.
+    let out = wiringcraft(&dir, &cache, &["lib", "add", "Lib", "folder", "b"])?;
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("source \"Lib\" exists"), "{stderr}");
+    let out = wiringcraft(&dir, &cache, &["lib", "sync"])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}

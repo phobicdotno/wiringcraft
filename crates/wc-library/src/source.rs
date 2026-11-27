@@ -117,9 +117,12 @@ pub fn redact_location(location: &str) -> String {
     let Some((scheme, rest)) = location.split_once("://") else {
         return location.to_owned();
     };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
-        Some(at) => format!("{scheme}://***{}", &rest[at..]),
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => {
+            let after = rest.strip_prefix(authority).unwrap_or_default();
+            format!("{scheme}://***@{host}{after}")
+        }
         None => location.to_owned(),
     }
 }

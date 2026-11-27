@@ -4241,7 +4241,7 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             reference,
         } => {
             store::check_id(&name).map_err(e)?;
-            if p.meta.libraries.iter().any(|l| l.name == name) {
+            if p.meta.libraries.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
                 return Err(format!("source {name:?} exists"));
             }
             if kind != "folder" && kind != "git" {
