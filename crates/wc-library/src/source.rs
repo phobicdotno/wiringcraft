@@ -164,22 +164,49 @@ fn redact_text(text: &str, location: &str) -> String {
             text = mask_before_at(&text, &credential_forms(userinfo));
         }
     }
-    text
+    mask_url_userinfo(&text)
+}
+
+/// `text` with the user name and password of every URL in it replaced by `***`, however they
+/// are encoded: after each `://`, everything up to an `@` that comes before the next `/`,
+/// whitespace, quote or the end of the text.
+fn mask_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once("://") {
+        out.push_str(before);
+        out.push_str("://");
+        let authority = after
+            .split(|c: char| c == '/' || c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
+            .next()
+            .unwrap_or(after);
+        match authority.rsplit_once('@') {
+            Some((userinfo, _)) => {
+                out.push_str("***");
+                rest = after.get(userinfo.len()..).unwrap_or_default();
+            }
+            None => rest = after,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The ways a URL's `user:password` may be printed: the user name and password together, then
 /// the user name alone, each as configured, percent-encoded (every character outside RFC 3986's
-/// unreserved set as `%XX`, with uppercase and with lowercase hex) and percent-decoded.
+/// unreserved set as `%XX`, with uppercase and with lowercase hex), percent-decoded, and as git
+/// normalizes it (encoding only what is not already a valid `%XX`).
 fn credential_forms(userinfo: &str) -> Vec<String> {
     let parts: Vec<&str> = match userinfo.split_once(':') {
         Some((user, password)) => vec![user, password],
         None => vec![userinfo],
     };
-    let ways: [fn(&str) -> String; 4] = [
+    let ways: [fn(&str) -> String; 5] = [
         str::to_owned,
         |s| percent_encode(s, true),
         |s| percent_encode(s, false),
         percent_decode,
+        percent_normalize,
     ];
     let mut forms = Vec::new();
     for way in ways {
@@ -205,6 +232,31 @@ fn percent_encode(s: &str, upper: bool) -> String {
             }
         })
         .collect()
+}
+
+/// `s` as git normalizes a URL's user name or password: a valid `%XX` is kept as it is, and
+/// every other byte outside RFC 3986's unreserved characters is written as `%XX` (uppercase).
+fn percent_normalize(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let escape = bytes
+            .get(i..i + 3)
+            .filter(|e| b == b'%' && e.iter().skip(1).all(u8::is_ascii_hexdigit));
+        if let Some(escape) = escape {
+            out.extend(escape.iter().map(|&e| char::from(e)));
+            i += 3;
+            continue;
+        }
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// `s` with each `%XX` turned back into its byte (left as it is where it is not valid hex, or

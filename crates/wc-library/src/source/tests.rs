@@ -306,6 +306,30 @@ fn percent_encoded_credentials_are_redacted_too() {
     assert_eq!(text, "fatal: for 'https://***@host'");
 }
 
+#[test]
+fn credentials_git_normalized_are_redacted_too() {
+    let location = "https://tok%2Ax*@host/lib.git";
+    let text = redact_text("fatal: could not read Password for 'https://tok%2Ax%2A@host'", location);
+    assert_eq!(text, "fatal: could not read Password for 'https://***@host'");
+    // Without a scheme, the normalized form is found by itself.
+    let text = redact_text("for tok%2Ax%2A@host", location);
+    assert_eq!(text, "for ***@host");
+}
+
+#[test]
+fn every_url_in_the_text_has_its_user_name_and_password_hidden() {
+    let text = redact_text(
+        "fatal: from 'https://a:b@host/lib.git' via \"http://other:secret@proxy:8080\" and ssh://git@host",
+        "https://a:b@host/lib.git",
+    );
+    assert_eq!(
+        text,
+        "fatal: from 'https://***@host/lib.git' via \"http://***@proxy:8080\" and ssh://***@host"
+    );
+    // An @ after the host is part of the path and is left alone.
+    assert_eq!(mask_url_userinfo("see https://host/a@b"), "see https://host/a@b");
+}
+
 // A file URL with a host needs a Unix path after it.
 #[cfg(unix)]
 #[test]
