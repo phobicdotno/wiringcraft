@@ -188,10 +188,14 @@ fn header_separators(text: &str, delim: char) -> usize {
 /// The separator a CSV text uses: the one found most often in the header outside double-quoted
 /// text (see [`header_separators`]), also when blank lines come before the header.
 fn guess_delimiter(text: &str) -> char {
+    // A header with none of them is one column: a comma file, whose cells may hold any of the
+    // others as text (`Pump | duty`).
     SEPARATORS
         .into_iter()
-        .max_by_key(|d| header_separators(text, *d))
-        .unwrap_or(',')
+        .map(|d| (header_separators(text, d), d))
+        .filter(|(n, _)| *n > 0)
+        .max_by_key(|(n, _)| *n)
+        .map_or(',', |(_, d)| d)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -565,6 +569,13 @@ pub fn apply_plc_addresses(project: &mut Project, rows: &[PlcAddress]) -> PlcApp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_one_column_file_is_read_as_comma_separated() {
+        assert_eq!(guess_delimiter("Label\nPump | duty\n"), ',');
+        assert_eq!(guess_delimiter("a;b\n1;2\n"), ';');
+        assert_eq!(guess_delimiter("a\tb\n1\t2\n"), '\t');
+    }
+
     #[test]
     fn a_quoted_cell_left_open_is_noted_with_its_line() {
         let rows = records("a;b\n1;\"two\nlines\"\n3;\"open\nstill", ';');

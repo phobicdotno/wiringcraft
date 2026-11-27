@@ -3656,18 +3656,52 @@ fn run(mut cli: Cli) -> Res<()> {
                     }
                     let rows = wc_core::generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(e)?;
                     let copies = wc_core::generate::apply_rows(&m, &rows, set.as_deref()).map_err(e)?;
+                    // The symbol and part copies taking the macro's items may write, read first:
+                    // a run that fails after them (a macro too large for the page, a placement or
+                    // a save that fails) puts them back, so no page draws a symbol it did not.
+                    let mut item_ids: std::collections::BTreeSet<(ItemKind, &str)> = std::collections::BTreeSet::new();
                     for copy in &copies {
-                        take_macro_items(dir, &mut p, copy, "generate the pages again")?;
+                        item_ids.extend(copy.symbols.iter().map(|s| (ItemKind::Symbol, s.symbol.as_str())));
+                        item_ids.extend(
+                            copy.devices
+                                .values()
+                                .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+                                .map(|id| id.trim())
+                                .filter(|id| !id.is_empty())
+                                .map(|id| (ItemKind::Part, id)),
+                        );
+                    }
+                    let vendored: Vec<(PathBuf, Option<Vec<u8>>)> = item_ids
+                        .iter()
+                        .map(|(kind, id)| vendored_bytes(dir, *kind, id))
+                        .collect::<Res<_>>()?;
+                    let undo_vendored = |err: String| -> String {
+                        let failed = put_files_back(&vendored);
+                        if failed.is_empty() {
+                            err
+                        } else {
+                            format!(
+                                "{err}; symbol and part copies could not be put back: {}",
+                                failed.join("; ")
+                            )
+                        }
+                    };
+                    for copy in &copies {
+                        take_macro_items(dir, &mut p, copy, "generate the pages again").map_err(undo_vendored)?;
                     }
                     let extent = wc_core::generate::extent(&copies, |id| store::read_vendored_symbol(dir, id).ok());
                     let title = title.unwrap_or_else(|| m.name.clone());
-                    let generated = wc_core::generate::generate(&mut p, &copies, extent, size, &title).map_err(e)?;
+                    let generated = wc_core::generate::generate(&mut p, &copies, extent, size, &title)
+                        .map_err(|x| undo_vendored(e(x)))?;
                     // A save that fails half way puts the project's files back, so a second run
                     // does not place the rows already written again.
                     let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
-                    let before = snapshot_project(dir, &new_pages, &[])?;
+                    let mut before = snapshot_project(dir, &new_pages, &[]).map_err(undo_vendored)?;
                     // A link would become a plain file on the save and on the rollback (#614).
-                    refuse_linked_files(&before, "macro generate")?;
+                    refuse_linked_files(&before, "macro generate").map_err(undo_vendored)?;
+                    // The symbol and part copies go back with the project's files, as they were
+                    // before this run.
+                    before.extend(vendored.iter().cloned());
                     if let Err(err) = save(dir, &p) {
                         let failed = put_files_back(&before);
                         if failed.is_empty() {

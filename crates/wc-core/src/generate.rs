@@ -62,7 +62,8 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
         } else if key(name) == SET_COLUMN {
             Column::Set
         } else {
-            let known: Vec<&str> = m.placeholders.iter().map(|p| p.name.as_str()).collect();
+            // Quoted as the column is, so a control character in a name is shown escaped.
+            let known: Vec<String> = m.placeholders.iter().map(|p| format!("{:?}", p.name)).collect();
             let has = if known.is_empty() {
                 "it has no placeholders".to_owned()
             } else {
@@ -153,6 +154,7 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
                 }
             }
             pts.extend(w.via.iter().copied());
+            wire_label_points(m, w, &symbol, &mut pts);
         }
         for g in &m.graphics {
             drawn_points(g, &mut pts);
@@ -190,6 +192,64 @@ fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::
         for (at, line) in &lines {
             pts.extend(text_corners(*at, line, TAG_HEIGHT, align, 0.0));
         }
+    }
+}
+
+/// Points round a wire's label (its number, potential and cable core) as the PDF draws it: on
+/// the middle of its first segment, 2 mm high, right-aligned left of a vertical segment and
+/// centred above a horizontal one. A wire without a label, or whose first end is on a pin that
+/// is not there, adds nothing.
+fn wire_label_points(
+    m: &Macro,
+    w: &crate::project::Wire,
+    symbol: &impl Fn(&str) -> Option<Symbol>,
+    pts: &mut Vec<Point>,
+) {
+    let core = w.cable.as_ref().map(|c| {
+        if c.core.is_empty() {
+            c.cable.to_string()
+        } else {
+            format!("{}:{}", c.cable, c.core)
+        }
+    });
+    let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref(), core.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if label.is_empty() {
+        return;
+    }
+    let end = |e: &Endpoint| match e {
+        Endpoint::Point { at } => Some(*at),
+        Endpoint::Pin { item, pin } => {
+            let s = m.symbols.iter().find(|s| s.id == *item)?;
+            let def = symbol(&s.symbol)?;
+            let p = def.pins.iter().find(|p| p.name == *pin)?;
+            Some(s.at + p.at.transform(s.rotation, s.mirror))
+        }
+    };
+    let Some(p) = end(&w.from) else { return };
+    let Some(q) = w.via.first().copied().or_else(|| end(&w.to)) else {
+        return;
+    };
+    let mid = Point::new((p.x + q.x) / 2.0, (p.y + q.y) / 2.0);
+    let text = label.join(" ");
+    if (p.x - q.x).abs() < (p.y - q.y).abs() {
+        pts.extend(text_corners(
+            Point::new(mid.x - 1.0, mid.y + 0.8),
+            &text,
+            2.0,
+            Align::Right,
+            0.0,
+        ));
+    } else {
+        pts.extend(text_corners(
+            Point::new(mid.x, mid.y - 1.0),
+            &text,
+            2.0,
+            Align::Center,
+            0.0,
+        ));
     }
 }
 
@@ -302,24 +362,30 @@ pub fn generate(
         .max()
         .and_then(|key| key.into_iter().next());
     let (prefix, mut next_number) = last.unwrap_or_default();
+    // A new number must not be one there is once spaces are trimmed (` 4 ` and `5` give ` 6`, not
+    // ` 5`), as `page add` tells numbers apart.
+    let numbers: BTreeSet<String> = work.pages.iter().map(|p| p.number.trim().to_owned()).collect();
+    // Ids are told apart without regard to case, as the store does; one cursor walks the free ids.
+    let ids: BTreeSet<String> = work.pages.iter().map(|p| p.id.to_ascii_lowercase()).collect();
+    let mut id_cursor = 0u64;
     let mut out = Generated::default();
     let mut page_id = String::new();
     for (i, m) in copies.iter().enumerate() {
         let slot = i % per_page;
         if slot == 0 {
-            let mut n = 1u64;
-            // Ids are told apart without regard to case, as the store does.
-            while work
-                .pages
-                .iter()
-                .any(|p| p.id.eq_ignore_ascii_case(&format!("p{n:04}")))
-            {
-                n += 1;
+            id_cursor += 1;
+            while ids.contains(&format!("p{id_cursor:04}")) {
+                id_cursor += 1;
             }
-            page_id = format!("p{n:04}");
-            next_number = next_number
-                .checked_add(1)
-                .ok_or_else(|| Error::Invalid(format!("no page number is left after {prefix}{next_number}")))?;
+            page_id = format!("p{id_cursor:04}");
+            loop {
+                next_number = next_number
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Invalid(format!("no page number is left after {prefix}{next_number}")))?;
+                if !numbers.contains(format!("{prefix}{next_number}").trim()) {
+                    break;
+                }
+            }
             let mut page = Page::new(page_id.clone(), format!("{prefix}{next_number}"), title);
             page.size = size;
             work.pages.push(page);
@@ -446,7 +512,7 @@ mod tests {
     fn a_bad_table_is_refused_with_why() -> Result<()> {
         let m = starter()?;
         let typo = err_of(rows_from_table(&m, &table(&[&["kw", "nmae"], &["1", "x"]]), &[]));
-        assert!(typo.contains("\"nmae\"") && typo.contains("kW, Name"), "{typo}");
+        assert!(typo.contains("\"nmae\"") && typo.contains("\"kW\", \"Name\""), "{typo}");
         let twice = err_of(rows_from_table(&m, &table(&[&["kW", "KW"], &["1", "2"]]), &[]));
         assert!(twice.contains("two columns"), "{twice}");
         let empty = err_of(rows_from_table(&m, &table(&[&["kW"]]), &[]));
@@ -468,7 +534,11 @@ mod tests {
     fn a_macro_name_with_control_characters_is_shown_escaped() -> Result<()> {
         let mut m = starter()?;
         m.name = "evil\u{1b}[31m".into();
+        if let Some(p) = m.placeholders.first_mut() {
+            p.name = "bad\u{7}name".into();
+        }
         let typo = err_of(rows_from_table(&m, &table(&[&["nmae"], &["x"]]), &[]));
+        assert!(!typo.contains('\u{7}') && typo.contains("\"bad\\u{7}name\""), "{typo}");
         let set = err_of(apply_rows(
             &m,
             &rows_from_table(&m, &table(&[&["set"], &["nope"]]), &[])?,
@@ -705,6 +775,42 @@ mod tests {
     }
 
     #[test]
+    fn a_wire_label_counts_as_wide_as_it_is_drawn() -> Result<()> {
+        let mut one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        // A 10 mm horizontal wire whose potential name is far wider than the wire.
+        let name = "L1-MAIN-SUPPLY-FROM-THE-INCOMING-FEEDER";
+        let wire = crate::project::Wire {
+            id: "wl".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(10.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        one.wires = vec![wire.clone()];
+        let (plain_min, plain_max) = extent(std::slice::from_ref(&one), |_| None);
+        one.wires = vec![crate::project::Wire {
+            potential: Some(name.into()),
+            ..wire
+        }];
+        let (min, max) = extent(std::slice::from_ref(&one), |_| None);
+        let half = crate::font::text_width_mm(name, 2.0) / 2.0;
+        assert!(
+            min.x <= 5.0 - half + 1e-9 && max.x >= 5.0 + half - 1e-9,
+            "{min:?} {max:?}"
+        );
+        assert!(min.x < plain_min.x && max.x >= plain_max.x);
+        Ok(())
+    }
+
+    #[test]
     fn new_pages_come_after_every_page_with_free_ids() -> Result<()> {
         let one = starter()?.apply(Some("small"), &BTreeMap::new())?;
         let ext = extent(std::slice::from_ref(&one), |_| None);
@@ -712,6 +818,8 @@ mod tests {
             (&["1", "12.3", "4"][..], "13"),
             (&["A7", "3"], "A8"),
             (&[" 4 ", "2"], " 5"),
+            // ` 5` would be `5` once trimmed, which is taken.
+            (&[" 4 ", "5"], " 6"),
             (&[], "1"),
         ] {
             let mut project = Project::new("x");

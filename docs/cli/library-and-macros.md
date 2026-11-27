@@ -217,8 +217,8 @@ a plain name on the device; `check` reports it.
 
 `macro generate` places a macro once per row of a table, so a list of motors, valves or I/O
 channels becomes schematic pages in one step. The example needs a macro `starter` (made in the
-app like `feeder` above) with the placeholders `kW` and `Section` and the value sets `0.75 kW`
-and `3 kW`:
+app like `feeder` above) with the placeholders `kW` and `Section` (default `2.5 mm²`) and the
+value sets `0.75 kW` (`kW` = `0.75`) and `3 kW` (`kW` = `3`):
 
 ```sh
 wiringcraft macro generate starter --table motors.csv --set "3 kW" --title Motors --size A3
