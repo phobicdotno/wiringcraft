@@ -70,6 +70,8 @@ pub struct Editor {
     pub place_turn: (Rotation, bool),
     /// A wire being drawn: its start and the bends so far.
     pub wire: Option<(Endpoint, Vec<Point>)>,
+    /// The id of the page that wire was started on: on another page it is dropped.
+    pub wire_page: Option<String>,
     pub view: View,
     pub cursor: Option<Point>,
     drag: Option<Drag>,
@@ -148,6 +150,7 @@ impl Default for Editor {
             drag: None,
             shape_points: Vec::new(),
             shape_page: None,
+            wire_page: None,
             finish_shape: false,
             cancel_drag: false,
             last_shape_click: None,
@@ -2473,13 +2476,18 @@ fn shape_tool(
     }
 }
 
-/// A drawing started on another page does not go on this one: its clicks are dropped when
-/// the page shown changes (by id, so the same page moved in the navigator keeps them).
+/// A drawing or wire started on another page does not go on this one: its clicks are dropped
+/// when the page shown changes (by id, so the same page moved in the navigator keeps them).
 pub(crate) fn drop_draft_of_other_page(open: &Open, ed: &mut Editor) {
     let page_id = open.project.pages.get(ed.page).map(|p| p.id.as_str());
     if !ed.shape_points.is_empty() && ed.shape_page.as_deref() != page_id {
         ed.shape_points.clear();
         ed.message = shape_hint(ed.tool, 0).into();
+    }
+    // A wire started on the page left behind would end here from a pin or point of that page.
+    if ed.wire.is_some() && ed.wire_page.is_some() && ed.wire_page.as_deref() != page_id {
+        ed.wire = None;
+        ed.wire_page = None;
     }
 }
 
@@ -2737,6 +2745,7 @@ fn wire_tool(
         match ed.wire.take() {
             None => {
                 ed.wire = Some((end, Vec::new()));
+                ed.wire_page = Some(page.id.clone());
                 ed.message =
                     "Click bends, then a pin to finish (double-click ends on a free point, Esc cancels).".into();
             }
@@ -4596,6 +4605,45 @@ mod tests {
 
         let bend = click_then_leave(&mut o, &mut ed, egui::pos2(500.0, 550.0), 2.0);
         assert_eq!(ed.wire, Some((Endpoint::Point { at: start }, vec![bend])));
+    }
+
+    /// A wire started on one page is dropped when another page is shown, also by a way that
+    /// sets the page shown directly (New page, Duplicate page, the device list), so its next
+    /// click does not end it on the new page (#1154).
+    #[test]
+    fn a_wire_started_on_one_page_is_dropped_on_another() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+            ..View::default()
+        };
+        let on = egui::pos2(500.0, 450.0);
+        click_at(&ctx, &mut o, &mut ed, on, 1.0);
+        painted(&ctx, &mut o, &mut ed, 1.5, vec![]);
+        assert!(ed.wire.is_some(), "kept while its page is shown");
+
+        // As Pages > New page does: the new page is shown with the wire tool still on.
+        ed.page = o.add_page();
+        painted(&ctx, &mut o, &mut ed, 2.0, vec![]);
+        assert!(ed.wire.is_none(), "the wire begun on the other page is dropped");
+        let end = on + Vec2::new(60.0, 40.0);
+        click_at(&ctx, &mut o, &mut ed, end, 3.0);
+        click_at(&ctx, &mut o, &mut ed, end, 3.1);
+        assert!(
+            o.project.pages[ed.page].wires.is_empty(),
+            "no wire from the other page's start: {:?}",
+            o.project.pages[ed.page].wires
+        );
+        assert!(o.project.pages[0].wires.is_empty());
     }
 
     /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
