@@ -972,16 +972,22 @@ fn the_starter_battery_has_plus_and_minus_pins() -> Result<()> {
 }
 
 #[test]
+fn the_starter_changeover_contact_has_its_pins_on_the_5_mm_grid() -> Result<()> {
+    // #1148: pins 12 and 14 sat 4 mm to the sides, so a wire drawn on the grid missed them.
+    let (_tmp, lib) = starter_library()?;
+    let (s, _) = lib.symbol("wc.contact.co")?;
+    let pins: Vec<_> = s.pins.iter().map(|p| (p.name.as_str(), p.at.x, p.at.y)).collect();
+    assert_eq!(pins, [("11", 0.0, 0.0), ("12", -5.0, 15.0), ("14", 5.0, 15.0)]);
+    Ok(())
+}
+
+#[test]
 fn every_starter_pin_sits_on_the_5_mm_grid() -> Result<()> {
-    // #1149: pins off the grid cannot be reached by a wire drawn on it. The changeover
-    // contact has its own test (#1148).
+    // #1149: pins off the grid cannot be reached by a wire drawn on it.
     let on_grid = |v: f64| ((v / 5.0).round() * 5.0 - v).abs() < 1e-9;
     let (_tmp, lib) = starter_library()?;
     let mut off = Vec::new();
     for id in lib.index(ItemKind::Symbol).keys() {
-        if id == "wc.contact.co" {
-            continue;
-        }
         let (s, _) = lib.symbol(id)?;
         for p in &s.pins {
             if !on_grid(p.at.x) || !on_grid(p.at.y) {
