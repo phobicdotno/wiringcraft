@@ -245,7 +245,7 @@ pub fn generate(
     let (gw, gh) = (max.x - min.x + slack_x, max.y - min.y + slack_y);
     if gw > x1 - x0 || gh > y1 - y0 {
         return Err(Error::Invalid(format!(
-            "macro {} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
+            "macro {:?} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
             first.name,
             max.x - min.x,
             max.y - min.y,
@@ -262,10 +262,11 @@ pub fn generate(
     let mut work = project.clone();
     // After the last page in page order (see `Project::sort_pages`): its first number, one up.
     // `12.3` gives `13`, `A7` gives `A8`, so every new page sorts after every page there is.
+    // Numbers are taken as `sort_pages` takes them, untrimmed: ` 4 ` gives ` 5`.
     let last = work
         .pages
         .iter()
-        .map(|p| natural_key(p.number.trim()))
+        .map(|p| natural_key(&p.number))
         .max()
         .and_then(|key| key.into_iter().next());
     let (prefix, mut next_number) = last.unwrap_or_default();
@@ -492,9 +493,19 @@ mod tests {
         assert!((max.x - (20.0 + width)).abs() < 1e-9, "{max:?}");
         // The copies stay apart on the page: the second starts past the long label.
         let mut project = Project::new("x");
-        let copies = [long.clone(), short, long];
+        // A later copy's longer label sets the pitch for all of them.
+        let copies = [short.clone(), long, short];
         let ext = extent(&copies, |_| None);
         generate(&mut project, &copies, ext, PageSize::A3, "Fans")?;
+        // Every label stays inside the frame.
+        let (fx0, fx1) = (FRAME_MARGIN, PageSize::A3.mm().0 - FRAME_MARGIN);
+        for page in &project.pages {
+            for g in &page.graphics {
+                let mut pts = Vec::new();
+                drawn_points(g, &mut pts);
+                assert!(pts.iter().all(|p| p.x >= fx0 && p.x <= fx1), "{g:?}");
+            }
+        }
         let xs: Vec<f64> = project
             .pages
             .iter()
@@ -577,7 +588,12 @@ mod tests {
     fn new_pages_come_after_every_page_with_free_ids() -> Result<()> {
         let one = starter()?.apply(Some("small"), &BTreeMap::new())?;
         let ext = extent(std::slice::from_ref(&one), |_| None);
-        for (numbers, want) in [(&["1", "12.3", "4"][..], "13"), (&["A7", "3"], "A8"), (&[], "1")] {
+        for (numbers, want) in [
+            (&["1", "12.3", "4"][..], "13"),
+            (&["A7", "3"], "A8"),
+            (&[" 4 ", "2"], " 5"),
+            (&[], "1"),
+        ] {
             let mut project = Project::new("x");
             for (i, n) in numbers.iter().enumerate() {
                 // Ids differing only in case from the next free one are skipped.

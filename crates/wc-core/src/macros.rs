@@ -94,7 +94,7 @@ impl Macro {
     /// fill declared placeholders, every placeholder the texts use is declared, symbol ids are
     /// unique and wires only end on the macro's own symbols.
     pub fn check(&self) -> Result<()> {
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let mut names: Vec<&str> = Vec::new();
         for p in &self.placeholders {
             let n = p.name.trim();
@@ -165,7 +165,7 @@ impl Macro {
     /// without a value is an error.
     pub fn apply(&self, set: Option<&str>, overrides: &BTreeMap<String, String>) -> Result<Macro> {
         self.check()?;
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let chosen = match set.map(str::trim).filter(|s| !s.is_empty()) {
             Some(name) => match self.value_set(name) {
                 Some(v) => Some(v),
@@ -287,7 +287,7 @@ impl Macro {
     /// Rename declared placeholder `old` to `new` (names matched without regard to case): its
     /// declaration, its values in the value sets and its uses in the texts.
     pub fn rename_declared(&mut self, old: &str, new: &str) -> Result<()> {
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let new = new.trim();
         if new.is_empty() {
             return bad(format!("placeholder {} needs a new name", old.trim()));
