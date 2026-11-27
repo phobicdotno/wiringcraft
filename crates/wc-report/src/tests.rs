@@ -381,6 +381,71 @@ fn cable_list_names_a_part_missing_from_the_library_copy_by_its_id() {
 }
 
 #[test]
+fn cable_list_lists_a_cable_of_the_devices_file_without_drawn_cores() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w5 = DeviceTag::parse("-W5").unwrap();
+    p.devices.insert(
+        w5.clone(),
+        Device {
+            description: "Pump cable".into(),
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    // A terminal named like a cable is no cable.
+    p.devices.insert(DeviceTag::parse("-X1.W1").unwrap(), Device::default());
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows.len(), 2);
+    assert_eq!(t.rows[0][..4], ["-W1", "", "", "1"]);
+    assert_eq!(t.rows[1], ["-W5", "LAPP.1119203", "Pump cable", "", "", "", ""]);
+    assert!(t.row_pages.get(1).is_none_or(String::is_empty));
+}
+
+#[test]
+fn cable_list_lists_a_hierarchical_cable_drawn_as_no_terminal() {
+    let (mut p, s, parts) = fixture();
+    // -A1.WD3 is drawn with a standalone symbol and has no cores yet; the marking list lists
+    // it as a cable, and so does the cable list. -X1.W1 is drawn as a terminal.
+    let wd3 = DeviceTag::parse("-A1.WD3").unwrap();
+    p.devices.insert(
+        wd3.clone(),
+        Device {
+            description: "Sensor cable".into(),
+            ..Default::default()
+        },
+    );
+    p.devices.insert(DeviceTag::parse("-X1.W1").unwrap(), Device::default());
+    p.pages[0].symbols.push(place("s9", "lamp", 200.0, Some("-A1.WD3")));
+    p.pages[0].symbols.push(place("t9", "term", 210.0, Some("-X1.W1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = cable_list(&i);
+    let cables: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).filter(|c| !c.is_empty()).collect();
+    assert_eq!(cables, ["-A1.WD3"]);
+    assert_eq!(t.rows[0], ["-A1.WD3", "", "Sensor cable", "", "", "", ""]);
+    let marked: Vec<String> = marking_list(&i, &[MarkerKind::Cables])
+        .rows
+        .iter()
+        .map(|r| r[2].clone())
+        .collect();
+    assert_eq!(marked, ["-A1.WD3"]);
+}
+
+#[test]
 fn check_names_a_cable_core_on_two_connections() {
     let (mut p, s, parts) = fixture();
     let found = |p: &Project| {

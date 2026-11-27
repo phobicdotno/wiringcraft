@@ -408,38 +408,12 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
         }
     }
 
-    // Terminals have terminal markers: the drawn ones and the spares the terminal strip editor
-    // keeps (a spare that is drawn too is a drawn terminal already). Only the device and cable
-    // markers need them.
-    let mut terminals: BTreeSet<DeviceTag> = BTreeSet::new();
-    // The terminals on the rail: spares and terminals on schematic pages. An overview draws
-    // terminals again, and one drawn only there is no terminal of the plan.
-    let mut on_rail: BTreeSet<DeviceTag> = BTreeSet::new();
-    if wanted(MarkerKind::Devices) || wanted(MarkerKind::Cables) {
-        for l in &i.project.meta.strips {
-            for n in &l.spares {
-                if let Ok(tag) = DeviceTag::parse(&format!("{}.{n}", l.strip)) {
-                    terminals.insert(tag.clone());
-                    on_rail.insert(tag);
-                }
-            }
-        }
-        for page in &i.project.pages {
-            for s in &page.symbols {
-                // The same rule as the terminal plan: a symbol the project has no copy of is a
-                // terminal when its tag has a terminal level (`-X1.3`).
-                let role = i.symbols.get(&s.symbol).map(|y| y.role);
-                if let Some(tag) = &s.tag
-                    && crate::counts_as_terminal(role, Some(tag))
-                {
-                    terminals.insert(tag.clone());
-                    if !page.overview {
-                        on_rail.insert(tag.clone());
-                    }
-                }
-            }
-        }
-    }
+    // Terminals have terminal markers; only the device and cable markers need them.
+    let (terminals, on_rail) = if wanted(MarkerKind::Devices) || wanted(MarkerKind::Cables) {
+        terminal_tags(i)
+    } else {
+        Default::default()
+    };
 
     if wanted(MarkerKind::Devices) {
         // Devices are marked by their tag; terminals and cables have markers of their own,
@@ -487,6 +461,39 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
     t
 }
 
+/// The tags of terminals as (all terminals, terminals on the rail). All terminals are the drawn
+/// ones and the spares the terminal strip editor keeps (a spare that is drawn too is a drawn
+/// terminal already). On the rail are the spares and the terminals on schematic pages: an
+/// overview draws terminals again, and one drawn only there is no terminal of the plan.
+pub(crate) fn terminal_tags(i: &Inputs<'_>) -> (BTreeSet<DeviceTag>, BTreeSet<DeviceTag>) {
+    let mut terminals: BTreeSet<DeviceTag> = BTreeSet::new();
+    let mut on_rail: BTreeSet<DeviceTag> = BTreeSet::new();
+    for l in &i.project.meta.strips {
+        for n in &l.spares {
+            if let Ok(tag) = DeviceTag::parse(&format!("{}.{n}", l.strip)) {
+                terminals.insert(tag.clone());
+                on_rail.insert(tag);
+            }
+        }
+    }
+    for page in &i.project.pages {
+        for s in &page.symbols {
+            // The same rule as the terminal plan: a symbol the project has no copy of is a
+            // terminal when its tag has a terminal level (`-X1.3`).
+            let role = i.symbols.get(&s.symbol).map(|y| y.role);
+            if let Some(tag) = &s.tag
+                && crate::counts_as_terminal(role, Some(tag))
+            {
+                terminals.insert(tag.clone());
+                if !page.overview {
+                    on_rail.insert(tag.clone());
+                }
+            }
+        }
+    }
+    (terminals, on_rail)
+}
+
 /// The location part of a tag (`+C1` of `=A+C1-K1`), or nothing.
 fn location_of(tag: &DeviceTag) -> String {
     if tag.location.is_empty() {
@@ -497,7 +504,7 @@ fn location_of(tag: &DeviceTag) -> String {
 }
 
 /// Whether a device tag names a cable by its IEC 81346-2 letter code (`-W1`, `-WD3`).
-fn is_cable_tag(tag: &DeviceTag) -> bool {
+pub(crate) fn is_cable_tag(tag: &DeviceTag) -> bool {
     tag.product.last().is_some_and(|p| {
         p.strip_prefix('W').is_some_and(|rest| {
             rest.chars()

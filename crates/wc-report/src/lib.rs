@@ -938,7 +938,8 @@ fn cable_core_label(c: &wc_core::CableCore) -> String {
 /// Cable list: every cable with its type, then one row per core with the wire's two ends. Each
 /// row links to the page its core is drawn on ([`Table::row_pages`]). Overview pages
 /// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
-/// and would list each core twice.
+/// and would list each core twice. A cable of the devices file with no cores drawn yet (`-W5`,
+/// named by the cable letter code) gets one row of its own with empty core cells.
 pub fn cable_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Cable list",
@@ -964,7 +965,30 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             ));
         }
     }
+    // Cables listed before their cores are drawn, told from terminals named like a cable
+    // (`-X1.W1`) as the marking list does: a terminal on the rail is no cable. A tag drawn on a
+    // schematic page with a symbol of known role is a cable when that role is not a terminal
+    // (`-A1.WD3`); one not drawn so is a terminal when it has a terminal level.
+    let (_, on_rail) = marking::terminal_tags(i);
+    let drawn_with_role: BTreeSet<&DeviceTag> = i
+        .project
+        .pages
+        .iter()
+        .filter(|pg| !pg.overview)
+        .flat_map(|pg| &pg.symbols)
+        .filter(|s| i.symbols.contains_key(&s.symbol))
+        .filter_map(|s| s.tag.as_ref())
+        .collect();
+    for tag in i.project.devices.keys() {
+        let terminal = on_rail.contains(tag) || (!drawn_with_role.contains(tag) && counts_as_terminal(None, Some(tag)));
+        if !terminal && marking::is_cable_tag(tag) {
+            cores.entry(tag.clone()).or_default();
+        }
+    }
     for (cable, mut list) in cores {
+        if list.is_empty() {
+            list.push(Default::default());
+        }
         list.sort_by_key(|a| natural_key(&a.0));
         let device = i.project.devices.get(&cable);
         let part_id = device.and_then(|d| d.part.as_ref());
