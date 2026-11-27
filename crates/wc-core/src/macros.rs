@@ -703,6 +703,10 @@ mod tests {
         let mut m = m;
         m.wires[0].spec.colour = Some("{{colour}}".into());
         m.wires[0].spec.kind = Some("{{kind}}".into());
+        m.placeholders.extend(["colour", "kind"].map(|name| Placeholder {
+            name: name.into(),
+            ..Default::default()
+        }));
         let padded: BTreeMap<String, String> = [
             ("section".to_owned(), "1.5".to_owned()),
             ("colour".to_owned(), " BU ".to_owned()),
