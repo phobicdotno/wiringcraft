@@ -102,7 +102,9 @@ net3: -K1:14 -P1:X1
 
 `nets` lists the connected pins across all pages. Add `--via x,y` for bend points.
 
-In the app: Wire (W), then click a pin or point and the other end.
+In the app: Wire (W), then click a pin or point, click any bends, and click a pin to finish.
+A single click on a free point adds a bend; double-click a free point to end the wire there,
+as for the wires to 0V and 24V above. Esc cancels.
 
 ## 6. Run the check
 
