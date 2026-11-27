@@ -924,6 +924,14 @@ impl Open {
         // Every symbol it uses, checked against its pin (a loaded copy may be another version);
         // those copied from another project are taken from the library when possible.
         let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        // What the symbols change (pins, loaded symbols, terminal tracking) goes back when a
+        // part then refuses the paste.
+        let (project, symbols, library, terminals) = (
+            self.project.clone(),
+            self.symbols.clone(),
+            self.library.clone(),
+            self.terminals_before.clone(),
+        );
         self.ensure_symbols(ids)?;
         use wc_core::placement::{DeviceData, OutOfTags};
         // The copied data first for a macro or a copy from another project; within one project
@@ -937,12 +945,21 @@ impl Open {
         // takes them (#1855); Undo takes their pins back.
         let parts = match data {
             DeviceData::GroupFirst => self.parts_to_take(clip.devices.values()),
-            DeviceData::ProjectFirst | DeviceData::GroupOnly => Vec::new(),
+            DeviceData::ProjectFirst | DeviceData::GroupOnly => Ok(Vec::new()),
         };
         let lock = self.project.lock.clone();
-        let (taken, r) = self.take_parts(parts.iter().map(String::as_str));
-        if r.is_err() {
-            return self.give_back(taken, lock, r.map(|()| Vec::new()));
+        let (taken, r) = match parts {
+            Ok(parts) => self.take_parts(parts.iter().map(String::as_str)),
+            Err(e) => (Default::default(), Err(e)),
+        };
+        if let Err(e) = r {
+            let r = self.give_back(taken, lock, Err(e));
+            self.project = project;
+            self.symbols = symbols;
+            self.library = library;
+            self.terminals_before = terminals;
+            self.touch();
+            return r;
         }
         let group = wc_core::placement::Group {
             symbols: &clip.symbols,
@@ -1580,6 +1597,19 @@ mod tests {
         assert_eq!(o.undo_mark(), mark, "no undo step");
         assert!(!o.parts.contains_key(MAIN));
         assert!(!copy_of(&o, MAIN).exists(), "the copy taken on the way is removed");
+
+        // A symbol the project does not pin yet is taken first: it goes back too.
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        for s in &mut m.symbols {
+            s.symbol = "wc.coil.valve".into();
+        }
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        assert!(!before.lock.symbols.contains_key("wc.coil.valve"));
+        let err = o.insert_macro(page, &path, None).unwrap_err();
+        assert!(err.contains(ACCESSORY), "{err}");
+        assert_eq!(o.project, before, "no symbol pin either");
+        assert!(!o.symbols.contains_key("wc.coil.valve"), "nor a loaded symbol");
+        assert_eq!(o.undo_mark(), mark);
     }
 
     #[test]

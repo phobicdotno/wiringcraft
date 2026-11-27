@@ -608,7 +608,7 @@ pub struct Open {
     pub picture_problems: BTreeMap<String, String>,
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
-    terminals_before: Option<wc_core::project::TerminalNumbers>,
+    pub(crate) terminals_before: Option<wc_core::project::TerminalNumbers>,
     /// How far the running select-tool move drag has moved its items in `project`: kept with
     /// every undo and redo step taken during the drag, so Escape can take back from each just
     /// the part of the move it holds (#863). Zero outside a drag.
@@ -1322,8 +1322,12 @@ impl Open {
     /// The parts `devices` name (their main parts and accessories) that a macro or a copy from
     /// another project takes into the project when it is placed (#1855), as the CLI's `macro
     /// place` does: those the project pins, and those a library has. A part no library has
-    /// stays a name on the device; `check` reports it.
-    pub(crate) fn parts_to_take<'a>(&self, devices: impl IntoIterator<Item = &'a wc_core::Device>) -> Vec<String> {
+    /// stays a name on the device; `check` reports it. Libraries that cannot be opened refuse
+    /// with why, as a part they hold would otherwise be left out unnoticed.
+    pub(crate) fn parts_to_take<'a>(
+        &self,
+        devices: impl IntoIterator<Item = &'a wc_core::Device>,
+    ) -> Result<Vec<String>, String> {
         let ids: std::collections::BTreeSet<&str> = devices
             .into_iter()
             .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
@@ -1331,18 +1335,24 @@ impl Open {
             .filter(|id| !id.is_empty())
             .collect();
         // The library is opened only when a part is not pinned.
-        let mut lib: Option<Option<wc_library::Library>> = None;
+        let mut lib: Option<wc_library::Library> = None;
         let mut out = Vec::new();
         for id in ids {
             if !self.project.lock.parts.contains_key(id) {
-                let lib = lib.get_or_insert_with(|| wc_library::Library::open(&self.dir, &self.project).ok());
-                if lib.as_ref().is_none_or(|lib| lib.locate(ItemKind::Part, id).is_none()) {
+                let lib = match &mut lib {
+                    Some(lib) => &*lib,
+                    None => &*lib.insert(
+                        wc_library::Library::open(&self.dir, &self.project)
+                            .map_err(|e| format!("part {id}: the libraries cannot be opened to look for it: {e}"))?,
+                    ),
+                };
+                if lib.locate(ItemKind::Part, id).is_none() {
                     continue;
                 }
             }
             out.push(id.to_owned());
         }
-        out
+        Ok(out)
     }
 
     /// Replace a device's accessories (its parts after the main part). New parts are taken from
@@ -4154,7 +4164,10 @@ impl Open {
         // below goes back to the lock before them.
         let parts = self.parts_to_take(copies.iter().flat_map(|c| c.devices.values()));
         let lock = self.project.lock.clone();
-        let (taken, r) = self.take_parts(parts.iter().map(String::as_str));
+        let (taken, r) = match parts {
+            Ok(parts) => self.take_parts(parts.iter().map(String::as_str)),
+            Err(e) => (TakenParts::default(), Err(e)),
+        };
         if let Err(e) = r {
             let r = self.give_back(taken, lock, Err(e));
             self.project = before;
