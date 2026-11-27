@@ -76,7 +76,12 @@ library with `wiringcraft lib propose <source> <id>`: the file goes to
 `<source>/proposed/symbols/<id>.json` for someone to review.
 
 `wiringcraft lib lock` pins symbols that are used but not pinned yet (for example after a hand
-edit of a page file) and writes a pinned copy again when it is missing.
+edit of a page file) and writes a pinned copy again when it is missing or unreadable. It only
+restores the pinned version, taken from the pinned source or any other library source that
+still holds it. When no source holds that version (for example the library now has only a newer
+one), the copy is not restored and `lib lock` says so: put the file back from the project's
+history, add a library source that holds the pinned version, or take the newer version with
+`lib update`.
 
 ## Placing, turning and mirroring
 
