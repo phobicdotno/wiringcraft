@@ -279,6 +279,51 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
 }
 
 #[test]
+fn dxf_circles_and_arcs_wider_than_the_default_pen_keep_their_width() {
+    // A symbol's circle and arc are drawn 0.3 mm wide; R12 CIRCLE and ARC cannot carry that
+    // (#1287). A thin circle stays a CIRCLE.
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.width(0.25);
+    pen.circle((20.0, 20.0), 3.0, false);
+    pen.width(0.3);
+    pen.circle((50.0, 50.0), 5.0, false);
+    pen.arc((50.0, 50.0), 10.0, 0.0, 90.0, false);
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let d = dxf(&page);
+    assert_eq!(d.matches("0\nCIRCLE\n").count(), 1, "{d}");
+    assert!(d.contains("0\nCIRCLE\n8\n0\n62\n7\n10\n20\n20\n80\n40\n3\n"), "{d}");
+    assert!(!d.contains("0\nARC\n"), "{d}");
+    // The wide circle: a closed polyline of two half circles, its width on every part.
+    assert!(
+        d.contains(
+            "0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n1\n40\n0.3\n41\n0.3\n\
+             0\nVERTEX\n8\n0\n10\n45\n20\n50\n40\n0.3\n41\n0.3\n42\n1\n\
+             0\nVERTEX\n8\n0\n10\n55\n20\n50\n40\n0.3\n41\n0.3\n42\n1\n0\nSEQEND\n"
+        ),
+        "{d}"
+    );
+    // The quarter arc: from the right of the centre to below it on the page (above it with y
+    // up), clockwise, so a negative bulge of tan(90/4).
+    assert!(
+        d.contains(
+            "0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n0\n40\n0.3\n41\n0.3\n\
+             0\nVERTEX\n8\n0\n10\n60\n20\n50\n40\n0.3\n41\n0.3\n42\n-0.414214\n\
+             0\nVERTEX\n8\n0\n10\n50\n20\n40\n40\n0.3\n41\n0.3\n0\nSEQEND\n"
+        ),
+        "{d}"
+    );
+    assert!(d.contains("$ACADVER\n1\nAC1009\n") && !d.contains("LWPOLYLINE"));
+}
+
+#[test]
 fn svg_texts_keep_their_spaces() {
     // Viewers squeeze leading and repeated spaces unless the text says to keep them.
     let mut pen = crate::writer::Pen::new(100.0);

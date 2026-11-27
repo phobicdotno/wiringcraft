@@ -652,6 +652,39 @@ fn wide(ink: &Stroke) -> bool {
     ink.width.is_finite() && ink.width > 0.25 + 1e-9
 }
 
+/// The vertices of an arc as a DXF polyline, in page millimetres (y down), each with the bulge
+/// of the segment it starts. A full turn is two half circles (a closed polyline); an arc is
+/// cut into pieces of at most 90 degrees, so no bulge grows large.
+fn arc_vertices(center: (f64, f64), radius: f64, start: f64, end: f64, full: bool) -> Vec<((f64, f64), f64)> {
+    if full {
+        let left = (center.0 - radius, center.1);
+        let right = (center.0 + radius, center.1);
+        return vec![(left, 1.0), (right, 1.0)];
+    }
+    let sweep = end - start;
+    let pieces = ((sweep.abs() / 90.0).ceil() as usize).max(1);
+    let step = sweep / pieces as f64;
+    // Clockwise on the y-down page stays clockwise once y is flipped: a negative bulge.
+    let bulge = -(step.to_radians() / 4.0).tan();
+    (0..=pieces)
+        .map(|k| {
+            let at = on_circle(center, radius, start + step * k as f64);
+            (at, if k < pieces { bulge } else { 0.0 })
+        })
+        .collect()
+}
+
+/// A bulge with six decimals (three would bend a long arc visibly off its circle).
+fn bulge_num(v: f64) -> String {
+    let s = format!("{v:.6}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" || s.is_empty() {
+        "0".into()
+    } else {
+        s.to_owned()
+    }
+}
+
 /// A DXF (R12, ASCII) drawing of one page in millimetres, y up with the origin at the page's
 /// bottom left corner, as CAD tools expect.
 pub fn dxf(page: &PageDrawing) -> String {
@@ -766,6 +799,33 @@ pub fn dxf(page: &PageDrawing) -> String {
                         pair(40, &w);
                         pair(41, &w);
                         pair(42, "1");
+                    }
+                    pair(0, "SEQEND");
+                    pair(8, layer);
+                    continue;
+                }
+                if !*filled && wide(ink) {
+                    // R12 CIRCLE and ARC have no width: a wide one is a polyline of bulged
+                    // segments along the same path, with its width as a wide line has.
+                    let w = num(ink.width);
+                    let vertices = arc_vertices(*center, *radius, *start, *end, full);
+                    pair(0, "POLYLINE");
+                    pair(8, layer);
+                    pair(62, &colour);
+                    pair(66, "1");
+                    pair(70, if full { "1" } else { "0" });
+                    pair(40, &w);
+                    pair(41, &w);
+                    for ((px, py), bulge) in vertices {
+                        pair(0, "VERTEX");
+                        pair(8, layer);
+                        pair(10, &num(px));
+                        pair(20, &num(y(py)));
+                        pair(40, &w);
+                        pair(41, &w);
+                        if bulge != 0.0 {
+                            pair(42, &bulge_num(bulge));
+                        }
                     }
                     pair(0, "SEQEND");
                     pair(8, layer);
