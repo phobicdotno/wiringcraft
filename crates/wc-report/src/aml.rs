@@ -15,6 +15,13 @@ use wc_core::symbol::SymbolRole;
 
 use crate::{Inputs, natural_key, net_names};
 
+/// `s` escaped for XML text and attribute values.
+///
+/// Markup characters become entities. Tab, line feed and carriage return become `&#9;`, `&#10;`
+/// and `&#13;`, so a reader does not turn them into spaces when it normalises an attribute value.
+/// Every other character is kept only when XML 1.0 allows it (the `Char` production:
+/// `#x20-#xD7FF`, `#xE000-#xFFFD` and `#x10000-#x10FFFF`); the rest, such as other C0 control
+/// characters, `U+FFFE` and `U+FFFF`, are dropped.
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -24,9 +31,11 @@ fn esc(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            '\t' | '\n' | '\r' => out.push(ch),
-            c if c.is_control() => {}
-            c => out.push(c),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => out.push(ch),
+            _ => {}
         }
     }
     out
@@ -52,7 +61,9 @@ pub struct AmlCounts {
 
 /// The project as an AutomationML document. `written` is the time stamp CAEX asks for
 /// (`2026-11-16T22:00:00Z`); the caller passes it so the same project always gives the same file.
-pub fn automationml(i: &Inputs<'_>, written: &str) -> (String, AmlCounts) {
+/// `file_name` is the name of the file being written (`plant-v2.aml`), which goes in the CAEX
+/// `FileName` attribute; when it is empty, the project name plus `.aml` is used instead.
+pub fn automationml(i: &Inputs<'_>, written: &str, file_name: &str) -> (String, AmlCounts) {
     let mut counts = AmlCounts::default();
     let is_device = |page: &str, item: &str| -> Option<DeviceTag> {
         let s = i.project.page(page)?.symbol(item)?;
@@ -105,14 +116,19 @@ pub fn automationml(i: &Inputs<'_>, written: &str) -> (String, AmlCounts) {
     } else {
         i.project.meta.name.trim()
     };
+    let file_name = if file_name.is_empty() {
+        format!("{name}.aml")
+    } else {
+        file_name.to_string()
+    };
     let _ = writeln!(
         out,
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<CAEXFile FileName=\"{}.aml\" SchemaVersion=\"3.0\" \
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<CAEXFile FileName=\"{}\" SchemaVersion=\"3.0\" \
          xmlns=\"http://www.dke.de/CAEX\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  \
          <SourceDocumentInformation OriginName=\"WiringCraft\" OriginID=\"wiringcraft\" OriginVersion=\"{}\" \
          LastWritingDateTime=\"{}\"/>\n  <InstanceHierarchy Name=\"{}\" Version=\"1\">\n    \
          <InternalElement Name=\"{}\" ID=\"project\">",
-        esc(name),
+        esc(&file_name),
         env!("CARGO_PKG_VERSION"),
         esc(if written.is_empty() {
             "1970-01-01T00:00:00Z"
