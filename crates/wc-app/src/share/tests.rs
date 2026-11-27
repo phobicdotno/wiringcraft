@@ -1211,7 +1211,7 @@ fn wire_numbering_in_a_session_leaves_pages_others_hold_and_says_so() -> TestRes
     let done = host_open.number_wires(wc_core::numbering::Rule::Sequential);
     assert_eq!(done.skipped, ["3"]);
     assert_eq!(done.done.wires, 2, "the cover and the host's own page");
-    assert!(done.report().contains("Page(s) 3 were left as they are"));
+    assert!(done.report().contains("Page 3 was left as it is"));
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
 
     let numbered = |o: &Open, page: &str| {

@@ -5457,7 +5457,7 @@ mod tests {
         open.held_by_others.insert(held, "Ola".into());
         let done = call(&mut a, "number_wires", json!({"rule": "sequential", "overwrite": true})).unwrap();
         // Its numbers stay as they were, but it is still reported as left out.
-        assert!(done.contains("Page(s) 2 were left as they are"), "{done}");
+        assert!(done.contains("Page 2 was left as it is"), "{done}");
         let open = a.open.as_ref().unwrap();
         let on = |i: usize| open.project.pages[i].wires[0].number.clone();
         assert_eq!(on(pages[0]).as_deref(), Some("2"), "the held page is not changed");
