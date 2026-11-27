@@ -5562,10 +5562,32 @@ mod tests {
         )
         .unwrap();
         assert!(said.contains("renamed to -K2"), "{said}");
-        let open = a.open.as_ref().unwrap();
+        let open = a.open.as_mut().unwrap();
         assert_eq!(
             open.project.devices.get(&k2).and_then(|d| d.part.as_deref()),
             Some("example.ex-tb-2-5")
+        );
+
+        // A part the device already has is not checked again, even one no library has: the
+        // rename goes through and the part is kept.
+        open.project.devices.entry(k2.clone()).or_default().part = Some("no.such".into());
+        let said = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K2", "rename_to": "-K3", "part": "no.such"}),
+        )
+        .unwrap();
+        assert!(said.contains("renamed to -K3"), "{said}");
+        let k3 = DeviceTag::parse("-K3").unwrap();
+        assert_eq!(
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .devices
+                .get(&k3)
+                .and_then(|d| d.part.as_deref()),
+            Some("no.such")
         );
     }
 
