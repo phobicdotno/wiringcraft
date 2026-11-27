@@ -64,6 +64,24 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
+/// `old` under the new tag of its parent (its tag one product level up), when the group holds
+/// that parent: `-X1.3` of a strip `-X1` placed as `-X2` is `-X2.3`, and placed as `-X1` it
+/// stays `-X1.3`.
+fn under_renamed_parent(renamed: &BTreeMap<&DeviceTag, Option<DeviceTag>>, old: &DeviceTag) -> Option<DeviceTag> {
+    let (last, rest) = old.product.split_last()?;
+    if rest.is_empty() {
+        return None;
+    }
+    let parent = DeviceTag {
+        product: rest.to_vec(),
+        ..old.clone()
+    };
+    let new_parent = renamed.get(&parent)?.as_ref()?;
+    let mut t = new_parent.clone();
+    t.product.push(last.clone());
+    Some(t)
+}
+
 /// The first product `<letter>1` to `<letter>9999` that no tag in `used` has, whatever its
 /// function and location, nor has as the first level of a longer product: terminal `-X1.3` or
 /// part `-K1.2` takes `X1` or `K1` too. `None` for an empty letter code or when all are taken.
@@ -122,31 +140,66 @@ pub fn place(
         .iter()
         .filter(|_| data != DeviceData::ProjectFirst)
         .filter_map(|w| w.cable.as_ref().map(|c| &c.cable));
-    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()).chain(cables) {
-        if renamed.contains_key(old) {
-            continue;
-        }
-        let new = match free_tag_like(&used, old) {
-            Some(t) => t,
-            None if out_of_tags == OutOfTags::Fail => {
-                return Err(Error::Invalid(format!("no free tag like {old}")));
-            }
-            None => {
-                renamed.insert(old, None);
+    // Shorter tags first, so a strip (`-X1`) has its new tag before its terminals (`-X1.3`).
+    let mut olds: Vec<&DeviceTag> = group
+        .symbols
+        .iter()
+        .filter_map(|s| s.tag.as_ref())
+        .chain(cables)
+        .collect();
+    olds.sort_by_key(|t| t.product.len());
+    // Two passes: first every tag that keeps its own number (on its own or on its strip's new
+    // tag), then the ones whose number is taken there, so a taken number never pushes another
+    // terminal off a number that was free (#1780).
+    let mut pending = olds;
+    for first in [true, false] {
+        let mut deferred: Vec<&DeviceTag> = Vec::new();
+        for old in std::mem::take(&mut pending) {
+            if renamed.contains_key(old) {
                 continue;
             }
-        };
-        let (project_data, group_data) = (project.devices.get(old), group.devices.get(old));
-        let device = match data {
-            DeviceData::ProjectFirst => project_data.or(group_data),
-            DeviceData::GroupFirst => group_data.or(project_data),
-            DeviceData::GroupOnly => group_data,
+            // A terminal (or other sub-tag) of a strip the group holds follows the strip to its
+            // new tag, keeping its own number when that is free there, else taking the next free
+            // number on that strip.
+            let followed = under_renamed_parent(&renamed, old);
+            if first {
+                let parent_deferred = old.product.split_last().is_some_and(|(_, rest)| {
+                    deferred.iter().any(|d| {
+                        d.product.as_slice() == rest && d.function == old.function && d.location == old.location
+                    })
+                });
+                if parent_deferred || followed.as_ref().is_some_and(|t| used.contains(t)) {
+                    deferred.push(old);
+                    continue;
+                }
+            }
+            let new = match followed
+                .clone()
+                .filter(|t| !used.contains(t))
+                .or_else(|| free_tag_like(&used, followed.as_ref().unwrap_or(old)))
+            {
+                Some(t) => t,
+                None if out_of_tags == OutOfTags::Fail => {
+                    return Err(Error::Invalid(format!("no free tag like {old}")));
+                }
+                None => {
+                    renamed.insert(old, None);
+                    continue;
+                }
+            };
+            let (project_data, group_data) = (project.devices.get(old), group.devices.get(old));
+            let device = match data {
+                DeviceData::ProjectFirst => project_data.or(group_data),
+                DeviceData::GroupFirst => group_data.or(project_data),
+                DeviceData::GroupOnly => group_data,
+            }
+            .cloned()
+            .unwrap_or_default();
+            used.insert(new.clone());
+            devices.push((new.clone(), device));
+            renamed.insert(old, Some(new));
         }
-        .cloned()
-        .unwrap_or_default();
-        used.insert(new.clone());
-        devices.push((new.clone(), device));
-        renamed.insert(old, Some(new));
+        pending = deferred;
     }
     project.devices.extend(devices);
 
