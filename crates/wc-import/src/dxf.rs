@@ -4428,6 +4428,32 @@ mod tests {
     }
 
     #[test]
+    fn attributes_of_an_invisible_insert_use_the_budget() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nIN\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let attribs = "0\nATTRIB\n2\nA\n1\nx\n0\nATTRIB\n2\nB\n1\ny\n0\nATTRIB\n2\nC\n1\nz\n";
+        let hidden = format!("0\nINSERT\n2\nIN\n10\n0\n20\n0\n60\n1\n66\n1\n{attribs}");
+        // The INSERT and two of its attributes take the budget of 3; the third attribute and
+        // the two lines after it are counted as over the limit, and nothing is drawn.
+        let line = "0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
+        let d = parse(&dxf(&format!("{hidden}{line}{line}"), blocks))?;
+        let (mut skipped, mut budget) = (BTreeMap::new(), 3);
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert!(shapes.is_empty(), "{shapes:?}");
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&3), "{skipped:?}");
+        assert_eq!(budget, 0);
+        // A block holding such an INSERT, placed as a 4 x 5 array: each copy walks the
+        // attributes again and pays for them, so the budget runs out instead of being walked free.
+        let rep = format!("0\nBLOCK\n2\nREP\n{hidden}0\nENDBLK\n");
+        let arr = "0\nINSERT\n2\nREP\n10\n0\n20\n0\n70\n4\n71\n5\n44\n1\n45\n1\n";
+        let d = parse(&dxf(arr, &format!("{blocks}{rep}")))?;
+        let (mut skipped, mut budget) = (BTreeMap::new(), 50);
+        draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert_eq!(budget, 0, "20 copies of 4 entities need more than 50");
+        assert!(skipped.get(OVER_LIMIT).is_some_and(|n| *n > 0), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_solid_is_a_filled_outline() -> Result<()> {
         // A triangle (third and fourth corner the same) and a square, corners in "Z" order.
         let ents = "0\nSOLID\n10\n0\n20\n0\n11\n4\n21\n0\n12\n0\n22\n3\n13\n0\n23\n3\n\
