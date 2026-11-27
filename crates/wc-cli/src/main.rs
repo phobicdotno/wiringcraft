@@ -3492,6 +3492,10 @@ fn run(mut cli: Cli) -> Res<()> {
                     println!("{i}");
                 }
                 RevisionCmd::Uncloud { page, index, rev } => {
+                    // The letter `revision cloud --rev` would have tagged the clouds with, so the
+                    // same typed letter takes them off again; the typed tag itself still matches
+                    // a cloud whose revision is gone.
+                    let kept = rev.as_deref().and_then(|r| p.revision(r)).map(|r| r.letter.clone());
                     let pg = p.page_mut(&page).ok_or_else(|| format!("no page {page:?}"))?;
                     let before = pg.clouds.len();
                     match (index, rev) {
@@ -3499,8 +3503,18 @@ fn run(mut cli: Cli) -> Res<()> {
                             pg.clouds.remove(i);
                         }
                         (Some(i), None) => return Err(format!("page {page:?} has no cloud {i}")),
-                        (None, Some(r)) => pg.clouds.retain(|c| c.revision != r.trim()),
-                        _ => return Err("give a cloud's index or --rev, not both".into()),
+                        (None, Some(r)) => {
+                            pg.clouds
+                                .retain(|c| c.revision != r.trim() && Some(&c.revision) != kept.as_ref());
+                            if pg.clouds.len() == before {
+                                return Err(format!(
+                                    "page {page:?} has no cloud of revision {}",
+                                    escape_field(r.trim())
+                                ));
+                            }
+                        }
+                        (Some(_), Some(_)) => return Err("give a cloud's index or --rev, not both".into()),
+                        (None, None) => return Err("give a cloud's index or --rev".into()),
                     }
                     if pg.clouds.len() != before {
                         save(dir, &p)?;
