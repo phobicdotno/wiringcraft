@@ -240,15 +240,17 @@ impl Panel {
 
     /// The right end a rail at `index` cannot be shortened past: the right edge of the
     /// devices clipped onto it (their middle within 20 mm of its centre line and their outline
-    /// over its length). `None` when it is not a rail or carries no device.
+    /// over its length). A rail drawn right to left (a negative length) counts from its real
+    /// left end. `None` when it is not a rail or carries no device.
     pub fn rail_devices_end(&self, index: usize) -> Option<f64> {
         let Some(PanelItem::Rail { at, length }) = self.items.get(index) else {
             return None;
         };
+        let (left, right) = (at.x.min(at.x + length), at.x.max(at.x + length));
         self.items
             .iter()
             .filter_map(PanelItem::device_bounds)
-            .filter(|(a, b)| ((a.y + b.y) / 2.0 - at.y).abs() < 20.0 && b.x > at.x && a.x < at.x + length)
+            .filter(|(a, b)| ((a.y + b.y) / 2.0 - at.y).abs() < 20.0 && b.x > left && a.x < right)
             .map(|(_, b)| b.x)
             .reduce(f64::max)
     }
@@ -257,7 +259,9 @@ impl Panel {
     /// right end or the duct's bottom-right corner goes to `to`, as near as it can: the left
     /// end or top-left corner stays put, the item stays on the plate and at least
     /// [`MIN_RESIZE`] millimetres long or wide, and a rail is never shortened past the
-    /// devices on it (see [`Panel::rail_devices_end`]); they stay where they are. Returns
+    /// devices on it (see [`Panel::rail_devices_end`]); they stay where they are. A rail drawn
+    /// right to left (a negative length) is resized from its real left end and is stored from
+    /// that end afterwards, like a duct whose corners were the other way round. Returns
     /// whether anything changed; a device, an index past the end, or an item whose left end
     /// or top-left corner is less than [`MIN_RESIZE`] from the plate's right or bottom edge
     /// changes nothing.
@@ -279,9 +283,16 @@ impl Panel {
         };
         match item {
             PanelItem::Rail { at, length } => {
-                let Some(l) = reach(at.x, to.x, devices_end.unwrap_or(f64::MIN), pw) else {
+                // A negative length runs left from `at`, so the left end is the far one.
+                let left = if *length < 0.0 && length.is_finite() {
+                    at.x + *length
+                } else {
+                    at.x
+                };
+                let Some(l) = reach(left, to.x, devices_end.unwrap_or(f64::MIN), pw) else {
                     return false;
                 };
+                at.x = left;
                 *length = l;
             }
             PanelItem::Duct { min, max } => {
@@ -443,14 +454,14 @@ impl Panel {
 /// A part's footprint (width, height) in millimetres, if it has one. Each dimension comes from
 /// the part's `Width` or `Height` property, else from the extents of its footprint drawing
 /// ([`crate::part::Footprint`]), else from the size of its 3D model ([`crate::ModelSize`]); a
-/// part with one property and a drawing takes the other dimension from the drawing.
+/// part with one property and a drawing takes the other dimension from the drawing. Of several
+/// properties for one dimension (`Width` and `Width mm`), the first with a usable value counts.
 pub fn part_size(part: &Part) -> Option<(f64, f64)> {
     let find = |keys: &[&str]| {
         part.properties
             .iter()
-            .find(|(k, _)| keys.iter().any(|key| k.trim().eq_ignore_ascii_case(key)))
-            .and_then(|(_, v)| leading_number(v))
-            .filter(|v| *v > 0.0 && *v <= 5000.0)
+            .filter(|(k, _)| keys.iter().any(|key| k.trim().eq_ignore_ascii_case(key)))
+            .find_map(|(_, v)| leading_number(v).filter(|v| *v > 0.0 && *v <= 5000.0))
     };
     let w = find(&["width", "width mm", "breite", "bredde"]);
     let h = find(&["height", "height mm", "höhe", "hoehe", "høyde", "hoyde"]);
@@ -466,19 +477,18 @@ pub fn part_size(part: &Part) -> Option<(f64, f64)> {
     ))
 }
 
-/// A part's depth (out of the plate) in millimetres, if it has one: its `Depth` property, else
-/// the depth of its 3D model ([`crate::ModelSize`]).
+/// A part's depth (out of the plate) in millimetres, if it has one: its `Depth` property (the
+/// first with a usable value, of several), else the depth of its 3D model ([`crate::ModelSize`]).
 pub fn part_depth(part: &Part) -> Option<f64> {
     part.properties
         .iter()
-        .find(|(k, _)| {
+        .filter(|(k, _)| {
             matches!(
                 k.trim().to_lowercase().as_str(),
                 "depth" | "depth mm" | "tiefe" | "dybde"
             )
         })
-        .and_then(|(_, v)| leading_number(v))
-        .filter(|d| *d > 0.0 && *d <= MAX_DEPTH)
+        .find_map(|(_, v)| leading_number(v).filter(|d| *d > 0.0 && *d <= MAX_DEPTH))
         .or_else(|| {
             part.model
                 .filter(crate::ModelSize::is_usable)
@@ -842,6 +852,25 @@ mod tests {
         deep.model = Some(crate::ModelSize { width: 0.0, ..model });
         assert_eq!(part_size(&deep), None, "an unusable model is no size");
         assert_eq!(part_depth(&deep), None);
+    }
+
+    #[test]
+    fn an_empty_size_property_leaves_the_next_one_to_count() {
+        let mut p = Part::default();
+        for (k, v) in [
+            ("Width", ""),
+            ("Width mm", "45"),
+            ("Height", "n/a"),
+            ("Höhe", "90"),
+            ("Depth", "0"),
+            ("Depth mm", "70"),
+        ] {
+            p.properties.insert(k.into(), v.into());
+        }
+        assert_eq!(part_size(&p), Some((45.0, 90.0)));
+        assert_eq!(part_depth(&p), Some(70.0));
+        p.properties.insert("Width mm".into(), "".into());
+        assert_eq!(part_size(&p), None, "no usable width anywhere");
     }
 
     #[test]
@@ -1376,6 +1405,23 @@ mod tests {
         assert_eq!(p.rail_devices_end(0), None);
         assert!(p.resize_item(0, Point::new(-50.0, 100.0)));
         assert_eq!(rail_length(&p), MIN_RESIZE);
+    }
+
+    #[test]
+    fn a_rail_drawn_right_to_left_resizes_by_its_real_ends() {
+        // The same rail as `rail_with_device`, drawn from x 300 back to x 100.
+        let mut p = rail_with_device();
+        p.items[0] = PanelItem::Rail {
+            at: Point::new(300.0, 100.0),
+            length: -200.0,
+        };
+        assert_eq!(p.rail_devices_end(0), Some(210.0));
+        // Shortened, it stops at its device and keeps its left end at x 100.
+        assert!(p.resize_item(0, Point::new(120.0, 100.0)));
+        assert_eq!(rail_length(&p), 110.0);
+        assert_eq!(p.items[1].anchor(), Point::new(160.0, 55.0), "the device stays");
+        assert!(p.resize_item(0, Point::new(450.0, 100.0)));
+        assert_eq!(rail_length(&p), 350.0);
     }
 
     #[test]

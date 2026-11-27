@@ -574,7 +574,8 @@ struct MarkingArgs {
 enum CommentCmd {
     /// Pin a comment on a page. Prints its id.
     Add {
-        /// The page's id.
+        /// The page's id or number. An id wins: when one page's number is another page's id,
+        /// the page with that id is taken, so give the id of the page you mean.
         page: String,
         /// The comment.
         text: String,
@@ -612,7 +613,8 @@ enum CommentCmd {
     },
     /// List the comments, of one page or all; open ones only unless --all.
     List {
-        /// Only this page's comments (page id).
+        /// Only this page's comments: the page's id or number. An id wins when one page's
+        /// number is another page's id.
         page: Option<String>,
         /// Resolved comments too.
         #[arg(long)]
@@ -2885,8 +2887,8 @@ fn run(mut cli: Cli) -> Res<()> {
                     for pg in &p.pages {
                         println!(
                             "{:<10} {:<6} {} ({} symbols, {} wires){}",
-                            pg.id,
-                            pg.number,
+                            escape_field(&pg.id),
+                            escape_field(&pg.number),
                             escape_field(&pg.title),
                             pg.symbols.len(),
                             pg.wires.len(),
@@ -3451,22 +3453,60 @@ fn run(mut cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
-                    // A pinned symbol keeps its pinned version: a missing copy is put back from
-                    // a library that still has that version, never from a newer one. A symbol
-                    // without a pin is taken from the library and pinned, also when a copy is
-                    // left from an earlier attempt that failed before it was pinned.
+                    // A pinned symbol or part keeps its pinned version: a missing copy is put
+                    // back from a library that still has that version, never from a newer one.
+                    // One without a pin is taken from the library and pinned, also when a copy
+                    // is left from an earlier attempt that failed before it was pinned. The
+                    // parts are those the macro's devices and their accessories name, as
+                    // `device --part` takes them; a part no library has is left as it is.
                     let symbols: std::collections::BTreeSet<&str> =
                         m.symbols.iter().map(|s| s.symbol.as_str()).collect();
-                    // The library is opened only when a symbol needs it, so a macro whose
-                    // symbols all have their pinned copies works without it.
+                    let parts: std::collections::BTreeSet<&str> = m
+                        .devices
+                        .values()
+                        .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+                        .map(|id| id.trim())
+                        .filter(|id| !id.is_empty())
+                        .collect();
+                    let items = symbols
+                        .into_iter()
+                        .map(|id| (ItemKind::Symbol, id))
+                        .chain(parts.into_iter().map(|id| (ItemKind::Part, id)));
+                    // The library is opened only when an item needs it, so a macro whose
+                    // symbols and parts all have their pinned copies works without it.
                     let mut lib: Option<wc_library::Library> = None;
-                    for id in symbols {
-                        let pin = p.lock.symbols.get(id).cloned();
+                    for (kind, id) in items {
+                        let what = match kind {
+                            ItemKind::Symbol => "symbol",
+                            ItemKind::Part => "part",
+                        };
+                        let pin = match kind {
+                            ItemKind::Symbol => p.lock.symbols.get(id),
+                            ItemKind::Part => p.lock.parts.get(id),
+                        }
+                        .cloned();
                         if pin.is_some() {
-                            let vendored = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                            let vendored = store::vendor_path(dir, kind, id).map_err(e)?;
                             if vendored.exists() {
                                 // A copy that cannot be read is reported now, not after saving.
-                                store::read_vendored_symbol(dir, id).map_err(e)?;
+                                match kind {
+                                    ItemKind::Symbol => store::read_vendored_symbol(dir, id).map(drop),
+                                    ItemKind::Part => store::read_vendored_part(dir, id).map(drop),
+                                }
+                                .map_err(e)?;
+                                continue;
+                            }
+                        }
+                        // A part no library has stays a name on the device, as before: `check`
+                        // reports it, and value sets may name parts kept elsewhere.
+                        if pin.is_none() && kind == ItemKind::Part {
+                            if lib.is_none() {
+                                match wc_library::Library::open(dir, &p) {
+                                    Ok(opened) => lib = Some(opened),
+                                    Err(_) => continue,
+                                }
+                            }
+                            if lib.as_ref().is_none_or(|lib| lib.locate(kind, id).is_none()) {
                                 continue;
                             }
                         }
@@ -3476,24 +3516,41 @@ fn run(mut cli: Cli) -> Res<()> {
                         };
                         match pin {
                             Some(pin) => {
-                                let fits = |s: &wc_core::Symbol| {
-                                    if s.id != id {
-                                        Err(format!("its file holds {}", s.id))
-                                    } else if s.hash() != pin.hash {
+                                let fits = |found: &str, hash: String| {
+                                    if found != id {
+                                        Err(format!("its file holds {found}"))
+                                    } else if hash != pin.hash {
                                         Err("another version".to_owned())
                                     } else {
                                         Ok(())
                                     }
                                 };
-                                let s = lib.find_version(ItemKind::Symbol, id, &pin.source, fits).map_err(|why| {
+                                let missing = |why: String| {
                                     format!(
-                                        "symbol {id}: its copy in the project is missing and no library has the version the project pins ({why})"
+                                        "{what} {id}: its copy in the project is missing and no library has the version the project pins ({why})"
                                     )
-                                })?;
-                                store::write_vendored_symbol(dir, &s).map_err(e)?;
+                                };
+                                match kind {
+                                    ItemKind::Symbol => {
+                                        let s = lib
+                                            .find_version(kind, id, &pin.source, |s: &wc_core::Symbol| {
+                                                fits(&s.id, s.hash())
+                                            })
+                                            .map_err(missing)?;
+                                        store::write_vendored_symbol(dir, &s).map_err(e)?;
+                                    }
+                                    ItemKind::Part => {
+                                        let part = lib
+                                            .find_version(kind, id, &pin.source, |part: &wc_core::Part| {
+                                                fits(&part.id, part.hash())
+                                            })
+                                            .map_err(missing)?;
+                                        store::write_vendored_part(dir, &part).map_err(e)?;
+                                    }
+                                }
                             }
                             None => {
-                                wc_library::take(dir, &mut p, lib, ItemKind::Symbol, id).map_err(e)?;
+                                wc_library::take(dir, &mut p, lib, kind, id).map_err(e)?;
                             }
                         }
                     }
@@ -4145,7 +4202,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     .page_id
                     .as_deref()
                     .and_then(|id| p.page(id))
-                    .map(|pg| format!("page {}: ", pg.number))
+                    .map(|pg| format!("page {}: ", escape_field(&pg.number)))
                     .unwrap_or_default();
                 println!("{:<7} {page}{}", f.severity.label(), escape_field(&f.message));
             }
@@ -4154,9 +4211,21 @@ fn run(mut cli: Cli) -> Res<()> {
                 count(wc_report::Severity::Warning),
                 count(wc_report::Severity::Note),
             );
-            println!("{errors} errors, {warnings} warnings, {notes} notes");
+            let counted = |n: usize, one: &str| {
+                if n == 1 {
+                    format!("1 {one}")
+                } else {
+                    format!("{n} {one}s")
+                }
+            };
+            println!(
+                "{}, {}, {}",
+                counted(errors, "error"),
+                counted(warnings, "warning"),
+                counted(notes, "note")
+            );
             if errors > 0 {
-                return Err(format!("the project check found {errors} errors"));
+                return Err(format!("the project check found {}", counted(errors, "error")));
             }
         }
         Cmd::Report { kind, format, out, sep } => {
