@@ -1925,6 +1925,11 @@ impl App {
                 let sel = std::mem::take(&mut self.ed.selection);
                 open.delete_many(page, &sel);
             }
+            // As Delete: a turn would end the drag under the pointer, and Escape could no
+            // longer put the device back as it was (#1257).
+            Action::Rotate if self.ed.panel.is_some() && self.ed.panel_drag.is_some() => {
+                self.ed.message = "Let go of the move first, then turn the device.".into();
+            }
             Action::Rotate if self.ed.panel.is_some() => {
                 if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick)
                     && !open.rotate_panel_device(pi, item)
@@ -9081,6 +9086,52 @@ mod nudge_tests {
         app.ed.panel_drag = None;
         app.carry_out(Action::Delete);
         assert_eq!(items(&app), 0, "after letting go, Delete removes it");
+    }
+
+    #[test]
+    fn rotate_waits_for_a_panel_device_drag_to_end() {
+        use wc_core::geom::Rotation;
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut app, _ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: Rotation::R0,
+            }],
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        let turn = |app: &App| match app.open.as_ref().unwrap().project.panels[panel].items[0] {
+            PanelItem::Device { rotation, .. } => rotation,
+            _ => unreachable!("the device is there"),
+        };
+        let steps = app.open.as_ref().unwrap().undo_steps();
+        app.ed.panel_drag = Some((
+            Point::new(100.0, 100.0),
+            None,
+            app.open.as_ref().unwrap().project.panels[panel].items[0].clone(),
+        ));
+        app.carry_out(Action::Rotate);
+        assert_eq!(turn(&app), Rotation::R0, "the held device is not turned");
+        assert_eq!(
+            app.open.as_ref().unwrap().undo_steps(),
+            steps,
+            "and no undo step is made"
+        );
+        assert!(app.ed.panel_drag.is_some(), "the drag goes on");
+        assert!(app.ed.message.contains("Let go"), "{}", app.ed.message);
+        app.ed.panel_drag = None;
+        app.carry_out(Action::Rotate);
+        assert_eq!(turn(&app), Rotation::R90, "after letting go, Rotate turns it");
     }
 
     #[test]
