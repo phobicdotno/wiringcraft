@@ -6056,6 +6056,39 @@ mod tests {
     }
 
     #[test]
+    fn cut_leaves_a_wire_the_copy_left_out_on_the_page_and_selected() {
+        use crate::state::Selection;
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        o.project.pages[0].graphics.push(wc_core::Shape::Line {
+            a: Point::new(50.0, 50.0),
+            b: Point::new(80.0, 50.0),
+        });
+        // A wire ending on a symbol that is not on the page: the copy leaves it out.
+        o.add_wire(
+            0,
+            wc_core::Endpoint::Point {
+                at: Point::new(50.0, 60.0),
+            },
+            wc_core::Endpoint::Pin {
+                item: "gone".into(),
+                pin: "1".into(),
+            },
+            vec![],
+        );
+        let w = o.project.pages[0].wires.last().unwrap().id.clone();
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Wire(w.clone())];
+        a.run(Action::Cut);
+        assert_eq!(a.ed.message, "Cut 1 item.");
+        let pg = &a.open.as_ref().unwrap().project.pages[0];
+        assert!(pg.graphics.is_empty(), "the cut line is gone");
+        assert!(pg.wires.iter().any(|x| x.id == w), "the wire not copied stays");
+        assert_eq!(a.ed.selection, [Selection::Wire(w)]);
+        assert!(a.clipboard.wires.is_empty());
+    }
+
+    #[test]
     fn page_up_and_page_down_open_the_previous_and_next_page() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);

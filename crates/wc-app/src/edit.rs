@@ -854,13 +854,16 @@ impl Open {
             .filter(|s| syms.contains(s.id.as_str()))
             .cloned()
             .collect();
+        // Ends are checked against the symbols copied: a selected id no longer on the page
+        // (a stale selection) copies nothing a wire could stay on.
+        let copied: BTreeSet<&str> = symbols.iter().map(|s| s.id.as_str()).collect();
         let mut out_wires = Vec::new();
         // A wire whose end on a symbol left out has no position (the symbol or pin is missing)
         // is left out too: it would still end on that symbol, and it is not drawn anyway.
         'wires: for w in carried_wires(p, &syms, &wires) {
             let mut w = w.clone();
             for e in [&mut w.from, &mut w.to] {
-                if pin_item(e).is_some_and(|i| !syms.contains(i)) {
+                if pin_item(e).is_some_and(|i| !copied.contains(i)) {
                     match self.end_pos(p, e) {
                         Some(at) => *e = Endpoint::Point { at },
                         None => continue 'wires,
@@ -1862,6 +1865,21 @@ mod tests {
         assert!(
             clip.wires.is_empty(),
             "the wire would still end on the symbol it was copied without: {:?}",
+            clip.wires
+        );
+    }
+
+    #[test]
+    fn a_wire_on_a_selected_symbol_gone_from_the_page_is_not_copied() {
+        let (_tmp, mut o, page, _a, b) = setup();
+        // `b` is still selected but no longer on the page; the wire still names it.
+        o.project.pages[page].symbols.retain(|s| s.id != b);
+        let w = o.project.pages[page].wires[0].id.clone();
+        let clip = o.copy(page, &[Selection::Symbol(b), Selection::Wire(w)]);
+        assert!(clip.symbols.is_empty());
+        assert!(
+            clip.wires.is_empty(),
+            "the wire would end on a symbol the copy does not have: {:?}",
             clip.wires
         );
     }
