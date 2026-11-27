@@ -178,17 +178,20 @@ pub fn check_with_unreadable(
     }
     for ((tag, _), uses) in &seen {
         if uses.len() > 1 {
-            let pages: BTreeSet<&str> = uses.iter().map(|(pg, _)| pg.number.as_str()).collect();
+            // In page order (uses come in it), each page once.
+            let mut pages: Vec<&str> = Vec::new();
+            for (pg, _) in uses {
+                if !pages.contains(&pg.number.as_str()) {
+                    pages.push(&pg.number);
+                }
+            }
+            let word = if pages.len() == 1 { "page" } else { "pages" };
             for (page, item) in uses {
                 out.push(at(
                     page,
                     item,
                     Severity::Error,
-                    format!(
-                        "{tag} is drawn {} times (pages {})",
-                        uses.len(),
-                        pages.iter().copied().collect::<Vec<_>>().join(", ")
-                    ),
+                    format!("{tag} is drawn {} times ({word} {})", uses.len(), pages.join(", ")),
                 ));
             }
         }
