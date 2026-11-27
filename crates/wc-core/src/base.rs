@@ -119,7 +119,13 @@ fn fail_for_test() -> Result<()> {
 
 /// Give a project loaded from a base project its own name and date and drop its comments.
 pub fn fill(project: &mut Project, name: &str, date: &str) {
-    let put = |s: &str| s.replace("{name}", name).replace("{date}", date);
+    // One pass, so a name that itself reads `{date}` is kept as written.
+    let put = |s: &str| {
+        s.split("{name}")
+            .map(|part| part.replace("{date}", date))
+            .collect::<Vec<_>>()
+            .join(name)
+    };
     project.meta.name = name.to_owned();
     for v in project.meta.title_block.values_mut() {
         *v = put(v);
@@ -683,5 +689,157 @@ mod tests {
         assert_eq!(civil_date(20_775), (2026, 11, 18));
         assert_eq!(civil_date(-1), (1969, 12, 31));
         assert_eq!(today().len(), 10);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod base_tests {
+    use super::*;
+    use crate::Page;
+    use crate::project::LibrarySource;
+
+    fn folder(location: &str) -> LibrarySource {
+        LibrarySource {
+            name: location.into(),
+            kind: "folder".into(),
+            location: location.into(),
+            reference: None,
+        }
+    }
+
+    #[test]
+    fn fill_puts_name_and_date_into_every_title_field_and_page_title() {
+        let mut p = Project::new("Base");
+        p.meta
+            .title_block
+            .insert("note".into(), "{name}/{name} on {date}".into());
+        let mut page = Page::new("p0001", "1", "{date}: {name}");
+        page.title_block.insert("checked".into(), "{name} by {date}".into());
+        page.title_block.insert("date".into(), "{date}".into());
+        p.pages = vec![page];
+        fill(&mut p, "Job", "2027-01-02");
+        assert_eq!(p.meta.name, "Job");
+        assert_eq!(p.meta.title_block["note"], "Job/Job on 2027-01-02");
+        assert_eq!(p.meta.title_block["date"], "2027-01-02");
+        assert_eq!(p.pages[0].title, "2027-01-02: Job");
+        assert_eq!(p.pages[0].title_block["checked"], "Job by 2027-01-02");
+        assert!(!p.pages[0].title_block.contains_key("date"));
+    }
+
+    #[test]
+    fn fill_does_not_expand_placeholders_inside_the_new_name() {
+        let mut p = Project::new("Base");
+        p.meta.title_block.insert("t".into(), "{name}".into());
+        fill(&mut p, "{date}", "2027-01-02");
+        assert_eq!(p.meta.name, "{date}");
+        assert_eq!(p.meta.title_block["t"], "{date}");
+    }
+
+    #[test]
+    fn outside_libraries_lists_only_relative_folders_that_leave_the_project() {
+        let mut p = Project::new("Base");
+        let mut git = folder("../remote.git");
+        git.kind = "git".into();
+        let abs = if cfg!(windows) { "C:\\lib" } else { "/srv/lib" };
+        p.meta.libraries = vec![
+            folder("lib"),
+            folder("./lib/../other"),
+            folder("a/../../up"),
+            folder(".."),
+            folder("deep/../../../far"),
+            folder(abs),
+            git,
+        ];
+        assert_eq!(
+            outside_libraries(&p),
+            vec!["a/../../up".to_owned(), "..".to_owned(), "deep/../../../far".to_owned()]
+        );
+    }
+
+    #[test]
+    fn written_parts_split_on_slashes_and_drop_empty_parts() {
+        let parts: Vec<_> = written_parts("./a//../b/").collect();
+        assert_eq!(
+            parts,
+            vec![
+                Component::CurDir,
+                Component::Normal("a".as_ref()),
+                Component::ParentDir,
+                Component::Normal("b".as_ref()),
+            ]
+        );
+        assert_eq!(written_parts("").count(), 0);
+    }
+
+    #[test]
+    fn lexical_works_out_dots_by_name() {
+        let p = lexical(Path::new("/x/./y/../z").components());
+        assert_eq!(p, Path::new("/x/z"));
+        // Going up past the root stays at the root.
+        let p = lexical(Path::new("/x").components().chain(written_parts("../../..")));
+        assert_eq!(p, Path::new("/"));
+    }
+
+    #[test]
+    fn walk_keeps_missing_folders_and_goes_up_through_them_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let p = tmp.path().join("gone").join("deeper").join("..").join("kept");
+        assert_eq!(walk(p.components()).unwrap(), root.join("gone").join("kept"));
+    }
+
+    #[test]
+    fn nested_git_and_comments_folders_are_copied_only_the_top_ones_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("from"), tmp.path().join("to"));
+        fs::create_dir_all(from.join("sub/.git")).unwrap();
+        fs::create_dir_all(from.join("sub").join(COMMENTS_DIR)).unwrap();
+        fs::create_dir_all(from.join(COMMENTS_DIR)).unwrap();
+        fs::write(from.join("sub/.git/x"), "x").unwrap();
+        fs::write(from.join("sub").join(COMMENTS_DIR).join("c"), "c").unwrap();
+        fs::create_dir_all(from.join("empty")).unwrap();
+        copy_tree(&from, &to, true).unwrap();
+        assert_eq!(fs::read_to_string(to.join("sub/.git/x")).unwrap(), "x");
+        assert!(to.join("sub").join(COMMENTS_DIR).join("c").is_file());
+        assert!(!to.join(COMMENTS_DIR).exists());
+        assert!(to.join("empty").is_dir(), "empty folders come along");
+    }
+
+    #[test]
+    fn staging_folders_are_new_hidden_siblings_of_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("job");
+        let a = staging_dir(&target).unwrap();
+        let b = staging_dir(&target).unwrap();
+        assert_ne!(a, b);
+        for s in [&a, &b] {
+            assert!(s.is_dir());
+            assert_eq!(s.parent(), Some(tmp.path()));
+            let name = s.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with(".job.new-"), "{name}");
+        }
+    }
+
+    #[test]
+    fn civil_dates_follow_the_century_leap_rules() {
+        // 1900 and 2100 are not leap years, 2000 is.
+        assert_eq!(civil_date(-25_508), (1900, 3, 1));
+        assert_eq!(civil_date(-25_509), (1900, 2, 28));
+        assert_eq!(civil_date(47_540), (2100, 2, 28));
+        assert_eq!(civil_date(47_541), (2100, 3, 1));
+        assert_eq!(civil_date(10_956), (1999, 12, 31));
+        assert_eq!(civil_date(10_957), (2000, 1, 1));
+    }
+
+    #[test]
+    fn a_base_folder_with_only_a_folder_named_like_the_project_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("base");
+        fs::create_dir_all(b.join(PROJECT_FILE)).unwrap();
+        let Err(err) = create_from(&b, &tmp.path().join("new"), "N", "2026-11-18") else {
+            unreachable!("a folder is no project file")
+        };
+        assert!(err.to_string().contains("no project"), "{err}");
     }
 }
