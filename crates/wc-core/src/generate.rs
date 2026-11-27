@@ -572,6 +572,21 @@ mod tests {
     }
 
     #[test]
+    fn declared_value_set_names_are_shown_escaped() -> Result<()> {
+        let mut m = starter()?;
+        let Some(first) = m.value_sets.first_mut() else {
+            return Err(Error::Invalid("the starter has value sets".into()));
+        };
+        first.name = "Bad\u{1b}[31m".into();
+        let rows = rows_from_table(&m, &table(&[&["set", "kW"], &["Nope", "1"]]), &[1, 4])?;
+        let err = err_of(apply_rows(&m, &rows, None));
+        assert!(err.contains("line 4"), "{err}");
+        assert!(err.contains("\"Bad\\u{1b}[31m\""), "{err}");
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_bad_table_is_refused_with_why() -> Result<()> {
         let m = starter()?;
         let typo = err_of(rows_from_table(&m, &table(&[&["kw", "nmae"], &["1", "x"]]), &[]));
