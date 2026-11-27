@@ -997,6 +997,9 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             cores.entry(tag.clone()).or_default();
         }
     }
+    // Numbers by value (`-W2` before `-W10`), as the device list.
+    let mut cores: Vec<(DeviceTag, Vec<Core>)> = cores.into_iter().collect();
+    cores.sort_by_cached_key(|(tag, _)| natural_key(&tag.to_string()));
     for (cable, mut list) in cores {
         if list.is_empty() {
             list.push(Default::default());
@@ -1307,6 +1310,9 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     for l in &i.project.meta.strips {
         strips.entry(l.strip.to_string()).or_default();
     }
+    // Strips by number value (`-X2` before `-X10`), as the device list.
+    let mut strips: Vec<(String, Vec<Term>)> = strips.into_iter().collect();
+    strips.sort_by_cached_key(|(strip, _)| natural_key(strip));
     for (strip, mut list) in strips {
         // Numbered ones by number; unnumbered ones keep drawing order and are numbered after.
         let page_order = |id: &str| i.project.pages.iter().position(|p| p.id == id).unwrap_or(usize::MAX);

@@ -410,6 +410,35 @@ fn natural_order() {
 }
 
 #[test]
+fn terminal_plan_sorts_strips_by_number_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s10", "term", 140.0, Some("-X10.1")));
+    let t = terminal_plan(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let mut strips: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    strips.dedup();
+    assert_eq!(strips, ["-X1", "-X2", "-X10"]);
+}
+
+#[test]
+fn cable_list_sorts_cables_by_number_value() {
+    let (mut p, s, parts) = fixture();
+    for tag in ["-W10", "-W2"] {
+        p.devices.insert(DeviceTag::parse(tag).unwrap(), Device::default());
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let cables: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(cables, ["-W2", "-W10"]);
+}
+
+#[test]
 fn cable_list_groups_cores_by_cable() {
     let (mut p, s, parts) = fixture();
     let w1 = DeviceTag::parse("-W1").unwrap();
