@@ -208,6 +208,27 @@ fn device_list_merges_symbols_of_one_device() {
 }
 
 #[test]
+fn device_list_sorts_numbers_by_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.extend([
+        place("s10", "lamp", 200.0, Some("-P10")),
+        place("s11", "lamp", 210.0, Some("-P2")),
+    ]);
+    let t = device_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let lamps: Vec<&str> = t
+        .rows
+        .iter()
+        .map(|r| r[0].as_str())
+        .filter(|d| d.starts_with("-P"))
+        .collect();
+    assert_eq!(lamps, ["-P1", "-P2", "-P10"]);
+}
+
+#[test]
 fn wire_list_names_both_ends_and_inherits_potentials() {
     let (p, s, parts) = fixture();
     let t = wire_list(&Inputs {

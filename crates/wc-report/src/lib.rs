@@ -788,11 +788,14 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
     t
 }
 
-/// Device list: every tag with its description, part and the pages it appears on.
+/// Device list: every tag with its description, part and the pages it appears on, with
+/// numbers sorted by value (`-K2` before `-K10`).
 pub fn device_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Device list", &["Device", "Description", "Part", "Symbols", "Pages"]);
     let index = i.project.tag_index();
-    for tag in all_tags(i) {
+    let mut tags: Vec<DeviceTag> = all_tags(i).into_iter().collect();
+    tags.sort_by_cached_key(|t| natural_key(&t.to_string()));
+    for tag in tags {
         let dev = i.project.devices.get(&tag);
         let uses = index.get(&tag).map(Vec::as_slice).unwrap_or(&[]);
         let symbols: BTreeSet<String> = uses
