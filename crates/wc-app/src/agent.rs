@@ -12179,6 +12179,36 @@ mod tests {
     }
 
     #[test]
+    fn paste_onto_a_smaller_page_with_no_pointer_on_the_sheet_keeps_the_copy_on_the_page() {
+        let (_tmp, mut a) = app(vec![]);
+        // Near the lower right of an A3 sheet: below it is past the edge of an A4 one (#1545).
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "line", "a": {"x": 380, "y": 250}, "b": {"x": 390, "y": 250}}}),
+        )
+        .unwrap();
+        a.ed.page = 1;
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Copy);
+        let open = a.open.as_mut().unwrap();
+        if let Some(p) = open.project.pages.get_mut(1) {
+            p.size = PageSize::A4;
+        }
+        a.ed.cursor = None;
+        a.run(Action::Paste);
+        assert_eq!(a.ed.message, "Pasted 1 item.");
+        let Some(Shape::Line { a: from, .. }) = page2(&a).graphics.get(1) else {
+            unreachable!("a line is pasted: {:?}", page2(&a).graphics);
+        };
+        assert_eq!(
+            *from,
+            Point::new(10.0, 10.0),
+            "near the top-left corner of the A4 sheet"
+        );
+    }
+
+    #[test]
     fn the_text_and_comment_dialogs_add_nothing_to_a_layer_hidden_while_they_were_open() {
         use crate::layers::Layer;
         let (_tmp, mut a) = app(vec![]);
