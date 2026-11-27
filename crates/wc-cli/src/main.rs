@@ -5218,22 +5218,31 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
                 if c.resolved && !all {
                     continue;
                 }
+                // Comment files come from other people through git, so their ids, names and
+                // texts are escaped like other listings: no control character reaches the
+                // terminal, and only a comment's own line breaks start a new line (#1343).
                 let number = p.page(&c.page).map(|pg| pg.number.as_str()).unwrap_or("?");
                 let at = c.at.map(|a| format!(" at {:.0},{:.0}", a.x, a.y)).unwrap_or_default();
                 println!(
-                    "{} page {number}{at}  {}  {}{}",
-                    c.id,
-                    c.author,
+                    "{} page {}{at}  {}  {}{}",
+                    escape_field(&c.id),
+                    escape_field(number),
+                    escape_field(&c.author),
                     &utc_date(c.time)[..10],
                     if c.resolved { "  (resolved)" } else { "" }
                 );
-                println!("    {}", c.text.replace('\n', "\n    "));
+                let lines = |t: &str| -> Vec<String> {
+                    t.split('\n')
+                        .map(|l| escape_field(l.strip_suffix('\r').unwrap_or(l)))
+                        .collect()
+                };
+                println!("    {}", lines(&c.text).join("\n    "));
                 for r in &c.replies {
                     println!(
                         "    > {} ({}): {}",
-                        r.author,
+                        escape_field(&r.author),
                         &utc_date(r.time)[..10],
-                        r.text.replace('\n', " ")
+                        lines(&r.text).join(" ")
                     );
                 }
             }
