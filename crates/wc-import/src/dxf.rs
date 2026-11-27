@@ -1092,10 +1092,11 @@ const MISSING_BLOCK_NAMES: usize = 3;
 /// How many characters of a missing block's name the warning keeps.
 const MISSING_BLOCK_NAME_LEN: usize = 64;
 
-/// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
+
+/// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 /// The `skipped` key of a line whose ends are not numbers once placed.
 const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";

@@ -181,7 +181,6 @@ impl Parts {
         }
     }
 
-    /// Put these parts into `project`.
     /// Add `newer` to these parts: where both name a record, `newer`'s version stays.
     pub fn merge(&mut self, newer: Parts) {
         if newer.meta.is_some() {
@@ -195,6 +194,7 @@ impl Parts {
         self.lock_parts.extend(newer.lock_parts);
     }
 
+    /// Put these parts into `project`.
     pub fn apply(&self, project: &mut Project) {
         if let Some(meta) = &self.meta {
             project.meta = (**meta).clone();

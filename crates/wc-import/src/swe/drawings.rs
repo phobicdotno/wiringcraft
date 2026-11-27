@@ -543,8 +543,6 @@ fn read_entry<R: Read + std::io::Seek>(
     (Ok(bytes), read)
 }
 
-/// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
-/// it passes), not its whole circle.
 /// How far from the page origin a footprint drawn from a block may reach, in millimetres.
 pub(super) const MAX_COORD: f64 = 1e6;
 
@@ -556,6 +554,8 @@ fn placement(s: &SweSymbol) -> [f64; 4] {
     [cos * sx, -sin * sx, sin * sy, cos * sy]
 }
 
+/// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
+/// it passes), not its whole circle.
 fn corners_of(shape: &Shape) -> Vec<Point> {
     let Shape::Arc {
         center,
