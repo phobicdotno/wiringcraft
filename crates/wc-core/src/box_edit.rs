@@ -101,7 +101,12 @@ pub struct BoxEdit<'a> {
 /// refuses, a rename to a point the new box does not have, a removed point whose wire's
 /// free end would join another wire's free end there that it was not connected to, and a
 /// rename to a name the box did not have that a wire already ends on (the two would join).
-pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Result<Option<BoxEditPlan>> {
+pub fn plan<'s>(
+    project: &Project,
+    old: &Symbol,
+    edit: &BoxEdit<'_>,
+    symbol: &dyn Fn(&str) -> Option<&'s Symbol>,
+) -> crate::Result<Option<BoxEditPlan>> {
     let bad = |why: String| Err(crate::Error::Invalid(why));
     if crate::black_box_layout(old).is_none() {
         return bad(format!("{} is not a black box", edit.item));
@@ -265,7 +270,19 @@ pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Resul
     if plan.ends.iter().any(|c| matches!(c.end, Endpoint::Point { .. })) {
         let mut after = project.clone();
         plan.apply_ends(&mut after);
-        if let Some(j) = crate::connectivity::new_point_joins(project, &after).first() {
+        // The box moves as the edit applies it, so its kept points are checked where they land
+        // (only this copy: the others stay where they are).
+        if let Some(placed) = after
+            .pages
+            .get_mut(edit.page)
+            .and_then(|p| p.symbols.iter_mut().find(|s| s.id == edit.item))
+        {
+            placed.at = placed.at + edit.moved;
+        }
+        // Pin places count too: a free end on a segment between two pins joins that wire.
+        let before_symbol = |id: &str| if id == old.id { Some(old) } else { symbol(id) };
+        let after_symbol = |id: &str| if id == old.id { Some(&plan.symbol) } else { symbol(id) };
+        if let Some(j) = crate::connectivity::new_point_joins(project, &after, &before_symbol, &after_symbol).first() {
             let number = project.pages.get(j.page).map_or("?", |p| p.number.as_str());
             return bad(format!(
                 "wire {} on page {number} would keep a free end at ({}, {}), where wire {} already ends, and the two would be joined; move one of these wire ends first",
@@ -364,7 +381,7 @@ mod tests {
     }
 
     fn run(p: &Project, sym: &Symbol, e: &BoxEdit<'_>) -> BoxEditPlan {
-        match plan(p, sym, e) {
+        match plan(p, sym, e, &|_| None) {
             Ok(Some(plan)) => plan,
             other => unreachable!("{other:?}"),
         }
@@ -375,7 +392,10 @@ mod tests {
         let (p, sym) = setup();
         let pins = [pin("A", BoxSide::Left, 5.0), pin("B", BoxSide::Right, 5.0)];
         let (r, d) = (BTreeMap::new(), BTreeSet::new());
-        assert!(matches!(plan(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)), Ok(None)));
+        assert!(matches!(
+            plan(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d), &|_| None),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -416,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_point_may_not_join_its_wire_to_another_net_at_a_free_end() {
+    fn a_removed_point_may_leave_its_wire_on_free_ends_it_already_met() {
         let (mut p, sym) = setup();
         let pins = [pin("B", BoxSide::Right, 5.0)];
         let r = BTreeMap::new();
@@ -425,20 +445,73 @@ mod tests {
         p.pages[0].wires.push(wire("w5", free(100.0, 55.0), free(80.0, 55.0)));
         let plan = run(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d));
         assert_eq!(plan.ends.len(), 2);
-        // w6 ends there instead, on no net of w1's: refused, naming both wires.
+        // w6 ends there only: a free end on the end of w1 (whose pin the box's symbol places)
+        // joins w1 before the edit already, so taking A off joins nothing new either.
         p.pages[0].wires.pop();
         p.pages[0].wires.push(wire("w6", free(100.0, 55.0), free(0.0, 0.0)));
-        let Err(err) = plan_err(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)) else {
-            unreachable!()
+        let plan = run(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d));
+        assert_eq!(plan.ends.len(), 2);
+    }
+
+    #[test]
+    fn a_removed_point_may_not_land_its_wire_on_a_pin_to_pin_wire_passing_by() {
+        let (mut p, sym) = setup();
+        // Two one-point boxes c1 and c2, wired straight down past A at (100, 55).
+        let cc = crate::black_box("cc", "Clip", 10.0, 10.0, &[pin("X", BoxSide::Left, 0.0)])
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        for (id, y) in [("c1", 40.0), ("c2", 70.0)] {
+            p.pages[0].symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "cc".into(),
+                at: Point::new(100.0, y),
+                rotation: Rotation::R0,
+                mirror: false,
+                tag: None,
+            });
+        }
+        p.pages[0].wires.push(wire("w7", on("c1", "X"), on("c2", "X")));
+        let pins = [pin("B", BoxSide::Right, 5.0)];
+        let r = BTreeMap::new();
+        let d: BTreeSet<String> = ["A".to_owned()].into();
+        let e = edit((20.0, 10.0), &pins, &r, &d);
+        // Taking A off leaves w1's end on w7's line, which joins the two nets: refused.
+        let symbols = |id: &str| match id {
+            "cc" => Some(&cc),
+            _ => None,
         };
+        let err = plan(&p, &sym, &e, &symbols).err().map(|e| e.to_string());
         assert!(
-            err.contains("wire w1 on page 1") && err.contains("wire w6") && err.contains("joined"),
-            "{err}"
+            err.as_ref()
+                .is_some_and(|e| e.contains("wire w1 on page 1") && e.contains("wire w7")),
+            "{err:?}"
         );
     }
 
+    #[test]
+    fn a_moved_box_may_not_bring_a_kept_point_onto_a_removed_points_free_end() {
+        let (p, sym) = setup();
+        let pins = [pin("B", BoxSide::Right, 5.0)];
+        let r = BTreeMap::new();
+        let d: BTreeSet<String> = ["A".to_owned()].into();
+        // A comes off and leaves w1's end at (100, 55); standing still, nothing joins.
+        assert!(plan_err(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)).is_ok());
+        // Moved 20 to the left, B (and w2's end on it) lands on that free end: refused.
+        let mut e = edit((20.0, 10.0), &pins, &r, &d);
+        e.moved = Point::new(-20.0, 0.0);
+        let Err(err) = plan_err(&p, &sym, &e) else {
+            unreachable!()
+        };
+        assert!(
+            err.contains("wire w1") && err.contains("wire w2") && err.contains("joined"),
+            "{err}"
+        );
+        // Moved down instead, B lands nowhere near it: allowed.
+        e.moved = Point::new(0.0, 20.0);
+        assert!(plan_err(&p, &sym, &e).is_ok());
+    }
+
     fn plan_err(p: &Project, sym: &Symbol, e: &BoxEdit<'_>) -> Result<(), String> {
-        plan(p, sym, e).map(|_| ()).map_err(|e| e.to_string())
+        plan(p, sym, e, &|_| None).map(|_| ()).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -468,16 +541,16 @@ mod tests {
         let (r, d) = (BTreeMap::new(), BTreeSet::new());
         // Two points at one corner, and a box without area, are refused by the box itself.
         let pins = [pin("A", BoxSide::Top, 20.0), pin("B", BoxSide::Right, 0.0)];
-        assert!(plan(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)).is_err());
-        assert!(plan(&p, &sym, &edit((0.0, 10.0), &[], &r, &d)).is_err());
+        assert!(plan(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d), &|_| None).is_err());
+        assert!(plan(&p, &sym, &edit((0.0, 10.0), &[], &r, &d), &|_| None).is_err());
         let bad_rename: BTreeMap<String, String> = [("A".into(), "Q".into())].into();
         let pins = [pin("A", BoxSide::Left, 5.0)];
-        let err = plan(&p, &sym, &edit((20.0, 10.0), &pins, &bad_rename, &d)).err();
+        let err = plan(&p, &sym, &edit((20.0, 10.0), &pins, &bad_rename, &d), &|_| None).err();
         assert!(err.is_some_and(|e| e.to_string().contains("no connection point Q")));
         // Two points renamed to one: their wires would join.
         let both: BTreeMap<String, String> = [("A".into(), "Q".into()), ("B".into(), "Q".into())].into();
         let pins = [pin("Q", BoxSide::Left, 5.0)];
-        let err = plan(&p, &sym, &edit((20.0, 10.0), &pins, &both, &d)).err();
+        let err = plan(&p, &sym, &edit((20.0, 10.0), &pins, &both, &d), &|_| None).err();
         assert!(
             err.as_ref().is_some_and(|e| e.to_string().contains("renamed to Q")),
             "{err:?}"
@@ -486,7 +559,7 @@ mod tests {
         // A valid edit of a box that is not on the page.
         let mut e = edit((30.0, 10.0), &pins, &r, &d);
         e.item = "nope";
-        let err = plan(&p, &sym, &e).err();
+        let err = plan(&p, &sym, &e, &|_| None).err();
         assert!(
             err.as_ref().is_some_and(|e| e.to_string().contains("no box nope")),
             "{err:?}"

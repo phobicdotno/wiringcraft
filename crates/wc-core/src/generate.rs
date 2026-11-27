@@ -167,26 +167,18 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
 /// The height the PDF and the canvas draw a device tag's lines at.
 const TAG_HEIGHT: f64 = 2.5;
 
-/// Points round a placed symbol's device tag as `wc_pdf::layout::tag_lines` draws it: one line
+/// Points round a placed symbol's device tag as [`crate::tag::tag_lines`] lays it out: one line
 /// per `=function`, `+location` and `-product`, centred on the tag position, right-aligned (left
 /// where the placement turns that side round). The product line is measured three digits longer,
 /// as placing a copy can give it a higher number than the macro's own.
 fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::DeviceTag, pts: &mut Vec<Point>) {
-    let ta = def.tag_at.transform(s.rotation, s.mirror) + s.at;
-    let reversed = Point::new(1.0, 0.0).transform(s.rotation, s.mirror).x < -0.5;
-    let align = if reversed { Align::Left } else { Align::Right };
-    let mut lines = Vec::new();
-    if !tag.function.is_empty() {
-        lines.push(format!("={}", tag.function.join(".")));
+    let (align, mut lines) = crate::tag::tag_lines(s, def, tag);
+    // The product line is the last one; a copy's number can be up to three digits longer.
+    if let Some((_, product)) = lines.last_mut() {
+        product.push_str("999");
     }
-    if !tag.location.is_empty() {
-        lines.push(format!("+{}", tag.location.join(".")));
-    }
-    lines.push(format!("-{}999", tag.product.join(".")));
-    let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
-    for (i, line) in lines.iter().enumerate() {
-        let at = Point::new(ta.x, top + 3.0 * i as f64);
-        pts.extend(text_corners(at, line, TAG_HEIGHT, align, 0.0));
+    for (at, line) in &lines {
+        pts.extend(text_corners(*at, line, TAG_HEIGHT, align, 0.0));
     }
 }
 

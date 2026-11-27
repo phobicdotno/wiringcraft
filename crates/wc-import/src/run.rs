@@ -803,6 +803,56 @@ pub fn save(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, &p).map(|_| ()).map_err(e)
 }
 
+/// The [`terminal_numbers`](wc_core::project::terminal_numbers) of `p` read with the symbols
+/// `incoming` added to the project's own readable copies (a copy the project can read is kept).
+///
+/// A symbol the project has no readable copy of, which the command brings, changes which
+/// placed items are terminals. Whether the jumpers' and rail order's numbers were given with
+/// it or without it cannot be told, so a strip it renumbers is not guessed at: the command is
+/// refused, before it writes anything. `what` names what brings the symbols ("import",
+/// "macro") and `again` what to do once the file is back ("import again").
+pub fn terminal_numbers_with(
+    dir: &Path,
+    p: &Project,
+    incoming: &[wc_core::Symbol],
+    what: &str,
+    again: &str,
+) -> Res<wc_core::project::TerminalNumbers> {
+    let (own, _) = store::vendored_symbols(dir, p);
+    let mut symbols = own.clone();
+    for s in incoming {
+        symbols.entry(s.id.clone()).or_insert_with(|| s.clone());
+    }
+    let with = wc_core::project::terminal_numbers(p, |id| symbols.get(id).map(|s| s.role));
+    let without = wc_core::project::terminal_numbers(p, |id| own.get(id).map(|s| s.role));
+    let strips: std::collections::BTreeSet<&DeviceTag> = with
+        .iter()
+        .filter(|(k, v)| without.get(*k) != Some(*v))
+        .map(|(_, (strip, _))| strip)
+        .chain(
+            without
+                .iter()
+                .filter(|(k, v)| with.get(*k) != Some(*v))
+                .map(|(_, (strip, _))| strip),
+        )
+        .collect();
+    if let Some(strip) = strips.into_iter().find(|s| {
+        p.meta.jumpers.iter().any(|j| &j.strip == *s) || p.meta.strip_layout(s).is_some_and(|l| !l.is_empty())
+    }) {
+        let missing: Vec<&str> = incoming
+            .iter()
+            .filter(|s| !own.contains_key(&s.id))
+            .map(|s| s.id.as_str())
+            .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
+            .collect();
+        return Err(format!(
+            "the jumpers and rail order of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the {what} brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and {again}",
+            missing.join(", ")
+        ));
+    }
+    Ok(with)
+}
+
 /// Save a project whose jumpers already follow their terminals: after `add_built`, which
 /// moves the project's own jumpers itself and adds the imported ones with their final numbers.
 pub fn save_imported(dir: &Path, p: &Project) -> Res<()> {
@@ -1849,43 +1899,7 @@ pub fn add_built(
     let before = if !p.meta.follows_terminals() {
         None
     } else {
-        // A symbol the project has no readable copy of, which the import brings, changes which
-        // placed items are terminals. Whether the jumpers' and rail order's numbers were given
-        // with it or without it cannot be told, so a strip it renumbers is not guessed at.
-        let (own, _) = store::vendored_symbols(dir, p);
-        let mut symbols = own.clone();
-        for s in &built.symbols {
-            symbols.entry(s.id.clone()).or_insert_with(|| s.clone());
-        }
-        let with = wc_core::project::terminal_numbers(p, |id| symbols.get(id).map(|s| s.role));
-        let without = wc_core::project::terminal_numbers(p, |id| own.get(id).map(|s| s.role));
-        let strips: std::collections::BTreeSet<&DeviceTag> = with
-            .iter()
-            .filter(|(k, v)| without.get(*k) != Some(*v))
-            .map(|(_, (strip, _))| strip)
-            .chain(
-                without
-                    .iter()
-                    .filter(|(k, v)| with.get(*k) != Some(*v))
-                    .map(|(_, (strip, _))| strip),
-            )
-            .collect();
-        if let Some(strip) = strips.into_iter().find(|s| {
-            p.meta.jumpers.iter().any(|j| &j.strip == *s) || p.meta.strip_layout(s).is_some_and(|l| !l.is_empty())
-        }) {
-            let missing: Vec<&str> = built
-                .symbols
-                .iter()
-                .filter(|s| !own.contains_key(&s.id))
-                .map(|s| s.id.as_str())
-                .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
-                .collect();
-            return Err(format!(
-                "the jumpers and rail order of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
-                missing.join(", ")
-            ));
-        }
-        Some(with)
+        Some(terminal_numbers_with(dir, p, &built.symbols, "import", "import again")?)
     };
     // A write that fails puts back the files written before it (and removes the ones it made),
     // so each copy still matches its pin. Only files this import changed are put back: one it

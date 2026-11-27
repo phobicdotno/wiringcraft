@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::geom::{Align, Point, Shape};
 use wc_core::symbol::SymbolRole;
-use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Symbol};
+use wc_core::{DeviceTag, Endpoint, Page, PageSize, Project, Symbol};
 
 use crate::Options;
 use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
@@ -22,11 +22,7 @@ pub fn column_of(size: PageSize, x: f64) -> usize {
 }
 
 /// A pin's position on the page.
-pub fn pin_position(placed: &PlacedSymbol, symbol: &Symbol, pin: &str) -> Option<Point> {
-    symbol
-        .pin(pin)
-        .map(|p| p.at.transform(placed.rotation, placed.mirror) + placed.at)
-}
+pub use wc_core::pin_position;
 
 /// One appearance of a tagged symbol.
 #[derive(Debug, Clone)]
@@ -89,30 +85,7 @@ pub struct XrefMark {
 
 pub const XREF_HEIGHT: f64 = 1.8;
 
-/// A placed symbol's device tag as drawn: how its lines align, and each line (`=function`,
-/// `+location`, `-product`) with its baseline anchor in page mm, centred on the tag position.
-/// The lines are right-aligned there, so they grow away from a drawing to their right; where
-/// the placement turns that side round (a mirror, or half a turn) they are left-aligned.
-pub fn tag_lines(placed: &PlacedSymbol, symbol: &Symbol, tag: &DeviceTag) -> (Align, Vec<(Point, String)>) {
-    let ta = symbol.tag_at.transform(placed.rotation, placed.mirror) + placed.at;
-    let reversed = Point::new(1.0, 0.0).transform(placed.rotation, placed.mirror).x < -0.5;
-    let align = if reversed { Align::Left } else { Align::Right };
-    let mut lines = Vec::new();
-    if !tag.function.is_empty() {
-        lines.push(format!("={}", tag.function.join(".")));
-    }
-    if !tag.location.is_empty() {
-        lines.push(format!("+{}", tag.location.join(".")));
-    }
-    lines.push(format!("-{}", tag.product.join(".")));
-    let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
-    let lines = lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, l)| (Point::new(ta.x, top + 3.0 * i as f64), l))
-        .collect();
-    (align, lines)
-}
+pub use wc_core::tag::tag_lines;
 
 /// Cross-reference texts for a page: a coil (or a breaker with aux contacts) lists its contacts
 /// with their pins and locations, a contact points back to it, an interruption point lists where the wire continues.
@@ -2381,7 +2354,7 @@ mod template_tests {
         let symbols = BTreeMap::from([("coil".to_owned(), coil)]);
         let (mut p, mut page) = demo(PageSize::A3, false);
         // 205 mm across an A3 frame: column 5 of 10, column 10 of 20.
-        page.symbols.push(PlacedSymbol {
+        page.symbols.push(wc_core::PlacedSymbol {
             id: "s1".into(),
             symbol: "coil".into(),
             at: Point::new(205.0, 100.0),

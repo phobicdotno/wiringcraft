@@ -254,6 +254,14 @@ pub fn black_box_layout(sym: &Symbol) -> Option<(f64, f64, Vec<BoxPin>)> {
     Some((max.x, max.y, pins))
 }
 
+/// Where pin `pin` of `symbol` is on the page, placed as `placed` places it: turned, mirrored
+/// and moved. `None` when the symbol has no such pin.
+pub fn pin_position(placed: &crate::project::PlacedSymbol, symbol: &Symbol, pin: &str) -> Option<crate::geom::Point> {
+    symbol
+        .pin(pin)
+        .map(|p| p.at.transform(placed.rotation, placed.mirror) + placed.at)
+}
+
 #[cfg(test)]
 mod black_box_tests {
     use super::*;

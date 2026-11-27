@@ -393,7 +393,10 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             for &a in actions {
                 let info = a.info();
                 if ui
-                    .add(egui::Button::new(info.label).shortcut_text(info.shortcut))
+                    .add(
+                        egui::Button::new(info.label)
+                            .shortcut_text(crate::chrome::shortcut_hint(ui.ctx().os(), info.shortcut)),
+                    )
                     .clicked()
                 {
                     ed.menu_action = Some(a);
