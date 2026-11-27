@@ -795,6 +795,31 @@ pub fn read_file(path: impl AsRef<Path>) -> Res<Vec<u8>> {
     std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", escape_field(&path.display().to_string())))
 }
 
+/// The copies of the macro `m` a table places, one per row: `bytes` is the table (CSV or
+/// `.xlsx`), each row's cells fill the placeholders and a `set` column picks the row's value
+/// set (else `default_set`). `macro generate` and the app's Insert > Macro > From table both
+/// prepare the table here.
+///
+/// `name` is what the messages call the table (its path); it is escaped with [`escape_field`]
+/// here. A file cut short inside a quoted cell is refused: it would place a row with half a
+/// value.
+pub fn macro_table_copies(
+    m: &wc_core::macros::Macro,
+    bytes: &[u8],
+    name: &str,
+    default_set: Option<&str>,
+) -> Res<Vec<wc_core::macros::Macro>> {
+    let shown = escape_field(name);
+    let rows = crate::csv::file_rows(bytes).map_err(|err| format!("{shown}: {err}"))?;
+    if let Some(line) = rows.open_quote {
+        return Err(format!(
+            "{shown}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed"
+        ));
+    }
+    let rows = wc_core::generate::rows_from_table(m, &rows.cells, &rows.numbers).map_err(e)?;
+    wc_core::generate::apply_rows(m, &rows, default_set).map_err(e)
+}
+
 /// Save the project. Jumpers and strip layouts first follow their terminals: what the command
 /// renamed, moved or deleted is found by comparing with the project as it is on disk.
 pub fn save(dir: &Path, p: &Project) -> Res<()> {
@@ -2168,6 +2193,38 @@ mod tests {
             Ok(t) => t,
             Err(x) => unreachable!("no temp folder: {x}"),
         }
+    }
+
+    /// A macro's table gives one copy per row, and its name is escaped in the refusals that
+    /// name it (#1865).
+    #[test]
+    fn a_macro_table_gives_a_copy_per_row_and_is_named_escaped() {
+        let m = wc_core::macros::Macro {
+            name: "Pump".to_owned(),
+            placeholders: vec![wc_core::macros::Placeholder {
+                name: "what".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let name = "pu\u{1b}[2Jmps\t.csv";
+        let copies = |bytes: &[u8]| macro_table_copies(&m, bytes, name, None).map(|c| c.len());
+        assert_eq!(copies(b"What\nPump 1\nPump 2\nFan\n"), Ok(3));
+        assert_eq!(
+            copies(b"what\nPump 1\n\"Pump 2\n"),
+            Err(
+                "pu\\u{1b}[2Jmps\\t.csv: line 3: a quoted cell is not closed before the end of the file; nothing was placed"
+                    .to_owned()
+            )
+        );
+        let old_xls = copies(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1");
+        assert!(
+            matches!(&old_xls, Err(why) if why.starts_with("pu\\u{1b}[2Jmps\\t.csv: ") && why.contains(".xls")),
+            "{old_xls:?}"
+        );
+        // A column no placeholder has is the macro's own refusal, without the table's name.
+        let typo = copies(b"wat\nPump 1\n");
+        assert!(matches!(&typo, Err(why) if why.contains("\"wat\"")), "{typo:?}");
     }
 
     /// The built-in DWG reader takes a file up to its limit, and refuses one a byte larger with

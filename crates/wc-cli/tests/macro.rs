@@ -598,6 +598,117 @@ fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
     Ok(())
 }
 
+/// Rows naming the same symbol and parts take each once per run (#1864). What the run writes
+/// and refuses is as when every row looked its items up again: the same pins and copies, a
+/// part no library has left alone, and of two parts that cannot be taken the one of the
+/// earlier row is named.
+#[test]
+fn a_table_whose_rows_share_parts_takes_them_as_row_by_row() -> TestResult {
+    use wc_core::lock::ItemKind;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let lib = tmp.path().join("lib");
+    for folder in ["symbols", "parts", "macros"] {
+        std::fs::create_dir_all(lib.join(folder))?;
+    }
+    std::fs::copy(
+        repo.join("library/symbols/wc.coil.json"),
+        lib.join("symbols/wc.coil.json"),
+    )?;
+    let (red, green) = ("example.ex-lamp-24-rd", "example.ex-lamp-24-gn");
+    for part in [red, green] {
+        std::fs::copy(
+            repo.join(format!("library/parts/{part}.json")),
+            lib.join(format!("parts/{part}.json")),
+        )?;
+    }
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let generate = |table: &Path| {
+        let table = table.to_str().ok_or("path")?;
+        wiringcraft(
+            &dir,
+            &["macro", "generate", "starter", "--table", table, "--set", "3 kW"],
+        )
+    };
+
+    // The red lamp first, though the green one sorts before it; each named by several rows.
+    let table = tmp.path().join("lamps.csv");
+    std::fs::write(
+        &table,
+        format!("kW;part\n1;{red}\n2;nowhere.cap\n3;{green}\n4;{red}\n5;nowhere.cap\n6;{green}\n"),
+    )?;
+    let out = generate(&table)?;
+    assert!(out.contains("\n6 copies of Motor starter on "), "{out}");
+    let p = wc_core::store::load(&dir)?;
+    let parts: Vec<Option<&str>> = p.devices.values().map(|d| d.part.as_deref()).collect();
+    assert_eq!(
+        parts,
+        [red, "nowhere.cap", green, red, "nowhere.cap", green].map(Some),
+        "{:?}",
+        p.devices.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        p.lock.parts.keys().map(String::as_str).collect::<Vec<_>>(),
+        [green, red],
+        "the library's parts are pinned, the part no library has is not"
+    );
+    assert!(p.lock.symbols.contains_key("wc.coil"));
+    for part in [red, green] {
+        assert!(
+            wc_core::store::vendor_path(&dir, ItemKind::Part, part)?.exists(),
+            "{part}"
+        );
+    }
+    let pins = p.lock.clone();
+    let pages = p.pages.len();
+
+    // Both copies gone and the library holding other versions: the earlier row's part is the
+    // one named, and nothing is placed.
+    let mut originals = Vec::new();
+    for part in [red, green] {
+        std::fs::remove_file(wc_core::store::vendor_path(&dir, ItemKind::Part, part)?)?;
+        let file = lib.join(format!("parts/{part}.json"));
+        let original = std::fs::read_to_string(&file)?;
+        let mut newer: serde_json::Value = serde_json::from_str(&original)?;
+        newer["description"] = "A newer lamp".into();
+        std::fs::write(&file, newer.to_string())?;
+        originals.push((file, original));
+    }
+    let Err(err) = generate(&table) else {
+        return Err("generated with newer versions of pinned parts".into());
+    };
+    assert!(
+        err.contains(&format!("part {red}: its copy in the project is missing")) && !err.contains(green),
+        "{err}"
+    );
+    let p = wc_core::store::load(&dir)?;
+    assert_eq!((p.pages.len(), &p.lock), (pages, &pins));
+
+    // With the pinned versions back in the library the copies come back, pins as they were.
+    for (file, original) in &originals {
+        std::fs::write(file, original)?;
+    }
+    let out = generate(&table)?;
+    assert!(out.contains("\n6 copies of Motor starter on "), "{out}");
+    let p = wc_core::store::load(&dir)?;
+    assert_eq!(p.lock, pins);
+    for part in [red, green] {
+        assert!(
+            wc_core::store::vendor_path(&dir, ItemKind::Part, part)?.exists(),
+            "{part}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn a_generation_whose_save_fails_leaves_the_project_as_it_was() -> TestResult {
     let tmp = tempfile::tempdir()?;
