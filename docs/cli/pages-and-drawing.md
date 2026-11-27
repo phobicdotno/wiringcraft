@@ -18,10 +18,11 @@ Creates the folder `pump` with a project in it and makes it a git repository wit
 commit (`--no-git` skips that). The name defaults to the folder's name. A new project has one
 page, `p0001`, number 1, marked as the cover page.
 
-`--template <folder or git URL>` starts from a base project instead: its pages, settings,
-title block, library sources and pictures are copied (not its review comments or history), and
-`{name}` and `{date}` in its title block and page titles become the new project's name and
-today's date.
+`--template <folder or git URL>` starts from a base project instead. Everything in it is copied
+except its review comments and history: pages, settings, title block, library sources,
+pictures, macros (`macros/`), device data (`devices.json`) and the vendored library items
+(`vendor/`). `{name}` and `{date}` in its title block and page titles become the new project's
+name and today's date.
 
 A new project has no library sources, so `place` finds no symbols until one is added, e.g.
 `wiringcraft lib add builtin folder <path to the library folder>`.
