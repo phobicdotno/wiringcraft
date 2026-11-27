@@ -987,3 +987,36 @@ fn a_placement_whose_save_fails_leaves_the_folder_as_it_was() -> TestResult {
     assert!(dir.join("vendor/symbols/wc.coil.json").exists());
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn a_placement_refuses_project_files_that_are_links() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (dir, _lib) = project_with_a_pair_macro(tmp.path(), "wc.coil")?;
+    // The cover page is a link to a file kept elsewhere: a save would put a plain file there.
+    let cover = dir.join("pages/p0001.page.json");
+    let kept = tmp.path().join("cover.page.json");
+    std::fs::rename(&cover, &kept)?;
+    std::os::unix::fs::symlink(&kept, &cover)?;
+    let target = std::fs::read(&kept)?;
+    let before = folder(&dir)?;
+    let err = wiringcraft(&dir, &["macro", "place", "p1", "pair", "--at", "50,60"])
+        .err()
+        .ok_or("a linked page is refused")?;
+    assert!(err.contains("is a link; macro place"), "{err}");
+    assert!(
+        std::fs::symlink_metadata(&cover)?.file_type().is_symlink(),
+        "the link stays"
+    );
+    assert_eq!(std::fs::read(&kept)?, target, "the file it points to is as it was");
+    assert!(
+        !dir.join("vendor/symbols/wc.coil.json").exists(),
+        "the symbol copy taken before the refusal is taken back"
+    );
+    assert_eq!(
+        changed(&before, &folder(&dir)?),
+        Vec::<&Path>::new(),
+        "the folder is as it was"
+    );
+    Ok(())
+}
