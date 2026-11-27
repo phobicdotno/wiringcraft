@@ -165,6 +165,15 @@ impl Assistant {
     }
 }
 
+/// Why a changing tool waits while the unsaved-changes question is open.
+const UNSAVED_ASKED: &str = "the person is being asked whether to save the open project's unsaved \
+                             changes; wait for their answer.";
+
+/// What `open_project` says while the person is asked about the open project's unsaved changes.
+const OPEN_ASKED: &str = "Not opened yet: the open project has unsaved changes, and the person was \
+                          asked whether to save them first. It opens when they answer; wait for them \
+                          and do not ask to open it again.";
+
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "name": name,
@@ -2224,6 +2233,11 @@ impl App {
                 if let Some(m) = self.take_message() {
                     return Err(m);
                 }
+                // The open project has unsaved changes: the person is asked whether to save them
+                // first, and the project opens when they answer (#1019).
+                if matches!(&self.dialog, Some(Dialog::Unsaved(crate::Leave::Open(_)))) {
+                    return Ok(OPEN_ASKED.into());
+                }
                 match &self.open {
                     Some(o) if o.dir == path => Ok(format!("Opened {}.", o.project.meta.name)),
                     _ => Err("The project was not opened.".into()),
@@ -2719,11 +2733,8 @@ impl App {
                 let warnings = open.edit_black_box(page, id, (width, height), &pins, &renamed, &removed)?;
                 // A wire being drawn from a point of the box that was renamed, moved or taken off
                 // would be saved on a stale point: it is dropped, to be started again.
-                let point_changed = |pin: &str| {
-                    renamed.contains_key(pin)
-                        || renamed.values().any(|to| to == pin)
-                        || old.iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
-                };
+                let point_changed =
+                    |pin: &str| crate::black_box_tool::point_changed(pin, &old, &pins, &renamed, &removed);
                 let shown = open.project.pages.get(self.ed.page);
                 let dropped = matches!(
                     &self.ed.wire,
@@ -3614,6 +3625,11 @@ impl App {
                 "{name} was not run: an import is running in the app; wait until it is done."
             )));
         }
+        // While the person is asked whether to save the open project's unsaved changes, a
+        // change would land in what they are answering about: only the reading tools run.
+        if matches!(self.dialog, Some(Dialog::Unsaved(_))) && !READ_TOOLS.contains(&name) {
+            return Started::Done(Err(format!("{name} was not run: {UNSAVED_ASKED}")));
+        }
         match name {
             "run_command" => match self.command_start(v) {
                 Ok(p) => Started::Running(p),
@@ -4130,6 +4146,42 @@ mod tests {
         assert_eq!(row.description, new.description);
     }
 
+    /// Save in the unsaved-changes question while an assistant command runs waits, as Save
+    /// does: nothing was saved, so the window does not close (#1019).
+    #[test]
+    fn save_and_close_stays_open_while_a_command_runs() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        open.save().unwrap();
+        assert!(!open.dirty);
+        a.save_and_leave(crate::Leave::Close);
+        assert_eq!(a.ed.message, App::SAVE_WAITS);
+        assert_eq!(a.closing, crate::Closing::No, "the window stays open");
+    }
+
+    /// Asked to open a project while the open one has unsaved changes, the assistant hears
+    /// that the person is asked first, not that the open failed (#1019).
+    #[test]
+    fn open_project_over_unsaved_changes_says_the_person_is_asked() {
+        let (tmp, mut a) = app(vec![]);
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let first = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().dirty = true;
+        let r = a.agent_tool("open_project", &json!({ "path": other.display().to_string() }));
+        assert_eq!(r, Ok(OPEN_ASKED.to_owned()));
+        assert!(matches!(a.dialog, Some(Dialog::Unsaved(crate::Leave::Open(_)))));
+        assert_eq!(a.open.as_ref().unwrap().dir, first);
+        // While the question is open only the reading tools run, also later in the same answer.
+        let placed = a.agent_start("place_symbol", &json!({ "symbol": "wc.coil", "x": 20, "y": 20 }));
+        assert!(
+            matches!(&placed, Started::Done(Err(e)) if e.contains(UNSAVED_ASKED)),
+            "an edit waits for the answer"
+        );
+        assert!(matches!(a.agent_start("get_state", &json!({})), Started::Done(Ok(_))));
+    }
+
     fn app(answers: Vec<Value>) -> (tempfile::TempDir, App) {
         let (tmp, open) = crate::state::tests::project();
         let mut prefs = crate::prefs::Prefs::default();
@@ -4158,6 +4210,7 @@ mod tests {
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
+            closing: crate::Closing::No,
         };
         (tmp, app)
     }
