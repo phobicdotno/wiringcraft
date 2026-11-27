@@ -4227,7 +4227,14 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::Aml { out } => {
             let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            // The export is built without such a symbol (its connection points are left out),
+            // so it is warned about as `pdf` does.
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            warn(
+                missing
+                    .iter()
+                    .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
+            );
             let parts = vendored_parts(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
@@ -4255,7 +4262,14 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::PlcVars { out } => {
             let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            // The list is built without such a symbol (its points are left out), so it is
+            // warned about as `pdf` does.
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            warn(
+                missing
+                    .iter()
+                    .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
+            );
             let parts = vendored_parts(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
@@ -4274,7 +4288,14 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::Nets => {
             let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            // The nets are linked without such a symbol's role, so it is warned about as `pdf`
+            // does.
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            warn(
+                missing
+                    .iter()
+                    .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
+            );
             let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id).map(|s| s.role));
             for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
