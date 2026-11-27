@@ -2416,7 +2416,7 @@ impl App {
         // An open dialog takes the keyboard: a shortcut would change the project under it (the
         // cover form's Cancel takes back only what the form changed).
         let dialog_open = self.dialog.is_some();
-        let mut out = ctrl_shortcuts(ctx, dialog_open);
+        let mut out = ctrl_shortcuts(ctx, dialog_open, ctx.wants_keyboard_input());
         if dialog_open {
             return out;
         }
@@ -5345,8 +5345,10 @@ fn enter_typed_value(ctx: &egui::Context) {
     }
 }
 
-/// The Ctrl shortcuts pressed this frame, none while a dialog is open.
-fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
+/// The Ctrl shortcuts pressed this frame, none while a dialog is open. While a text field has
+/// the keyboard (`typing`), Ctrl+A, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y are left to the field: they
+/// select its text and undo or redo the typing, not select the page or undo the schematic.
+fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool, typing: bool) -> Vec<Action> {
     let mut out = Vec::new();
     if dialog_open {
         return out;
@@ -5368,6 +5370,9 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::J, Action::Assistant),
             (Key::D, Action::Duplicate),
         ] {
+            if typing && is_text_edit_key(k) {
+                continue;
+            }
             // With Shift first: Ctrl+Shift+N is a new project, Ctrl+Shift+Z redoes (a plain Ctrl
             // shortcut would also take them, as it lets Shift through).
             let shifted = match k {
@@ -5386,6 +5391,11 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
         }
     });
     out
+}
+
+/// The Ctrl keys a text field handles itself: select all, undo and redo.
+fn is_text_edit_key(k: Key) -> bool {
+    matches!(k, Key::A | Key::Z | Key::Y)
 }
 
 /// Whether `key` was pressed this frame with modifiers that `ok` accepts. It looks at the
@@ -6936,7 +6946,7 @@ mod renderer_tests {
                 ..Default::default()
             };
             let mut got = Vec::new();
-            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open));
+            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open, false));
             got
         };
         assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
@@ -6999,27 +7009,52 @@ mod renderer_tests {
     #[test]
     fn ctrl_shift_z_redoes_and_ctrl_z_undoes() {
         let ctx = egui::Context::default();
-        let press = |modifiers: Modifiers, key: Key| {
-            let raw = egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
-                ..Default::default()
-            };
-            let mut got = Vec::new();
-            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, false));
-            got
-        };
+        let press = |modifiers: Modifiers, key: Key| press_ctrl(&ctx, modifiers, key, false);
         let shift = Modifiers::COMMAND | Modifiers::SHIFT;
         assert_eq!(press(shift, Key::Z), [Action::Redo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Z), [Action::Undo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Y), [Action::Redo]);
         assert_eq!(press(shift, Key::N), [Action::NewProject]);
+    }
+
+    /// In a text field Ctrl+A, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y are the field's (select its
+    /// text, undo or redo the typing); the other Ctrl shortcuts still work.
+    #[test]
+    fn a_text_field_keeps_its_select_all_undo_and_redo_keys() {
+        let ctx = egui::Context::default();
+        let typing = |modifiers: Modifiers, key: Key| press_ctrl(&ctx, modifiers, key, true);
+        let shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        for (m, k) in [
+            (Modifiers::COMMAND, Key::A),
+            (Modifiers::COMMAND, Key::Z),
+            (shift, Key::Z),
+            (Modifiers::COMMAND, Key::Y),
+        ] {
+            assert!(typing(m, k).is_empty(), "{m:?} {k:?} is left to the text field");
+        }
+        assert_eq!(typing(Modifiers::COMMAND, Key::S), [Action::Save]);
+        assert_eq!(typing(shift, Key::S), [Action::SaveAs]);
+        assert_eq!(typing(Modifiers::COMMAND, Key::F), [Action::Find]);
+        // Out of a text field they are the app's again.
+        assert_eq!(press_ctrl(&ctx, Modifiers::COMMAND, Key::A, false), [Action::SelectAll]);
+    }
+
+    /// The Ctrl shortcuts of one key press, with or without a text field having the keyboard.
+    fn press_ctrl(ctx: &egui::Context, modifiers: Modifiers, key: Key, typing: bool) -> Vec<Action> {
+        let raw = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, false, typing));
+        got
     }
 
     #[test]
