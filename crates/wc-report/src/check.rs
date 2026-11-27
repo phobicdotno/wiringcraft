@@ -940,7 +940,7 @@ fn same_pin_wires(i: &Inputs<'_>, out: &mut Vec<Finding>) {
             {
                 let same_id = page.wires.iter().filter(|x| x.id == w.id).count();
                 let which = if same_id > 1 {
-                    let k = page.wires[..n].iter().filter(|x| x.id == w.id).count() + 1;
+                    let k = page.wires.iter().take(n).filter(|x| x.id == w.id).count() + 1;
                     format!(" (wire {k} of {same_id} with id {} on this page)", w.id)
                 } else {
                     String::new()
