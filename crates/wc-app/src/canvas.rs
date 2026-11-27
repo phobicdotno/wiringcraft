@@ -2874,6 +2874,19 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
     {
         via.push(Point::new(l.x, e.y));
     }
+    // A spot clicked twice is one bend: drop bends on the point before them or on the end, so
+    // the wire has no zero-length segment (and no junction dot on a plain bend, #1236).
+    let mut prev = open.end_pos(page, &start);
+    via.retain(|p| {
+        let keep = prev != Some(*p);
+        prev = Some(*p);
+        keep
+    });
+    if let Some(e) = open.end_pos(page, &end) {
+        while via.last() == Some(&e) {
+            via.pop();
+        }
+    }
     if start == end {
         ed.message = "A wire needs two different ends.".into();
         return;
@@ -4822,6 +4835,45 @@ mod tests {
 
         let bend = click_then_leave(&mut o, &mut ed, egui::pos2(500.0, 550.0), 2.0);
         assert_eq!(ed.wire, Some((Endpoint::Point { at: start }, vec![bend])));
+    }
+
+    /// A bend clicked twice on the same spot leaves no zero-length segment in the finished
+    /// wire, so no junction dot shows on that plain bend (#1236).
+    #[test]
+    fn a_bend_clicked_twice_leaves_no_zero_length_segment() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+            ..Default::default()
+        };
+        let start = egui::pos2(500.0, 450.0);
+        let bend = start + Vec2::new(0.0, 90.0);
+        let end = bend + Vec2::new(90.0, 0.0);
+        click_at(&ctx, &mut o, &mut ed, start, 1.0);
+        // The start spot again, then the bend twice, each a separate single click.
+        click_at(&ctx, &mut o, &mut ed, start, 2.0);
+        click_at(&ctx, &mut o, &mut ed, bend, 3.0);
+        click_at(&ctx, &mut o, &mut ed, bend, 4.0);
+        click_at(&ctx, &mut o, &mut ed, end, 5.0);
+        click_at(&ctx, &mut o, &mut ed, end, 5.1);
+        assert!(ed.wire.is_none());
+        let page = o.project.pages[0].clone();
+        assert_eq!(page.wires.len(), 1, "{:?}", page.wires);
+        let w = &page.wires[0];
+        let pts = o.wire_points(&page, w).unwrap();
+        assert_eq!(pts.len(), 3, "start, one bend, end: {pts:?}");
+        assert!(pts.windows(2).all(|ab| ab[0] != ab[1]), "{pts:?}");
+        let lines = vec![pts.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>()];
+        assert!(wc_pdf::junctions(&lines).is_empty(), "{pts:?}");
     }
 
     /// A wire started on one page is dropped when another page is shown, also by a way that
