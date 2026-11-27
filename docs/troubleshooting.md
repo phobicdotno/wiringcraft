@@ -7,7 +7,8 @@ start with `error:` or `warning:`.
 ## Where the app writes its log
 
 The desktop app keeps a log, `wiringcraft.log`, in the `logs` folder of its settings folder:
-`$XDG_CONFIG_HOME/wiringcraft/logs` when that variable is set, otherwise
+`$XDG_CONFIG_HOME/wiringcraft/logs` when that variable holds an absolute path (an empty or relative
+value is ignored), otherwise
 `%APPDATA%\wiringcraft\logs` on Windows and `~/.config/wiringcraft/logs` elsewhere. It holds up
 to five files of 1 MB (`wiringcraft.log`, then `.1` to `.4`). Home folders, API keys, tokens,
 email addresses and device tags are masked before a line is written. Help, Report a problem
