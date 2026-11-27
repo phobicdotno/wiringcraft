@@ -103,6 +103,29 @@ fn symbol_level_changes() -> std::result::Result<(), wc_core::Error> {
 }
 
 #[test]
+fn a_symbol_swapped_for_another_is_named() -> std::result::Result<(), wc_core::Error> {
+    let mut a = Page::new("p", "3", "X");
+    place(&mut a, "s1", "-K1", 10.0)?;
+    let shown = |b: &Page| -> Vec<String> {
+        changes::page_changes(Some(&a), Some(b))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    // Alone: named, not the catch-all "page changed".
+    let mut b = a.clone();
+    b.symbols[0].symbol = "contact.nc".into();
+    assert_eq!(shown(&b), ["page 3: -K1 symbol coil -> contact.nc"]);
+    // Together with a move of the same symbol: still listed.
+    b.symbols[0].at.x = 30.0;
+    assert_eq!(
+        shown(&b),
+        ["page 3: -K1 symbol coil -> contact.nc", "page 3: contact.nc -K1 moved"]
+    );
+    Ok(())
+}
+
+#[test]
 fn page_setting_changes_are_reported() -> std::result::Result<(), wc_core::Error> {
     let mut a = Page::new("p", "3", "X");
     place(&mut a, "s1", "-K1", 10.0)?;

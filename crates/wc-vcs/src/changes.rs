@@ -52,6 +52,14 @@ pub enum Change {
         from: String,
         to: String,
     },
+    /// The placed symbol kept its id but now draws another library symbol (`from` -> `to`),
+    /// for example a make contact turned into a break contact.
+    SymbolReplaced {
+        page: String,
+        item: String,
+        from: String,
+        to: String,
+    },
     WireAdded {
         page: String,
         wire: String,
@@ -86,6 +94,9 @@ impl std::fmt::Display for Change {
             Change::SymbolRemoved { page, item, what } => write!(f, "page {page}: {what} {item} removed"),
             Change::SymbolMoved { page, item, what } => write!(f, "page {page}: {what} {item} moved"),
             Change::SymbolRetagged { page, item, from, to } => write!(f, "page {page}: {item} tag {from} -> {to}"),
+            Change::SymbolReplaced { page, item, from, to } => {
+                write!(f, "page {page}: {item} symbol {from} -> {to}")
+            }
             Change::WireAdded { page, wire } => write!(f, "page {page}: wire {wire} added"),
             Change::WireRemoved { page, wire } => write!(f, "page {page}: wire {wire} removed"),
             Change::WireChanged { page, wire } => write!(f, "page {page}: wire {wire} changed"),
@@ -173,6 +184,14 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
                                 item: s.id.clone(),
                                 from: prev.tag.as_ref().map(|t| t.to_string()).unwrap_or_default(),
                                 to: s.tag.as_ref().map(|t| t.to_string()).unwrap_or_default(),
+                            });
+                        }
+                        if prev.symbol != s.symbol {
+                            out.push(Change::SymbolReplaced {
+                                page: page.clone(),
+                                item: tag_or_symbol(s),
+                                from: prev.symbol.clone(),
+                                to: s.symbol.clone(),
                             });
                         }
                         if prev.at != s.at || prev.rotation != s.rotation || prev.mirror != s.mirror {

@@ -179,6 +179,8 @@ enum Dialog {
     /// Save refused: this project file waits to be written again after a failed Undo or Redo,
     /// but was changed outside WiringCraft since (#662). Asks which version to keep.
     ChangedOutside(PathBuf),
+    /// Save changes to the open project before what was asked drops them? (#1019)
+    Unsaved(Leave),
     /// A base project being fetched from this git URL for a new project ([`App::fetch`]).
     Fetching(String),
     /// Help, Report a problem: the masked log to look at before anything is sent.
@@ -260,6 +262,33 @@ enum Dialog {
 /// Whether a dialog belongs to the open project, so it is closed when another project is
 /// opened. Only the dialogs that do not refer to it stay: opening or making a project, a
 /// message, a fetch in progress and the problem report.
+/// What the person asked for that replaces or closes the open project, waiting while the
+/// [`Dialog::Unsaved`] question about its unsaved changes is answered (#1019).
+#[derive(Debug, Clone, PartialEq)]
+enum Leave {
+    /// Open the project in this folder in its place.
+    Open(PathBuf),
+    /// Close the window.
+    Close,
+}
+
+/// Why a window close was called off while a dialog holds work of its own (#1019).
+const DIALOG_HOLDS_CLOSE: &str = "The window was not closed: finish or close the open dialog first.";
+
+/// Where a window close the person asked for stands (#1019).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum Closing {
+    #[default]
+    No,
+    /// Asked while a field had the keyboard: it waits a frame for the field's value to be
+    /// entered, then asks about unsaved changes or closes.
+    WaitsForTyped,
+    /// Nothing unsaved stops it: the window is closed at the end of this frame.
+    Go,
+    /// The window was told to close: the close request that makes is let through.
+    Going,
+}
+
 fn bound_to_project(d: &Dialog) -> bool {
     !matches!(
         d,
@@ -316,6 +345,8 @@ struct App {
     /// Actions that save the project, waiting one frame for the field that had the keyboard to
     /// enter what was typed in it ([`wait_for_typed_value`]).
     after_typed: Vec<Action>,
+    /// A window close the person asked for, while it waits for a typed value or is let through.
+    closing: Closing,
 }
 
 /// File > Import running on a worker thread, and what to do with the project when it ends.
@@ -603,7 +634,8 @@ impl App {
         let busy = ctx.input(|i| i.pointer.any_down())
             || matches!(
                 self.dialog,
-                Some(Dialog::Cover { .. } | Dialog::Template { .. } | Dialog::Racks { .. })
+                // The unsaved-changes question too: a join would save what it asks about.
+                Some(Dialog::Cover { .. } | Dialog::Template { .. } | Dialog::Racks { .. } | Dialog::Unsaved(_))
             )
             || self.assistant.command_running();
         self.share.set_command_running(self.assistant.command_running());
@@ -620,7 +652,15 @@ impl App {
         }
         // A save waiting for a typed value runs on the project it was asked for first: a
         // joined copy waits for it, also when an assistant's Undo syncs before the panels.
-        let busy = busy || !self.after_typed.is_empty();
+        // So does a close, from the frame it waits for a typed value until the window is gone
+        // (after Don't save, a join would save what the person chose to drop), and an Open
+        // whose file dialog has not been shown yet. And so does the unsaved-changes question:
+        // its answer saves or drops the project it was asked about.
+        let busy = busy
+            || !self.after_typed.is_empty()
+            || self.closing != Closing::No
+            || matches!(self.pending, Some(Pending::Open))
+            || matches!(self.dialog, Some(Dialog::Unsaved(_)));
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -784,6 +824,7 @@ impl App {
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
+            closing: Closing::No,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -793,7 +834,21 @@ impl App {
         app
     }
 
+    /// Open the project in `dir` in place of the open one. With unsaved changes in the open
+    /// project the person is asked first whether to save them (#1019); it opens once answered.
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
+        // A black box change the save refused is not in the project yet either.
+        let unsaved =
+            self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels, &self.ed);
+        if self.importing.is_none() && unsaved {
+            self.ask_unsaved(Leave::Open(dir.to_path_buf()));
+            return;
+        }
+        self.replace_project(dir, prefs);
+    }
+
+    /// Open the project in `dir`, dropping the open one as it is.
+    fn replace_project(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
         // The import writes to the open project's folder and is taken into it when it ends.
         if self.importing.is_some() {
             self.dialog = Some(Dialog::Message(format!("The project was not opened: {IMPORT_RUNNING}")));
@@ -1315,9 +1370,131 @@ impl App {
         }
     }
 
+    /// Closing the window would drop the open project's unsaved changes: a close the person
+    /// asked for is called off, and they are asked whether to save them first (#1019). Asked
+    /// while a field has the keyboard, the close waits a frame so the value typed there is
+    /// entered first and counts as a change ([`App::close_or_ask`]).
+    fn ask_before_closing(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.importing.is_some() {
+            // Called off by `hold_close_while_importing`: a later close asks again.
+            self.closing = Closing::No;
+            return;
+        }
+        match self.closing {
+            Closing::Going => return,
+            Closing::WaitsForTyped => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                return;
+            }
+            Closing::No | Closing::Go => {}
+        }
+        let Some(open) = self.open.as_ref() else { return };
+        if ctx.memory(|m| m.focused()).is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = Closing::WaitsForTyped;
+            ctx.request_repaint();
+        } else if open.dirty || panels::black_box_draft_refused(&self.panels, &self.ed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ask_unsaved(Leave::Close);
+        } else if self.dialog_holds_work() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = Closing::No;
+            self.ed.message = DIALOG_HOLDS_CLOSE.into();
+        }
+    }
+
+    /// Whether the open dialog holds work of its own not applied yet (Project properties with
+    /// a name typed, say): closing the window or asking about unsaved changes waits until it
+    /// is finished or closed.
+    fn dialog_holds_work(&self) -> bool {
+        self.dialog.as_ref().is_some_and(|d| {
+            !matches!(
+                d,
+                Dialog::Message(_)
+                    | Dialog::Unsaved(_)
+                    | Dialog::OpenPath(..)
+                    | Dialog::Report { .. }
+                    | Dialog::Fetching(_)
+            )
+        })
+    }
+
+    /// The frame after a close waited for a typed value, once the panels entered it: ask about
+    /// unsaved changes, or close.
+    fn close_or_ask(&mut self) {
+        if self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels, &self.ed) {
+            self.closing = Closing::No;
+            self.ask_unsaved(Leave::Close);
+        } else if self.dialog_holds_work() {
+            self.closing = Closing::No;
+            self.ed.message = DIALOG_HOLDS_CLOSE.into();
+        } else {
+            self.closing = Closing::Go;
+        }
+    }
+
+    /// Ask whether to save the open project's unsaved changes before `leave` drops them. Not
+    /// over a dialog that holds work of its own: that is finished or closed first.
+    fn ask_unsaved(&mut self, leave: Leave) {
+        let what = match leave {
+            Leave::Open(_) => "The project was not opened",
+            Leave::Close => "The window was not closed",
+        };
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|d| !matches!(d, Dialog::Message(_) | Dialog::Unsaved(_) | Dialog::OpenPath(..)))
+        {
+            self.ed.message =
+                format!("{what}: the open project has unsaved changes. Finish or close the open dialog first.");
+            return;
+        }
+        self.ed.message = format!("{what}: the open project has unsaved changes.");
+        self.dialog = Some(Dialog::Unsaved(leave));
+    }
+
+    /// Don't save: carry out what was asked, dropping the unsaved changes.
+    fn leave(&mut self, leave: Leave) {
+        match leave {
+            Leave::Open(dir) => {
+                let mut prefs = std::mem::take(&mut self.prefs);
+                self.replace_project(&dir, &mut prefs);
+                self.prefs = prefs;
+            }
+            Leave::Close => self.closing = Closing::Go,
+        }
+    }
+
+    /// Save, then carry out what was asked. When the save does not go through, or a black box
+    /// form's change it applies first is refused (its reason shows, and the form keeps the
+    /// change), the project stays open as it is.
+    fn save_and_leave(&mut self, leave: Leave) {
+        self.carry_out(Action::Save);
+        // While an assistant command runs, Save waits (`SAVE_WAITS`): nothing was saved.
+        if self.assistant.command_running()
+            || self.open.as_ref().is_some_and(|o| o.dirty)
+            || panels::black_box_draft_refused(&self.panels, &self.ed)
+        {
+            return;
+        }
+        self.leave(leave);
+    }
+
     /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
     /// one waits, another is not taken (the first stays and the action says so).
     fn run(&mut self, a: Action) {
+        // Save as would apply the black box form before its picker is refused: refused here
+        // first, so a refused Save as changes nothing (#1019).
+        if a == Action::SaveAs && self.pending.is_some() {
+            self.ed.message = format!(
+                "{} was not done: another file dialog is waiting to open; try again after it.",
+                a.info().label
+            );
+            return;
+        }
         let earlier = self.pending.take();
         self.carry_out(a);
         // The turn for the symbol on the pointer belongs to the place tool: an action that
@@ -1589,14 +1766,16 @@ impl App {
         // A black box form changed and not applied yet is applied before the project is saved.
         // Why it was refused, or what to check after it went in, stays in the message the save
         // leaves.
-        let refused = if saves_project(a) && !self.assistant.command_running() {
-            match panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels) {
-                Ok(note) => note,
-                Err(r) => Some(r),
-            }
-        } else {
-            None
-        };
+        // Not for a Save as that is refused in a shared session: a refused save changes nothing.
+        let refused =
+            if saves_project(a) && !self.assistant.command_running() && !(a == Action::SaveAs && self.share.active()) {
+                match panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels) {
+                    Ok(note) => note,
+                    Err(r) => Some(r),
+                }
+            } else {
+                None
+            };
         if let Some(r) = &refused {
             self.ed.message = r.clone();
         }
@@ -2271,6 +2450,7 @@ impl App {
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
             Dialog::ChangedOutside(_) => "Save",
+            Dialog::Unsaved(_) => "Unsaved changes",
             Dialog::Fetching(_) => "New project",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
@@ -2551,6 +2731,29 @@ impl App {
                                 }));
                                 keep = false;
                             }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Unsaved(leave) => {
+                    let name = self.open.as_ref().map(|o| o.project.meta.name.as_str()).unwrap_or_default();
+                    ui.label(format!("Save changes to {name}?"));
+                    ui.label(match leave {
+                        Leave::Open(dir) => format!("{} opens in its place.", dir.display()),
+                        Leave::Close => "The window closes.".into(),
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            let leave = leave.clone();
+                            then = Some(Box::new(move |app: &mut App| app.save_and_leave(leave)));
+                            keep = false;
+                        }
+                        if ui.button("Don't save").clicked() {
+                            let leave = leave.clone();
+                            then = Some(Box::new(move |app: &mut App| app.leave(leave)));
+                            keep = false;
                         }
                         if ui.button("Cancel").clicked() {
                             keep = false;
@@ -4417,13 +4620,28 @@ impl App {
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;
-        if let Err(e) = recorded {
+        if let Err(e) = &recorded
+            && matches!(self.dialog, Some(Dialog::Unsaved(_)))
+        {
+            // The open project's unsaved changes are asked about first: the question stays, and
+            // the new project is not open yet.
+            self.ed.message = format!("The new project's first version could not be recorded: {e}");
+        } else if let Err(e) = recorded {
             self.dialog = Some(Dialog::Message(match self.dialog.take() {
                 // Opening it failed too: both reasons show.
                 Some(Dialog::Message(m)) => format!("{m}\nIts first version could not be recorded either:\n{e}"),
                 _ => format!("The new project is open, but its first version could not be recorded:\n{e}"),
             }));
         }
+    }
+
+    /// Whether a fetched base project may replace the open one now: not while a save waits for
+    /// a typed value, which first goes into the project it was asked for, nor while a close is
+    /// under way, which asks about the project open now. Nor while an Open waits for its file
+    /// dialog: it asks about the project open now too, and once the dialog has run (or was
+    /// cancelled) the fetch is taken up again.
+    fn fetch_may_open(&self) -> bool {
+        self.after_typed.is_empty() && self.closing == Closing::No && !matches!(self.pending, Some(Pending::Open))
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
@@ -5041,13 +5259,14 @@ fn saves_project(a: Action) -> bool {
 }
 
 /// A value typed in a field (a Properties field, say) is entered when the field is left or on
-/// Enter. When this frame's actions save the project while a field still has the keyboard
-/// (Ctrl+S typed in it), the saving action and those after it are taken out of `actions` and
-/// returned, to wait one frame: the field keeps the keyboard for this frame, so text typed in
-/// the same frame as Ctrl+S still reaches it. `App::update` takes them up in the next frame
+/// Enter. When this frame's actions save the project, or open another one (which asks about
+/// unsaved changes, #1019), while a field still has the keyboard (Ctrl+S typed in it), that
+/// action and those after it are taken out of `actions` and returned, to wait one frame: the
+/// field keeps the keyboard for this frame, so text typed in the same frame as Ctrl+S still
+/// reaches it. `App::update` takes them up in the next frame
 /// with [`enter_typed_value`] (#932).
 fn wait_for_typed_value(ctx: &egui::Context, actions: &mut Vec<Action>) -> Vec<Action> {
-    let Some(at) = actions.iter().position(|a| saves_project(*a)) else {
+    let Some(at) = actions.iter().position(|a| saves_project(*a) || *a == Action::Open) else {
         return Vec::new();
     };
     if ctx.memory(|m| m.focused()).is_none() {
@@ -5555,7 +5774,14 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A close that waited a frame for a typed value: the field gives up the keyboard, so
+        // the panels enter its value before the close asks about unsaved changes.
+        let close_waited = self.closing == Closing::WaitsForTyped;
+        if close_waited {
+            enter_typed_value(ctx);
+        }
         self.hold_close_while_importing(ctx);
+        self.ask_before_closing(ctx);
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -5608,9 +5834,7 @@ impl eframe::App for App {
             o.follow_terminals();
         }
         self.live_check(ctx);
-        // A fetched base project replaces the open one: not while a save waits for a typed
-        // value, which first goes into the project it was asked for.
-        if self.after_typed.is_empty() {
+        if self.fetch_may_open() {
             self.poll_fetch(ctx);
         } else {
             ctx.request_repaint();
@@ -5725,6 +5949,9 @@ impl eframe::App for App {
         for a in after_panels {
             self.run(a);
         }
+        if close_waited && self.closing == Closing::WaitsForTyped {
+            self.close_or_ask();
+        }
         self.run_menu_action();
         // The picker opens on the next frame, outside the panel that asked for it.
         if let Some((kind, part)) = self.ed.ask_attach.take() {
@@ -5764,6 +5991,10 @@ impl eframe::App for App {
             });
         }
         self.dialogs(ctx);
+        if self.closing == Closing::Go {
+            self.closing = Closing::Going;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // While an import runs, the windows that edit the project, a library or the session
         // wait (they show again when it is done), not only behind the import window.
         if self.importing.is_none() {
@@ -7409,6 +7640,7 @@ mod nudge_tests {
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
+            closing: Closing::No,
         };
         (tmp, app, egui::Context::default())
     }
@@ -7678,6 +7910,235 @@ mod nudge_tests {
         app.fetch = None;
     }
 
+    /// One frame of the whole app; `close` adds the window's close button. Returns the
+    /// commands the frame sent to the window.
+    fn app_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        close: bool,
+    ) -> Vec<egui::ViewportCommand> {
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut raw = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        if close {
+            raw.viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        let out = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// An app with its coil moved one step: the project has unsaved changes.
+    fn changed_app() -> (tempfile::TempDir, App, egui::Context) {
+        let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app.open.as_mut().unwrap().save().unwrap();
+        press(&mut app, &ctx, Key::ArrowLeft, false);
+        assert!(app.open.as_ref().unwrap().dirty, "the move is not saved yet");
+        (tmp, app, ctx)
+    }
+
+    fn coil_on_disk(app: &App) -> Point {
+        let saved = wc_core::store::load(&app.open.as_ref().unwrap().dir).unwrap();
+        saved.pages[app.ed.page].symbols[1].at
+    }
+
+    /// Closing the window with unsaved changes asks first: Cancel keeps the window and the
+    /// changes, Don't save closes without them, Save closes with them on disk (#1019).
+    #[test]
+    fn closing_the_window_asks_to_save_unsaved_changes() {
+        use egui::ViewportCommand::{CancelClose, Close};
+        let unsaved = Point::new(50.0, 60.0);
+        for answer in ["Cancel", "Don't save", "Save"] {
+            let (_tmp, mut app, ctx) = changed_app();
+            let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+            assert!(sent.contains(&CancelClose), "{answer}: the close is called off");
+            assert!(
+                matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+                "{answer}: the person is asked"
+            );
+            // The buttons close the dialog and run their work.
+            app.dialog = None;
+            match answer {
+                "Don't save" => app.leave(Leave::Close),
+                "Save" => app.save_and_leave(Leave::Close),
+                _ => {}
+            }
+            let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+            assert_eq!(sent.contains(&Close), answer != "Cancel", "{answer}: the window closes");
+            if answer != "Cancel" {
+                // The close request that makes is let through, without asking again.
+                let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+                assert!(!sent.contains(&CancelClose), "{answer}: not called off again");
+                assert!(app.dialog.is_none(), "{answer}: not asked again");
+            }
+            let open = app.open.as_ref().unwrap();
+            assert_eq!(coil_at(&app), unsaved, "{answer}: the open project keeps the change");
+            assert_eq!(open.dirty, answer != "Save", "{answer}");
+            let on_disk = if answer == "Save" {
+                unsaved
+            } else {
+                Point::new(55.0, 60.0)
+            };
+            assert_eq!(coil_on_disk(&app), on_disk, "{answer}: what is on disk");
+        }
+        // Nothing unsaved: the window closes at once.
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(!sent.contains(&CancelClose));
+        assert!(app.dialog.is_none());
+    }
+
+    /// A device tag typed and not entered yet when the window's close button is pressed is
+    /// entered first: it counts as an unsaved change, and Save writes it (#1019).
+    #[test]
+    fn closing_the_window_enters_a_typed_value_first() {
+        use egui::ViewportCommand::{CancelClose, Close};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let tag = |app: &App| {
+            app.open.as_ref().unwrap().project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let typed = format!("{}7", tag(&app).unwrap());
+        // The text and the close come in one frame: the field still takes the text.
+        let sent = app_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())], true);
+        assert!(sent.contains(&CancelClose), "the close waits");
+        assert_eq!(app.closing, Closing::WaitsForTyped);
+        assert!(!app.open.as_ref().unwrap().dirty, "typed, not entered yet");
+        let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(!sent.contains(&Close));
+        assert_eq!(tag(&app).as_ref(), Some(&typed), "entered");
+        assert!(
+            matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+            "the entered value is an unsaved change: the person is asked"
+        );
+        app.dialog = None;
+        app.save_and_leave(Leave::Close);
+        let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(sent.contains(&Close), "saved, then closed");
+        let open = app.open.as_ref().unwrap();
+        let saved = wc_core::store::load(&open.dir).unwrap();
+        assert_eq!(
+            saved.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string),
+            Some(typed)
+        );
+
+        // A field with the keyboard and nothing typed: the close waits a frame, then goes on.
+        let (_tmp, mut app, ctx) = self::app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&CancelClose));
+        let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(sent.contains(&Close), "nothing unsaved: it closes");
+        assert!(app.dialog.is_none());
+    }
+
+    /// Opening another project with unsaved changes asks first: Cancel keeps the open project
+    /// and its changes, Don't save opens the other without saving, Save saves, then opens it
+    /// (#1019).
+    #[test]
+    fn opening_another_project_asks_to_save_unsaved_changes() {
+        for answer in ["Cancel", "Don't save", "Save"] {
+            let (tmp, mut app, ctx) = changed_app();
+            let first = app.open.as_ref().unwrap().dir.clone();
+            let page = app.ed.page;
+            let other = tmp.path().join("other");
+            wc_core::store::create(&other, "Other").unwrap();
+            let mut prefs = Prefs::default();
+            app.open_dir(&other, &mut prefs);
+            assert_eq!(app.open.as_ref().unwrap().dir, first, "{answer}: not replaced yet");
+            let Some(Dialog::Unsaved(Leave::Open(asked))) = app.dialog.take() else {
+                unreachable!("{answer}: the person is asked")
+            };
+            match answer {
+                "Don't save" => app.leave(Leave::Open(asked)),
+                "Save" => app.save_and_leave(Leave::Open(asked)),
+                _ => {}
+            }
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            let open = app.open.as_ref().unwrap();
+            let opened = answer != "Cancel";
+            assert_eq!(open.dir != first, opened, "{answer}: the other project is open");
+            if !opened {
+                assert!(open.dirty, "Cancel keeps the changes");
+            }
+            let saved = wc_core::store::load(&first).unwrap();
+            let on_disk = saved.pages[page].symbols[1].at;
+            let expected = if answer == "Save" {
+                Point::new(50.0, 60.0)
+            } else {
+                Point::new(55.0, 60.0)
+            };
+            assert_eq!(on_disk, expected, "{answer}: what is on disk");
+        }
+    }
+
+    /// Ctrl+O typed in a field with a value not entered yet waits a frame like Ctrl+S, so the
+    /// value is in the project when Open asks about unsaved changes (#1019).
+    #[test]
+    fn ctrl_o_enters_a_typed_value_first() {
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let open_key = egui::Event::Key {
+            key: Key::O,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Text("7".into()), open_key],
+            modifiers: Modifiers::COMMAND,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        assert_eq!(app.after_typed, [Action::Open], "Open waits a frame");
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(matches!(app.pending, Some(Pending::Open)), "then asks for the folder");
+        assert!(app.open.as_ref().unwrap().dirty, "with the typed value entered");
+        // The folder picker is not shown in a test.
+        app.pending = None;
+    }
+
     /// A session join that would replace the open project waits while a save waits for a
     /// typed value, also when something syncs the session before the panels have entered it
     /// (an assistant's Undo does): the typed value is saved in the project it was typed in,
@@ -7784,6 +8245,260 @@ mod nudge_tests {
         let symbol = back.project.pages[page].symbol(&id).unwrap().symbol.clone();
         let names: Vec<&str> = back.symbols[&symbol].pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["A"], "the saved box has the point name typed in the form");
+    }
+
+    /// Save in the unsaved-changes question with a black box form whose change is refused
+    /// (two points with one name): the project is saved, but the window stays open and the
+    /// form keeps the change and its reason (#1019).
+    #[test]
+    fn save_and_close_stays_open_when_the_black_box_form_is_refused() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pin = |name: &str, offset| BoxPin {
+            name: name.into(),
+            side: BoxSide::Left,
+            offset,
+        };
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .add_black_box(
+                page,
+                Point::new(120.0, 40.0),
+                Point::new(140.0, 60.0),
+                &[pin("1", 5.0), pin("2", 10.0)],
+                None,
+            )
+            .unwrap();
+        app.ed.select_only(Selection::Symbol(id));
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[1].name = "1".into();
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose));
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        app.dialog = None;
+        app.save_and_leave(Leave::Close);
+        assert!(!app.open.as_ref().unwrap().dirty, "the project itself was saved");
+        assert!(
+            panels::black_box_draft_refused(&app.panels, &app.ed),
+            "the form keeps the change"
+        );
+        assert!(app.ed.message.contains("not changed"), "{}", app.ed.message);
+        let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(!sent.contains(&egui::ViewportCommand::Close), "the window stays open");
+        // The project is saved, but the refused change is not in it: a second close, or an
+        // Open, asks again instead of dropping it.
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose));
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        app.dialog = None;
+        let other = _tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let mut prefs = std::mem::take(&mut app.prefs);
+        app.open_dir(&other, &mut prefs);
+        app.prefs = prefs;
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Open(_)))));
+        assert_ne!(app.open.as_ref().unwrap().dir, other, "not opened before the answer");
+    }
+
+    /// While the unsaved-changes question is open, a session join does not come in: it would
+    /// save the changes the question asks about, and drop the question (#1019).
+    #[test]
+    fn a_session_join_waits_while_the_unsaved_changes_question_is_open() {
+        let (tmp, mut app, ctx) = changed_app();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose));
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.dir, first, "not joined while the question is open");
+        assert!(open.dirty, "nothing was saved");
+        assert!(
+            matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+            "the question stays"
+        );
+    }
+
+    /// An assistant's Undo syncs the session directly; it does not join a guest's copy while
+    /// the unsaved-changes question is open either (#1019).
+    #[test]
+    fn an_assistant_sync_waits_while_the_unsaved_changes_question_is_open() {
+        let (tmp, mut app, ctx) = changed_app();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.sync_session_now(false);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.dir, first, "not joined while the question is open");
+        assert!(open.dirty, "nothing was saved");
+        assert!(
+            matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+            "the question stays"
+        );
+    }
+
+    /// After Don't save the window is closing: a session join approved meanwhile does not save
+    /// the changes the person chose to drop (#1019).
+    #[test]
+    fn a_session_join_does_not_save_after_dont_save() {
+        let (tmp, mut app, ctx) = changed_app();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.dialog = None;
+        app.leave(Leave::Close);
+        app.sync_session_now(false);
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "not joined while closing");
+        assert_eq!(
+            coil_on_disk(&app),
+            Point::new(55.0, 60.0),
+            "the dropped change is not saved"
+        );
+    }
+
+    /// An Open whose file dialog has not been shown yet keeps a join from saving and replacing
+    /// the project it will ask about (#1019).
+    #[test]
+    fn a_session_join_waits_while_an_open_is_pending() {
+        let (tmp, mut app, _ctx) = changed_app();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        app.run(Action::Open);
+        assert!(matches!(app.pending, Some(Pending::Open)));
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.sync_session_now(false);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.dir, first, "not joined while the Open waits");
+        assert!(open.dirty, "nothing was saved without asking");
+    }
+
+    /// A project with nothing unsaved still does not close over a dialog holding work of its
+    /// own (Project properties): the close is called off and the dialog stays (#1019).
+    #[test]
+    fn closing_waits_for_a_dialog_that_holds_work() {
+        use egui::ViewportCommand::{CancelClose, Close};
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app.run(Action::ProjectProps);
+        assert!(matches!(app.dialog, Some(Dialog::ProjectProps { .. })));
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&CancelClose), "the close is called off");
+        assert!(!sent.contains(&Close));
+        assert!(
+            matches!(app.dialog, Some(Dialog::ProjectProps { .. })),
+            "the dialog stays"
+        );
+        assert_eq!(app.ed.message, DIALOG_HOLDS_CLOSE);
+        // A message box holds nothing: the window closes.
+        app.dialog = Some(Dialog::Message("Note".into()));
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(!sent.contains(&CancelClose));
+    }
+
+    /// Save as while another file dialog waits to open is refused before it applies the black
+    /// box form: a refused Save as changes nothing (#1019).
+    #[test]
+    fn save_as_refused_for_a_waiting_picker_leaves_the_black_box_form() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = app
+            .open
+            .as_mut()
+            .unwrap()
+            .add_black_box(page, Point::new(120.0, 40.0), Point::new(140.0, 60.0), &pins, None)
+            .unwrap();
+        app.ed.select_only(Selection::Symbol(id));
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        panels::black_box_form_mut(&mut app.panels).unwrap().rows[0].name = "A".into();
+        app.pending = Some(Pending::Open);
+        let steps = app.open.as_ref().unwrap().undo_steps();
+        app.run(Action::SaveAs);
+        assert!(matches!(app.pending, Some(Pending::Open)), "the waiting picker stays");
+        assert!(app.ed.message.contains("was not done"), "{}", app.ed.message);
+        assert_eq!(
+            app.open.as_ref().unwrap().undo_steps(),
+            steps,
+            "the project is not changed"
+        );
+        assert!(
+            panels::black_box_form_mut(&mut app.panels).is_some_and(|f| f.changed()),
+            "the form keeps the change"
+        );
+    }
+
+    /// A fetched base project does not replace the open one while an Open waits for its file
+    /// dialog, and is taken up again once that dialog has run or was cancelled (#1019).
+    #[test]
+    fn a_fetch_waits_while_an_open_waits_for_its_file_dialog() {
+        let (_tmp, mut app, _ctx) = changed_app();
+        assert!(app.fetch_may_open());
+        app.run(Action::Open);
+        assert!(matches!(app.pending, Some(Pending::Open)));
+        assert!(!app.fetch_may_open(), "the Open asks first");
+        // The file dialog ran, or was cancelled: the pending Open is gone.
+        app.pending = None;
+        assert!(app.fetch_may_open(), "the fetch is taken up again");
+    }
+
+    /// A close asked for while a field has the keyboard waits a frame for the typed value; a
+    /// fetched base project or a session join does not replace the open project in that frame
+    /// (#1019).
+    #[test]
+    fn a_fetched_project_or_a_join_waits_while_a_close_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let was_open = app.open.as_ref().unwrap().dir.clone();
+        let new_dir = tmp.path().join("fetched");
+        wc_core::store::create(&new_dir, "Fetched").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        app.fetch = Some(BaseFetch {
+            dir: new_dir,
+            source: "https://example.invalid/base.git".into(),
+            was_open: Some(was_open.clone()),
+            made: false,
+            cancel: std::sync::Arc::default(),
+            done,
+        });
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        let sent = app_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())], true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose));
+        assert_eq!(app.closing, Closing::WaitsForTyped);
+        assert!(app.fetch.is_some(), "the fetch waits");
+        assert_eq!(app.open.as_ref().unwrap().dir, was_open, "not replaced by the fetch");
+        // A sync before the panels of the next frame, as an assistant's Undo makes.
+        app.sync_session_now(false);
+        assert_eq!(app.open.as_ref().unwrap().dir, was_open, "the join waits for the close");
     }
 
     /// What to check after a black box form goes in with the save (a wire on a point that
@@ -8237,6 +8952,7 @@ mod menu_action_tests {
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
+            closing: Closing::No,
         };
         (tmp, app, id)
     }

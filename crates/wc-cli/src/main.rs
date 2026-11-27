@@ -243,7 +243,7 @@ enum Cmd {
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
     NumberWires {
-        /// `sequential`, `page-column` or `potential`.
+        /// `sequential`, `page-column` or `potential` (any case; `page_column` works too).
         #[arg(long, default_value = "page-column")]
         rule: String,
         /// Renumber connections that already have a number too.
@@ -1105,7 +1105,8 @@ enum StripCmd {
         strip: Option<String>,
     },
     /// Put a strip's terminals in this rail order, e.g. `strip order -X1 3 1 2`. Terminals
-    /// left out follow at the end; no terminals goes back to the order by number.
+    /// left out follow at the end; no terminals goes back to the order by number. Every
+    /// terminal given must be on the strip, drawn or spare.
     Order {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -3637,6 +3638,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
                 StripCmd::Order { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    // A strip or terminal the project does not have is refused, as `jumper add`
+                    // does; no terminals (back to the order by number) needs no check.
+                    if !terminals.is_empty() {
+                        let current = rail(&p, &strip);
+                        if current.is_empty() {
+                            return Err(no_strip(&strip, &unreadable));
+                        }
+                        for t in terminals.iter().map(|t| t.trim()) {
+                            if !current.iter().any(|(n, _)| n == t) {
+                                return Err(format!("{strip} has no terminal {}", escape_field(t)));
+                            }
+                        }
+                    }
                     if p.meta.set_terminal_order(&strip, &terminals)? {
                         save(dir, &p)?;
                     }
@@ -4937,13 +4951,13 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
         }
         VcsCmd::PageLog { page, limit } => {
             let p = load(dir)?;
-            let page_id = p
-                .pages
-                .iter()
-                .find(|pg| pg.id == page || pg.number == page)
-                .map(|pg| pg.id.clone())
-                .unwrap_or(page);
+            let known = p.pages.iter().find(|pg| pg.id == page || pg.number == page);
+            let page_id = known.map(|pg| pg.id.clone()).unwrap_or(page);
             let versions = wc_vcs::page_history(&git, &page_id, limit).map_err(e)?;
+            // A removed page keeps its recorded history; a page neither here nor recorded is a typo.
+            if known.is_none() && versions.is_empty() {
+                check_pages(&p, std::slice::from_ref(&page_id))?;
+            }
             if versions.is_empty() {
                 println!("no recorded versions of page {page_id}");
             }
@@ -8652,6 +8666,25 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn strip_order_refuses_a_strip_or_terminal_the_project_does_not_have() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap_err();
+        assert_eq!(err, "no terminal strip -X1");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        draw_x1_terminals(&dir);
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "99"]).unwrap_err();
+        assert_eq!(err, "-X1 has no terminal 99");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.strips.len(), 1);
+        // No terminals still goes back to the order by number.
+        cli(&dir, &["strip", "order", "--", "-X1"]).unwrap();
+        assert!(load(&dir).unwrap().meta.strips.is_empty());
     }
 
     #[test]
