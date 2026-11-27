@@ -75,6 +75,20 @@ impl DeviceTag {
                     current = Some(c);
                 }
                 c if c.is_alphanumeric() || c == '.' || c == '_' => buf.push(c),
+                // Pasted from a word processor or a PDF, a dash is often one of these.
+                '\u{2010}'..='\u{2015}'
+                | '\u{2212}'
+                | '\u{FE63}'
+                | '\u{FF0D}'
+                | '\u{FE62}'
+                | '\u{FF0B}'
+                | '\u{FE66}'
+                | '\u{FF1D}' => {
+                    return Err(Error::Tag(
+                        s.into(),
+                        "a sign that only looks like =, + or -: type the plain one",
+                    ));
+                }
                 _ => return Err(Error::Tag(s.into(), "only letters, digits, '.', '_' allowed")),
             }
         }
@@ -188,6 +202,22 @@ mod tests {
             ("+C1..R2-K1", "the location aspect (+) has an empty level"),
             ("=-K1", "the function aspect (=) has no name"),
             ("K1", "must start with =, + or -"),
+            (
+                "\u{2013}K1",
+                "a sign that only looks like =, + or -: type the plain one",
+            ),
+            (
+                "=A+C1\u{2212}K1",
+                "a sign that only looks like =, + or -: type the plain one",
+            ),
+            (
+                "\u{FF0B}C1-K1",
+                "a sign that only looks like =, + or -: type the plain one",
+            ),
+            (
+                "=A\u{FF1D}B-K1",
+                "a sign that only looks like =, + or -: type the plain one",
+            ),
         ] {
             let Err(e) = DeviceTag::parse(bad) else {
                 unreachable!("{bad} should fail");
