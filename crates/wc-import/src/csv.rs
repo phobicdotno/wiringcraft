@@ -45,6 +45,10 @@ pub struct Rows {
     pub cells: Vec<Vec<String>>,
     /// The line or worksheet row of each of `cells`.
     pub numbers: Vec<usize>,
+    /// The line a quoted cell opens on when the text ends before its closing quote (the cell
+    /// is kept up to the end of the text). Commands that must not take a cut-short file refuse
+    /// it with this line.
+    pub open_quote: Option<usize>,
 }
 
 impl Rows {
@@ -58,7 +62,11 @@ impl Rows {
 impl From<Vec<Vec<String>>> for Rows {
     fn from(cells: Vec<Vec<String>>) -> Self {
         let numbers = (1..=cells.len()).collect();
-        Rows { cells, numbers }
+        Rows {
+            cells,
+            numbers,
+            open_quote: None,
+        }
     }
 }
 
@@ -79,6 +87,8 @@ pub fn records(text: &str, delim: char) -> Rows {
     let mut quoted = false;
     // The line being read, and the one the record being read starts on.
     let (mut line, mut start) = (1usize, 1usize);
+    // The line the quoted cell being read opens on.
+    let mut quote_line = 1usize;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if quoted {
@@ -98,6 +108,7 @@ pub fn records(text: &str, delim: char) -> Rows {
             }
         } else if c == '"' && field.is_empty() {
             quoted = true;
+            quote_line = line;
         } else if c == delim {
             row.push(unguard(std::mem::take(&mut field)));
         } else if c == '\n' || c == '\r' {
@@ -116,6 +127,9 @@ pub fn records(text: &str, delim: char) -> Rows {
         } else {
             field.push(c);
         }
+    }
+    if quoted {
+        out.open_quote = Some(quote_line);
     }
     row.push(unguard(field));
     if row.iter().any(|f| !f.trim().is_empty()) {
@@ -551,6 +565,13 @@ pub fn apply_plc_addresses(project: &mut Project, rows: &[PlcAddress]) -> PlcApp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quoted_cell_left_open_is_noted_with_its_line() {
+        let rows = records("a;b\n1;\"two\nlines\"\n3;\"open\nstill", ';');
+        assert_eq!(rows.open_quote, Some(4));
+        assert_eq!(rows.cells.len(), 3);
+        assert_eq!(records("a;\"b\nc\"\n", ';').open_quote, None);
+    }
 
     #[test]
     fn kind_tells_plc_lists_from_parts_lists_by_header() {

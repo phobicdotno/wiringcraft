@@ -790,7 +790,8 @@ enum MacroCmd {
     /// filling its placeholders. The table (CSV or an `.xlsx` workbook) names its columns in
     /// its first row: a placeholder's name fills that placeholder, a column `set` picks the
     /// row's value set (over `--set`), and an empty cell leaves the value set's or default
-    /// value. The copies go on new pages after the last one, left to right and row below
+    /// value. A macro that declares a placeholder `set` takes that column as the placeholder,
+    /// and then `--set` alone picks the value set. The copies go on new pages after the last one, left to right and row below
     /// row, each with the next free tags. Prints the new pages' ids and the number of copies.
     Generate {
         /// The macro's name or file name.
@@ -3614,20 +3615,36 @@ fn run(mut cli: Cli) -> Res<()> {
                         Some(bytes) => bytes,
                         None => run::read_file(&table)?,
                     };
-                    let rows = wc_import::csv::file_rows(&bytes)
-                        .map_err(|err| format!("{}: {}", escape_field(&table.display().to_string()), e(err)))?;
+                    let shown = escape_field(&table.display().to_string());
+                    let rows = wc_import::csv::file_rows(&bytes).map_err(|err| format!("{shown}: {}", e(err)))?;
+                    // A file cut short inside a quoted cell would place a row with half a value.
+                    if let Some(line) = rows.open_quote {
+                        return Err(format!(
+                            "{shown}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed"
+                        ));
+                    }
                     let rows = wc_core::generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(e)?;
                     let copies = wc_core::generate::apply_rows(&m, &rows, set.as_deref()).map_err(e)?;
                     for copy in &copies {
                         take_macro_items(dir, &mut p, copy)?;
                     }
-                    let extent = copies
-                        .first()
-                        .map(|first| wc_core::generate::extent(first, |id| store::read_vendored_symbol(dir, id).ok()))
-                        .unwrap_or_default();
+                    let extent = wc_core::generate::extent(&copies, |id| store::read_vendored_symbol(dir, id).ok());
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let generated = wc_core::generate::generate(&mut p, &copies, extent, size, &title).map_err(e)?;
-                    save(dir, &p)?;
+                    // A save that fails half way puts the project's files back, so a second run
+                    // does not place the rows already written again.
+                    let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
+                    let before = snapshot_project(dir, &new_pages, &[])?;
+                    if let Err(err) = save(dir, &p) {
+                        let failed = put_files_back(&before);
+                        if failed.is_empty() {
+                            return Err(err);
+                        }
+                        return Err(format!(
+                            "{err}; putting the project's files back failed too: {}",
+                            failed.join("; ")
+                        ));
+                    }
                     println!("{}", generated.pages.join(" "));
                     let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
                     println!(

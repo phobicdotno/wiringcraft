@@ -552,6 +552,7 @@ fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
     let p = wc_core::store::load(&dir)?;
     let page = p.page("p0002").ok_or("page")?;
     assert_eq!((page.number.as_str(), page.title.as_str()), ("3", "Motors"));
+    assert_eq!(page.size, wc_core::PageSize::A4);
     let rows: Vec<(String, String, Option<String>)> = page
         .symbols
         .iter()
@@ -578,5 +579,79 @@ fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
     assert!(ys.windows(2).all(|w| w[0] == w[1]), "{ys:?}");
     assert!(xs.iter().chain(&ys).all(|v| v % 5.0 == 0.0), "{xs:?} {ys:?}");
     assert!(p.lock.symbols.contains_key("wc.coil"));
+    Ok(())
+}
+
+#[test]
+fn a_generation_whose_save_fails_leaves_the_project_as_it_was() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let table = tmp.path().join("motors.csv");
+    // Thirty rows: more than one small page holds.
+    std::fs::write(&table, format!("set\n{}", "3 kW\n".repeat(30)))?;
+    let args = [
+        "macro",
+        "generate",
+        "starter",
+        "--table",
+        table.to_str().ok_or("path")?,
+        "--size",
+        "100x110",
+    ];
+    // A folder where the second new page's file goes makes the save fail after the first.
+    let before = wc_core::store::load(&dir)?;
+    // (the store writes `<file>.tmp` and renames it into place).
+    let blocker = dir.join("pages/p0003.page.json.tmp");
+    std::fs::create_dir_all(&blocker)?;
+    assert!(wiringcraft(&dir, &args).is_err(), "the save failed");
+    assert!(
+        !dir.join("pages/p0002.page.json").exists(),
+        "the first new page is taken back"
+    );
+    std::fs::remove_dir(&blocker)?;
+    assert_eq!(wc_core::store::load(&dir)?.pages, before.pages);
+    let out = wiringcraft(&dir, &args)?;
+    assert!(out.starts_with("p0002 p0003"), "{out}");
+    assert!(out.contains("30 copies"), "{out}");
+    let p = wc_core::store::load(&dir)?;
+    let placed: usize = p.pages.iter().map(|pg| pg.symbols.len()).sum();
+    assert_eq!(placed, 30, "one copy per row");
+    Ok(())
+}
+
+#[test]
+fn a_table_cut_short_inside_a_quoted_cell_places_nothing() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    std::fs::create_dir_all(dir.join("macros"))?;
+    std::fs::write(dir.join("macros/starter.json"), STARTER)?;
+    let table = tmp.path().join("cut.csv");
+    std::fs::write(&table, "set;kW\n3 kW;\"4\n\"\n3 kW;\"5")?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    ) else {
+        return Err("generated from a table cut short".into());
+    };
+    assert!(err.contains("line 4") && err.contains("not closed"), "{err}");
     Ok(())
 }
