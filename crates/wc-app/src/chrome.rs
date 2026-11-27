@@ -24,6 +24,16 @@ pub fn shortcut_hint(os: egui::os::OperatingSystem, shortcut: &str) -> String {
     }
 }
 
+/// An action's `tip` as the keys are on `os`: a Ctrl shortcut named in the text (Redo's
+/// Ctrl+Shift+Z) is Cmd on a Mac, as in [`shortcut_hint`].
+pub fn tip_hint(os: egui::os::OperatingSystem, tip: &str) -> String {
+    if os == egui::os::OperatingSystem::Mac {
+        tip.replace("Ctrl+", "Cmd+")
+    } else {
+        tip.to_owned()
+    }
+}
+
 #[derive(Default)]
 pub struct ChromeState {
     pub ribbon_tab: usize,
@@ -218,7 +228,7 @@ pub fn menu_bar(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<Action>) {
                                 .selected(status.active(*a));
                             if ui
                                 .add_enabled(status.enabled(*a), button)
-                                .on_hover_text(info.tip)
+                                .on_hover_text(tip_hint(ui.ctx().os(), info.tip))
                                 .clicked()
                             {
                                 out.push(*a);
@@ -282,10 +292,10 @@ fn icon_button_rect(
     };
     icons::paint(p, rect.shrink(size * 0.2), info.icon, c, accent);
     let tip = if info.shortcut.is_empty() {
-        format!("{}\n{}", info.label, info.tip)
+        format!("{}\n{}", info.label, tip_hint(ui.ctx().os(), info.tip))
     } else {
         let keys = shortcut_hint(ui.ctx().os(), info.shortcut);
-        format!("{} ({keys})\n{}", info.label, info.tip)
+        format!("{} ({keys})\n{}", info.label, tip_hint(ui.ctx().os(), info.tip))
     };
     // A pointer release counts only over the button where it is now: egui hit-tests against the
     // last frame, where a button with an id (a ribbon button) that has moved since still looks to
@@ -713,6 +723,18 @@ mod tests {
         assert_eq!(shortcut_hint(Mac, "Del"), "Del");
         assert_eq!(shortcut_hint(Mac, ""), "");
         assert_eq!(shortcut_hint(Windows, "Ctrl+S"), "Ctrl+S");
+    }
+
+    #[test]
+    fn the_redo_tip_names_cmd_shift_z_on_a_mac() {
+        use egui::os::OperatingSystem::{Mac, Nix, Windows};
+        let tip = Action::Redo.info().tip;
+        assert_eq!(
+            tip_hint(Mac, tip),
+            "Redo the last change you undid (Cmd+Shift+Z works too)"
+        );
+        assert_eq!(tip_hint(Windows, tip), tip);
+        assert_eq!(tip_hint(Nix, tip), tip);
     }
 
     #[test]

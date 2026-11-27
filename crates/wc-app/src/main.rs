@@ -1379,7 +1379,11 @@ impl App {
                 for a in IMPORT_VIEW_CONTROLS {
                     let info = a.info();
                     let on = *a == Action::Layers && self.show_layers;
-                    if ui.selectable_label(on, info.label).on_hover_text(info.tip).clicked() {
+                    if ui
+                        .selectable_label(on, info.label)
+                        .on_hover_text(chrome::tip_hint(ui.ctx().os(), info.tip))
+                        .clicked()
+                    {
                         actions.push(*a);
                     }
                 }
