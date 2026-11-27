@@ -2727,7 +2727,12 @@ impl App {
                         };
                         ui.add(egui::Label::new(RichText::new(shown).monospace().small()).wrap());
                     });
-                    ui.checkbox(include, "Include this log in my report");
+                    // An empty log has nothing to include: the box is greyed out and shown
+                    // unticked, so it does not claim a log goes with the report.
+                    let mut nothing = false;
+                    let tick = if log.is_empty() { &mut nothing } else { &mut *include };
+                    ui.add_enabled(!log.is_empty(), egui::Checkbox::new(tick, "Include this log in my report"))
+                        .on_disabled_hover_text("The log is empty.");
                     ui.horizontal(|ui| {
                         if ui.button("Open the report form").clicked() {
                             let (request, copy) = report_request(log, *include);
@@ -2739,7 +2744,7 @@ impl App {
                             }
                             self.open_url
                                 .push(feedback::form_url(feedback::Kind::Problem, &request));
-                            applog::info(if *include {
+                            applog::info(if *include && !log.is_empty() {
                                 "report form opened with the log"
                             } else {
                                 "report form opened without the log"
