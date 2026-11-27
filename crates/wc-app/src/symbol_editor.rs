@@ -775,10 +775,12 @@ impl SymbolEditor {
         }
         let mut names = std::collections::BTreeSet::new();
         for p in &s.pins {
-            if p.name.trim().is_empty() {
+            // Spaces around a name are dropped on save, so `A1` and `A1 ` are one name.
+            let name = p.name.trim();
+            if name.is_empty() {
                 out.push("Every pin needs a name.".into());
-            } else if !names.insert(p.name.as_str()) {
-                out.push(format!("Two pins are called {}.", p.name));
+            } else if !names.insert(name) {
+                out.push(format!("Two pins are called {name}."));
             }
         }
         // Two pins on one point would connect each other's wires.
@@ -805,6 +807,9 @@ impl SymbolEditor {
             .ok_or("No library folder is chosen.")?
             .clone();
         self.symbol.id = self.symbol.id.trim().to_owned();
+        for p in &mut self.symbol.pins {
+            p.name = p.name.trim().to_owned();
+        }
         let id = self.symbol.id.clone();
         let file = root.join("symbols").join(format!("{id}.json"));
         let same =
@@ -1871,6 +1876,25 @@ mod tests {
         e.nudge(Point::new(SNAP, 0.0));
         assert!(e.problems().is_empty(), "{:?}", e.problems());
         e.save()?;
+        Ok(())
+    }
+
+    #[test]
+    fn pin_names_are_saved_without_spaces_around_them() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let mut e = SymbolEditor::new(vec![("mine".into(), tmp.path().join("lib"))]);
+        draw_coil(&mut e);
+        e.symbol.id = "my.coil".into();
+        e.symbol.name = "Coil".into();
+        // A2 renamed in its Name field to A1 with a space after it.
+        e.symbol.pins[1].name = "A1 ".into();
+        assert_eq!(e.problems(), ["Two pins are called A1."]);
+        e.symbol.pins[1].name = " A2 ".into();
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        let saved = e.save()?;
+        assert_eq!(saved.symbol.pins[1].name, "A2");
+        let back: Symbol = serde_json::from_str(&std::fs::read_to_string(&saved.path)?)?;
+        assert!(back.pin("A2").is_some(), "{:?}", back.pins);
         Ok(())
     }
 
