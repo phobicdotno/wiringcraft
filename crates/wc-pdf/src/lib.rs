@@ -17,7 +17,8 @@ use wc_core::{Project, Symbol};
 
 pub use layout::{
     CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, cover_logo_box, cover_logo_default,
-    fit_picture, frame_marks, junctions, logo_boxes, pin_position, title_logo_box, title_logo_boxes, xref_marks,
+    fit_picture, frame_marks, jumper_points, junctions, logo_boxes, pin_position, title_logo_box, title_logo_boxes,
+    xref_marks,
 };
 pub use picture::{Pictures, read_picture, read_pictures};
 pub use vector::{
