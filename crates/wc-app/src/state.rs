@@ -4007,6 +4007,37 @@ impl Open {
         self.paste(page, &clip, at)
     }
 
+    /// Insert > Macro, From table…: place the macro once per row of `table` (CSV or `.xlsx`),
+    /// each row's cells filling its placeholders and a `set` column picking the row's value
+    /// set (else `default_set`), on new pages the size of page `page`, as `wiringcraft macro
+    /// generate` does. One undo step; nothing changes when a row or a copy cannot be placed.
+    pub fn generate_from_table(
+        &mut self,
+        page: usize,
+        path: &Path,
+        table: &Path,
+        default_set: Option<&str>,
+    ) -> Result<wc_core::generate::Generated, String> {
+        use wc_core::generate;
+        let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", table.display()))?;
+        let rows = wc_import::csv::file_rows(&bytes).map_err(|e| format!("{}: {e}", table.display()))?;
+        let rows = generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(|e| e.to_string())?;
+        let copies = generate::apply_rows(&m, &rows, default_set).map_err(|e| e.to_string())?;
+        let Some(first) = copies.first() else {
+            return Ok(generate::Generated::default());
+        };
+        let ids: std::collections::BTreeSet<&str> = first.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        self.ensure_symbols(ids)?;
+        let extent = generate::extent(first, |id| self.symbols.get(id).cloned());
+        let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
+        let mut project = self.project.clone();
+        let done = generate::generate(&mut project, &copies, extent, size, &m.name).map_err(|e| e.to_string())?;
+        self.checkpoint();
+        self.project = project;
+        Ok(done)
+    }
+
     /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
     /// recorded when no number changes. In a shared session the pages someone else has open
     /// keep their wires as they are; their numbers are listed in `skipped`, and a later run

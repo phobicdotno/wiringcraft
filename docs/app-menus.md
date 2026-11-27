@@ -73,7 +73,7 @@ the schematic behind it.
 - **Wire**: draw a wire: click a pin or point, then the other end.
 - **Auto-wire**: draw wires between pins that line up when a symbol is placed or moved (hold Alt to skip once). Click again to turn it off.
 - ---
-- **Macro**: insert a saved group of symbols and wires from the project or the library.
+- **Macro**: insert a saved group of symbols and wires from the project or the library, or place one once per row of a table with **From table…** ([details](macros-and-templates.md#pages-from-a-table)).
 - **Save as macro**: save the selected symbols, wires and drawings as a macro.
 
 ### Page
@@ -196,3 +196,4 @@ Right-click a terminal under **Devices**:
 ## Other menus
 
 - **Insert…** in the Macro window: shown for a macro with variants instead of Insert. It asks which variant to insert and lists them.
+- **From table…** in the Macro window: asks for a CSV or Excel table and places the macro once per row on new pages. For a macro with variants it is a menu that first asks which variant rows without a `set` column use.

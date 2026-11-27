@@ -2647,7 +2647,7 @@ impl App {
                         );
                     }
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                        egui::Grid::new("macros").striped(true).num_columns(4).show(ui, |ui| {
+                        egui::Grid::new("macros").striped(true).num_columns(5).show(ui, |ui| {
                             for m in list.iter() {
                                 ui.vertical(|ui| {
                                     ui.set_min_width(320.0);
@@ -2659,6 +2659,37 @@ impl App {
                                     }
                                 });
                                 ui.label(m.source.as_str());
+                                // A table places it once per row on new pages.
+                                let hint = "Pick a CSV or Excel table: one copy per row on new pages, its columns \
+                                            filling the placeholders (a column \"set\" picks the variant)";
+                                if m.value_sets.is_empty() || m.error.is_some() {
+                                    if ui
+                                        .add_enabled(m.error.is_none(), egui::Button::new("From table…"))
+                                        .on_hover_text(hint)
+                                        .clicked()
+                                    {
+                                        let (path, name) = (m.path.clone(), m.name.clone());
+                                        then = Some(Box::new(move |app: &mut App| app.macro_from_table(&path, &name, None)));
+                                        keep = false;
+                                    }
+                                } else {
+                                    ui.menu_button("From table…", |ui| {
+                                        ui.label("Variant for rows without a set column:");
+                                        let choices = std::iter::once(None).chain(m.value_sets.iter().map(Some));
+                                        for set in choices {
+                                            if ui.button(set.map_or("None: every row names one", String::as_str)).clicked() {
+                                                let (path, name, set) = (m.path.clone(), m.name.clone(), set.cloned());
+                                                then = Some(Box::new(move |app: &mut App| {
+                                                    app.macro_from_table(&path, &name, set.as_deref())
+                                                }));
+                                                keep = false;
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(hint);
+                                }
                                 // A project macro's placeholders and variants are edited here; a
                                 // library's macros belong to the library.
                                 if m.project {
@@ -4786,6 +4817,41 @@ impl App {
             },
             Err(e) => Dialog::Message(format!("The macro could not be read:\n{e}")),
         });
+    }
+
+    /// Insert > Macro, From table…: ask for the table, then place the macro once per row on new
+    /// pages and show the first of them.
+    fn macro_from_table(&mut self, path: &std::path::Path, name: &str, default_set: Option<&str>) {
+        let page = self.ed.page;
+        let Some(open) = self.open.as_mut() else { return };
+        let table = match pick_open("Table for the macro", &open.dir, ("Tables", &["csv", "txt", "xlsx"])) {
+            Picked::Path(f) => f,
+            Picked::Cancelled => return,
+            Picked::Failed(e) | Picked::Unsure(e) => {
+                self.dialog = Some(Dialog::Message(format!(
+                    "{e}\nThe command line does the same: wiringcraft macro generate <macro> --table <file>"
+                )));
+                return;
+            }
+        };
+        match open.generate_from_table(page, path, &table, default_set) {
+            Ok(done) => {
+                if let Some(first) = done.pages.first()
+                    && let Some(i) = open.project.pages.iter().position(|p| &p.id == first)
+                {
+                    self.ed.show_page(i);
+                }
+                self.ed.selection.clear();
+                let pages = if done.pages.len() == 1 { "page" } else { "pages" };
+                let copies = if done.copies == 1 { "copy" } else { "copies" };
+                self.ed.message = format!(
+                    "{} {copies} of {name} on {} new {pages}.",
+                    done.copies,
+                    done.pages.len()
+                );
+            }
+            Err(e) => self.dialog = Some(Dialog::Message(format!("Could not place {name} from the table:\n{e}"))),
+        }
     }
 
     fn insert_macro(&mut self, path: &std::path::Path, name: &str, value_set: Option<&str>) {
