@@ -422,6 +422,21 @@ const RIBBON_BUTTON: f32 = 66.0;
 /// The room a divider takes between two ribbon groups.
 const RIBBON_DIVIDER: f32 = 9.0;
 
+/// The most lines a ribbon button's label wraps to.
+const RIBBON_LABEL_ROWS: usize = 3;
+
+/// A ribbon button's label, centred under its icon and wrapped onto up to
+/// [`RIBBON_LABEL_ROWS`] lines rather than cut to one: cut to the button's width, labels that
+/// start alike ("Move page up" and "Move page down", the three "Parts from ..." imports) all
+/// read the same.
+fn ribbon_label(text: &str, color: Color32) -> egui::text::LayoutJob {
+    let mut job =
+        egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(11.0), color, RIBBON_BUTTON);
+    job.wrap.max_rows = RIBBON_LABEL_ROWS;
+    job.halign = egui::Align::Center;
+    job
+}
+
 /// Lay out one ribbon tab's groups; returns the rectangles of its buttons. Groups go side by
 /// side and start a new row when the next one would not fit, so every button stays on screen in
 /// a narrow window; a group wider than the window wraps its own buttons. Each button's id comes
@@ -455,7 +470,8 @@ fn ribbon_groups(
     }
     let mut rects = Vec::new();
     for row in rows {
-        ui.horizontal(|ui| {
+        // Top-aligned, so the icons line up when one label wraps to more lines than the rest.
+        ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             for (k, &(gname, actions)) in row.into_iter().enumerate() {
                 if k > 0 {
@@ -469,7 +485,7 @@ fn ribbon_groups(
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for line in actions.chunks(per_row) {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_top(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 for a in line {
                                     let r = ui.push_id((gname, *a), |ui| {
@@ -495,12 +511,7 @@ fn ribbon_groups(
                                                 } else {
                                                     t.muted.gamma_multiply(0.6)
                                                 };
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(a.info().label).size(11.0).color(c),
-                                                    )
-                                                    .wrap_mode(egui::TextWrapMode::Truncate),
-                                                );
+                                                ui.add(egui::Label::new(ribbon_label(a.info().label, c)).wrap());
                                                 icon
                                             },
                                         )
@@ -564,6 +575,19 @@ mod tests {
         }
         fn enabled(&self, _: Action) -> bool {
             true
+        }
+    }
+
+    /// A button's tooltip is its label, its shortcut and its tip: a tip that only says the label
+    /// again tells nothing (Redo, Zoom in and Zoom out did).
+    #[test]
+    fn no_tooltip_repeats_the_label() {
+        for a in Action::ALL {
+            let info = a.info();
+            assert!(
+                !info.tip.trim().eq_ignore_ascii_case(info.label.trim()),
+                "{a:?}: the tip only repeats the label"
+            );
         }
     }
 
@@ -907,6 +931,35 @@ mod tests {
     }
 
     #[test]
+    fn every_ribbon_label_is_shown_whole() {
+        // A label cut short can read the same as its neighbour's ("Move page..." for both Move
+        // page up and Move page down), so each wraps under its button and shows every word.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            for (tab, groups) in RIBBON {
+                for a in groups.iter().flat_map(|(_, a)| a.iter()) {
+                    let label = a.info().label;
+                    let galley = ctx.fonts(|f| f.layout_job(ribbon_label(label, Color32::WHITE)));
+                    let shown: String = galley
+                        .rows
+                        .iter()
+                        .flat_map(|r| r.glyphs.iter().map(|g| g.chr))
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    let whole: String = label.chars().filter(|c| !c.is_whitespace()).collect();
+                    assert_eq!(shown, whole, "{tab}: {label:?} is cut short");
+                    assert!(
+                        galley.size().x <= RIBBON_BUTTON + 0.5,
+                        "{tab}: {label:?} is wider than its button"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn a_remembered_ribbon_tab_opens_again_and_one_out_of_range_opens_the_first() {
         assert_eq!(ChromeState::with_ribbon_tab(1).ribbon_tab, 1);
         assert_eq!(
@@ -971,5 +1024,17 @@ mod tests {
             wide.iter().all(|r| (r.center().y - wide[1].center().y).abs() < 1.0),
             "one row"
         );
+    }
+
+    #[test]
+    fn no_two_classic_toolbar_buttons_share_an_icon() {
+        // The classic toolbar shows icons without labels: each must say which command it is.
+        let mut buttons: Vec<Action> = TOOLBAR.iter().flat_map(|g| g.iter().copied()).collect();
+        buttons.extend([Action::ToggleChrome, Action::ToggleTheme]);
+        for (i, a) in buttons.iter().enumerate() {
+            for b in &buttons[i + 1..] {
+                assert_ne!(a.info().icon, b.info().icon, "{a:?} and {b:?} look the same");
+            }
+        }
     }
 }

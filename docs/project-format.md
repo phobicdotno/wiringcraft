@@ -64,7 +64,7 @@ location = "/home/user/wiringcraft/library"
 | `[[rule]]` | the project's own check rules | `rules set` |
 | `rules_off` | library rules this project turns off, as `source:number` or `source:name` | `rules off` |
 | `[[rack]]` | PLC racks and the cards in their slots (`[[rack.card]]`) | `rack` |
-| `[[network]]` | fieldbus networks: their devices, addresses and cables | |
+| `[[network]]` | fieldbus networks: their devices, addresses and cables ([docs](networks.md)) | |
 
 Examples from a scratch project:
 

@@ -435,3 +435,237 @@ mod tests {
         assert!(check_limits(&t).is_ok());
     }
 }
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    /// Reads a zip part as text.
+    fn part(bytes: &[u8], name: &str) -> std::io::Result<String> {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(std::io::Error::other)?;
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut z.by_name(name).map_err(std::io::Error::other)?, &mut out)?;
+        Ok(out)
+    }
+
+    /// Undoes the SpreadsheetML `_xHHHH_` escapes, as a spreadsheet program reads them.
+    fn unescape_xstring(s: &str) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < s.len() {
+            if is_xstring_escape(&s[i..]) {
+                let code = s.get(i + 2..i + 6).and_then(|h| u32::from_str_radix(h, 16).ok());
+                if let Some(c) = code.and_then(char::from_u32) {
+                    out.push(c);
+                    i += 7;
+                    continue;
+                }
+            }
+            let Some(c) = s[i..].chars().next() else { unreachable!() };
+            out.push(c);
+            i += c.len_utf8();
+        }
+        out
+    }
+
+    /// Every cell of a worksheet as (reference, text), read with an XML parser; a parser error
+    /// is returned with its reason, so malformed XML fails the test.
+    fn cells(xml: &str) -> Result<Vec<(String, String)>, String> {
+        let err = |e: &dyn std::fmt::Display| format!("the XML does not parse: {e}");
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut out = Vec::new();
+        let mut cell = None;
+        let mut in_t = false;
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) if e.name().as_ref() == b"c" => {
+                    let r = e.try_get_attribute("r").map_err(|e| err(&e))?;
+                    cell = match r {
+                        Some(a) => Some(a.unescape_value().map_err(|e| err(&e))?.into_owned()),
+                        None => None,
+                    };
+                }
+                Ok(Event::Start(e)) if e.name().as_ref() == b"t" => in_t = true,
+                Ok(Event::End(e)) if e.name().as_ref() == b"t" => in_t = false,
+                Ok(Event::Text(t)) if in_t => {
+                    let text = t.unescape().map_err(|e| err(&e))?.into_owned();
+                    out.push((cell.clone().unwrap_or_default(), unescape_xstring(&text)));
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(err(&e)),
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn every_character_reads_back_through_an_xml_parser() -> std::io::Result<()> {
+        let tricky = "a\tb\nc\rd\u{1}e\u{1F}f <&>\"' part_x0041_ \u{FFFE} 漢字 ⚡";
+        let t = Table {
+            title: "Text".into(),
+            columns: vec!["Value".into()],
+            rows: vec![vec![tricky.into()]],
+            ..Table::default()
+        };
+        let xml = part(&t.to_xlsx()?, "xl/worksheets/sheet1.xml")?;
+        assert_eq!(
+            cells(&xml),
+            Ok(vec![
+                ("A1".to_owned(), "Value".to_owned()),
+                ("A2".to_owned(), tricky.to_owned())
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_without_header_starts_at_row_one_unfrozen_and_plain() {
+        let t = Table {
+            title: "Plain".into(),
+            rows: vec![vec!["x".into()], vec!["y".into()]],
+            ..Table::default()
+        };
+        let xml = sheet_xml(&t);
+        assert!(!xml.contains("frozen"), "{xml}");
+        assert!(!xml.contains(" s=\"1\""), "{xml}");
+        assert_eq!(
+            cells(&xml),
+            Ok(vec![
+                ("A1".to_owned(), "x".to_owned()),
+                ("A2".to_owned(), "y".to_owned())
+            ])
+        );
+        // A refused cell is named by its sheet row, which here starts with the first data row.
+        let long = Table {
+            rows: vec![vec!["z".repeat(MAX_CELL_CHARS + 1)]],
+            ..t
+        };
+        let msg = check_limits(&long).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(msg.contains("cell A1"), "{msg}");
+        // Without a header every one of Excel's rows holds data.
+        let full = Table {
+            rows: vec![Vec::new(); MAX_ROWS],
+            ..Table::default()
+        };
+        assert!(check_limits(&full).is_ok());
+    }
+
+    #[test]
+    fn empty_cells_are_left_out_but_keep_the_cells_after_them_in_place() {
+        let t = Table {
+            title: "Gaps".into(),
+            columns: vec!["A".into(), String::new(), "C".into()],
+            rows: vec![vec![String::new(), "b".into()], Vec::new()],
+            ..Table::default()
+        };
+        let xml = sheet_xml(&t);
+        assert_eq!(
+            cells(&xml),
+            Ok(vec![
+                ("A1".to_owned(), "A".to_owned()),
+                ("C1".to_owned(), "C".to_owned()),
+                ("B2".to_owned(), "b".to_owned()),
+            ])
+        );
+        // An empty row is still written, so the rows after it keep their numbers.
+        assert!(xml.contains("<row r=\"3\"></row>"), "{xml}");
+    }
+
+    #[test]
+    fn column_widths_follow_the_widest_line_within_bounds() {
+        let t = Table {
+            title: "Widths".into(),
+            columns: vec!["A".into(), "Name".into(), "Note".into()],
+            rows: vec![vec![
+                "x".into(),
+                "y".repeat(100),
+                "short\na much longer second line".into(),
+                // Wider than the header: the extra column still gets a width.
+                "ten chars!".into(),
+            ]],
+            ..Table::default()
+        };
+        let xml = sheet_xml(&t);
+        let width = |n: usize, w: usize| format!("<col min=\"{n}\" max=\"{n}\" width=\"{w}\" customWidth=\"1\"/>");
+        assert!(
+            xml.contains(&width(1, 4 + 2)),
+            "narrow columns get the least width: {xml}"
+        );
+        assert!(xml.contains(&width(2, MAX_WIDTH + 2)), "wide columns are capped: {xml}");
+        assert!(xml.contains(&width(3, 25 + 2)), "the widest line counts: {xml}");
+        assert!(xml.contains(&width(4, 10 + 2)), "{xml}");
+        assert!(!xml.contains("min=\"5\""), "{xml}");
+        // A table with no cells at all has no column list.
+        assert!(!sheet_xml(&Table::default()).contains("<cols>"));
+    }
+
+    #[test]
+    fn cell_length_is_counted_in_utf16_units_as_excel_counts() {
+        // U+1F600 is one char but two UTF-16 units.
+        let half = MAX_CELL_CHARS / 2 + 1;
+        let t = Table {
+            title: "Wide".into(),
+            columns: vec!["😀".repeat(half)],
+            ..Table::default()
+        };
+        assert!(half < MAX_CELL_CHARS);
+        let msg = check_limits(&t).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(msg.contains("cell A1"), "{msg}");
+        let fits = Table {
+            columns: vec!["😀".repeat(MAX_CELL_CHARS / 2)],
+            ..t
+        };
+        assert!(check_limits(&fits).is_ok());
+    }
+
+    #[test]
+    fn sheet_names_with_markup_are_escaped_in_the_workbook() -> std::io::Result<()> {
+        let t = Table {
+            title: "A&B <\"x\">\u{7}".into(),
+            ..Table::default()
+        };
+        let wb = part(&t.to_xlsx()?, "xl/workbook.xml")?;
+        assert!(wb.contains("name=\"A&amp;B &lt;&quot;x&quot;&gt;\""), "{wb}");
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(&wb);
+        let mut name = None;
+        loop {
+            match reader.read_event() {
+                Ok(Event::Empty(e)) if e.name().as_ref() == b"sheet" => {
+                    let a = e.try_get_attribute("name").map_err(std::io::Error::other)?;
+                    name = match a {
+                        Some(a) => Some(a.unescape_value().map_err(std::io::Error::other)?.into_owned()),
+                        None => None,
+                    };
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(std::io::Error::other(e)),
+                _ => {}
+            }
+        }
+        assert_eq!(name.as_deref(), Some("A&B <\"x\">"));
+        Ok(())
+    }
+
+    #[test]
+    fn every_sheet_has_its_relationship_and_content_type() {
+        let rels = workbook_rels(3);
+        for i in 1..=3 {
+            assert!(rels.contains(&format!("Id=\"rId{i}\"")), "{rels}");
+            assert!(rels.contains(&format!("Target=\"worksheets/sheet{i}.xml\"")), "{rels}");
+        }
+        // The styles take the id after the last sheet, so no id is used twice.
+        assert!(rels.contains(
+            "Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\""
+        ));
+        assert_eq!(rels.matches("Id=\"rId").count(), 4);
+        let types = content_types(3);
+        assert_eq!(types.matches("/xl/worksheets/sheet").count(), 3);
+        assert!(types.contains("/xl/worksheets/sheet3.xml"));
+        assert!(!types.contains("/xl/worksheets/sheet4.xml"));
+        let wb = workbook_xml(&["One".into(), "Two".into()]);
+        assert!(wb.contains("<sheet name=\"Two\" sheetId=\"2\" r:id=\"rId2\"/>"), "{wb}");
+    }
+}
