@@ -948,6 +948,53 @@ fn the_logo_shows_in_every_title_block_and_on_the_cover_stored_once() {
 }
 
 #[test]
+fn a_logo_cover_box_that_is_not_a_number_takes_the_default_place() {
+    let mut png = Vec::new();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, image::Rgb([200, 30, 30])));
+    assert!(
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p0", "0", "Cover");
+    cover.cover = true;
+    project.pages = vec![cover.clone()];
+    let mut underlays = BTreeMap::new();
+    underlays.insert("pictures/logo.png".to_string(), png);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    let (default_pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let default_box = cover_logo_box(&project, &cover);
+    let cover_svg = |project: &Project| {
+        let (pages, _) = page_drawings(project, &BTreeMap::new(), &opts);
+        let Some(page) = pages.first() else {
+            unreachable!("the cover page is drawn")
+        };
+        svg(page)
+    };
+    let default_svg = cover_svg(&project);
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/logo.png".into(),
+            cover: Some((Point::new(bad, 40.0), Point::new(140.0, 60.0))),
+        });
+        assert_eq!(cover_logo_box(&project, &cover), default_box, "{bad}");
+        let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // Drawn as if no box were set, instead of `NaN` in the page.
+        assert!(pdf == default_pdf, "{bad}: the PDF differs from the default place");
+        assert_eq!(cover_svg(&project), default_svg, "{bad}");
+    }
+}
+
+#[test]
 fn a_missing_logo_is_a_warning_and_the_export_still_works() {
     let mut project = Project::new("x");
     project.pages = vec![Page::new("p1", "1", "Mains")];

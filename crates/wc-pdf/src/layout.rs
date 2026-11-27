@@ -543,13 +543,21 @@ pub fn cover_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> 
     if !page.cover {
         return None;
     }
-    Some(match logo.cover {
+    Some(match placed_cover_box(logo) {
         Some((a, b)) => (
             Point::new(a.x.min(b.x), a.y.min(b.y)),
             Point::new(a.x.max(b.x), a.y.max(b.y)),
         ),
         None => cover_logo_default(project, page),
     })
+}
+
+/// The cover box the user put the logo in, unless a corner is not a number (`nan` or `inf`
+/// typed into `project.toml`): such a box is drawn nowhere, so the logo takes its default place
+/// instead of writing `NaN` into the page (#1183).
+fn placed_cover_box(logo: &wc_core::Logo) -> Option<(Point, Point)> {
+    logo.cover
+        .filter(|(a, b)| [a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()))
 }
 
 /// Every box the project's logo is drawn in on `page`: the title block's, and on the cover
@@ -609,7 +617,11 @@ fn cover_name_y(rows: usize, logo: bool, y0: f64, y1: f64) -> f64 {
 /// Whether the cover shows the project's logo in its default place, above the name: only then
 /// does the name leave room for it.
 fn default_cover_logo(project: &Project) -> bool {
-    project.meta.logo.as_ref().is_some_and(|l| l.cover.is_none())
+    project
+        .meta
+        .logo
+        .as_ref()
+        .is_some_and(|l| placed_cover_box(l).is_none())
 }
 
 /// How many rows of the cover's field table fit on a cover whose drawing area runs from `y0`
