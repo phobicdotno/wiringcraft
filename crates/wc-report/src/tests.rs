@@ -3885,6 +3885,64 @@ fn check_warns_about_panel_devices_that_overlap_stick_out_or_left_the_project() 
 }
 
 #[test]
+fn check_warns_about_panel_rails_and_ducts_that_stick_out_of_the_plate() {
+    use wc_core::panel::{Panel, PanelItem};
+    let (mut p, s, parts) = fixture();
+    // As an imported cabinet layout or a hand-edited file can have them.
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    plate.items = vec![
+        // Flush with the plate's left and right edges: on the plate.
+        PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(400.0, 40.0),
+        },
+        PanelItem::Rail {
+            at: Point::new(0.0, 100.0),
+            length: 400.0,
+        },
+        // Runs 50 mm past the right edge.
+        PanelItem::Rail {
+            at: Point::new(50.0, 200.0),
+            length: 400.0,
+        },
+        // Reaches below the bottom edge.
+        PanelItem::Duct {
+            min: Point::new(0.0, 280.0),
+            max: Point::new(40.0, 320.0),
+        },
+    ];
+    let Ok(k1) = DeviceTag::parse("=A+C1-K1") else {
+        unreachable!()
+    };
+    // A device whose position is not a number is not on the plate either.
+    plate.items.push(PanelItem::Device {
+        tag: k1,
+        at: Point::new(f64::NAN, 10.0),
+        width: 40.0,
+        height: 80.0,
+        rotation: Rotation::R0,
+    });
+    p.panels.push(plate);
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .filter(|f| f.message.starts_with("panel "))
+    .map(|f| f.message)
+    .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(has("panel Main: rail at 50,200 sticks out of the plate"), "{found:?}");
+    assert!(
+        has("panel Main: duct 0,280 to 40,320 sticks out of the plate"),
+        "{found:?}"
+    );
+    assert!(has("panel Main: =A+C1-K1 sticks out of the plate"), "{found:?}");
+    assert_eq!(found.len(), 3, "{found:?}");
+}
+
+#[test]
 fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
     use wc_core::panel::Panel;
     let (mut p, mut s, parts) = fixture();

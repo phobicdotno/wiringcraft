@@ -429,10 +429,11 @@ pub fn check_with_unreadable(
 
     wire_numbers(i, &wire_net, &mut out);
 
-    // Panel layouts: devices covering each other, sticking out of the plate, or whose tag is
-    // no longer in the project. Outlines that only touch do not overlap. A tag is in the project
-    // when it is drawn on a page or listed in the devices file; unlike `all_tags`, a tag drawn
-    // only as interruption points still counts, so its plate entry is not called stale.
+    // Panel layouts: rails and ducts sticking out of the plate, and devices covering each
+    // other, sticking out of the plate, or whose tag is no longer in the project. Outlines that
+    // only touch do not overlap. A tag is in the project when it is drawn on a page or listed in
+    // the devices file; unlike `all_tags`, a tag drawn only as interruption points still counts,
+    // so its plate entry is not called stale.
     let index = p.tag_index();
     for panel in &p.panels {
         let warn = |message: String| Finding {
@@ -450,11 +451,26 @@ pub fn check_with_unreadable(
                 _ => None,
             })
             .collect();
+        let on_plate = |min: Point, max: Point| wc_core::panel::outline_on_plate(panel.width, panel.height, min, max);
+        // Rails and ducts too, named as a plate resize names them.
+        for it in &panel.items {
+            let (min, max) = it.bounds();
+            let what = match it {
+                wc_core::panel::PanelItem::Rail { at, .. } => format!("rail at {},{}", at.x, at.y),
+                wc_core::panel::PanelItem::Duct { min, max } => {
+                    format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y)
+                }
+                wc_core::panel::PanelItem::Device { .. } => continue,
+            };
+            if !on_plate(min, max) {
+                out.push(warn(format!("{what} sticks out of the plate")));
+            }
+        }
         for (n, (tag, min, max)) in devices.iter().enumerate() {
             if !index.contains_key(*tag) && !p.devices.contains_key(*tag) {
                 out.push(warn(format!("{tag} is on the plate but no longer in the project")));
             }
-            if min.x < -eps || min.y < -eps || max.x > panel.width + eps || max.y > panel.height + eps {
+            if !on_plate(*min, *max) {
                 out.push(warn(format!("{tag} sticks out of the plate")));
             }
             for (other, omin, omax) in &devices[n + 1..] {
