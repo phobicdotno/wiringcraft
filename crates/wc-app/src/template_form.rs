@@ -147,6 +147,8 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
     let mut remove = None;
     let mut raise = None;
     egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+        // The id each header keeps its open state under, as the header itself reports it.
+        let mut header_ids = Vec::with_capacity(draft.boxes.len());
         for (i, b) in draft.boxes.iter_mut().enumerate() {
             let heading = if !b.label.is_empty() {
                 b.label.clone()
@@ -155,7 +157,7 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
             } else {
                 "(no label)".to_owned()
             };
-            egui::CollapsingHeader::new(heading).id_salt(("box", i)).show(ui, |ui| {
+            let header = egui::CollapsingHeader::new(heading).id_salt(("box", i)).show(ui, |ui| {
                 egui::Grid::new(("box-grid", i))
                     .num_columns(2)
                     .spacing([8.0, 4.0])
@@ -211,12 +213,10 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
                     }
                 });
             });
+            header_ids.push(header.header_response.id);
         }
         if remove.is_some() || raise.is_some() {
-            let ids: Vec<egui::Id> = (0..draft.boxes.len())
-                .map(|i| ui.make_persistent_id(("box", i)))
-                .collect();
-            carry_open(ui.ctx(), &ids, |open| {
+            carry_open(ui.ctx(), &header_ids, |open| {
                 if let Some(i) = remove {
                     open.remove(i);
                 } else if let Some(i) = raise {
