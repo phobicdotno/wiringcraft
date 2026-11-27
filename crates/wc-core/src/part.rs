@@ -257,7 +257,9 @@ impl Contacts {
 /// The contact elements a contact symbol with these pin names draws, by IEC 60947 terminal
 /// numbers: single-digit pairs 1-2, 3-4, 5-6, 7-8 are main contacts; two-digit numbers group by
 /// their first digit, where x1-x2 and x5-x6 are NC, x3-x4 and x7-x8 are NO, and x1-x2-x4 or
-/// x5-x6-x8 are changeovers when x3 or x7 is not there. Pins that fit none of these are left out.
+/// x5-x6-x8 are changeovers when x3 or x7 is not there. A changeover drawn by its make side
+/// only, x1-x4 or x5-x8 (again without x3 or x7), uses one changeover too. Pins that fit none
+/// of these are left out.
 pub fn contact_kinds<'a>(pins: impl IntoIterator<Item = &'a str>) -> Vec<ContactKind> {
     let mut singles = std::collections::BTreeSet::new();
     let mut groups: BTreeMap<u32, std::collections::BTreeSet<u32>> = BTreeMap::new();
@@ -287,8 +289,9 @@ pub fn contact_kinds<'a>(pins: impl IntoIterator<Item = &'a str>) -> Vec<Contact
         let has = |d: &[u32]| d.iter().all(|u| units.contains(u));
         // x1-x2-x4 is a changeover only when x3 is not there: with it, x1-x2 and x3-x4 are a
         // separate NC and NO (as on an overload relay's 95-96 and 97-98).
-        let co_low = has(&[1, 2, 4]) && !units.contains(&3);
-        let co_high = has(&[5, 6, 8]) && !units.contains(&7);
+        // x1-x4 without x2 is its make side alone, as a relay's changeover drawn as an NO is.
+        let co_low = has(&[1, 4]) && !units.contains(&3);
+        let co_high = has(&[5, 8]) && !units.contains(&7);
         if co_low {
             out.push(ContactKind::Co);
         } else if has(&[1, 2]) {
@@ -356,6 +359,21 @@ mod tests {
         assert_eq!(contact_kinds(["13", "14", "21", "22"]), [No, Nc]);
         assert!(contact_kinds(["A1", "A2"]).is_empty());
         assert!(contact_kinds(["13"]).is_empty(), "half a contact");
+        // A changeover drawn by its make side only still uses one changeover.
+        assert_eq!(contact_kinds(["11", "14"]), [Co]);
+        assert_eq!(contact_kinds(["15", "18"]), [Co]);
+        assert_eq!(contact_kinds(["11", "14", "21", "24"]), [Co, Co]);
+        assert_eq!(contact_kinds(["11", "13", "14"]), [No], "x3 makes x3-x4 an NO");
+        // A relay with two changeovers drawn as three NOs uses one more than it has.
+        let mut drawn = Contacts::default();
+        for k in contact_kinds(["11", "14", "21", "24", "31", "34"]) {
+            drawn.add(k);
+        }
+        let has = Contacts {
+            co: 2,
+            ..Default::default()
+        };
+        assert_eq!(has.overflow(&drawn).map(|o| o.co), Some(1));
         assert!(contact_kinds(["L", "N", "PE", "113", "07"]).is_empty());
     }
 
