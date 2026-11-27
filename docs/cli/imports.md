@@ -12,7 +12,9 @@ output. A command that fails prints `error: ...` and exits with code 1. Texts ta
 
 Commands that add pages refuse a page number or page id the project already has, before anything
 is written, and name the page that holds it: import again with `--first-page` set to a free
-number. A first page number above 1000000000 is refused.
+number. One exception: `pdf` checks each page's id (`pdf-<number>`) only as it gets to that page,
+so a scanned page before it may already have left its picture in `underlays/`; delete that file. A first page number above 1000000000 is
+refused.
 
 Imports that add devices, symbols or parts to the project (`aml`, `eplan`, `swe`, `swe-library`
 without `--lib`) check everything first, so a refused import leaves the project as it was. They
@@ -24,6 +26,8 @@ refuse:
 - a new version of a symbol that drops a pin a wire in the project ends on (`move those wires first`).
 
 The same item coming again unchanged is fine. When a save fails half way, the files are put back.
+If putting a file back fails too, the error says which ones (`putting back the vendored files
+failed too: ...`); check those files, for example against the project's history.
 
 ## Symbols into a library
 
@@ -102,7 +106,9 @@ wiringcraft import symbol-qet [OPTIONS] --lib <LIB> <FILES>...
 | `--letter-code <LETTER_CODE>` | Letter code for new devices. Left out, each element keeps the letter code read from its label (`-K1` gives `K`) |
 
 Writes one symbol per file, `<lib>/symbols/<prefix>.<file name>.json`; the first terminal becomes
-the origin. A file that cannot be read is reported and skipped, the others are still written,
+the origin. Two files with the same name in different folders give the same id: the first is
+written and the later one is reported (`gives the same id ...`) and skipped. A file that cannot be
+read is reported and skipped, the others are still written,
 and the command then fails with `<n> of <m> element(s) could not be imported`.
 
 ```sh
@@ -257,7 +263,9 @@ wiringcraft import wago <FILE>
 Reads back a list written by `wiringcraft export wago-configurator`, with the articles and
 accessories chosen in the configurator. Each row is matched by its Index to the terminal or strip
 device it stands for, and its article to a part of the project or its libraries (by order
-number, or part id); matched articles become the devices' parts and accessories. Rows that cannot
+number, or part id); matched articles become the devices' parts and accessories, and a jumper row's
+article becomes the part of that jumper. A row the configurator added without an Index is read as
+a new accessory of the strip its Strip column names, when the project has that strip. Rows that cannot
 be matched are listed as `not matched: line <n> (<index>): ...` with the reason, such as an
 article no library has (import the maker's catalogue first) or a row the project no longer has
 (export the list again). Unmatched rows do not make the command fail.
@@ -440,8 +448,9 @@ Imports the open-format entries of another tool's project archive, each as its o
 
 Without `--lib`, KiCad libraries and parts lists are listed with a warning, not imported. An
 entry that fails is warned about and the others still come in; a DXF that fails leaves no empty
-page behind. Old `.xls` workbooks are skipped with a warning (save them as `.xlsx`), and a list
-that is neither kind is skipped. An archive with nothing importable is refused; run
+page behind (if removing that page fails, a warning says `the empty page <id> could not be
+removed`; delete it with `wiringcraft page remove`). Old `.xls` workbooks are skipped with a
+warning (save them as `.xlsx`), and a list that is neither kind is skipped. An archive with nothing importable is refused; run
 `wiringcraft inspect` to see what is there.
 
 ```sh
