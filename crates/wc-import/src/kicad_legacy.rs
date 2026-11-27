@@ -560,8 +560,9 @@ fn write_symbol(out: &mut String, d: &Def) {
         let unit = if d.units > 1 { *unit } else { (*unit).min(1) };
         blocks.entry((unit, style)).or_default().extend(items);
     }
-    // Every unit the `DEF` line declares, also one drawn only by the common items.
-    for unit in 1..=d.units {
+    // Every unit the `DEF` line declares, also one drawn only by the common items, up to the
+    // importer's own limit (a `DEF` may declare up to 1000).
+    for unit in 1..=d.units.min(crate::kicad::MAX_UNITS as _) {
         blocks.entry((unit, 1)).or_default();
     }
     for ((unit, style), items) in &blocks {
@@ -744,6 +745,14 @@ ENDDEF
             alias.contains("\"LAMP_24V\"") && alias.contains("\"Reference\" \"H\""),
             "{sym}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn declared_units_are_written_up_to_the_importer_s_limit() -> Result<()> {
+        let lib = "EESchema-LIBRARY Version 2.4\nDEF MANY U 0 40 Y Y 1000 L N\nDRAW\nX 1 1 0 0 100 R 50 50 1 1 P\nENDDRAW\nENDDEF\n";
+        let (sym, _) = to_kicad_sym(lib)?;
+        assert_eq!(sym.matches("(symbol \"MANY_").count(), crate::kicad::MAX_UNITS, "{sym}");
         Ok(())
     }
 

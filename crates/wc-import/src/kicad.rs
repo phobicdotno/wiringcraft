@@ -241,7 +241,7 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
 }
 
 /// Most units read from one symbol; real parts stay far below (a quad gate has four).
-const MAX_UNITS: usize = 64;
+pub(crate) const MAX_UNITS: usize = 64;
 
 /// A sub-symbol's unit and body style from its name, `<base>_<unit>_<style>`.
 fn unit_and_style(unit: &Sexp, base: &str) -> (u32, u32) {
