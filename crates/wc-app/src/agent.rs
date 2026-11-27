@@ -11340,6 +11340,20 @@ mod tests {
             r.as_ref().is_err_and(|e| e.contains("-K1")),
             "names what sticks out: {r:?}"
         );
+        let long_rail = json!({"kind": "rail", "at": {"x": 550.0, "y": 100.0}, "length": 100.0});
+        let back_rail = json!({"kind": "rail", "at": {"x": 50.0, "y": 100.0}, "length": -100.0});
+        let duct = json!({"kind": "duct", "min": {"x": 10.0, "y": 700.0}, "max": {"x": 590.0, "y": 840.0}});
+        for (item, name) in [
+            (long_rail, "rail at 550,100"),
+            (back_rail, "rail at 50,100"),
+            (duct, "duct 10,700"),
+        ] {
+            let content = json!({"name": "P", "width": 600.0, "height": 800.0, "items": [item]});
+            let r = call(&mut a, "panels", json!({"action": "replace", "content": content}));
+            assert!(r.as_ref().is_err_and(|e| e.contains(name)), "{name} sticks out: {r:?}");
+            assert_eq!(a.open.as_ref().unwrap().project, project, "the layout stays as it was");
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark, "no undo step");
+        }
         let ok = json!({"name": "P", "width": 600.0, "height": 800.0, "items": [rail]});
         call(&mut a, "panels", json!({"action": "replace", "content": ok})).unwrap();
         assert_eq!(a.open.as_ref().unwrap().project.panels[0].items.len(), 1);

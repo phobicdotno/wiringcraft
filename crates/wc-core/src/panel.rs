@@ -388,8 +388,9 @@ impl Panel {
             .iter()
             .filter_map(|item| match item {
                 PanelItem::Rail { at, length } => {
-                    // A 35 mm rail on its centre line.
-                    let (min, max) = (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5));
+                    // A 35 mm rail on its centre line. A negative length runs left from `at`.
+                    let (x0, x1) = (at.x.min(at.x + length), at.x.max(at.x + length));
+                    let (min, max) = (Point::new(x0, at.y - 17.5), Point::new(x1, at.y + 17.5));
                     outside(min, max).then(|| format!("rail at {},{}", at.x, at.y))
                 }
                 PanelItem::Duct { min, max } => {
