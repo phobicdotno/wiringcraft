@@ -171,8 +171,9 @@ What comes across:
 - Symbols, drawn from their DWG blocks in the archive with their connection points at the
   original positions. A block whose pins match a built-in WiringCraft symbol (coil A1/A2,
   contacts 13/14 and 11/12, lamp X1/X2, terminal 1/2) uses that symbol; a symbol map file can
-  choose others. A block without a readable drawing is drawn as a box, and so is every block
-  when you import a bare database, which has no DWG files.
+  choose others (the symbol must be in the project's libraries). A block that matches no
+  built-in or mapped symbol is drawn from its DWG block when it has one, and as a box otherwise.
+  A bare database has no DWG files, so its blocks that match no symbol are boxes.
 - From each page's own drawing: texts, frames and notes. Block references (the symbols and the
   title block, which WiringCraft draws itself) and lines that lie on a wire are left out.
 - Wires joined to the symbols, with wire numbers, cross-section and colour; cables with their
