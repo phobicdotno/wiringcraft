@@ -340,7 +340,7 @@ impl Action {
             Action::PageHistory => i(
                 "Page history",
                 "Who changed this page, when, and what they changed",
-                Icon::History,
+                Icon::PageHistory,
                 "",
             ),
             Action::LineTool => i("Line", "Draw a line: click both ends", Icon::Line, "L"),
@@ -505,13 +505,13 @@ impl Action {
             Action::NewSymbol => i(
                 "New symbol",
                 "Draw a new symbol and save it into a library folder",
-                Icon::Symbol,
+                Icon::SymbolNew,
                 "",
             ),
             Action::EditSymbol => i(
                 "Edit symbol",
                 "Change a library symbol (the selected one, or pick one)",
-                Icon::Symbol,
+                Icon::SymbolEdit,
                 "",
             ),
             Action::ImportSymbols => i(

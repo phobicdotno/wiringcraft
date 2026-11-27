@@ -951,4 +951,16 @@ mod tests {
             "one row"
         );
     }
+
+    #[test]
+    fn no_two_classic_toolbar_buttons_share_an_icon() {
+        // The classic toolbar shows icons without labels: each must say which command it is.
+        let mut buttons: Vec<Action> = TOOLBAR.iter().flat_map(|g| g.iter().copied()).collect();
+        buttons.extend([Action::ToggleChrome, Action::ToggleTheme]);
+        for (i, a) in buttons.iter().enumerate() {
+            for b in &buttons[i + 1..] {
+                assert_ne!(a.info().icon, b.info().icon, "{a:?} and {b:?} look the same");
+            }
+        }
+    }
 }

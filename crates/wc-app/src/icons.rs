@@ -12,6 +12,8 @@ pub enum Icon {
     Redo,
     Select,
     Symbol,
+    SymbolNew,
+    SymbolEdit,
     Wire,
     Macro,
     Delete,
@@ -53,6 +55,7 @@ pub enum Icon {
     Commit,
     Branch,
     History,
+    PageHistory,
     Layout,
     Panel,
     Comment,
@@ -142,13 +145,23 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                 true,
             );
         }
-        Icon::Symbol => {
+        Icon::Symbol | Icon::SymbolNew | Icon::SymbolEdit => {
             // A make contact between two leads.
             line((12.0, 2.0), (12.0, 8.0));
             line((12.0, 16.0), (12.0, 22.0));
             line((12.0, 16.0), (7.0, 8.5));
             p.circle_filled(at(12.0, 8.0), 1.6 * s, accent);
             p.circle_filled(at(12.0, 16.0), 1.6 * s, accent);
+            if icon == Icon::SymbolNew {
+                // The plus of "add", as on a new page or project.
+                aline((19.0, 4.0), (19.0, 12.0));
+                aline((15.0, 8.0), (23.0, 8.0));
+            } else if icon == Icon::SymbolEdit {
+                // A pencil, its tip on the lower lead.
+                aline((16.0, 19.0), (22.0, 13.0));
+                aline((20.5, 11.5), (23.5, 14.5));
+                p.line_segment([at(14.5, 20.5), at(16.0, 19.0)], st);
+            }
         }
         Icon::Macro => {
             // Two symbols joined by a wire, inside a dashed group box.
@@ -520,6 +533,13 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
             arc(12.0, 12.0, 8.5, 0.0, 360.0);
             aline((12.0, 7.0), (12.0, 12.0));
             aline((12.0, 12.0), (15.5, 14.5));
+        }
+        Icon::PageHistory => {
+            // A page with a clock on it.
+            poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
+            arc(12.0, 14.0, 4.5, 0.0, 360.0);
+            aline((12.0, 11.5), (12.0, 14.0));
+            aline((12.0, 14.0), (14.0, 15.5));
         }
         Icon::Layout => {
             p.rect_stroke(
