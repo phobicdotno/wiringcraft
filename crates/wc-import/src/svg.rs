@@ -1,6 +1,7 @@
 //! SVG symbol import. Pins are marked by `id="pin:NAME"`, `data-pin="NAME"` or
 //! `class="pin"` (named by order). One SVG user unit is one millimetre unless the root element
-//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox.
+//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox. An absolute
+//! height as well fits the viewBox into both by `preserveAspectRatio`, as a browser does.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -290,6 +291,28 @@ fn length_mm(v: &str) -> Option<f64> {
     .find_map(|(unit, per)| v.strip_suffix(unit).map(|n| (n, per)))?;
     let mm = n.trim().parse::<f64>().ok()? * per;
     mm.is_finite().then_some(mm)
+}
+
+/// The viewBox `vb` (x, y, width, height) fitted to a root `width` and `height` in millimetres,
+/// as a browser does. With no absolute height the width alone sets the scale. With both,
+/// `preserveAspectRatio` decides: `meet` (the default) takes the smaller scale, `slice` the
+/// larger, and `none` scales each axis on its own. Where the drawing sits inside the box does not
+/// matter here: the symbol is moved to its first pin afterwards.
+fn viewbox_fit(w: f64, h: Option<f64>, vb: [f64; 4], par: &str) -> M {
+    let sx = w / vb[2];
+    let (sx, sy) = match h.filter(|h| *h > 0.0 && vb[3] > 0.0).map(|h| h / vb[3]) {
+        None => (sx, sx),
+        Some(sy) => {
+            let par = par.to_ascii_lowercase();
+            let mut words = par.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("none"), _) => (sx, sy),
+                (_, Some("slice")) => (sx.max(sy), sx.max(sy)),
+                _ => (sx.min(sy), sx.min(sy)),
+            }
+        }
+    };
+    M([sx, 0.0, 0.0, sy, -vb[0] * sx, -vb[1] * sy])
 }
 
 fn num(e: &BytesStart, name: &str) -> f64 {
@@ -923,8 +946,9 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 if let (Some(wmm), 4) = (length_mm(&w), vbn.len())
                     && vbn[2] > 0.0
                 {
-                    let s = wmm / vbn[2];
-                    m = m.mul(&M([s, 0.0, 0.0, s, -vbn[0] * s, -vbn[1] * s]));
+                    let hmm = attr(&e, "height").and_then(|h| length_mm(&h));
+                    let par = attr(&e, "preserveAspectRatio").unwrap_or_default();
+                    m = m.mul(&viewbox_fit(wmm, hmm, [vbn[0], vbn[1], vbn[2], vbn[3]], &par));
                 }
             }
         }
@@ -1255,6 +1279,37 @@ mod tests {
             let s = symbol(&svg, "svg.u", "U")?;
             assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 80.0).abs() < 1e-3, "{w}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn viewbox_fits_an_absolute_width_and_height_by_preserve_aspect_ratio() -> Result<()> {
+        // A 40 x 40 mm box over a viewBox 80 x 160: the height limits it to 0.25 mm per unit,
+        // so the drawing is 20 x 40 mm, whatever the alignment.
+        let fit = |par: &str| -> Result<(Point, Point)> {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="10 0 80 160" {par}>
+                    <circle id="pin:1" cx="10" cy="0" r="1"/><circle id="pin:2" cx="90" cy="160" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            Ok((pin_at(&s, "1"), pin_at(&s, "2")))
+        };
+        let size = |(a, b): (Point, Point)| (b.x - a.x, b.y - a.y);
+        let close = |(x, y): (f64, f64), (ex, ey): (f64, f64)| (x - ex).abs() < 1e-3 && (y - ey).abs() < 1e-3;
+        for par in [
+            "",
+            r#"preserveAspectRatio="xMidYMid meet""#,
+            r#"preserveAspectRatio="xMinYMax""#,
+        ] {
+            let got = fit(par)?;
+            assert!(close(size(got), (20.0, 40.0)), "{par}: {got:?}");
+        }
+        // slice takes the larger scale, none scales each axis on its own.
+        let got = fit(r#"preserveAspectRatio="xMidYMid slice""#)?;
+        assert!(close(size(got), (40.0, 80.0)), "{got:?}");
+        let got = fit(r#"preserveAspectRatio="none""#)?;
+        assert!(close(size(got), (40.0, 40.0)), "{got:?}");
         Ok(())
     }
 
