@@ -91,7 +91,8 @@ impl Macro {
     }
 
     /// Check the placeholders and value sets: names are unique and not empty, value sets only
-    /// fill declared placeholders, and every placeholder the texts use is declared.
+    /// fill declared placeholders, every placeholder the texts use is declared, symbol ids are
+    /// unique and wires only end on the macro's own symbols.
     pub fn check(&self) -> Result<()> {
         let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
         let mut names: Vec<&str> = Vec::new();
@@ -105,7 +106,15 @@ impl Macro {
             }
             names.push(n);
         }
-        let symbols: BTreeSet<&str> = self.symbols.iter().map(|s| s.id.as_str()).collect();
+        let mut symbols: BTreeSet<&str> = BTreeSet::new();
+        for s in &self.symbols {
+            if !symbols.insert(s.id.as_str()) {
+                return bad(format!(
+                    "two symbols share the id {}, so wires to it would join the wrong one",
+                    s.id
+                ));
+            }
+        }
         for w in &self.wires {
             for end in [&w.from, &w.to] {
                 if let Endpoint::Pin { item, .. } = end
@@ -218,10 +227,12 @@ impl Macro {
             }
         }
         for d in out.devices.values_mut() {
-            if d.part.as_deref().is_some_and(|s| s.trim().is_empty()) {
-                d.part = None;
+            // A part id is kept trimmed, as `device --part` stores it, so it matches its pin.
+            d.part = d.part.take().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+            for a in &mut d.accessories {
+                a.part = a.part.trim().to_owned();
             }
-            d.accessories.retain(|a| !a.part.trim().is_empty());
+            d.accessories.retain(|a| !a.part.is_empty());
             // An empty property is no property, as when typed empty in the device's form.
             d.properties.retain(|_, v| !v.trim().is_empty());
         }
@@ -513,6 +524,7 @@ pub fn list_macros(root: &Path) -> Vec<(String, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::DevicePart;
 
     fn err_of<T>(r: Result<T>) -> String {
         r.err().map(|e| e.to_string()).unwrap_or_default()
@@ -737,6 +749,36 @@ mod tests {
         let placed = m.apply(None, &all)?;
         // An empty part is no part.
         assert_eq!(placed.devices[&DeviceTag::parse("-Q1")?].part, None);
+        // A part typed with spaces around it is kept trimmed.
+        let mut spaced = all.clone();
+        spaced.insert("part".into(), " SIE.3RV2011-1AA10 ".into());
+        let placed = m.apply(None, &spaced)?;
+        assert_eq!(
+            placed.devices[&DeviceTag::parse("-Q1")?].part.as_deref(),
+            Some("SIE.3RV2011-1AA10")
+        );
+        // Accessory parts are trimmed too, and one that comes out blank is dropped.
+        let mut extras = m.clone();
+        if let Some(d) = extras.devices.values_mut().next() {
+            d.accessories = vec![
+                DevicePart {
+                    part: " nowhere.cap ".into(),
+                    qty: 2,
+                },
+                DevicePart {
+                    part: "  ".into(),
+                    qty: 1,
+                },
+            ];
+        }
+        let placed = extras.apply(None, &all)?;
+        assert_eq!(
+            placed.devices[&DeviceTag::parse("-Q1")?].accessories,
+            [DevicePart {
+                part: "nowhere.cap".into(),
+                qty: 2
+            }]
+        );
         // A property that comes out empty is no property; one with text is kept.
         let mut blank = m.clone();
         if let Some(d) = blank.devices.values_mut().next() {
@@ -777,6 +819,16 @@ mod tests {
             pin: "1".into(),
         };
         assert!(err_of(dangling.check()).contains("s9"));
+
+        // Two symbols with one id are refused: placing would hang the wires on the wrong one.
+        let mut shared = starter()?;
+        let first = shared.symbols[0].id.clone();
+        let mut twin = shared.symbols[0].clone();
+        twin.tag = None;
+        shared.symbols.push(twin);
+        let err = err_of(shared.check());
+        assert!(err.contains(&format!("two symbols share the id {first}")), "{err}");
+        assert!(shared.apply(Some("3 kW"), &none).is_err());
 
         let mut stray = starter()?;
         stray.value_sets[0].values.insert("voltage".into(), "400".into());

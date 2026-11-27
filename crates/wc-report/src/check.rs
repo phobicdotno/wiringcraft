@@ -117,9 +117,32 @@ pub fn check_with_unreadable(
     }
 
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
+    // A symbol with two pins of one name is told once, where it is first drawn: a wire names a
+    // pin only by its name, so the second pin can never be reached.
+    let mut twice_told: BTreeSet<&str> = BTreeSet::new();
     for page in &p.pages {
         for s in &page.symbols {
-            if !i.symbols.contains_key(&s.symbol) {
+            if let Some(sym) = i.symbols.get(&s.symbol) {
+                let mut names = BTreeSet::new();
+                let twice: BTreeSet<&str> = sym
+                    .pins
+                    .iter()
+                    .map(|q| q.name.as_str())
+                    .filter(|n| !names.insert(*n))
+                    .collect();
+                if !twice.is_empty() && twice_told.insert(&s.symbol) {
+                    let list = twice.into_iter().collect::<Vec<_>>().join(", ");
+                    out.push(at(
+                        page,
+                        &s.id,
+                        Severity::Warning,
+                        format!(
+                            "symbol {} has more than one pin named {list}: wires reach only the first",
+                            s.symbol
+                        ),
+                    ));
+                }
+            } else {
                 out.push(at(
                     page,
                     &s.id,
@@ -400,7 +423,9 @@ pub fn check_with_unreadable(
             })
             .collect();
         for w in &page.wires {
-            if w.potential.is_some() {
+            // A blank name is no potential (connectivity joins nothing by it), so it does not
+            // excuse a free end.
+            if w.potential.as_deref().is_some_and(|n| !n.trim().is_empty()) {
                 continue;
             }
             for e in [&w.from, &w.to] {
@@ -463,8 +488,9 @@ pub fn check_with_unreadable(
 
     cable_cores(i, &wire_net, &mut out);
 
-    // Shorts: one net carrying two potential names (for example L1 and L2).
-    let nets = wc_core::connectivity::nets_linked(p, |id| i.symbols.get(id).map(|s| s.role));
+    // Shorts: one net carrying two potential names (for example L1 and L2), also when only
+    // wires and junctions join them.
+    let nets = wc_core::connectivity::shorted_nets(p, |id| i.symbols.get(id).map(|s| s.role));
     for n in nets {
         let names: BTreeSet<&str> = n.names.iter().map(String::as_str).collect();
         if names.len() > 1 {
@@ -984,12 +1010,12 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
 /// Cable cores on two connections: a core is one conductor, so all wires that name it must be
 /// one connection (net). Wires on overview pages repeat connections on purpose and do not count;
 /// wires that touch no pin are no connection, and a wire naming only its cable (no core) names
-/// no conductor.
+/// no conductor. Core names match ignoring case ("bn" is core BN), named as first drawn.
 fn cable_cores(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
     let p = i.project;
     // Per core: the nets it is on, in drawing order, each with the first wire naming it there.
     type Uses<'p> = Vec<(usize, &'p Page, &'p str)>;
-    let mut by_core: BTreeMap<(&DeviceTag, &str), Uses> = BTreeMap::new();
+    let mut by_core: BTreeMap<(&DeviceTag, String), (&str, Uses)> = BTreeMap::new();
     for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
         for (wi, w) in page.wires.iter().enumerate() {
             let Some(c) = &w.cable else { continue };
@@ -1000,13 +1026,15 @@ fn cable_cores(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
             let Some(&net) = wire_net.get(&(pi, wi)) else {
                 continue;
             };
-            let nets = by_core.entry((&c.cable, core)).or_default();
+            let (_, nets) = by_core
+                .entry((&c.cable, core.to_uppercase()))
+                .or_insert((core, Vec::new()));
             if !nets.iter().any(|(n, ..)| *n == net) {
                 nets.push((net, page, w.id.as_str()));
             }
         }
     }
-    for ((cable, core), nets) in by_core.iter().filter(|(_, n)| n.len() > 1) {
+    for ((cable, _), (core, nets)) in by_core.iter().filter(|(_, (_, n))| n.len() > 1) {
         // Named on the wire of the second connection: the first may well be the right one.
         let Some((_, page, wire)) = nets.get(1) else { continue };
         out.push(at(

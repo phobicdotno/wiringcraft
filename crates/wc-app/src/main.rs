@@ -556,6 +556,8 @@ impl chrome::Status for StatusView<'_> {
                 Action::Undo => return se.can_undo(),
                 Action::Redo => return se.can_redo(),
                 Action::Delete => return se.selected.is_some(),
+                // Refused while the editor is open (`carry_out`): not offered either (#1345).
+                a if held_by_symbol_editor(a) => return false,
                 _ => {}
             }
         }
@@ -2549,6 +2551,10 @@ impl App {
             Dialog::Reports(_) | Dialog::ReportLayout { .. } | Dialog::Check(_) | Dialog::Translations(_)
         );
         let screen = ctx.screen_rect();
+        // The symbol editor (its window shows after this one) owns an Escape that drops its
+        // half-drawn shape or cancels its drag: one press does one thing.
+        let editor_escape = self.symbol_editor.as_ref().is_some_and(|e| e.wants_escape(ctx));
+        let escape = !editor_escape && escape_cancels(ctx);
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
@@ -2724,7 +2730,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             then = Some(Box::new(|app: &mut App| {
                                 if let Some(open) = &app.open {
                                     app.dialog = Some(Dialog::Macros(open.macros()));
@@ -3049,7 +3055,7 @@ impl App {
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                         }
                     });
@@ -3121,7 +3127,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.show_check()));
                         }
@@ -3375,7 +3381,7 @@ impl App {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_template(*since, before);
                             }
@@ -3432,7 +3438,7 @@ impl App {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_racks(*since, before);
                             }
@@ -3713,7 +3719,7 @@ impl App {
                             if ui.button("Built-in layout").on_hover_text("Clear the form to the report's own columns").clicked() {
                                 **form = form.cleared();
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button("Cancel").clicked() || escape {
                                 let k = form.kind;
                                 then = Some(Box::new(move |app: &mut App| app.dialog = Some(Dialog::Reports(k))));
                                 keep = false;
@@ -5125,11 +5131,12 @@ fn window_icon() -> egui::IconData {
         })
 }
 
-/// The main window: size, title and icon.
-fn main_viewport() -> egui::ViewportBuilder {
+/// The main window: size (as it was last closed), title and icon.
+fn main_viewport(window: &prefs::Window) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_inner_size([1400.0, 860.0])
-        .with_min_inner_size([900.0, 560.0])
+        .with_inner_size(window.open_size())
+        .with_min_inner_size(prefs::Window::MIN)
+        .with_maximized(window.maximized)
         .with_title("WiringCraft")
         .with_icon(window_icon())
 }
@@ -5482,6 +5489,27 @@ fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool)
     i.events
         .iter()
         .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && ok(modifiers)))
+}
+
+/// Whether Escape, pressed this frame, cancels the open form dialog (rules, translations, macro
+/// placeholders, page template, PLC racks, report layout). An Escape that closes a drop-down
+/// list open since last frame only closes that list, so the form and its edits stay. A key
+/// repeat of a held Escape does not count: holding it to close a list would cancel the form.
+fn escape_cancels(ctx: &egui::Context) -> bool {
+    let pressed = ctx.input(|i| {
+        i.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::Escape,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                }
+            )
+        })
+    });
+    pressed && !ctx.memory(|m| m.any_popup_open())
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -5938,7 +5966,23 @@ fn export_drawings_logged(open: &Open, dir: &Path) -> (String, String) {
     }
 }
 
+/// Note the main window from one frame's viewport. Its size is kept in points at GUI zoom 1,
+/// the unit the window opens with, so a window closed while zoomed in opens at the same size.
+/// A minimized window reports no usable size and changes nothing.
+fn remember_window(window: &mut prefs::Window, v: &egui::ViewportInfo, zoom: f32) {
+    if v.minimized == Some(true) {
+        return;
+    }
+    let size = v.inner_rect.map(|r| [r.width() * zoom, r.height() * zoom]);
+    window.remember(size, v.maximized);
+}
+
 impl eframe::App for App {
+    /// The window's size and maximized state are kept for the next start.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        prefs::Prefs::save_window(self.prefs.window);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // A close that waited a frame for a typed value: the field gives up the keyboard, so
         // the panels enter its value before the close asks about unsaved changes.
@@ -5951,6 +5995,8 @@ impl eframe::App for App {
         }
         self.hold_close_while_importing(ctx);
         self.ask_before_closing(ctx);
+        let zoom = ctx.zoom_factor();
+        ctx.input(|i| remember_window(&mut self.prefs.window, i.viewport(), zoom));
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -6983,7 +7029,7 @@ fn main() -> eframe::Result {
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let wanted = std::env::var(RENDERER_VAR).ok();
     let options = eframe::NativeOptions {
-        viewport: main_viewport(),
+        viewport: main_viewport(&Prefs::load().window),
         renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
@@ -7271,6 +7317,8 @@ mod library_tests {
 
 #[cfg(test)]
 mod icon_tests {
+    use eframe::egui;
+
     #[test]
     fn the_window_icon_is_built_in() {
         let icon = super::window_icon();
@@ -7280,8 +7328,43 @@ mod icon_tests {
 
     #[test]
     fn the_main_window_carries_the_icon() {
-        let icon = super::main_viewport().icon;
+        let icon = super::main_viewport(&Default::default()).icon;
         assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
+    }
+
+    #[test]
+    fn the_main_window_opens_at_the_kept_size_and_state() {
+        let window = super::prefs::Window {
+            size: Some([1200.0, 700.0]),
+            maximized: true,
+        };
+        let v = super::main_viewport(&window);
+        assert_eq!(v.inner_size, Some(egui::vec2(1200.0, 700.0)));
+        assert_eq!(v.maximized, Some(true));
+    }
+
+    #[test]
+    fn the_window_size_is_kept_without_the_gui_zoom() {
+        let mut window = super::prefs::Window::default();
+        let mut v = egui::ViewportInfo {
+            inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        // At GUI zoom 1.2 a 1440 x 960 window measures 1200 x 800 points.
+        super::remember_window(&mut window, &v, 1.2);
+        let kept = window.size;
+        assert!(
+            matches!(kept, Some([w, h]) if (w - 1440.0).abs() < 0.01 && (h - 960.0).abs() < 0.01),
+            "{kept:?}"
+        );
+        // A minimized window changes nothing, not even the maximized state.
+        v.minimized = Some(true);
+        v.maximized = Some(true);
+        v.inner_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.0, 0.0)));
+        super::remember_window(&mut window, &v, 1.0);
+        assert!(!window.maximized);
+        assert_eq!(window.size, kept);
     }
 }
 
@@ -7896,6 +7979,60 @@ mod marking_tests {
 }
 
 #[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> bool {
+        let mut esc = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| esc = escape_cancels(ctx),
+        );
+        esc
+    }
+
+    fn escape() -> egui::Event {
+        key(false)
+    }
+
+    fn release() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    pub(super) fn key(repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn escape_cancels_a_form_dialog_unless_it_closes_an_open_drop_down() {
+        let ctx = egui::Context::default();
+        assert!(!frame(&ctx, vec![]));
+        assert!(frame(&ctx, vec![escape()]));
+        // Escape held down: its repeats do not cancel the form.
+        assert!(!frame(&ctx, vec![key(true)]));
+        // Let go of Escape so the popup case below is a fresh press, not a repeat.
+        assert!(!frame(&ctx, vec![release()]));
+        ctx.memory_mut(|m| m.open_popup(egui::Id::new("combo")));
+        assert!(!frame(&ctx, vec![escape()]));
+    }
+}
+
+#[cfg(test)]
 mod page_size_tests {
     use super::*;
 
@@ -7978,6 +8115,42 @@ mod nudge_tests {
             closing: Closing::No,
         };
         (tmp, app, egui::Context::default())
+    }
+
+    /// The menu and toolbars do not offer what the symbol editor holds back: the commands it
+    /// refuses show disabled while it is open, and enabled again once it is closed (#1345).
+    #[test]
+    fn commands_held_by_the_symbol_editor_show_disabled() {
+        use chrome::Status;
+        let (_tmp, mut app, _) = app(Point::new(80.0, 60.0), false);
+        app.clipboard = app.open.as_ref().unwrap().copy(app.ed.page, &app.ed.selection);
+        let held = [
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::Duplicate,
+            Action::Rotate,
+            Action::Mirror,
+            Action::SelectAll,
+        ];
+        let se = symbol_editor::SymbolEditor::new(Vec::new());
+        for editor in [None, Some(&se)] {
+            let status = StatusView {
+                open: app.open.as_ref(),
+                ed: &app.ed,
+                prefs: &app.prefs,
+                clipboard: &app.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+                symbol_editor: editor,
+            };
+            for a in held {
+                assert!(held_by_symbol_editor(a));
+                assert_eq!(status.enabled(a), editor.is_none(), "{a:?}");
+            }
+        }
     }
 
     /// One frame with `key` pressed; `focus_text` gives a text field the keyboard first.
@@ -9853,6 +10026,50 @@ mod menu_action_tests {
             .find(|s| s.id == id)
             .unwrap()
             .rotation
+    }
+
+    /// Runs one frame of the dialogs with these events.
+    fn dialog_frame(a: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| a.dialogs(ctx),
+        );
+    }
+
+    #[test]
+    fn escape_cancels_the_racks_form_once_and_is_the_symbol_editors_while_it_draws() {
+        let (_tmp, mut a, _) = app();
+        let ctx = egui::Context::default();
+        a.ed.menu_action = Some(Action::PlcRacks);
+        a.run_menu_action();
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // The symbol editor drawing a shape takes the Escape: the form stays.
+        let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(symbol_editor::Tool::Line);
+        ed.click(wc_core::Point::new(0.0, 0.0));
+        assert!(ed.drawing_shape());
+        a.symbol_editor = Some(ed);
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Escape still held: its key repeat does not cancel the form either.
+        a.symbol_editor = None;
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(true)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Released and pressed again, with nothing half drawn, Escape cancels the form.
+        let release = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        dialog_frame(&mut a, &ctx, vec![release]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(a.dialog.is_none());
     }
 
     #[test]
