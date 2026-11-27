@@ -3290,6 +3290,158 @@ fn a_2010_class_section_with_its_closing_sentinel_4_bytes_early_is_refused() -> 
     Ok(())
 }
 
+// ---- read_classes on its own, without a drawing around it ----
+
+const CLASS_VERSIONS: [Version; 5] = [
+    Version::R2004,
+    Version::R2007,
+    Version::R2010,
+    Version::R2013,
+    Version::R2018,
+];
+
+/// The error `read_classes` gives for `data` of `v` (maintenance release 6), or a note that it
+/// gave none.
+fn class_error(data: &[u8], v: Version) -> String {
+    match read_classes(data, v, 6) {
+        Ok(c) => format!("no error, {} classes", c.len()),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn read_classes_gives_each_class_its_name_and_kind() -> TestResult {
+    for v in CLASS_VERSIONS {
+        let data = classes_section(
+            v,
+            &[
+                (500, "WIPEOUT", true),
+                (501, "DICTIONARYVAR", false),
+                (502, "IMAGE", true),
+            ],
+        );
+        let classes = read_classes(&data, v, 6)?;
+        assert_eq!(classes.len(), 3, "{v:?}: {classes:?}");
+        let want = [
+            (500, "WIPEOUT", true),
+            (501, "DICTIONARYVAR", false),
+            (502, "IMAGE", true),
+        ];
+        for (number, name, entity) in want {
+            assert_eq!(
+                classes.get(&number),
+                Some(&Class {
+                    dxf_name: name.to_string(),
+                    entity
+                }),
+                "{v:?}: {classes:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_highest_class_of_0_or_499_is_no_classes_and_one_between_is_refused() -> TestResult {
+    for v in CLASS_VERSIONS {
+        for max in [0, 499] {
+            let classes = read_classes(&classes_section_max(v, max, &[]), v, 6)?;
+            assert!(classes.is_empty(), "{v:?} {max}: {classes:?}");
+        }
+        for max in [1, 250, 498] {
+            let e = class_error(&classes_section_max(v, max, &[]), v);
+            assert!(e.contains(&format!("it says the highest class is {max}")), "{v:?}: {e}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn more_classes_than_allowed_are_refused_before_any_is_read() {
+    // 10 000 classes are allowed (500 to 10 499); one more is not, and is refused without
+    // reading a record (there are none to read).
+    for v in CLASS_VERSIONS {
+        let e = class_error(&classes_section_max(v, 10_500, &[]), v);
+        assert!(e.contains("it says the highest class is 10500"), "{v:?}: {e}");
+        // At the limit the header passes and the first missing record fails instead.
+        let e = class_error(&classes_section_max(v, 10_499, &[]), v);
+        assert!(!e.contains("highest class"), "{v:?}: {e}");
+        assert!(e.contains("AcDb:Classes"), "{v:?}: {e}");
+    }
+}
+
+#[test]
+fn a_class_numbered_below_500_is_refused() {
+    for v in CLASS_VERSIONS {
+        let e = class_error(&classes_section_max(v, 500, &[(499, "WIPEOUT", true)]), v);
+        assert!(e.contains("class 499 is outside 500 to 500"), "{v:?}: {e}");
+    }
+}
+
+#[test]
+fn class_errors_name_the_section_and_say_dwg_once() {
+    for v in CLASS_VERSIONS {
+        let twice = classes_section(v, &[(500, "WIPEOUT", true), (500, "IMAGE", true)]);
+        for data in [Vec::new(), vec![0u8; 40], twice] {
+            let e = class_error(&data, v);
+            assert!(
+                e.starts_with("DWG: the class section (AcDb:Classes) is damaged: "),
+                "{v:?}: {e}"
+            );
+            assert_eq!(e.matches("DWG: ").count(), 1, "{v:?}: {e}");
+        }
+    }
+}
+
+#[test]
+fn a_class_size_field_past_the_section_is_refused_without_overflow() {
+    for v in CLASS_VERSIONS {
+        let whole = classes_section(v, &[(500, "WIPEOUT", true)]);
+        for size in [u32::MAX, u32::MAX - 3, whole.len() as u32] {
+            let mut data = whole.clone();
+            data[16..20].copy_from_slice(&size.to_le_bytes());
+            let e = class_error(&data, v);
+            assert!(e.contains("its size is past its end"), "{v:?} {size:#X}: {e}");
+        }
+    }
+    // From 2007 the bit size can point past the section too.
+    for v in [Version::R2007, Version::R2010, Version::R2018] {
+        let mut data = classes_section(v, &[(500, "WIPEOUT", true)]);
+        let at = if v == Version::R2007 { 20 } else { 24 };
+        data[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let e = class_error(&data, v);
+        assert!(e.contains("its texts lie past its end"), "{v:?}: {e}");
+    }
+}
+
+#[test]
+fn every_cut_class_section_gives_an_error_not_a_panic() {
+    for v in CLASS_VERSIONS {
+        let whole = classes_section(v, &[(500, "WIPEOUT", true), (501, "IMAGE", false)]);
+        for len in 0..whole.len() {
+            assert!(read_classes(&whole[..len], v, 6).is_err(), "{v:?}: cut to {len} bytes");
+        }
+    }
+}
+
+#[test]
+fn flipped_bytes_in_a_class_section_do_not_panic() {
+    for v in CLASS_VERSIONS {
+        let whole = classes_section(v, &[(500, "WIPEOUT", true), (501, "IMAGE", false)]);
+        for at in 0..whole.len() {
+            for mask in [0x01, 0x80, 0xFF] {
+                let mut data = whole.clone();
+                data[at] ^= mask;
+                // Either result is fine; reading must only not panic, and any class it gives
+                // must be numbered within range.
+                if let Ok(classes) = read_classes(&data, v, 6) {
+                    assert!(classes.keys().all(|n| *n >= 500), "{v:?} {at} {mask:#X}: {classes:?}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_2004_drawing_in_windows_1251_reads_cyrillic() -> TestResult {
     let d = drawing(&cyrillic_2004(29))?;

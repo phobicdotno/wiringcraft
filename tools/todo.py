@@ -8,9 +8,12 @@
     python tools/todo.py release N --agent NAME
     python tools/todo.py add "Title" [--body TEXT]
 
-`--agent` defaults to the WC_AGENT environment variable. claim/renew/release post the command on
-the issue and wait for the claim bot's answer: exit 0 when granted, 2 when refused, 3 when the bot
-did not answer in time. The lock rules are in .github/scripts/claim.js.
+`--agent` defaults to the WC_AGENT environment variable; `--hours` is 1 to 24, default 4.
+next/claim/renew/release post the command on the issue and poll for the claim bot's answer for
+15 minutes: exit 0 when granted, 2 when refused (for next: no free todo), 3 when the bot did not
+answer in time. The `gh` calls have no timeout of their own, so a stalled request can make the
+wait longer than 15 minutes. add uses the title as the body when --body is not given. The lock rules are in
+.github/scripts/claim.js.
 """
 import argparse
 import json

@@ -1161,3 +1161,201 @@ fn in_work_tree_is_false_where_git_finds_no_repository() -> Result<()> {
     assert!(!Git::new(dir).in_work_tree()?);
     Ok(())
 }
+
+/// A new project folder with a first version, for the [`Git`] tests below.
+fn new_repo(tmp: &tempfile::TempDir) -> Result<Git> {
+    store::create(tmp.path(), "Demo")?;
+    let git = Git::new(tmp.path());
+    git.init()?;
+    Ok(git)
+}
+
+fn write(dir: &std::path::Path, name: &str, text: &str) -> Result<()> {
+    std::fs::write(dir.join(name), text).map_err(|e| wc_core::Error::io(name, e).into())
+}
+
+#[test]
+fn init_twice_records_nothing_more_and_keeps_the_projects_own_files() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    write(dir, ".gitattributes", "*.bin binary\n")?;
+    let git = Git::new(dir);
+    assert!(!git.is_repo());
+    assert_eq!(git.head(), None);
+    git.init()?;
+    assert!(git.is_repo());
+    let first = git.head();
+    assert!(first.is_some(), "a first version is recorded");
+    let gitattributes =
+        std::fs::read_to_string(dir.join(".gitattributes")).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(gitattributes, "*.bin binary\n", "an existing file is not overwritten");
+    let gitignore = std::fs::read_to_string(dir.join(".gitignore")).map_err(|e| wc_core::Error::io("read", e))?;
+    assert!(gitignore.contains(LOCK_FILE), "{gitignore}");
+
+    git.init()?;
+    assert_eq!(git.head(), first, "a second init records no new version");
+    assert_eq!(git_out(dir, &["rev-list", "--count", "HEAD"])?.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn a_revert_records_a_new_version_that_undoes_the_old_one() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = new_repo(&tmp)?;
+    write(dir, "notes.txt", "one\n")?;
+    let one = git.commit("Add notes")?.unwrap_or_default();
+    write(dir, "notes.txt", "two\n")?;
+    let two = git.commit("Change notes")?.unwrap_or_default();
+
+    let reverted = git.revert(&two)?;
+    assert!(reverted.is_some());
+    assert_ne!(reverted.as_deref(), Some(two.as_str()));
+    assert_eq!(git.head(), reverted);
+    assert_eq!(git.show("HEAD", "notes.txt").as_deref(), Some("one\n"));
+    assert_eq!(git.show(&one, "notes.txt").as_deref(), Some("one\n"));
+    assert_eq!(
+        git.show(&two, "notes.txt").as_deref(),
+        Some("two\n"),
+        "the history keeps both"
+    );
+    let (_, subject) = git.author_and_subject("HEAD")?;
+    assert!(subject.starts_with("Revert"), "{subject}");
+    assert!(git_out(dir, &["status", "--porcelain"])?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_revert_of_an_unknown_version_says_so_and_changes_nothing() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let git = new_repo(&tmp)?;
+    let head = git.head();
+    let err = git
+        .revert("no-such-branch")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("no such version: no-such-branch"), "{err}");
+    assert_eq!(git.head(), head);
+    Ok(())
+}
+
+#[test]
+fn a_merge_of_a_branch_already_contained_is_up_to_date() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = new_repo(&tmp)?;
+    git.create_branch("old")?;
+    git.switch("main")?;
+    write(dir, "notes.txt", "later\n")?;
+    git.commit("Later work")?;
+    let head = git.head();
+    assert_eq!(git.merge("old")?, MergeOutcome::UpToDate);
+    assert_eq!(git.head(), head, "no merge version is recorded");
+    // A name that is no branch is an error, not an empty list of conflicts.
+    assert!(git.merge("missing").is_err());
+    assert_eq!(git.head(), head);
+    Ok(())
+}
+
+#[test]
+fn a_switch_with_unrecorded_changes_is_refused_and_keeps_them() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = new_repo(&tmp)?;
+    git.create_branch("other")?;
+    write(dir, "notes.txt", "unsaved\n")?;
+    let err = git.switch("main").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("record or discard your changes first"), "{err}");
+    assert_eq!(git.current_branch().as_deref(), Some("other"));
+    let kept = std::fs::read_to_string(dir.join("notes.txt")).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(kept, "unsaved\n");
+    Ok(())
+}
+
+#[test]
+fn branches_are_listed_and_a_taken_name_is_refused() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let git = new_repo(&tmp)?;
+    git.create_branch("motor")?;
+    git.create_branch("lighting")?;
+    let mut branches = git.branches()?;
+    branches.sort();
+    assert_eq!(branches, ["lighting", "main", "motor"]);
+    assert!(git.create_branch("motor").is_err(), "already there");
+    assert!(git.create_branch("two words").is_err(), "not a branch name");
+    assert_eq!(git.current_branch().as_deref(), Some("lighting"));
+    assert_eq!(git.branches()?.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn a_detached_head_has_no_current_branch() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = new_repo(&tmp)?;
+    git_out(dir, &["switch", "-q", "--detach", "HEAD"])?;
+    assert_eq!(git.current_branch(), None);
+    assert!(git.head().is_some());
+    Ok(())
+}
+
+#[test]
+fn show_and_author_follow_the_version_asked_for() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = new_repo(&tmp)?;
+    write(dir, "notes.txt", "hello\n")?;
+    git.commit_as("Add notes\n\nWith a body.", "Guest <guest@example.com>")?;
+    assert_eq!(git.show("HEAD", "notes.txt").as_deref(), Some("hello\n"));
+    assert_eq!(git.show("HEAD~1", "notes.txt"), None, "not there yet");
+    assert_eq!(git.show("HEAD", "missing.txt"), None);
+    assert_eq!(
+        git.author_and_subject("HEAD")?,
+        ("Guest <guest@example.com>".to_owned(), "Add notes".to_owned())
+    );
+    assert_eq!(git.author_and_subject("HEAD~1")?.1, "New project");
+    Ok(())
+}
+
+#[test]
+fn the_exclude_scratch_file_sits_beside_the_list() {
+    let at = std::path::Path::new("/repo/.git/info/exclude");
+    let scratch = crate::git::exclude_scratch(at);
+    assert_eq!(scratch.parent(), at.parent());
+    assert_eq!(
+        scratch.file_name().and_then(|n| n.to_str()),
+        Some(format!("exclude.{}.new", std::process::id()).as_str())
+    );
+}
+
+#[test]
+fn a_subject_with_git_log_separators_keeps_its_commit() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let mut p = store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    if let Some(page) = p.page_mut("p0001") {
+        page.title = "Cover sheet".into();
+    }
+    store::save(dir, &p)?;
+    let subject = "Rename \u{1e}cover\u{1f} sheet";
+    git.commit(subject)?;
+
+    let rows = history(&git, 50)?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows.first().map(|r| r.commit.subject.as_str()), Some(subject));
+    assert!(rows.first().is_some_and(|r| r.commit.head), "{rows:?}");
+    // The map stays well-formed XML: the separators are left out of its text.
+    let svg = subway_svg(&rows);
+    assert!(svg.contains("Rename cover sheet"), "{svg}");
+    assert!(!svg.contains(['\u{1e}', '\u{1f}']), "{svg}");
+
+    let h = page_history(&git, "p0001", 10)?;
+    let subjects: Vec<&str> = h.iter().map(|v| v.subject.as_str()).collect();
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert_eq!(subjects.first(), Some(&subject));
+    Ok(())
+}
