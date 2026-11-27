@@ -6018,11 +6018,16 @@ impl eframe::App for App {
         } else {
             let mut start = None;
             let mut recent = None;
+            let mut forget = None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(t.backdrop))
                 .show(ctx, |ui| {
-                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent);
+                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent, &mut forget);
                 });
+            if let Some(d) = forget {
+                self.prefs.forget(&d);
+                self.prefs.save();
+            }
             if let Some(d) = recent {
                 let mut prefs = std::mem::take(&mut self.prefs);
                 self.open_dir(&d, &mut prefs);
@@ -6680,13 +6685,15 @@ fn read_only_banner(ui: &egui::Ui, t: &theme::Theme, name: &str) {
 }
 
 /// The start screen shown when no project is open: a card with the two ways in and the
-/// recently opened projects.
+/// recently opened projects. A recent folder that is gone is shown muted, and any entry can be
+/// taken out of the list from its right-click menu (`forget`).
 fn welcome(
     ui: &mut egui::Ui,
     t: &theme::Theme,
     recent: &[PathBuf],
     start: &mut Option<Action>,
     open_recent: &mut Option<PathBuf>,
+    forget: &mut Option<PathBuf>,
 ) {
     let width = 440.0;
     ui.add_space((ui.available_height() * 0.18).max(24.0));
@@ -6731,11 +6738,25 @@ fn welcome(
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| d.display().to_string());
-                        let r = panels::row(ui, false, panels::Lead::Dot(t.accent), RichText::new(name), false)
-                            .on_hover_text(d.display().to_string());
+                        let (dot, text, hover) = if d.is_dir() {
+                            (t.accent, RichText::new(name), d.display().to_string())
+                        } else {
+                            (
+                                t.muted,
+                                RichText::new(name).color(t.muted),
+                                format!("{} (folder not found)", d.display()),
+                            )
+                        };
+                        let r = panels::row(ui, false, panels::Lead::Dot(dot), text, false).on_hover_text(hover);
                         if r.clicked() {
                             *open_recent = Some(d.clone());
                         }
+                        r.context_menu(|ui| {
+                            if ui.button("Remove from recent projects").clicked() {
+                                *forget = Some(d.clone());
+                                ui.close_menu();
+                            }
+                        });
                     }
                 }
             });

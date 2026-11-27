@@ -280,6 +280,11 @@ impl Prefs {
         self.recent.insert(0, dir);
         self.recent.truncate(8);
     }
+
+    /// Take `dir` out of the recent projects (the start screen's "Remove from recent projects").
+    pub fn forget(&mut self, dir: &Path) {
+        self.recent.retain(|d| d != dir);
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +355,20 @@ mod tests {
         p.remember(PathBuf::new());
         assert_eq!(p.recent.len(), 1);
         assert!(absolute(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn a_recent_project_can_be_forgotten() {
+        let mut p = Prefs::default();
+        p.remember(PathBuf::from("projects/a"));
+        p.remember(PathBuf::from("projects/b"));
+        let a = p.recent[1].clone();
+        p.forget(&a);
+        assert_eq!(p.recent.len(), 1);
+        assert!(!p.recent.contains(&a));
+        // Forgetting a folder that is not in the list changes nothing.
+        p.forget(Path::new("/not/in/the/list"));
+        assert_eq!(p.recent.len(), 1);
     }
 
     #[test]
