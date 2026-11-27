@@ -698,6 +698,21 @@ mod tests {
         assert_eq!(w.spec.colour.as_deref(), Some("BK"));
         let blank: BTreeMap<String, String> = [("section".to_owned(), "  ".to_owned())].into_iter().collect();
         assert_eq!(m.apply(Some("3 kW"), &blank)?.wires[0].spec.section, None);
+
+        // Colour and type are trimmed the same way.
+        let mut m = m;
+        m.wires[0].spec.colour = Some("{{colour}}".into());
+        m.wires[0].spec.kind = Some("{{kind}}".into());
+        let padded: BTreeMap<String, String> = [
+            ("section".to_owned(), "1.5".to_owned()),
+            ("colour".to_owned(), " BU ".to_owned()),
+            ("kind".to_owned(), " H07V-K ".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let w = &m.apply(Some("3 kW"), &padded)?.wires[0];
+        assert_eq!(w.spec.colour.as_deref(), Some("BU"));
+        assert_eq!(w.spec.kind.as_deref(), Some("H07V-K"));
         Ok(())
     }
 
