@@ -47,7 +47,7 @@ the window is narrow, groups move to a second row rather than being cut off.
 | | Open | Open a project folder |
 | | Save | Save all changed pages |
 | History | Undo | Undo the last change |
-| | Redo | Redo |
+| | Redo | Redo the last change you undid (Ctrl+Shift+Z works too) |
 | Clipboard | Cut | Cut the selection |
 | | Copy | Copy the selection |
 | | Paste | Paste at the pointer; devices get the next free tags |
@@ -55,7 +55,7 @@ the window is narrow, groups move to a second row rather than being cut off.
 | | Symbol | Place the symbol chosen in the library picker |
 | | Wire | Draw a wire: click a pin or point, then the other end |
 | | Black box | Draw a black box for a device without a symbol: drag its rectangle, click its edges to add connection points, then click inside it (or press Enter) to tag it |
-| | Rotate | Rotate the selected symbols 90°, or the symbol being placed |
+| | Rotate | Rotate the selected symbols 90°, the symbol being placed, or the device picked on a panel layout |
 | | Mirror | Mirror the selected symbols left to right, or the symbol being placed |
 | | Delete | Delete the selection |
 | Graphics | Text | Write a text on the sheet: click where it goes |
@@ -71,15 +71,15 @@ the window is narrow, groups move to a second row rather than being cut off.
 | | Cover page | Open the cover page and edit the project's name and fields; they show on the cover and every title block |
 | | Page template | Edit the frame's reference columns and the title block's boxes, shared by every page |
 | | Duplicate page | Copy this page; its devices get the next free tags |
-| | Page properties | Number, title and sheet size of this page |
-| | Delete page | Delete this page |
-| View | Zoom in | Zoom in |
-| | Zoom out | Zoom out |
+| | Page properties | Edit this page's number, title, sheet size and its own title-block values |
+| | Delete page | Delete this page (asks first) |
+| View | Zoom in | Show the page larger |
+| | Zoom out | Show the page smaller |
 | | Fit page | Show the whole page |
 | | Grid | Show or hide the grid |
 | | Layers | Show, hide and lock drawings, wire numbers, cross-references, comments and scanned sheets on the canvas |
 | Library | Library | Compare the project's library items with the library |
-| | Update | Take the newer library versions |
+| | Update | Take the newer library versions of the project's symbols and parts, then show the library status |
 | | New symbol | Draw a new symbol and save it into a library folder |
 | | Edit symbol | Change a library symbol (the selected one, or pick one) |
 | Versions | Commit | Record a version of the project |
@@ -89,10 +89,10 @@ the window is narrow, groups move to a second row rather than being cut off.
 | | Join session | Work in a colleague's shared project: pick their session and ask to join |
 | Review | Comment | Pin a review comment on the sheet: click where it goes |
 | | Page history | Who changed this page, when, and what they changed |
-| Output | Check | Check the project: devices drawn twice, missing coils, shorts, open pins |
-| | Reports | Contents, parts, devices, wires, nets, terminals, cables, PLC I/O and locations as tables |
+| Output | Check | Check the project for problems such as devices drawn twice, contacts without a coil, shorts and open pins |
+| | Reports | Show the contents, parts, devices, wires, nets, terminals, cables, PLC I/O, PLC cards, locations and networks as tables |
 | | PDF | Export all pages and the reports to PDF |
-| Assistant | Assistant | Show the AI assistant: tell it what to draw or change and it works in the open project |
+| Assistant | Assistant | Show or hide the AI assistant: tell it what to draw or change and it works in the open project |
 
 Two switches sit at the right end of the toolbar: **Dark mode** (switch between the light and
 dark interface) and, at the very end, **Layout** (switch between classic toolbars and the ribbon).
