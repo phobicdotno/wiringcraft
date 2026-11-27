@@ -857,6 +857,7 @@ impl App {
         if let Some(d) = dir {
             app.open_dir(&d, &mut prefs);
         }
+        app.chrome = chrome::ChromeState::with_ribbon_tab(prefs.ribbon_tab);
         app.prefs = prefs;
         app
     }
@@ -1962,7 +1963,9 @@ impl App {
             }
             Action::Copy | Action::Cut => {
                 let clip = open.copy(page, &self.ed.selection);
-                if !clip.is_empty() {
+                if clip.is_empty() && only_uncopied(&self.ed.selection) {
+                    self.ed.message = format!("{} was not done: {NOT_COPIED}", a.info().label);
+                } else if !clip.is_empty() {
                     let n = clip.count();
                     self.copied_text = Some(clip.summary());
                     let copied_wires: std::collections::BTreeSet<String> =
@@ -1998,11 +2001,16 @@ impl App {
             Action::Paste => {
                 // At the pointer when it is over the sheet, otherwise a little below the original.
                 // The pointer on the desk beside the sheet would paste off the page (#1293).
+                // Below the original is off a smaller page, or past an edge: then near the
+                // sheet's top-left corner (#1545).
+                let near = |p: wc_core::geom::Point| p + wc_core::geom::Point::new(10.0, 10.0);
+                let below = Some(near(self.clipboard.anchor)).filter(|&at| canvas::on_paper(open, page, at));
                 let at = self
                     .ed
                     .cursor
                     .filter(|&at| canvas::on_paper(open, page, at))
-                    .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
+                    .or(below)
+                    .unwrap_or(near(wc_core::geom::Point::new(0.0, 0.0)));
                 match open.paste(page, &self.clipboard, at) {
                     Ok(pasted) if !pasted.is_empty() => {
                         self.ed.message = format!(
@@ -2028,6 +2036,9 @@ impl App {
                         self.ed.message = format!("Duplicated {n} {}.", if n == 1 { "item" } else { "items" });
                         self.ed.tool = Tool::Select;
                         self.ed.selection = copies;
+                    }
+                    Ok(_) if only_uncopied(&self.ed.selection) => {
+                        self.ed.message = format!("Nothing was duplicated: {NOT_COPIED}");
                     }
                     Ok(_) => {}
                     Err(e) => self.ed.message = format!("Nothing was duplicated: {e}"),
@@ -2667,12 +2678,18 @@ impl App {
                         .id_salt("macro-edit-scroll")
                         .max_height(ui.ctx().screen_rect().height() * 0.6)
                         .show(ui, |ui| macro_form::show(ui, form));
+                    // What keeps the form from being a macro is shown as it is typed, and Save
+                    // waits for it, as OK does in the rules and report layout dialogs.
+                    let bad = form.to_macro().err();
                     if let Some(e) = error {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
                     }
+                    if let Some(why) = bad.as_ref().filter(|b| error.as_ref() != Some(*b)) {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, why.as_str());
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
+                        if ui.add_enabled(bad.is_none(), egui::Button::new("Save")).clicked() {
                             // Saved through the project, so the save is one undo step.
                             let form = form.clone();
                             then = Some(Box::new(move |app: &mut App| {
@@ -2727,7 +2744,14 @@ impl App {
                         };
                         ui.add(egui::Label::new(RichText::new(shown).monospace().small()).wrap());
                     });
-                    ui.checkbox(include, "Include this log in my report");
+                    // An empty log has nothing to include: the box is greyed out and shown
+                    // unticked, so it does not claim a log goes with the report.
+                    let (enabled, mut ticked) = include_log_box(log, *include);
+                    ui.add_enabled(enabled, egui::Checkbox::new(&mut ticked, "Include this log in my report"))
+                        .on_disabled_hover_text("The log is empty.");
+                    if enabled {
+                        *include = ticked;
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Open the report form").clicked() {
                             let (request, copy) = report_request(log, *include);
@@ -2739,7 +2763,7 @@ impl App {
                             }
                             self.open_url
                                 .push(feedback::form_url(feedback::Kind::Problem, &request));
-                            applog::info(if *include {
+                            applog::info(if *include && !log.is_empty() {
                                 "report form opened with the log"
                             } else {
                                 "report form opened without the log"
@@ -2815,7 +2839,9 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.leave(leave)));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        // Escape is Cancel, as in the other dialogs: nothing is saved or dropped.
+                        // It is used up here, so the symbol editor does not also drop its shape.
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2825,7 +2851,8 @@ impl App {
                     egui::ScrollArea::vertical()
                         .max_height((screen.height() * 0.6).max(120.0))
                         .show(ui, |ui| ui.label(m.as_str()));
-                    if ui.button("OK").clicked() {
+                    // OK is the only answer: Enter and Escape give it too.
+                    if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape)) {
                         keep = false;
                     }
                 }
@@ -3545,7 +3572,8 @@ impl App {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.edit_rules()));
                         }
-                        if ui.button("Close").clicked() {
+                        // Escape closes the list, as it does the other read-only dialogs.
+                        if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -5883,6 +5911,11 @@ impl eframe::App for App {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
+        // A ribbon tab the user opened is the one the ribbon opens on next time.
+        if self.chrome.ribbon_tab != self.prefs.ribbon_tab {
+            self.prefs.ribbon_tab = self.chrome.ribbon_tab;
+            self.prefs.save();
+        }
         if self.importing.is_none() {
             actions = self.route_menu_to_symbol_editor(actions);
         }
@@ -6636,6 +6669,18 @@ fn follow_panel_pick(
 /// actions (properties, delete, move up or down) are about the current page even while a panel
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
+/// Why Copy, Cut and Duplicate leave a selection of only these alone.
+const NOT_COPIED: &str = "revision clouds and the revision table are not copied.";
+
+/// Whether `sel` holds something, but only revision clouds and the revision table, which a
+/// copy leaves out: then Copy, Cut and Duplicate say so rather than do nothing without a word.
+fn only_uncopied(sel: &[Selection]) -> bool {
+    !sel.is_empty()
+        && sel
+            .iter()
+            .all(|s| matches!(s, Selection::Cloud(_) | Selection::RevisionTable))
+}
+
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
     // With a panel shown Duplicate and Mirror still work on the schematic page under it (Delete
     // and Rotate go to the panel's picked device instead; Select all, Copy, Cut and Paste are
@@ -6746,6 +6791,13 @@ fn welcome(
 const REPORT_LOG_BYTES: usize = 60_000;
 /// How much of the log's end goes into the report form itself (the link has a size limit).
 const REPORT_FORM_BYTES: usize = 1_500;
+
+/// The "Include this log" box: whether it can be used and whether it shows ticked. An empty log
+/// has nothing to include, so the box is greyed out and unticked whatever was chosen.
+fn include_log_box(log: &str, include: bool) -> (bool, bool) {
+    let enabled = !log.is_empty();
+    (enabled, enabled && include)
+}
 
 /// The report form's fields and the text for the clipboard: the log goes in only when the person
 /// chose to include it and there is one.
@@ -7020,6 +7072,15 @@ mod renderer_tests {
         assert_eq!(press(Modifiers::COMMAND, Key::Z), [Action::Undo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Y), [Action::Redo]);
         assert_eq!(press(shift, Key::N), [Action::NewProject]);
+    }
+
+    /// An empty log greys out "Include this log" and shows it unticked; a log leaves the choice.
+    #[test]
+    fn the_include_log_box_is_off_for_an_empty_log() {
+        assert_eq!(include_log_box("", true), (false, false));
+        assert_eq!(include_log_box("", false), (false, false));
+        assert_eq!(include_log_box("started", true), (true, true));
+        assert_eq!(include_log_box("started", false), (true, false));
     }
 
     #[test]
@@ -8185,6 +8246,43 @@ mod nudge_tests {
         let sent = app_frame(&mut app, &ctx, Vec::new(), true);
         assert!(!sent.contains(&CancelClose));
         assert!(app.dialog.is_none());
+    }
+
+    /// Escape answers the unsaved-changes question as Cancel: the window stays open, the
+    /// change stays in the project and nothing is written. Enter or Escape closes a message
+    /// as OK (#1493).
+    #[test]
+    fn escape_cancels_the_unsaved_question_and_closes_a_message() {
+        use egui::ViewportCommand::Close;
+        let key = |key| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        let (_tmp, mut app, ctx) = changed_app();
+        app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+            "the person is asked"
+        );
+        // A window just opened is laid out unseen in its first frame.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let mut sent = app_frame(&mut app, &ctx, key(Key::Escape), false);
+        sent.extend(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert!(app.dialog.is_none(), "Escape answers the question");
+        assert!(!sent.contains(&Close), "the window stays open");
+        assert!(app.open.as_ref().unwrap().dirty, "the change is kept, unsaved");
+        assert_eq!(coil_on_disk(&app), Point::new(55.0, 60.0), "nothing is written");
+        for k in [Key::Enter, Key::Escape] {
+            app.dialog = Some(Dialog::Message("Done.".into()));
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, key(k), false);
+            assert!(app.dialog.is_none(), "{k:?} closes the message");
+        }
     }
 
     /// A device tag typed and not entered yet when the window's close button is pressed is

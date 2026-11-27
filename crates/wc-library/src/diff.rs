@@ -293,4 +293,119 @@ mod tests {
             vec!["3D size: not given -> 45×90×70 mm"]
         );
     }
+
+    #[test]
+    fn id_and_source_are_not_symbol_changes() {
+        let mut new = coil();
+        new.id = "coil2".into();
+        new.source = "vendor/coil.svg".into();
+        assert!(diff_symbols(&coil(), &new).is_empty());
+    }
+
+    #[test]
+    fn reordered_pins_are_not_a_change() {
+        let mut new = coil();
+        new.pins.reverse();
+        assert!(diff_symbols(&coil(), &new).is_empty());
+    }
+
+    #[test]
+    fn graphics_with_the_same_count_still_count_as_changed() {
+        let mut new = coil();
+        new.graphics = vec![Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(0.0, 12.0),
+        }];
+        assert_eq!(diff_symbols(&coil(), &new), vec!["graphics changed (1 -> 1 shapes)"]);
+    }
+
+    #[test]
+    fn every_removed_pin_comes_before_every_added_pin() {
+        let old = coil();
+        let mut new = coil();
+        new.pins = vec![Pin {
+            name: "X".into(),
+            at: Point::new(0.0, 0.0),
+            dir: PinDir::Up,
+        }];
+        assert_eq!(
+            diff_symbols(&old, &new),
+            vec![
+                "pin A1 removed (wires on it will be left open)",
+                "pin A2 removed (wires on it will be left open)",
+                "pin X added",
+            ]
+        );
+        assert_eq!(
+            diff_symbols(&new, &old),
+            vec![
+                "pin X removed (wires on it will be left open)",
+                "pin A1 added",
+                "pin A2 added",
+            ]
+        );
+    }
+
+    #[test]
+    fn part_id_is_not_a_part_change() {
+        let mut new = contactor();
+        new.id = "acme.c1-renamed".into();
+        assert!(diff_parts(&contactor(), &new).is_empty());
+    }
+
+    #[test]
+    fn a_symbol_given_where_there_was_none_reads_from_empty() {
+        let mut old = contactor();
+        old.symbol = None;
+        assert_eq!(diff_parts(&old, &contactor()), vec!["symbol: \"\" -> \"coil\""]);
+        let mut blank = contactor();
+        blank.symbol = Some(String::new());
+        assert!(diff_parts(&old, &blank).is_empty());
+    }
+
+    #[test]
+    fn property_lines_follow_the_name_order() {
+        let mut old = contactor();
+        old.properties.clear();
+        let mut new = old.clone();
+        for k in ["Zeta", "Alpha", "Mid"] {
+            new.properties.insert(k.into(), "1".into());
+        }
+        assert_eq!(
+            diff_parts(&old, &new),
+            vec!["property Alpha added", "property Mid added", "property Zeta added"]
+        );
+        assert_eq!(
+            diff_parts(&new, &old),
+            vec![
+                "property Alpha removed",
+                "property Mid removed",
+                "property Zeta removed",
+            ]
+        );
+    }
+
+    #[test]
+    fn contacts_given_for_the_first_time_read_from_not_given() {
+        let mut new = contactor();
+        new.contacts = Some(Contacts {
+            nc: 2,
+            ..Contacts::default()
+        });
+        assert_eq!(diff_parts(&contactor(), &new), vec!["contacts: not given -> 2 NC"]);
+    }
+
+    #[test]
+    fn a_removed_3d_size_reads_to_not_given() {
+        let mut old = contactor();
+        old.model = Some(ModelSize {
+            width: 22.5,
+            height: 100.0,
+            depth: 60.0,
+        });
+        assert_eq!(
+            diff_parts(&old, &contactor()),
+            vec!["3D size: 22.5×100×60 mm -> not given"]
+        );
+    }
 }
