@@ -894,3 +894,123 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
         ],
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn all_lists_each_action_once() {
+        let mut seen = HashSet::new();
+        for a in Action::ALL {
+            assert!(seen.insert(*a), "{a:?} is listed twice in Action::ALL");
+        }
+    }
+
+    #[test]
+    fn names_are_unique_ignoring_case_and_find_their_action() {
+        // The assistant looks actions up by name with `eq_ignore_ascii_case`, so two names
+        // that differ only in case would make one of them unreachable.
+        let mut seen = HashSet::new();
+        for a in Action::ALL {
+            let name = a.name();
+            assert!(!name.is_empty());
+            assert!(seen.insert(name.to_ascii_lowercase()), "{name} clashes");
+            let found = Action::ALL
+                .iter()
+                .find(|b| b.name().eq_ignore_ascii_case(&name.to_ascii_uppercase()));
+            assert_eq!(found, Some(a));
+        }
+        assert_eq!(Action::AddPage.name(), "AddPage");
+    }
+
+    #[test]
+    fn every_action_has_a_label_and_a_tip() {
+        for a in Action::ALL {
+            let info = a.info();
+            assert!(!info.label.trim().is_empty(), "{a:?} has no label");
+            assert_eq!(info.label, info.label.trim(), "{a:?} label has edge spaces");
+            assert!(!info.tip.trim().is_empty(), "{a:?} has no tip");
+            assert_eq!(info.shortcut, info.shortcut.trim(), "{a:?} shortcut");
+        }
+    }
+
+    #[test]
+    fn shortcuts_are_not_shared() {
+        let mut seen = HashSet::new();
+        for a in Action::ALL {
+            let s = a.info().shortcut;
+            if !s.is_empty() {
+                assert!(seen.insert(s), "{s} is bound to more than one action ({a:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn page_wide_actions_also_count_as_page_edits() {
+        for a in Action::ALL {
+            if a.edits_page_itself() {
+                assert!(a.edits_page(), "{a:?}");
+            }
+        }
+        for a in [Action::PageProps, Action::DeletePage, Action::PageUp, Action::PageDown] {
+            assert!(a.edits_page_itself(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn drawing_tools_edit_the_page_but_viewing_and_saving_do_not() {
+        for a in [
+            Action::PlaceSymbol,
+            Action::DrawWire,
+            Action::TextTool,
+            Action::Delete,
+            Action::Paste,
+            Action::Duplicate,
+        ] {
+            assert!(a.edits_page(), "{a:?}");
+            assert!(!a.edits_page_itself(), "{a:?}");
+        }
+        for a in [
+            Action::Save,
+            Action::Open,
+            Action::Copy,
+            Action::Select,
+            Action::ZoomIn,
+            Action::ZoomFit,
+            Action::ToggleGrid,
+            Action::ExportPdf,
+            Action::Find,
+            Action::NextPage,
+            Action::AddPage,
+            Action::Undo,
+        ] {
+            assert!(!a.edits_page(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn toolbar_and_ribbon_only_show_known_actions_without_empty_groups() {
+        let all: HashSet<Action> = Action::ALL.iter().copied().collect();
+        for group in TOOLBAR {
+            assert!(!group.is_empty());
+            for a in *group {
+                assert!(all.contains(a), "toolbar shows {a:?}, missing from ALL");
+            }
+        }
+        let mut tabs = HashSet::new();
+        for (tab, groups) in RIBBON {
+            assert!(tabs.insert(*tab), "ribbon tab {tab} twice");
+            assert!(!groups.is_empty(), "ribbon tab {tab} is empty");
+            for (name, actions) in *groups {
+                assert!(!actions.is_empty(), "ribbon group {tab}/{name} is empty");
+                let mut in_group = HashSet::new();
+                for a in *actions {
+                    assert!(all.contains(a), "ribbon shows {a:?}, missing from ALL");
+                    assert!(in_group.insert(*a), "{a:?} twice in {tab}/{name}");
+                }
+            }
+        }
+    }
+}
