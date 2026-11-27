@@ -2134,11 +2134,14 @@ fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Res
                 PLATE_SIDE.end()
             )
         })?;
-        if field == 1 {
-            changed.width = v;
+        let (w, h) = if field == 1 {
+            (v, changed.height)
         } else {
-            changed.height = v;
-        }
+            (changed.width, v)
+        };
+        // As `panel edit` in the CLI: rails, ducts and devices stay where they are, and a size
+        // that would leave any of them sticking out is refused.
+        changed.resize(w, h).map_err(|e| format!("{}.", capitalised(&e)))?;
     }
     if open.project.panels.iter().any(|p| p.id == id && *p != changed) {
         open.checkpoint();
@@ -2147,6 +2150,13 @@ fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Res
         }
     }
     Ok(())
+}
+
+/// `s` with its first letter in upper case.
+fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 /// Enter what was typed in the panel layout fields and not entered yet, in the panel it was
@@ -2656,6 +2666,21 @@ mod tests {
             assert_eq!(h.o.project, before, "{text:?}");
             assert_eq!(h.o.undo_mark(), mark, "{text:?}");
         }
+        // A plate too small for the ducts and rails on it is refused, naming them, as the CLI's
+        // `panel edit` does.
+        for (field, text) in [(1, "100"), (2, "300")] {
+            let (before, mark) = (h.o.project.clone(), h.o.undo_mark());
+            let r = enter_panel_field(&mut h.o, "panel1", field, text);
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.contains("sticking out") && e.contains("duct")),
+                "{text:?}: {r:?}"
+            );
+            assert_eq!(h.o.project, before, "{text:?}");
+            assert_eq!(h.o.undo_mark(), mark, "{text:?}");
+        }
+        // With nothing on it, the plate takes any size in the limits.
+        h.o.project.panels[0].items.clear();
         for (field, text, width, height) in [(1, "10", 10.0, 800.0), (2, " 10000 ", 10.0, 10000.0)] {
             let mark = h.o.undo_mark();
             assert_eq!(enter_panel_field(&mut h.o, "panel1", field, text), Ok(()));
