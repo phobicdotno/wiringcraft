@@ -156,5 +156,5 @@ black box tag, and closes the page history.
 | --- | --- |
 | Enter | Send the message |
 | Shift+Enter | New line |
-| Ctrl+V in the message box | Paste a picture from the clipboard as a screenshot (Windows and Linux; on macOS Cmd+V does not do it, use the Paste screenshot button or drop the file) |
-| Drop a picture on the window | Attach it as a screenshot, while the assistant panel is shown and not working on a message (then the drop is refused with a note) |
+| Ctrl+V in the message box | Paste a picture from the clipboard as a screenshot (Windows and Linux; on macOS Cmd+V does not do it, use the Paste screenshot button or drop the file). When the clipboard also holds text, Ctrl+V pastes the text and attaches no picture; use the Paste screenshot button then |
+| Drop a picture on the window | Attach a `.png`, `.jpg` or `.jpeg` file as a screenshot (other files are ignored), while the assistant panel is shown and not working on a message (then the drop is refused with a note) |
