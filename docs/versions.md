@@ -97,9 +97,11 @@ Merging brings the work of another branch into the one you are on
 unrecorded changes, and while an earlier merge is still waiting to be finished.
 
 Because each page is a separate file, two people who change different pages never conflict:
-git takes both changes. A conflict happens only when both branches changed the same page file
-in the same place, for example both gave page 3 a new title. The merge then stops and lists
-the files:
+git takes both changes. A conflict happens when both branches changed the same file in the
+same place, for example both gave page 3 a new title. That is most often a page file, but it
+can be any tracked file both branches change, such as `devices.json`, `project.toml` or
+`.gitattributes`, or a file one branch changed and the other deleted (a page removed on one
+branch and edited on the other). The merge then stops and lists the files:
 
 ```console
 $ wiringcraft vcs merge motor
@@ -111,8 +113,9 @@ error: resolve the files, then `wiringcraft vcs commit`, or undo the merge with 
 You then have two ways out:
 
 - Resolve it. Open the listed files in a text editor or any git merge tool, keep the version
-  you want of each conflicting part, and record a version with `wiringcraft vcs commit`. That
-  version finishes the merge.
+  you want of each conflicting part, and record a version with
+  `wiringcraft vcs commit -m "<what changed and why>"` (the message is required). That version
+  finishes the merge.
 - Undo it with `wiringcraft vcs merge --abort`, which puts the files back as they were before
   the merge.
 
