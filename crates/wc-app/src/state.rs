@@ -7781,6 +7781,7 @@ pub(crate) mod tests {
         // A breaker, which the library has and the project doesn't yet: loaded before the coil
         // (ids are loaded in order), and taken back with it.
         let mut breaker = clip.symbols[0].clone();
+        breaker.id = format!("{}-breaker", breaker.id);
         breaker.symbol = "wc.breaker.1p".into();
         breaker.tag = None;
         clip.symbols.insert(0, breaker);
