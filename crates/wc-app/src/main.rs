@@ -837,9 +837,8 @@ impl App {
     /// Open the project in `dir` in place of the open one. With unsaved changes in the open
     /// project the person is asked first whether to save them (#1019); it opens once answered.
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
-        // A black box change the save refused is not in the project yet either.
-        let unsaved =
-            self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels, &self.ed);
+        // A black box form changed and not applied (or refused) is not in the project yet either.
+        let unsaved = self.unsaved();
         if self.importing.is_none() && unsaved {
             self.ask_unsaved(Leave::Open(dir.to_path_buf()));
             return;
@@ -1396,7 +1395,7 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = Closing::WaitsForTyped;
             ctx.request_repaint();
-        } else if open.dirty || panels::black_box_draft_refused(&self.panels, &self.ed) {
+        } else if open.dirty || panels::black_box_draft_pending(open, &self.panels, &self.ed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.ask_unsaved(Leave::Close);
         } else if self.dialog_holds_work() {
@@ -1425,7 +1424,7 @@ impl App {
     /// The frame after a close waited for a typed value, once the panels entered it: ask about
     /// unsaved changes, or close.
     fn close_or_ask(&mut self) {
-        if self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels, &self.ed) {
+        if self.unsaved() {
             self.closing = Closing::No;
             self.ask_unsaved(Leave::Close);
         } else if self.dialog_holds_work() {
@@ -1474,13 +1473,18 @@ impl App {
     fn save_and_leave(&mut self, leave: Leave) {
         self.carry_out(Action::Save);
         // While an assistant command runs, Save waits (`SAVE_WAITS`): nothing was saved.
-        if self.assistant.command_running()
-            || self.open.as_ref().is_some_and(|o| o.dirty)
-            || panels::black_box_draft_refused(&self.panels, &self.ed)
-        {
+        if self.assistant.command_running() || self.unsaved() {
             return;
         }
         self.leave(leave);
+    }
+
+    /// Whether the open project has changes that closing it would drop: unsaved changes, or a
+    /// black box form changed and not applied (or refused) (#1024).
+    fn unsaved(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|o| o.dirty || panels::black_box_draft_pending(o, &self.panels, &self.ed))
     }
 
     /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
@@ -8302,6 +8306,126 @@ mod nudge_tests {
         app.prefs = prefs;
         assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Open(_)))));
         assert_ne!(app.open.as_ref().unwrap().dir, other, "not opened before the answer");
+    }
+
+    /// A saved project with a black box selected, whose form has a point renamed from 1 to A
+    /// and not applied: nothing else is unsaved.
+    fn black_box_draft_app() -> (tempfile::TempDir, App, egui::Context, String) {
+        use wc_core::{BoxPin, BoxSide};
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .add_black_box(page, Point::new(120.0, 40.0), Point::new(140.0, 50.0), &pins, None)
+            .unwrap();
+        open.save().unwrap();
+        app.ed.select_only(Selection::Symbol(id.clone()));
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        panels::black_box_form_mut(&mut app.panels).unwrap().rows[0].name = "A".into();
+        assert!(!app.open.as_ref().unwrap().dirty, "only the form holds the change");
+        (tmp, app, ctx, id)
+    }
+
+    /// The point names of the black box `id` in the project saved in `dir`.
+    fn box_points_on_disk(dir: &Path, page: usize, id: &str) -> Vec<String> {
+        let back = state::Open::load(dir).unwrap();
+        let symbol = back.project.pages[page].symbol(id).unwrap().symbol.clone();
+        back.symbols[&symbol].pins.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// A black box form changed and not applied counts as an unsaved change when the window is
+    /// closed: the person is asked; Cancel keeps the form's change, Don't save closes without
+    /// it, Save applies it and closes with it on disk (#1024).
+    #[test]
+    fn closing_the_window_asks_about_a_black_box_form_not_applied() {
+        use egui::ViewportCommand::{CancelClose, Close};
+        for answer in ["Cancel", "Don't save", "Save"] {
+            let (_tmp, mut app, ctx, id) = black_box_draft_app();
+            let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+            assert!(sent.contains(&CancelClose), "{answer}: the close is called off");
+            assert!(
+                matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+                "{answer}: the person is asked"
+            );
+            app.dialog = None;
+            match answer {
+                "Don't save" => app.leave(Leave::Close),
+                "Save" => app.save_and_leave(Leave::Close),
+                _ => {}
+            }
+            let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+            assert_eq!(sent.contains(&Close), answer != "Cancel", "{answer}: the window closes");
+            if answer == "Cancel" {
+                let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+                assert_eq!(form.rows[0].name, "A", "Cancel keeps the form's change");
+            }
+            let dir = app.open.as_ref().unwrap().dir.clone();
+            let on_disk = if answer == "Save" { "A" } else { "1" };
+            assert_eq!(
+                box_points_on_disk(&dir, app.ed.page, &id),
+                [on_disk],
+                "{answer}: what is on disk"
+            );
+        }
+    }
+
+    /// Opening another project with a black box form changed and not applied asks first:
+    /// Cancel keeps the form's change, Don't save opens the other project without it, Save
+    /// applies it, saves, then opens the other one. A change the form refuses keeps the project
+    /// open (#1024).
+    #[test]
+    fn opening_another_project_asks_about_a_black_box_form_not_applied() {
+        for answer in ["Cancel", "Don't save", "Save", "Save refused"] {
+            let (tmp, mut app, ctx, id) = black_box_draft_app();
+            let first = app.open.as_ref().unwrap().dir.clone();
+            let page = app.ed.page;
+            if answer == "Save refused" {
+                // A point with no name is refused.
+                panels::black_box_form_mut(&mut app.panels).unwrap().rows[0].name = String::new();
+            }
+            let other = tmp.path().join("other");
+            wc_core::store::create(&other, "Other").unwrap();
+            let mut prefs = Prefs::default();
+            app.open_dir(&other, &mut prefs);
+            assert_eq!(app.open.as_ref().unwrap().dir, first, "{answer}: not replaced yet");
+            let Some(Dialog::Unsaved(Leave::Open(asked))) = app.dialog.take() else {
+                unreachable!("{answer}: the person is asked")
+            };
+            match answer {
+                "Don't save" => app.leave(Leave::Open(asked)),
+                "Save" | "Save refused" => app.save_and_leave(Leave::Open(asked)),
+                _ => {}
+            }
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            let opened = matches!(answer, "Don't save" | "Save");
+            assert_eq!(
+                app.open.as_ref().unwrap().dir != first,
+                opened,
+                "{answer}: the other project is open"
+            );
+            if !opened {
+                assert!(
+                    panels::black_box_form_mut(&mut app.panels).is_some_and(|f| f.rows[0].name != "1"),
+                    "{answer}: the form keeps its change"
+                );
+            }
+            if answer == "Save refused" {
+                assert!(app.ed.message.contains("not changed"), "{}", app.ed.message);
+            }
+            let on_disk = if answer == "Save" { "A" } else { "1" };
+            assert_eq!(
+                box_points_on_disk(&first, page, &id),
+                [on_disk],
+                "{answer}: what is on disk"
+            );
+        }
     }
 
     /// While the unsaved-changes question is open, a session join does not come in: it would
