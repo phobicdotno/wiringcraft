@@ -1131,3 +1131,97 @@ fn variant_letter(id: u32) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn numbers_are_trimmed_and_only_finite_ones_kept() {
+        assert_eq!(number(" 2.5 "), Some(2.5));
+        assert_eq!(number("-0"), Some(0.0));
+        assert_eq!(number("NaN"), None);
+        assert_eq!(number("inf"), None);
+        assert_eq!(number("1e999"), None);
+        assert_eq!(number(""), None);
+        assert_eq!(number("1,5"), None);
+    }
+
+    #[test]
+    fn a_point_needs_x_and_y_and_drops_z() {
+        assert_eq!(point("1/2"), Some(Point::new(1.0, 2.0)));
+        assert_eq!(point("1/2/3"), Some(Point::new(1.0, 2.0)));
+        assert_eq!(point(" 4 / -5 /x"), Some(Point::new(4.0, -5.0)));
+        assert_eq!(point("1"), None);
+        assert_eq!(point("1/"), None);
+        assert_eq!(point("a/2"), None);
+        assert_eq!(point("1/NaN"), None);
+    }
+
+    #[test]
+    fn designations_are_trimmed_kept_in_order_and_capped() {
+        assert!(matches!(
+            designations(" 1 ; 2;;3 ").as_deref(),
+            Ok([a, b, c, d]) if a == "1" && b == "2" && c.is_empty() && d == "3"
+        ));
+        assert!(matches!(designations("").as_deref(), Ok([e]) if e.is_empty()));
+        let most = vec!["x"; MAX_DESIGNATIONS].join(";");
+        assert!(matches!(designations(&most), Ok(v) if v.len() == MAX_DESIGNATIONS));
+        let one_more = vec!["x"; MAX_DESIGNATIONS + 1].join(";");
+        assert!(matches!(designations(&one_more), Err(Error::Format(_))));
+    }
+
+    #[test]
+    fn a_text_in_no_language_is_used_only_when_nothing_is_translated() {
+        assert_eq!(text_of("??_??@24 V;"), "24 V");
+        assert_eq!(text_of("  ??_??@ 24 V ;??_??@other;"), "24 V");
+        assert_eq!(text_of("??_??@24 V;en_US@Input;"), "Input");
+        assert_eq!(text_of("de_DE@Eingang;en_US@Input;"), "Input");
+        assert_eq!(text_of(";;"), "");
+    }
+
+    #[test]
+    fn alignment_of_zero_and_large_numbers_stays_in_range() {
+        assert_eq!(alignment(0), Align::Left);
+        assert_eq!(alignment(9), Align::Right);
+        assert_eq!(alignment(10), Align::Left);
+        assert_eq!(alignment(u32::MAX), Align::Right);
+    }
+
+    #[test]
+    fn representation_types_have_names_and_unknown_ones_their_number() {
+        assert_eq!(representation(Some(1)), "multi-line");
+        assert_eq!(representation(Some(2)), "single-line");
+        assert_eq!(representation(Some(4)), "overview");
+        assert_eq!(representation(Some(6)), "panel layout");
+        assert_eq!(representation(Some(10)), "3D");
+        assert_eq!(representation(Some(7)), "type 7");
+        assert_eq!(representation(None), "unknown type");
+    }
+
+    #[test]
+    fn variant_letters_run_a_to_z_and_stop_at_z() {
+        assert_eq!(variant_letter(0), "A");
+        assert_eq!(variant_letter(1), "B");
+        assert_eq!(variant_letter(25), "Z");
+        assert_eq!(variant_letter(26), "Z");
+        assert_eq!(variant_letter(u32::MAX), "Z");
+    }
+
+    #[test]
+    fn counts_of_zero_are_not_recorded_and_others_add_up() {
+        let mut left_out = BTreeMap::new();
+        add(&mut left_out, "arcs", 0);
+        assert!(left_out.is_empty());
+        add(&mut left_out, "arcs", 2);
+        add(&mut left_out, "arcs", 3);
+        assert_eq!(left_out.get("arcs"), Some(&5));
+    }
+
+    #[test]
+    fn variant_zero_leaves_pin_directions_as_they_are() {
+        for d in [PinDir::Up, PinDir::Right, PinDir::Down, PinDir::Left] {
+            assert_eq!(turned(d, 0), d);
+        }
+    }
+}
