@@ -549,6 +549,9 @@ pub(crate) fn dxf_text(s: &str) -> String {
         match ch {
             '\\' => out.push_str("\\U+005C"),
             '%' if percent_pair => out.push_str("\\U+0025"),
+            // Caret notation: `^J` is read as a line feed and `^ ` as a caret. A caret at the
+            // end starts no code and stays readable.
+            '^' if i + 1 < chars.len() => out.push_str("\\U+005E"),
             c if c.is_ascii() => out.push(c),
             c if u32::from(c) > 0xFFFF => out.push('?'),
             c => {

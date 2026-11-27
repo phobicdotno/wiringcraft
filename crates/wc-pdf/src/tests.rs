@@ -221,6 +221,11 @@ fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
     // Beyond U+FFFF there is no four-digit code; a five-digit one would be misread.
     assert_eq!(vector::dxf_text("ok \u{1F600}"), "ok ?");
     assert_eq!(vector::dxf_text("Ålesund\n"), "\\U+00C5lesund");
+    // `^` and the character after it would be read as one control character (`^J` a line
+    // feed); a caret at the end starts nothing (#1250).
+    assert_eq!(vector::dxf_text("x^2 A^J"), "x\\U+005E2 A\\U+005EJ");
+    assert_eq!(vector::dxf_text("up^"), "up^");
+    assert_eq!(vector::dxf_text("^\t^"), "\\U+005E^");
 }
 
 #[test]
