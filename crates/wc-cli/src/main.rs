@@ -4318,7 +4318,7 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             reference,
         } => {
             store::check_id(&name).map_err(e)?;
-            if p.meta.libraries.iter().any(|l| l.name == name) {
+            if p.meta.libraries.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
                 return Err(format!("source {name:?} exists"));
             }
             if kind != "folder" && kind != "git" {
@@ -4333,8 +4333,20 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             save(dir, &p)?;
         }
         LibCmd::Sync => {
-            for line in wc_library::sync(dir, &p).map_err(e)? {
-                println!("{line}");
+            let outcomes = wc_library::sync(dir, &p).map_err(e)?;
+            let total = outcomes.len();
+            let mut failed = 0;
+            for outcome in outcomes {
+                match outcome {
+                    Ok(line) => println!("{line}"),
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!("{err}");
+                    }
+                }
+            }
+            if failed > 0 {
+                return Err(format!("{failed} of {total} library sources could not be synced"));
             }
         }
         LibCmd::Status => {

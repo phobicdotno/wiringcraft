@@ -35,6 +35,13 @@ fn commit_file(repo: &Path, text: &str) -> Result<()> {
     run_git(repo, &["commit", "-q", "-m", text])
 }
 
+/// One source synced through [`sync_all`], as the project's sync does it.
+fn sync_one(project_dir: &Path, s: &LibrarySource) -> Result<String> {
+    let mut outcomes = sync_all(project_dir, std::slice::from_ref(s))?;
+    assert_eq!(outcomes.len(), 1);
+    outcomes.pop().unwrap_or_else(|| unreachable!())
+}
+
 fn read(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(io)
 }
@@ -165,5 +172,186 @@ fn git_source_follows_a_changed_location() -> Result<()> {
     // The user points the source at another repository: the next sync takes that one.
     assert_eq!(sync(&new)?, format!("lib: updated from {}", new.display()));
     assert_eq!(read(&cache.join("git/lib/lib.txt"))?, "new");
+    Ok(())
+}
+
+#[test]
+fn a_failing_source_does_not_stop_the_ones_after_it() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir(&upstream).map_err(io)?;
+    run_git(&upstream, &["init", "-q", "-b", "main"])?;
+    commit_file(&upstream, "v1")?;
+    let loc = upstream.to_string_lossy().into_owned();
+    let missing = tmp.path().join("no-such-repo").to_string_lossy().into_owned();
+    let sources = [
+        src("gone", "git", &missing, None),
+        src("odd", "ftp", "somewhere", None),
+        src("good", "git", &loc, None),
+    ];
+
+    let outcomes = sync_all_in(tmp.path(), &sources, Some(&cache))?;
+    assert_eq!(outcomes.len(), 3);
+    let mut outcomes = outcomes.into_iter();
+    let (name, _) = source_message(outcomes.next().unwrap_or_else(|| unreachable!()));
+    assert_eq!(name, "gone");
+    let (name, message) = source_message(outcomes.next().unwrap_or_else(|| unreachable!()));
+    assert_eq!(name, "odd");
+    assert!(message.contains("\"ftp\""), "{message}");
+    // The source after the failing ones is still cloned.
+    assert_eq!(
+        outcomes.next().unwrap_or_else(|| unreachable!())?,
+        format!("good: cloned {loc}")
+    );
+    assert_eq!(read(&cache.join("git/good/lib.txt"))?, "v1");
+    Ok(())
+}
+
+#[test]
+fn two_sources_with_one_name_are_refused_before_anything_is_synced() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir(&upstream).map_err(io)?;
+    run_git(&upstream, &["init", "-q", "-b", "main"])?;
+    commit_file(&upstream, "v1")?;
+    let loc = upstream.to_string_lossy().into_owned();
+    // The names differ only in case: on Windows and macOS they would share one cache folder.
+    let sources = [src("lib", "git", &loc, None), src("Lib", "git", &loc, None)];
+
+    let (name, message) = source_message(sync_all_in(tmp.path(), &sources, Some(&cache)));
+    assert_eq!(name, "Lib");
+    assert!(message.contains("two library sources"), "{message}");
+    assert!(!cache.join("git").exists(), "nothing was synced");
+    Ok(())
+}
+
+#[test]
+fn redact_location_hides_the_user_and_password_of_a_url() {
+    assert_eq!(
+        redact_location("https://user:token@example.com/lib.git"),
+        "https://***@example.com/lib.git"
+    );
+    assert_eq!(redact_location("https://token@example.com"), "https://***@example.com");
+    // An @ after the host is part of the path, not a user name.
+    assert_eq!(
+        redact_location("https://example.com/a@b/lib.git"),
+        "https://example.com/a@b/lib.git"
+    );
+    assert_eq!(redact_location("git@example.com:lib.git"), "git@example.com:lib.git");
+    assert_eq!(redact_location("../lib"), "../lib");
+}
+
+#[test]
+fn redact_location_hides_the_query_and_fragment_of_a_url() {
+    assert_eq!(
+        redact_location("https://u:p@host/path?token=x#f"),
+        "https://***@host/path?***"
+    );
+    assert_eq!(redact_location("https://host/path?token=x"), "https://host/path?***");
+    assert_eq!(redact_location("https://host/path#f"), "https://host/path#***");
+    assert_eq!(redact_location("https://u@host?token=x"), "https://***@host?***");
+}
+
+#[test]
+fn git_error_text_is_redacted_in_every_form_of_the_url() {
+    let location = "https://u:p@host/lib.git?token=x";
+    let shown = "https://***@host/lib.git?***";
+    for printed in [location, "https://host/lib.git?token=x", "host/lib.git?token=x"] {
+        let text = redact_text(&format!("fatal: unable to access '{printed}': refused"), location);
+        assert_eq!(text, format!("fatal: unable to access '{shown}': refused"));
+    }
+}
+
+#[test]
+fn git_credential_prompts_do_not_show_the_user_name_or_password() {
+    let location = "https://user:pw@host/lib.git";
+    for printed in ["https://user:pw@host", "https://user@host", "user:pw@host"] {
+        let text = redact_text(
+            &format!("fatal: could not read Password for '{printed}': terminal prompts disabled"),
+            location,
+        );
+        assert!(!text.contains("user") && !text.contains("pw"), "{text}");
+        assert!(text.contains("***@host"), "{text}");
+    }
+}
+
+#[test]
+fn credentials_with_a_star_are_redacted_too() {
+    let location = "https://a*b:c*d@host/lib.git";
+    for printed in ["https://a*b:c*d@host", "https://a*b@host", "a*b:c*d@host"] {
+        let text = redact_text(&format!("fatal: could not read Password for '{printed}'"), location);
+        assert!(!text.contains("a*b") && !text.contains("c*d"), "{text}");
+        assert!(
+            text.contains("'https://***@host'") || text.contains("'***@host'"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn percent_encoded_credentials_are_redacted_too() {
+    let location = "https://tok*x:p*w@host/lib.git";
+    for printed in [
+        "https://tok%2Ax@host",
+        "https://tok%2ax@host",
+        "https://tok%2Ax:p%2Aw@host",
+    ] {
+        let text = redact_text(&format!("fatal: could not read Password for '{printed}'"), location);
+        assert_eq!(text, "fatal: could not read Password for 'https://***@host'");
+    }
+    // A location that is already encoded is found in its decoded form too.
+    let text = redact_text("fatal: for 'https://tok*x@host'", "https://tok%2Ax:p%2Aw@host/lib.git");
+    assert_eq!(text, "fatal: for 'https://***@host'");
+}
+
+#[test]
+fn credentials_git_normalized_are_redacted_too() {
+    let location = "https://tok%2Ax*@host/lib.git";
+    let text = redact_text("fatal: could not read Password for 'https://tok%2Ax%2A@host'", location);
+    assert_eq!(text, "fatal: could not read Password for 'https://***@host'");
+    // Without a scheme, the normalized form is found by itself.
+    let text = redact_text("for tok%2Ax%2A@host", location);
+    assert_eq!(text, "for ***@host");
+}
+
+#[test]
+fn every_url_in_the_text_has_its_user_name_and_password_hidden() {
+    let text = redact_text(
+        "fatal: from 'https://a:b@host/lib.git' via \"http://other:secret@proxy:8080\" and ssh://git@host",
+        "https://a:b@host/lib.git",
+    );
+    assert_eq!(
+        text,
+        "fatal: from 'https://***@host/lib.git' via \"http://***@proxy:8080\" and ssh://***@host"
+    );
+    // An @ after the host is part of the path and is left alone.
+    assert_eq!(mask_url_userinfo("see https://host/a@b"), "see https://host/a@b");
+}
+
+// A file URL with a host needs a Unix path after it.
+#[cfg(unix)]
+#[test]
+fn sync_messages_do_not_show_a_password_in_the_location() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir(&upstream).map_err(io)?;
+    run_git(&upstream, &["init", "-q", "-b", "main"])?;
+    commit_file(&upstream, "v1")?;
+    let path = upstream.to_string_lossy();
+    let url = format!("file://user:secret@localhost{path}");
+    let shown = format!("file://***@localhost{path}");
+    let missing = format!("file://user:secret@localhost{path}-gone");
+
+    let sync = |s: &LibrarySource| sync_one_in(tmp.path(), s, Some(&cache));
+    assert_eq!(sync(&src("lib", "git", &url, None))?, format!("lib: cloned {shown}"));
+    assert_eq!(
+        sync(&src("lib", "git", &url, None))?,
+        format!("lib: updated from {shown}")
+    );
+    let (_, message) = source_message(sync(&src("gone", "git", &missing, None)));
+    assert!(!message.contains("secret"), "{message}");
     Ok(())
 }

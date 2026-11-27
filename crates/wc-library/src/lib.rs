@@ -18,7 +18,7 @@ use wc_core::lock::ItemKind;
 use wc_core::{LockEntry, Part, Project, Symbol, store};
 
 pub use diff::{diff_parts, diff_symbols};
-pub use source::{Source, cache_root};
+pub use source::{Source, cache_root, redact_location};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -254,14 +254,11 @@ pub struct SearchHit {
 }
 
 /// Fetch or refresh every git source into the local cache. Folder sources need nothing.
-/// Returns one line of outcome per source.
-pub fn sync(project_dir: &Path, project: &Project) -> Result<Vec<String>> {
-    project
-        .meta
-        .libraries
-        .iter()
-        .map(|s| source::sync_one(project_dir, s))
-        .collect()
+/// Returns one outcome per source, in the project's order: a source that fails (an
+/// unreachable remote, say) does not stop the ones after it from being synced. Two sources
+/// with the same name (ignoring case) are an error, and then nothing is synced.
+pub fn sync(project_dir: &Path, project: &Project) -> Result<Vec<Result<String>>> {
+    source::sync_all(project_dir, &project.meta.libraries)
 }
 
 /// How a project's pinned item compares to the library.
