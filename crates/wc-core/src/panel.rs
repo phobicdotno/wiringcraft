@@ -574,6 +574,14 @@ pub fn arrange(
         .iter()
         .filter_map(|i| match i {
             PanelItem::Rail { at, length } => {
+                // A negative length runs left from `at`: use the rail from its left end, as
+                // `Panel::resize` reads it.
+                let (start, len) = if *length < 0.0 {
+                    (Point::new(at.x + length, at.y), -length)
+                } else {
+                    (*at, *length)
+                };
+                let (at, length) = (&start, &len);
                 let used_to = panel
                     .items
                     .iter()
@@ -1453,6 +1461,54 @@ mod tests {
             Some((Point::new(10.0, 105.0), Point::new(55.0, 195.0))),
             "the empty left rail takes it from its own left end"
         );
+    }
+
+    #[test]
+    fn arrange_uses_a_rail_drawn_right_to_left_from_its_left_end() {
+        // A rail drawn from x 250 back to x 50, with one device already on it.
+        let mut panel = Panel::new("p", "P", 300.0, 200.0);
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(250.0, 100.0),
+            length: -200.0,
+        });
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        let mut part = Part {
+            id: "c".into(),
+            ..Default::default()
+        };
+        part.properties.insert("Width".into(), "45".into());
+        part.properties.insert("Height".into(), "90".into());
+        parts.insert("c".to_string(), part);
+        let tags: Vec<DeviceTag> = ["-K1", "-K2", "-K3", "-K4", "-K5"]
+            .iter()
+            .filter_map(|t| tag(t))
+            .collect();
+        for t in &tags {
+            project.devices.insert(
+                t.clone(),
+                Device {
+                    part: Some("c".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let Some(first) = tags.first() else { unreachable!() };
+        panel.items.push(PanelItem::Device {
+            tag: first.clone(),
+            at: Point::new(50.0, 55.0),
+            width: 45.0,
+            height: 90.0,
+            rotation: Rotation::R0,
+        });
+        let done = arrange(&mut panel, &project, &parts, None);
+        // 50..250 holds four 45 mm devices with gaps; the one already there counts.
+        assert_eq!(done.placed.len(), 3, "{done:?}");
+        assert_eq!(done.did_not_fit, vec![tags[4].to_string()]);
+        let Some((min, _)) = panel.device(&tags[1]).and_then(PanelItem::device_bounds) else {
+            unreachable!()
+        };
+        assert_eq!(min, Point::new(95.0 + GAP, 55.0));
     }
 
     #[test]

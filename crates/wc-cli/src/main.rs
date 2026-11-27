@@ -993,12 +993,14 @@ enum JumperCmd {
         /// Terminal numbers, at least two.
         terminals: Vec<String>,
     },
-    /// Take terminals out of their jumper, e.g. `jumper remove -X1 4`.
+    /// Take terminals out of their jumper, e.g. `jumper remove -X1 4`. Nothing changes when
+    /// one of them is in no jumper of the strip.
     Remove {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
-        /// Terminal numbers.
+        /// Terminal numbers, at least one.
+        #[arg(required = true)]
         terminals: Vec<String>,
     },
     /// Give the jumper holding a terminal a part (article), e.g. `jumper part -X1 3 <part id>`
@@ -3759,12 +3761,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
                 JumperCmd::Remove { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
-                    let mut changed = false;
-                    for t in &terminals {
-                        changed |= p.meta.remove_from_jumper(&strip, t.trim());
+                    // Every terminal is checked first, as `jumper add` does, so a typo among them
+                    // refuses the whole command instead of being passed over.
+                    let terminals: Vec<&str> = terminals.iter().map(|t| t.trim()).collect();
+                    if let Some(t) = terminals.iter().find(|t| {
+                        !p.meta
+                            .jumpers
+                            .iter()
+                            .any(|j| j.strip == strip && j.terminals.iter().any(|n| n == *t))
+                    }) {
+                        return Err(format!("no jumper of {strip} has terminal {}", escape_field(t)));
                     }
-                    if !changed {
-                        return Err(format!("no jumper of {strip} has terminal {}", terminals.join(", ")));
+                    for t in terminals {
+                        p.meta.remove_from_jumper(&strip, t);
                     }
                     save(dir, &p)?;
                 }
@@ -3966,7 +3975,9 @@ fn run(mut cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
-            let parts = vendored_parts(dir, &p);
+            // A part whose copy cannot be read is left out of the reports and the panel sheets,
+            // so it is named in a warning rather than left out without a word.
+            let parts = vendored_parts_warning_unreadable(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
                 symbols: &symbols,
@@ -4012,7 +4023,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
                     networks,
-                    footprints: wc_pdf::footprints(vendored_parts(dir, &p).values()),
+                    footprints: wc_pdf::footprints(parts.values()),
                     plc_cards,
                 },
             );
@@ -4524,6 +4535,15 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
     Ok(())
 }
 
+/// Refuse a blank `--name` for `import symbol-dxf` and `symbol-svg`: the library would list
+/// the symbol with no name, and the symbol editor does not save one like that either.
+fn check_symbol_name(name: &str) -> Res<()> {
+    if name.trim().is_empty() {
+        return Err("the symbol name cannot be empty: give one with --name".into());
+    }
+    Ok(())
+}
+
 /// `input`: the file of `import wago` or `import plc-csv`, read already (before the project
 /// lock).
 fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
@@ -4536,6 +4556,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             category,
             letter_code,
         } => {
+            check_symbol_name(&name)?;
             let text = read_file(&file)?;
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
@@ -4601,6 +4622,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             category,
             letter_code,
         } => {
+            check_symbol_name(&name)?;
             let text = read_text(&file)?;
             let (mut s, warnings) = wc_import::svg::symbol_with_warnings(&text, &id, &name).map_err(e)?;
             warn(&warnings);
@@ -5259,13 +5281,81 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
     Ok(())
 }
 
-/// One recorded change as a line of text, with a file name from git escaped by [`escape_field`]
-/// so a control character in it cannot steer the terminal.
+/// One recorded change as a line of text, with each name in it (a file name from git, a page's
+/// number or title, a tag, a symbol) escaped by [`escape_field`], so a control character in a
+/// recorded file cannot steer the terminal. A renamed page's titles are printed quoted, which
+/// escapes them already.
 fn change_line(c: &wc_vcs::Change) -> String {
-    match c {
-        wc_vcs::Change::File { path, status } => format!("{} {status}", escape_field(path)),
-        c => c.to_string(),
-    }
+    use wc_vcs::Change as C;
+    let x = |s: &String| escape_field(s);
+    let c = match c {
+        C::PageAdded { page, title } => C::PageAdded {
+            page: x(page),
+            title: x(title),
+        },
+        C::PageRemoved { page, title } => C::PageRemoved {
+            page: x(page),
+            title: x(title),
+        },
+        C::PageRenamed { page, from, to } => C::PageRenamed {
+            page: x(page),
+            from: from.clone(),
+            to: to.clone(),
+        },
+        C::PageRenumbered { page, from } => C::PageRenumbered {
+            page: x(page),
+            from: x(from),
+        },
+        C::PageSettingChanged { page, what } => C::PageSettingChanged {
+            page: x(page),
+            what: x(what),
+        },
+        C::SymbolAdded { page, item, what } => C::SymbolAdded {
+            page: x(page),
+            item: x(item),
+            what: x(what),
+        },
+        C::SymbolRemoved { page, item, what } => C::SymbolRemoved {
+            page: x(page),
+            item: x(item),
+            what: x(what),
+        },
+        C::SymbolMoved { page, item, what } => C::SymbolMoved {
+            page: x(page),
+            item: x(item),
+            what: x(what),
+        },
+        C::SymbolRetagged { page, item, from, to } => C::SymbolRetagged {
+            page: x(page),
+            item: x(item),
+            from: x(from),
+            to: x(to),
+        },
+        C::SymbolReplaced { page, item, from, to } => C::SymbolReplaced {
+            page: x(page),
+            item: x(item),
+            from: x(from),
+            to: x(to),
+        },
+        C::WireAdded { page, wire } => C::WireAdded {
+            page: x(page),
+            wire: x(wire),
+        },
+        C::WireRemoved { page, wire } => C::WireRemoved {
+            page: x(page),
+            wire: x(wire),
+        },
+        C::WireChanged { page, wire } => C::WireChanged {
+            page: x(page),
+            wire: x(wire),
+        },
+        C::GraphicsChanged { page } => C::GraphicsChanged { page: x(page) },
+        C::File { path, status } => C::File {
+            path: x(path),
+            status: x(status),
+        },
+    };
+    c.to_string()
 }
 
 /// Who is writing a comment: the --author option, WIRINGCRAFT_USER, git's user.name, the login.
@@ -5337,22 +5427,35 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
                 if c.resolved && !all {
                     continue;
                 }
+                // Comment files come from other people through git, so their ids, names and
+                // texts are escaped like other listings: no control character reaches the
+                // terminal, and only a comment's own line breaks start a new line (#1343).
                 let number = p.page(&c.page).map(|pg| pg.number.as_str()).unwrap_or("?");
                 let at = c.at.map(|a| format!(" at {:.0},{:.0}", a.x, a.y)).unwrap_or_default();
                 println!(
-                    "{} page {number}{at}  {}  {}{}",
-                    c.id,
-                    c.author,
+                    "{} page {}{at}  {}  {}{}",
+                    escape_field(&c.id),
+                    escape_field(number),
+                    escape_field(&c.author),
                     &utc_date(c.time)[..10],
                     if c.resolved { "  (resolved)" } else { "" }
                 );
-                println!("    {}", c.text.replace('\n', "\n    "));
+                // A CR is dropped only as part of a CRLF line break; one at the very end of
+                // the text is not a line break and is printed escaped.
+                let lines = |t: &str| -> Vec<String> {
+                    let mut parts: Vec<&str> = t.split('\n').collect();
+                    for part in parts.iter_mut().rev().skip(1) {
+                        *part = part.strip_suffix('\r').unwrap_or(part);
+                    }
+                    parts.into_iter().map(escape_field).collect()
+                };
+                println!("    {}", lines(&c.text).join("\n    "));
                 for r in &c.replies {
                     println!(
                         "    > {} ({}): {}",
-                        r.author,
+                        escape_field(&r.author),
                         &utc_date(r.time)[..10],
-                        r.text.replace('\n', " ")
+                        lines(&r.text).join(" ")
                     );
                 }
             }
@@ -9218,6 +9321,23 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn jumper_remove_changes_nothing_when_a_terminal_is_in_no_jumper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        draw_x1_terminals(&dir);
+        cli(&dir, &["jumper", "add", "--", "-X1", "3", "4", "5"]).unwrap();
+        // 9 is a typo: 4 stays in the jumper and the error names 9.
+        let err = cli(&dir, &["jumper", "remove", "--", "-X1", "4", " 9 "]).unwrap_err();
+        assert_eq!(err, "no jumper of -X1 has terminal 9");
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "4", "5"]);
+        // No terminal at all is a usage error, not a half-sentence.
+        assert!(Cli::try_parse_from(["wiringcraft", "jumper", "remove", "--", "-X1"]).is_err());
+        cli(&dir, &["jumper", "remove", "--", "-X1", "4", " 5 "]).unwrap();
+        assert!(load(&dir).unwrap().meta.jumpers.is_empty());
     }
 
     #[test]
