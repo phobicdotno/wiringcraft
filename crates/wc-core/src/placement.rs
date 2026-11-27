@@ -64,6 +64,26 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
+/// `old` under the new tag of its parent (its tag one product level up), when the group's
+/// parent was renamed to a different tag: `-X1.3` of a strip `-X1` placed as `-X2` is `-X2.3`.
+fn under_renamed_parent(renamed: &BTreeMap<&DeviceTag, Option<DeviceTag>>, old: &DeviceTag) -> Option<DeviceTag> {
+    let (last, rest) = old.product.split_last()?;
+    if rest.is_empty() {
+        return None;
+    }
+    let parent = DeviceTag {
+        product: rest.to_vec(),
+        ..old.clone()
+    };
+    let new_parent = renamed.get(&parent)?.as_ref()?;
+    if *new_parent == parent {
+        return None;
+    }
+    let mut t = new_parent.clone();
+    t.product.push(last.clone());
+    Some(t)
+}
+
 /// Every tag the project uses: on its pages and in its device data.
 pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
     let mut used: BTreeSet<DeviceTag> = project.tag_index().into_keys().collect();
@@ -89,11 +109,17 @@ pub fn place(
     let mut used = used_tags(project);
     let mut renamed: BTreeMap<&DeviceTag, Option<DeviceTag>> = BTreeMap::new();
     let mut devices: Vec<(DeviceTag, Device)> = Vec::new();
-    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()) {
+    // Shorter tags first, so a strip (`-X1`) has its new tag before its terminals (`-X1.3`).
+    let mut olds: Vec<&DeviceTag> = group.symbols.iter().filter_map(|s| s.tag.as_ref()).collect();
+    olds.sort_by_key(|t| t.product.len());
+    for old in olds {
         if renamed.contains_key(old) {
             continue;
         }
-        let new = match free_tag_like(&used, old) {
+        // A terminal (or other sub-tag) of a strip the group holds follows the strip to its
+        // new tag, keeping its own number when that is free there.
+        let followed = under_renamed_parent(&renamed, old).filter(|t| !used.contains(t));
+        let new = match followed.or_else(|| free_tag_like(&used, old)) {
             Some(t) => t,
             None if out_of_tags == OutOfTags::Fail => {
                 return Err(Error::Invalid(format!("no free tag like {old}")));
