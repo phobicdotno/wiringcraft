@@ -54,13 +54,24 @@ pub struct Placed {
 }
 
 /// The first free tag with the same function, location and letter code as `like`, numbered
-/// 1 to 9999, that is not in `used`.
+/// 1 to 9999, that is not in `used` and does not hold a tag in `used`: strip `-X1` is taken
+/// when only its terminal `-X1.3` is drawn, as `-K1` is by its part `-K1.2`.
 pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<DeviceTag> {
     let letter = like.letter_code();
+    // Each used tag's parents: the same tag with fewer product levels.
+    let parents: BTreeSet<DeviceTag> = used
+        .iter()
+        .flat_map(|t| {
+            (1..t.product.len()).map(|n| DeviceTag {
+                product: t.product[..n].to_vec(),
+                ..t.clone()
+            })
+        })
+        .collect();
     (1..10_000).find_map(|n| {
         let mut t = like.clone();
         *t.product.last_mut()? = format!("{letter}{n}");
-        (!used.contains(&t)).then_some(t)
+        (!used.contains(&t) && !parents.contains(&t)).then_some(t)
     })
 }
 
@@ -204,6 +215,20 @@ mod tests {
         p.pages.push(page);
         p.devices.insert(tag("-K1"), device("project's"));
         p
+    }
+
+    #[test]
+    fn a_free_tag_is_not_the_strip_or_device_of_a_drawn_terminal_or_part() {
+        let mut p = project();
+        // Strip -X1 is drawn only as its terminal -X1.3, -K2 only as its part -K2.1.
+        p.pages[0].symbols.push(symbol("s2", "-X1.3"));
+        p.pages[0].symbols.push(symbol("s3", "-K2.1"));
+        let used = used_tags(&p);
+        assert_eq!(free_tag_like(&used, &tag("-X7")), Some(tag("-X2")));
+        assert_eq!(free_tag_like(&used, &tag("-K9")), Some(tag("-K3")));
+        // Another function's -X1 does not take this one's; a terminal still gets a free number.
+        assert_eq!(free_tag_like(&used, &tag("=A-X7")), Some(tag("=A-X1")));
+        assert_eq!(free_tag_like(&used, &tag("-X1.3")), Some(tag("-X1.1")));
     }
 
     #[test]
