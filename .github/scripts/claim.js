@@ -8,8 +8,8 @@
 //
 // A pull request that names an issue (`(#N)` in the title, or `Fixes #N` / `Claim #N` in the body)
 // claims it for the agent in its `Agent: <name>` body line, or for its branch name, until 4 h after
-// the pull request's last push or edit. A lock past its time is free for anyone; an hourly sweep
-// also posts the release and removes the `claimed` label.
+// the pull request's last push or edit. A lock past its time is free for anyone; a sweep every
+// 10 minutes also posts the release and removes the `claimed` label.
 //
 // The state lives in the bot's own comments: the newest bot comment carrying the marker below.
 // All runs of the claim workflow share one queue, so two claims at the same moment cannot both win,
@@ -126,7 +126,7 @@ function readMarker(body) {
   }
 }
 
-/** The claim state from an issue's comments (oldest first): `{ agent, until, pr }`. */
+/** The claim state from an issue's comments (oldest first): `{ agent, until, pr, commentId, kind }`. */
 function readState(comments) {
   for (let i = comments.length - 1; i >= 0; i--) {
     if (!isClaimBot(comments[i])) continue;
@@ -190,7 +190,10 @@ function decide(cmd, state, now) {
   return { ok: true, state: { agent: null, until: null, pr: null }, message: `Released (was \`${state.agent}\`). Free to claim.` };
 }
 
-/** Issue numbers a pull request names: `(#N)` in the title, `Fixes #N` or `Claim #N` in the body. */
+/**
+ * Issue numbers a pull request names, at most 5: `(#N)` in the title, `Fixes #N` or `Claim #N` in
+ * the body (also fix/fixed, close/closes/closed, resolve/resolves/resolved and claims).
+ */
 function parseRefs(title, body) {
   const refs = new Set();
   for (const m of String(title || '').matchAll(/\(#(\d+)\)/g)) refs.add(Number(m[1]));
@@ -241,7 +244,7 @@ async function answer({ github, owner, repo, issue, comment, now }) {
 }
 
 /**
- * Answer every command from the last hours that has no bot reply yet, oldest first. Every run does
+ * Answer every command from the last 6 hours that has no bot reply yet, oldest first. Every run does
  * this first: GitHub keeps only one pending run per concurrency group and cancels the others, so a
  * command whose own run was cancelled is answered by the next run.
  *

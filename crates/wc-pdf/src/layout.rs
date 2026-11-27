@@ -43,10 +43,12 @@ pub struct Appearance {
 }
 
 impl Appearance {
+    /// `page/column.row`, such as `3/2.B`. Blanks around a stored page number are left out, as
+    /// wire numbering leaves them out.
     pub fn location(&self) -> String {
         format!(
             "{}/{}.{}",
-            self.page_number,
+            self.page_number.trim(),
             self.column,
             wc_core::project::row_letter(self.row)
         )
@@ -57,6 +59,9 @@ impl Appearance {
 pub struct CrossRefs {
     pub mains: BTreeMap<DeviceTag, Vec<Appearance>>,
     pub auxes: BTreeMap<DeviceTag, Vec<Appearance>>,
+    /// Standalone devices by tag, such as a breaker or motor protection breaker: a contact
+    /// with no coil of its tag points to one of these instead (#1467).
+    pub standalones: BTreeMap<DeviceTag, Vec<Appearance>>,
     /// Interruption points on schematic pages, by tag.
     pub links: BTreeMap<DeviceTag, Vec<Appearance>>,
     /// Interruption points repeated on overview pages (line diagrams), by tag. They link
@@ -102,8 +107,8 @@ pub fn tag_lines(placed: &PlacedSymbol, symbol: &Symbol, tag: &DeviceTag) -> (Al
     (align, lines)
 }
 
-/// Cross-reference texts for a page: a coil lists its contacts with their pins and locations,
-/// a contact points back to its coil, an interruption point lists where the wire continues.
+/// Cross-reference texts for a page: a coil (or a breaker with aux contacts) lists its contacts
+/// with their pins and locations, a contact points back to it, an interruption point lists where the wire continues.
 /// Problems (a contact without a coil, an interruption point without a partner) go to `warnings`.
 pub fn xref_marks(
     page: &Page,
@@ -126,17 +131,33 @@ pub fn xref_marks(
         let right = placed.iter().map(|g| g.bounds().1.x).fold(s.at.x, f64::max);
         let (tag_align, tag_at) = tag_lines(s, sym, tag);
         match sym.role {
-            SymbolRole::Main => {
+            // A breaker or MPCB lists its aux contacts as a coil does, unless a coil of its
+            // tag lists them already (#1467).
+            SymbolRole::Main | SymbolRole::Standalone
+                if sym.role == SymbolRole::Main || !xref.mains.contains_key(tag) =>
+            {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
+                    // Only named pins are listed; a contact without any shows its location alone.
+                    let pins: Vec<&str> = a.pins.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+                    let text = if pins.is_empty() {
+                        a.location()
+                    } else {
+                        format!("{} {}", pins.join("-"), a.location())
+                    };
                     out.push(XrefMark {
                         at: Point::new(s.at.x + 5.0, below + 3.5 + line_h * i as f64),
                         align: Align::Left,
-                        text: format!("{} {}", a.pins.join("-"), a.location()),
+                        text,
                         target_page_id: a.page_id.clone(),
                     });
                 }
             }
-            SymbolRole::Auxiliary => match xref.mains.get(tag).and_then(|m| m.first()) {
+            SymbolRole::Auxiliary => match xref
+                .mains
+                .get(tag)
+                .or_else(|| xref.standalones.get(tag))
+                .and_then(|m| m.first())
+            {
                 Some(main) => out.push(XrefMark {
                     at: tag_at.last().map_or(s.at, |(at, _)| *at + Point::new(0.0, 3.0)),
                     align: tag_align,
@@ -191,6 +212,7 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
+                    SymbolRole::Standalone => x.standalones.entry(tag.clone()).or_default().push(a),
                     // A contact repeated on an overview page (line diagram) is not listed
                     // under its coil again: the schematic page draws it in detail (#1076).
                     SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),
@@ -211,6 +233,10 @@ impl CrossRefs {
             .map(|p| p.id.as_str())
             .collect();
         for list in x.mains.values_mut() {
+            list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
+        }
+        // The same for a breaker: its contacts point to its schematic drawing (#1467).
+        for list in x.standalones.values_mut() {
             list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
         }
         x
