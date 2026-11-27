@@ -1173,6 +1173,14 @@ mod tests {
         let mut q = p.clone();
         assert_eq!(replace(&mut q, &alone, "-K1", "-K2", opts)?, 0);
         assert_eq!(q, p);
+        // One occurrence in the tag changes and another does not: the hit counts as changed.
+        let mixed = Hit {
+            kind: FindKind::Tag,
+            target: hits[0].target.clone(),
+            value: "=A1+C1-K11".into(),
+        };
+        assert_eq!(replace_in_tag(&mixed.value, "1", "2", opts), "=A2+C2-K11");
+        assert_eq!(left_alone(&mixed, "1", "2", opts), None);
         // A change that would be refused is not "left alone".
         let hits = find(&p, "-K1", opts);
         assert_eq!(left_alone(&hits[0], "-K1", "?", opts), None);

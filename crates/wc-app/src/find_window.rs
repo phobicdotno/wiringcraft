@@ -99,6 +99,22 @@ impl FindState {
         left_alone(hit, &self.query, &self.with, self.options())
     }
 
+    /// A short note on how a replace in `hits` went. With an empty replacement field no hit is
+    /// marked beforehand (that looks like a plain search), so the note names the ticked hits
+    /// that were another device's tag and kept it.
+    pub fn replaced_note(&self, n: usize, hits: &[Hit]) -> String {
+        let note = replaced_note(n, hits);
+        let other = hits
+            .iter()
+            .filter(|h| left_alone(h, &self.query, &self.with, self.options()) == Some(LeftAlone::AnotherTag))
+            .count();
+        match other {
+            0 => note,
+            1 => format!("{note} 1 ticked hit is another tag and was not changed."),
+            k => format!("{note} {k} ticked hits are other tags and were not changed."),
+        }
+    }
+
     /// The line above the hits: how many were found, and how many of them the replace with the
     /// typed text leaves alone.
     fn found_note(&self) -> String {
@@ -450,6 +466,22 @@ mod tests {
         f.chosen[0] = false;
         assert!(f.chosen_hits().is_empty());
         assert_eq!(f.replace_blocked(), "This replace changes none of the ticked hits.");
+        // An empty replacement field marks nothing, so the note after the replace gives the
+        // reason for a ticked hit that kept its tag.
+        f.with.clear();
+        f.query = "K1".into();
+        f.refresh(&p);
+        f.chosen = vec![true; f.hits.len()];
+        let hits = f.chosen_hits();
+        assert_eq!(values(&hits), ["-K1", "-K15"]);
+        assert_eq!(
+            f.replaced_note(0, &hits[1..]),
+            "Nothing to replace in the ticked hits. 1 ticked hit is another tag and was not changed."
+        );
+        assert_eq!(f.replaced_note(1, &hits[..1]), "Replaced 1 value.");
+        f.query = "-K1".into();
+        f.with = "-K2".into();
+        f.refresh(&p);
         // The window draws with a marked hit.
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
