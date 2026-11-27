@@ -130,17 +130,18 @@ wire's data: `--number`, `--potential`, `--section` (with its unit), `--colour`,
 ## delete
 
 ```sh
-wiringcraft delete p2 s3 w2
+wiringcraft delete p2 s2 w2
 ```
 
 ```
-s3
+s2
+w1
 w2
-w4
+w3
 ```
 
 Deletes symbols and wires by id and prints each deleted id. Wires that end on a pin of a
-deleted symbol go too (here `w4`, which ended on `s3`). The device keeps its data. An id that
+deleted symbol go too (here `w1` and `w3`, which ended on `s2`). The device keeps its data. An id that
 is not on the page is an error, and then nothing is deleted.
 
 ## number-wires
@@ -160,7 +161,8 @@ Numbers the wires of the whole project. Every wire of one connection gets the sa
 - `page-column` (default): the page and column where the connection starts, `2.3`; more
   connections starting in the same column get `2.3.2`, `2.3.3`.
 - `sequential`: 1, 2, 3 in drawing order.
-- `potential`: the potential's name (`24V`), else sequential.
+- `potential`: the potential's name (`24V`), else sequential. A connection with no potential, or
+  with a name another connection already has, gets the next free sequential number.
 
 A connection that already has a number keeps it unless `--overwrite` is given. Wires that touch
 no pin, and the wires of overview pages, are left alone. `report wires` lists the result.
