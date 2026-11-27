@@ -243,3 +243,119 @@ impl Hub {
         std::mem::take(&mut self.closed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryJournal;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn only_an_ended_connection_is_orderly_and_every_reason_reads() {
+        let all = [
+            CloseReason::Ended,
+            CloseReason::LineTooLong { max: 4096 },
+            CloseReason::BadMessage("eof".into()),
+            CloseReason::ReadFailed("reset".into()),
+            CloseReason::WriteTimedOut,
+            CloseReason::WriteFailed("pipe".into()),
+        ];
+        let orderly: Vec<bool> = all.iter().map(CloseReason::is_orderly).collect();
+        assert_eq!(orderly, [true, false, false, false, false, false]);
+        assert!(all[1].to_string().contains("4096"));
+        for (reason, detail) in [(&all[2], "eof"), (&all[3], "reset"), (&all[5], "pipe")] {
+            assert!(reason.to_string().contains(detail), "{reason}");
+        }
+    }
+
+    #[test]
+    fn the_first_close_reason_stays() {
+        let slot = CloseSlot::default();
+        assert_eq!(slot.get(), None);
+        slot.set(CloseReason::WriteTimedOut);
+        slot.set(CloseReason::Ended);
+        assert_eq!(slot.get(), Some(CloseReason::WriteTimedOut));
+        // Clones share the slot, as a link's reader and writer threads do.
+        let other = slot.clone();
+        other.set(CloseReason::ReadFailed("x".into()));
+        assert_eq!(other.get(), Some(CloseReason::WriteTimedOut));
+    }
+
+    #[test]
+    fn messages_sent_before_the_other_end_went_are_read_before_closed() -> TestResult {
+        let (guest, host) = pair();
+        assert_eq!(guest.close_reason(), None, "open");
+        assert!(matches!(guest.try_recv(), Ok(None)));
+        host.send(HostMsg::Closed)?;
+        drop(host);
+        assert_eq!(guest.close_reason(), None, "not yet noticed");
+        assert!(matches!(guest.try_recv(), Ok(Some(HostMsg::Closed))));
+        assert!(matches!(guest.try_recv(), Err(Error::Closed)));
+        assert_eq!(guest.close_reason(), Some(CloseReason::Ended));
+        assert!(matches!(guest.send(GuestMsg::Leave), Err(Error::Closed)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_send_alone_marks_the_link_closed() {
+        let (guest, host) = pair();
+        drop(host);
+        assert!(matches!(guest.send(GuestMsg::Leave), Err(Error::Closed)));
+        assert_eq!(guest.close_reason(), Some(CloseReason::Ended));
+    }
+
+    #[test]
+    fn a_kept_reason_wins_over_ended() {
+        let (to_host, _from_guest) = channel::<GuestMsg>();
+        let (to_guest, from_host) = channel::<HostMsg>();
+        let reason = CloseSlot::default();
+        let link = Link::from_channels(to_host, from_host, reason.clone());
+        reason.set(CloseReason::LineTooLong { max: 10 });
+        drop(to_guest);
+        assert!(matches!(link.try_recv(), Err(Error::Closed)));
+        assert_eq!(link.close_reason(), Some(CloseReason::LineTooLong { max: 10 }));
+    }
+
+    #[test]
+    fn a_line_is_one_json_object_ending_in_one_newline() -> TestResult {
+        let line = encode(&GuestMsg::Leave)?;
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1);
+        assert!(matches!(decode::<GuestMsg>(&line)?, GuestMsg::Leave));
+        // A line ending as Windows writes it, or with no ending, reads the same.
+        let bare = line.trim_end();
+        assert!(matches!(decode::<GuestMsg>(&format!("{bare}\r\n"))?, GuestMsg::Leave));
+        assert!(matches!(decode::<GuestMsg>(bare)?, GuestMsg::Leave));
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_that_is_not_one_message_is_a_decode_error() {
+        for line in ["", "\n", "{", "[]", "{\"type\":\"leave\"} {\"type\":\"leave\"}", "null"] {
+            assert!(matches!(decode::<GuestMsg>(line), Err(Error::Decode(_))), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_connection_dropped_without_leaving_is_reported_once() {
+        let mut host = Host::new(
+            wc_core::Project::new("Demo"),
+            "Hanna",
+            "hanna@example.com",
+            Box::new(MemoryJournal::default()),
+        );
+        let mut hub = Hub::new();
+        assert!(hub.is_empty());
+        let (guest, host_end) = pair();
+        let id = hub.add(&mut host, host_end);
+        assert_eq!(hub.len(), 1);
+        hub.pump(&mut host);
+        assert!(hub.take_closed().is_empty(), "still open");
+        drop(guest);
+        hub.pump(&mut host);
+        assert!(hub.is_empty());
+        assert_eq!(hub.take_closed(), [(id, CloseReason::Ended)]);
+        assert!(hub.take_closed().is_empty(), "taken");
+    }
+}

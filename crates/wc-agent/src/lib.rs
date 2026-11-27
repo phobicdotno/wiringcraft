@@ -1160,3 +1160,218 @@ mod tests {
         assert!(body.get("fallbacks").is_none());
     }
 }
+
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+
+    fn stop_of(response: Value) -> Stop {
+        match Conversation::default().absorb(&response) {
+            Ok(reply) => reply.stop,
+            Err(e) => unreachable!("absorb failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn every_stop_reason_is_mapped() {
+        let with = |reason: Value| json!({"content": [], "stop_reason": reason});
+        assert_eq!(stop_of(with(json!("tool_use"))), Stop::ToolUse);
+        assert_eq!(stop_of(with(json!("end_turn"))), Stop::EndTurn);
+        assert_eq!(stop_of(with(json!("stop_sequence"))), Stop::EndTurn);
+        assert_eq!(stop_of(with(json!("max_tokens"))), Stop::MaxTokens);
+        assert_eq!(stop_of(with(json!("model_context_window_exceeded"))), Stop::ContextFull);
+        assert_eq!(stop_of(with(json!("pause_turn"))), Stop::Other("pause_turn".into()));
+        assert_eq!(stop_of(with(Value::Null)), Stop::Other("unknown".into()));
+        assert_eq!(stop_of(json!({"content": []})), Stop::Other("unknown".into()));
+    }
+
+    #[test]
+    fn a_refusal_carries_the_reason_when_given() {
+        let refused = json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"explanation": "Not allowed."}
+        });
+        assert_eq!(stop_of(refused), Stop::Refusal("Not allowed.".into()));
+        assert_eq!(
+            stop_of(json!({"content": [], "stop_reason": "refusal"})),
+            Stop::Refusal(String::new())
+        );
+    }
+
+    #[test]
+    fn an_answer_without_content_is_an_error_and_not_kept() {
+        let mut c = Conversation::default();
+        c.user("hi");
+        let long = "x".repeat(1000);
+        let Err(e) = c.absorb(&json!({"type": "error", "message": long})) else {
+            unreachable!("an answer without content was taken in")
+        };
+        assert!(e.starts_with("unexpected answer from the API: "), "{e}");
+        // The raw answer is cut short so the message stays readable.
+        assert!(e.ends_with('…'), "{e}");
+        assert!(e.chars().count() < 400, "{e}");
+        assert_eq!(c.messages().len(), 1);
+        assert_eq!(short("short"), "short");
+        assert_eq!(short(&"é".repeat(300)), "é".repeat(300));
+    }
+
+    #[test]
+    fn blank_text_is_left_out_but_the_content_is_kept_as_sent() {
+        let mut c = Conversation::default();
+        let response = json!({
+            "model": "claude-sonnet-5-5",
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "text", "text": "  \n"},
+                {"type": "text", "text": "Wiring K1."},
+                {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
+                {"type": "tool_use", "name": "add", "input": {"x": 2}},
+            ],
+            "usage": {
+                "input_tokens": 3,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 20,
+                "output_tokens": 7
+            }
+        });
+        let Ok(reply) = c.absorb(&response) else {
+            unreachable!("absorb failed")
+        };
+        assert_eq!(reply.text, vec!["Wiring K1.".to_owned()]);
+        // Only `tool_use` blocks become calls; a missing id reads as empty.
+        assert_eq!(
+            reply.calls,
+            vec![ToolCall {
+                id: String::new(),
+                name: "add".into(),
+                input: json!({"x": 2}),
+            }]
+        );
+        assert_eq!(reply.model, "claude-sonnet-5-5");
+        // Cached input counts too.
+        assert_eq!(reply.input_tokens, 123);
+        assert_eq!(reply.output_tokens, 7);
+        assert_eq!(c.messages()[0]["role"], "assistant");
+        assert_eq!(c.messages()[0]["content"], response["content"]);
+    }
+
+    #[test]
+    fn an_empty_answer_is_kept_as_a_placeholder() {
+        let mut c = Conversation::default();
+        let Ok(reply) = c.absorb(&json!({"content": [], "stop_reason": "end_turn"})) else {
+            unreachable!("absorb failed")
+        };
+        assert!(reply.text.is_empty() && reply.calls.is_empty());
+        assert_eq!((reply.input_tokens, reply.output_tokens), (0, 0));
+        assert_eq!(reply.model, "");
+        assert_eq!(
+            c.messages()[0]["content"],
+            json!([{"type": "text", "text": "(no answer)"}])
+        );
+    }
+
+    #[test]
+    fn tool_results_mark_errors_and_skip_an_empty_batch() {
+        let mut c = Conversation::default();
+        c.tool_results(Vec::new());
+        assert!(c.is_empty());
+        c.tool_results(vec![
+            ("a".into(), Ok("placed".into())),
+            ("b".into(), Err("no room".into())),
+        ]);
+        assert_eq!(c.messages().len(), 1);
+        let msg = &c.messages()[0];
+        assert_eq!(msg["role"], "user");
+        assert_eq!(
+            msg["content"],
+            json!([
+                {"type": "tool_result", "tool_use_id": "a", "content": "placed"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "no room", "is_error": true}
+            ])
+        );
+    }
+
+    #[test]
+    fn only_the_users_own_words_are_taken_back() {
+        let mut c = Conversation::default();
+        assert_eq!(c.take_unanswered(), None);
+
+        // The context added in front is dropped; joined words come back on separate lines.
+        c.user("<context>page 3</context>\n\nadd a fuse");
+        c.user("and a lamp");
+        assert_eq!(c.take_unanswered().as_deref(), Some("add a fuse\nand a lamp"));
+        assert!(c.is_empty());
+
+        // Text that only mentions the tag later is given back whole.
+        c.user("why </context>\n\nhere");
+        assert_eq!(c.take_unanswered().as_deref(), Some("why </context>\n\nhere"));
+
+        // A picture goes with the words; an empty text block stands in when there are none.
+        let shot = Image {
+            media_type: "image/jpeg".into(),
+            data: "AAAA".into(),
+        };
+        c.user_with("", std::slice::from_ref(&shot));
+        assert_eq!(c.messages()[0]["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(c.take_unanswered().as_deref(), Some(""));
+        c.user("");
+        assert_eq!(c.messages()[0]["content"], json!([{"type": "text", "text": ""}]));
+        assert_eq!(c.take_unanswered().as_deref(), Some(""));
+
+        // Tool results, or an answer already given, are never taken back.
+        c.tool_results(vec![("t".into(), Ok("ok".into()))]);
+        assert_eq!(c.take_unanswered(), None);
+        assert_eq!(c.messages().len(), 1);
+        let mut c = Conversation::default();
+        assert!(c.absorb(&json!({"content": [], "stop_reason": "end_turn"})).is_ok());
+        assert_eq!(c.take_unanswered(), None);
+        assert_eq!(c.messages().len(), 1);
+    }
+
+    #[test]
+    fn the_request_body_carries_the_settings() {
+        let mut c = Conversation::default();
+        c.user("hi");
+        let set = Settings {
+            model: "claude-fable-5-2".into(),
+            effort: "max".into(),
+            ..Settings::default()
+        };
+        let tools = vec![json!({"name": "add"})];
+        let body = c.body(&set, "be brief", &tools);
+        assert_eq!(body["model"], "claude-fable-5-2");
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["system"], json!([{"type": "text", "text": "be brief"}]));
+        assert_eq!(body["tools"], json!(tools));
+        assert_eq!(body["messages"], json!(c.messages()));
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["fallbacks"], "default");
+        // A model not in the list gets no fallbacks.
+        let other = Settings {
+            model: "claude-unknown".into(),
+            ..Settings::default()
+        };
+        assert!(c.body(&other, "", &[]).get("fallbacks").is_none());
+    }
+
+    #[test]
+    fn settings_fill_in_and_leave_out_empty_fields() {
+        let Ok(set) = serde_json::from_str::<Settings>(r#"{"backend": "api_key", "effort": "low"}"#) else {
+            unreachable!("settings did not parse")
+        };
+        assert_eq!(set.backend, Backend::ApiKey);
+        assert_eq!(set.effort, "low");
+        assert_eq!(set.model, MODELS[0].id);
+        assert_eq!(set.max_rounds, 60);
+        let Ok(saved) = serde_json::to_value(Settings::default()) else {
+            unreachable!("settings did not serialize")
+        };
+        assert_eq!(saved["backend"], "claude_login");
+        for gone in ["agent_command", "login_model", "api_key"] {
+            assert!(saved.get(gone).is_none(), "{gone}");
+        }
+        assert_eq!(shown_text("hi", 0), "hi");
+        assert_eq!(shown_text("", 3), "(3 screenshots)");
+    }
+}
