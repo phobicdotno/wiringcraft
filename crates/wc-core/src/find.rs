@@ -425,7 +425,9 @@ pub fn replace_renaming(
         .iter()
         .filter(|(from, _)| {
             let (strip, n) = from.terminal_parts();
+            // Not one whose old tag another rename takes: putting it back would overwrite that.
             !renames.contains_key(&strip)
+                && !renames.values().any(|to| to == *from)
                 && n.is_some_and(|n| project.meta.strip_layout(&strip).is_some_and(|l| l.spares.contains(&n)))
         })
         .map(|(from, to)| (from.clone(), to.clone()))
@@ -791,6 +793,28 @@ mod tests {
             "the spare's part goes with it"
         );
         assert!(!p.devices.contains_key(&tag("-X1.S1")));
+    }
+
+    #[test]
+    fn spares_renamed_onto_each_others_tags_keep_their_own_data() {
+        let mut p = sample();
+        let part = |s: &str| Device {
+            part: Some(s.into()),
+            ..Default::default()
+        };
+        for (strip, data) in [("-X12", "A"), ("-X122", "B")] {
+            p.meta.strips.push(crate::project::StripLayout {
+                strip: tag(strip),
+                order: Vec::new(),
+                spares: vec!["S1".into()],
+            });
+            p.devices.insert(tag(&format!("{strip}.S1")), part(data));
+        }
+        let opts = FindOptions { match_case: true };
+        let hits: Vec<Hit> = find(&p, "S1", opts);
+        assert_eq!(replace(&mut p, &hits, "12", "1", opts), Ok(2));
+        assert_eq!(p.devices.get(&tag("-X1.S1")), Some(&part("A")));
+        assert_eq!(p.devices.get(&tag("-X12.S1")), Some(&part("B")));
     }
 
     #[test]
