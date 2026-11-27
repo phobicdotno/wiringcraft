@@ -6481,7 +6481,7 @@ mod tests {
     fn a_text_report_keeps_each_row_on_one_line() {
         let t = wc_report::Table {
             title: "Locations\u{1b}[2J".into(),
-            columns: vec!["Location".into(), "Note".into()],
+            columns: vec!["Location".into(), "Note\nmore\tx".into()],
             rows: vec![
                 vec!["+A1".into(), "first line\nsecond\tline".into()],
                 vec!["+A2".into(), "red \u{1b}[31m".into()],
@@ -6492,7 +6492,7 @@ mod tests {
         assert_eq!(
             text,
             "Locations\\u{1b}[2J\n\
-             Location  Note\n\
+             Location  Note\\nmore\\tx\n\
              --------  ------------------------\n\
              +A1       first line\\nsecond\\tline\n\
              +A2       red \\u{1b}[31m\n"
