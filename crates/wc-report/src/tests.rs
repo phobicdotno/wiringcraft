@@ -1830,6 +1830,21 @@ fn plc_io_list_and_contents() {
     assert_eq!(t.rows[2][4], "-P1:X2");
     assert_eq!(t.rows[3][2], "u1 (no tag)");
 
+    // A blank `Address` left on the device does not hide its `PLC address`.
+    let mut q = p.clone();
+    let dev = q.devices.get_mut(&DeviceTag::parse("-A1.Q1").unwrap()).unwrap();
+    dev.properties.insert("Address".into(), "  ".into());
+    dev.properties.insert("PLC address".into(), "%Q0.1".into());
+    let blank = build(
+        Kind::Plc,
+        &Inputs {
+            project: &q,
+            symbols: &s,
+            parts: &parts,
+        },
+    );
+    assert_eq!(blank.rows[2][..3], ["%Q0.1", "Output", "-A1.Q1"]);
+
     let c = build(Kind::Contents, &i);
     assert_eq!(c.columns, ["Page", "Title", "Devices", "Wires"]);
     // K1 counts once for its coil and contact; the untagged input has no device.
