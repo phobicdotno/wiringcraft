@@ -323,6 +323,20 @@ fn viewbox_fit(w: f64, h: Option<f64>, vb: [f64; 4], par: &str) -> M {
     M([sx, 0.0, 0.0, sy, -vb[0] * sx, -vb[1] * sy])
 }
 
+/// The file's text, for a message: control characters (an ESC that would drive a terminal) are
+/// written as escapes.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn num(e: &BytesStart, name: &str) -> f64 {
     attr(e, name).and_then(|v| numbers(&v).first().copied()).unwrap_or(0.0)
 }
@@ -958,7 +972,8 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                     let par = attr(&e, "preserveAspectRatio").unwrap_or_default();
                     let fit = viewbox_fit(wmm, hmm, [vbn[0], vbn[1], vbn[2], vbn[3]], &par);
                     if fit.0.iter().any(|v| !v.is_finite()) {
-                        let h = attr(&e, "height").unwrap_or_default();
+                        let h = printable(&attr(&e, "height").unwrap_or_default());
+                        let (w, vb) = (printable(&w), printable(&vb));
                         return Err(Error::Format(format!(
                             "SVG: width=\"{w}\" height=\"{h}\" viewBox=\"{vb}\" give a size that cannot be drawn"
                         )));
@@ -1070,18 +1085,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 if let Some(why) = stopped {
                     let which = match attr(&e, "id") {
                         Some(i) => {
-                            // The id is the file's text: control characters (an ESC that would
-                            // drive a terminal) are written as escapes.
-                            let i: String = i
-                                .chars()
-                                .map(|c| {
-                                    if c.is_control() {
-                                        c.escape_default().to_string()
-                                    } else {
-                                        c.to_string()
-                                    }
-                                })
-                                .collect();
+                            let i = printable(&i);
                             format!("path {path_count} (id \"{i}\")")
                         }
                         None => format!("path {path_count}"),
@@ -1332,6 +1336,13 @@ mod tests {
         let thin = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-308" preserveAspectRatio="none">
             <line x1="0" y1="0" x2="80" y2="0"/></svg>"#;
         assert!(symbol(thin, "svg.u", "U").is_err());
+        // The message quotes the file's text with its control characters escaped.
+        let esc = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-308&#27;[J" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/></svg>"#;
+        match symbol(esc, "svg.u", "U") {
+            Err(Error::Format(m)) => assert!(m.contains("1e-308\\u{1b}[J") && !m.contains('\u{1b}'), "{m}"),
+            other => unreachable!("{:?}", other.map(|s| s.id)),
+        }
         // With none, a text is as high as the y axis makes it: 10 units at 0.25 mm.
         let text = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 160" preserveAspectRatio="none">
             <line x1="0" y1="0" x2="80" y2="160"/><text x="0" y="20" font-size="10">K</text></svg>"#;
