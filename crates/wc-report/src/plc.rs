@@ -716,10 +716,7 @@ mod tests {
                 assert!(l.contains(" AT %I* : BOOL;") || l.contains(" AT %Q* : BOOL;"), "{l}");
             }
             let line = |var: &str| d.iter().find(|l| l.starts_with(&format!("    {var} "))).copied();
-            assert!(
-                line("Q1")
-                    .is_some_and(|l| l.contains("AT %Q*") && l.contains("address \"%I0.0\" is not a PLC address"))
-            );
+            assert!(line("Q1").is_some_and(|l| l.contains("AT %Q*") && l.contains("address %IX0.0 is an input")));
             assert!(line("S1").is_some_and(|l| l.contains("address \"Slot 2\" is not a PLC address")));
             assert!(line("S2").is_some_and(|l| !l.contains("address")));
             // The untagged point is named after its symbol id, without "(no tag)".
