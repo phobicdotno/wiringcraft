@@ -784,7 +784,21 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 let (parts, stopped) = path(&attr(&e, "d").unwrap_or_default(), &m);
                 if let Some(why) = stopped {
                     let which = match attr(&e, "id") {
-                        Some(i) => format!("path {path_count} (id \"{i}\")"),
+                        Some(i) => {
+                            // The id is the file's text: control characters (an ESC that would
+                            // drive a terminal) are written as escapes.
+                            let i: String = i
+                                .chars()
+                                .map(|c| {
+                                    if c.is_control() {
+                                        c.escape_default().to_string()
+                                    } else {
+                                        c.to_string()
+                                    }
+                                })
+                                .collect();
+                            format!("path {path_count} (id \"{i}\")")
+                        }
                         None => format!("path {path_count}"),
                     };
                     warnings.push(format!("{which} is drawn only in part: {why}"));
@@ -1688,6 +1702,16 @@ mod tests {
             err.to_string(),
             "the drawing is empty: path 1 is drawn only in part: stopped at command 2 (A): an arc is cut \
              short after argument 6 (an arc takes 7)"
+        );
+        // An id that decodes to a control character comes out escaped, not raw.
+        let Err(err) = symbol("<svg><path id=\"&#27;[2J\" d=\"M 0 0 A\"/></svg>", "x", "x") else {
+            unreachable!("an empty drawing is an error");
+        };
+        let msg = err.to_string();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert!(
+            msg.contains("(id \"\\u{1b}[2J\")") && msg.contains("an arc has no arguments"),
+            "{msg}"
         );
     }
 
