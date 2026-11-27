@@ -1998,14 +1998,19 @@ impl App {
                     Err(e) => self.ed.message = format!("Nothing was duplicated: {e}"),
                 }
             }
+            // The new page is shown, also when a panel layout was shown (#1241).
             Action::AddPage => {
                 self.ed.page = open.add_page();
+                self.ed.panel = None;
+                self.ed.panel_pick = None;
                 self.ed.selection.clear();
                 self.ed.view.fit = true;
             }
             Action::DuplicatePage => {
                 if let Some(i) = open.duplicate_page(page) {
                     self.ed.page = i;
+                    self.ed.panel = None;
+                    self.ed.panel_pick = None;
                     self.ed.selection.clear();
                     self.ed.view.fit = true;
                 }
@@ -9520,6 +9525,38 @@ mod menu_action_tests {
             a.open.as_ref().unwrap().project.panels[1].items,
             vec![device("-B1", 30.0)]
         );
+    }
+
+    #[test]
+    fn new_and_duplicate_page_show_the_page_not_the_panel() {
+        let (_tmp, mut a, _) = app();
+        a.open
+            .as_mut()
+            .unwrap()
+            .project
+            .panels
+            .push(wc_core::panel::Panel::new("panel1", "Panel 1", 600.0, 800.0));
+        for action in [Action::AddPage, Action::DuplicatePage] {
+            a.ed.panel = Some(0);
+            a.ed.panel_pick = Some(0);
+            let pages = a.open.as_ref().unwrap().project.pages.len();
+            a.ed.menu_action = Some(action);
+            a.run_menu_action();
+            assert_eq!(
+                a.open.as_ref().unwrap().project.pages.len(),
+                pages + 1,
+                "{action:?} adds a page"
+            );
+            assert_eq!(
+                (a.ed.panel, a.ed.panel_pick),
+                (None, None),
+                "{action:?} closes the panel view"
+            );
+            assert_eq!(
+                a.open.as_ref().unwrap().project.pages[a.ed.page].number,
+                (pages + 1).to_string()
+            );
+        }
     }
 
     #[test]
