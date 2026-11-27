@@ -1427,6 +1427,11 @@ mod tests {
         let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
         assert!(err.contains("\"wat\""), "{err}");
         assert_eq!(o.project, before);
+        // So does a file cut short inside a quoted cell.
+        std::fs::write(&table, "what\nPump 1\n\"Pump 2\n").unwrap();
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.contains("line 3: a quoted cell is not closed"), "{err}");
+        assert_eq!(o.project, before);
 
         std::fs::write(&table, "What\nPump 1\nPump 2\nFan\n").unwrap();
         let done = o.generate_from_table(page, &path, &table, None).unwrap();

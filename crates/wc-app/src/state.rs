@@ -4022,14 +4022,24 @@ impl Open {
         let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
         let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", table.display()))?;
         let rows = wc_import::csv::file_rows(&bytes).map_err(|e| format!("{}: {e}", table.display()))?;
+        // A file cut short inside a quoted cell would place a row with half a value.
+        if let Some(line) = rows.open_quote {
+            return Err(format!(
+                "{}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed",
+                table.display()
+            ));
+        }
         let rows = generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(|e| e.to_string())?;
         let copies = generate::apply_rows(&m, &rows, default_set).map_err(|e| e.to_string())?;
-        let Some(first) = copies.first() else {
+        if copies.is_empty() {
             return Ok(generate::Generated::default());
-        };
-        let ids: std::collections::BTreeSet<&str> = first.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        }
+        let ids: std::collections::BTreeSet<&str> = copies
+            .iter()
+            .flat_map(|c| c.symbols.iter().map(|s| s.symbol.as_str()))
+            .collect();
         self.ensure_symbols(ids)?;
-        let extent = generate::extent(first, |id| self.symbols.get(id).cloned());
+        let extent = generate::extent(&copies, |id| self.symbols.get(id).cloned());
         let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
         let mut project = self.project.clone();
         let done = generate::generate(&mut project, &copies, extent, size, &m.name).map_err(|e| e.to_string())?;
