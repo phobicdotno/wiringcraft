@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::connectivity::{WireRef, wire_nets};
+use crate::connectivity::wire_nets_by_place;
 use crate::geom::Point;
 use crate::project::{Endpoint, Page, Project};
 
@@ -68,13 +68,15 @@ pub fn number_wires(
         page.wires.clear();
         page.symbols.clear();
     }
-    let (nets, wire_net) = wire_nets(&schematic, role);
+    // Each wire is known by its place, not its id: ids need not be unique on a page (a replaced
+    // page can repeat them), and two wires sharing one must not share a number too.
+    let (nets, wire_net) = wire_nets_by_place(&schematic, role);
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();
     for (pi, page) in project.pages.iter().enumerate() {
-        for w in &page.wires {
-            let Some(&n) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
+        for (wi, w) in page.wires.iter().enumerate() {
+            let Some(&n) = wire_net.get(&(pi, wi)) else {
                 continue;
             };
             // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
@@ -150,10 +152,9 @@ pub fn number_wires(
         connections: chosen.len(),
         wires: 0,
     };
-    for page in &mut project.pages {
-        for w in &mut page.wires {
-            let key: WireRef = (page.id.clone(), w.id.clone());
-            let Some(num) = wire_net.get(&key).and_then(|n| chosen.get(n)) else {
+    for (pi, page) in project.pages.iter_mut().enumerate() {
+        for (wi, w) in page.wires.iter_mut().enumerate() {
+            let Some(num) = wire_net.get(&(pi, wi)).and_then(|n| chosen.get(n)) else {
                 continue;
             };
             if w.number.as_deref() != Some(num.as_str()) {
@@ -285,6 +286,21 @@ mod tests {
         p.pages[0].wires[2].number = Some(" 1 ".into());
         number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
         // c keeps 1 without the spaces; the others get 2 and 3, not 1 again.
+        assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
+    }
+
+    #[test]
+    fn wires_sharing_an_id_are_numbered_by_their_own_connection() {
+        let mut p = project();
+        // e repeats c's id, as a replaced page can: c is not on the 24V net, so it must not
+        // take 24V, and its own connection still gets a number.
+        p.pages[0].wires[4].id = "c".into();
+        let n = number_wires(&mut p, Rule::Potential, false, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("2"), Some("2"), Some("1"), None, Some("24V")]);
+        assert_eq!(n.connections, 3);
+        let mut p = project();
+        p.pages[0].wires[4].id = "c".into();
+        number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
     }
 
