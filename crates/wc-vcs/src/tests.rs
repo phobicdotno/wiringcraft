@@ -739,3 +739,25 @@ fn a_page_file_that_is_not_text_is_changed_not_removed() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_new_branch_is_current_and_keeps_changes_not_yet_recorded() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let mut p = store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    p.meta.title_block.insert("customer".into(), "ACME".into());
+    store::save(dir, &p)?;
+    let pending = changes(&git, "HEAD", None)?;
+    assert!(!pending.is_empty(), "a change not yet recorded");
+
+    git.create_branch("draft")?;
+    assert_eq!(git.current_branch().as_deref(), Some("draft"));
+    assert_eq!(changes(&git, "HEAD", None)?, pending, "the change came along");
+    assert_eq!(
+        store::load(dir)?.meta.title_block.get("customer").map(String::as_str),
+        Some("ACME")
+    );
+    Ok(())
+}
