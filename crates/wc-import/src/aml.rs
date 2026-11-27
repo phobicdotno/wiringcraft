@@ -113,6 +113,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     let mut raw_links: Vec<(String, String, String)> = Vec::new();
     let mut iface_index: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut elem_ids: BTreeMap<String, usize> = BTreeMap::new();
+    // Each device's connection point names as the file gives them, before repeats get a mark.
+    let mut file_names: Vec<Vec<String>> = Vec::new();
     // Each finished element with the names of its parents and their designations (the tag
     // attribute when they have one, else the name).
     let mut pending: Vec<(Vec<String>, Vec<String>, Elem)> = Vec::new();
@@ -304,6 +306,7 @@ pub fn parse(text: &str) -> Result<AmlImport> {
             .into_iter()
             .filter(|(k, _)| !TAG_ATTRIBUTES.contains(&k.as_str()))
             .collect();
+        file_names.push(el.interfaces.iter().map(|(_, n)| n.clone()).collect());
         out.devices.push(AmlDevice {
             name: el.name,
             path,
@@ -322,12 +325,11 @@ pub fn parse(text: &str) -> Result<AmlImport> {
         let idx = *elem_ids
             .get(el)
             .or_else(|| elem_ids.get(&format!("{{{}}}", el.trim_matches(|c| c == '{' || c == '}'))))?;
-        // A name the element does not have would give a wire with no pin to end on.
-        out.devices[idx]
-            .interfaces
-            .iter()
-            .any(|n| n == iface)
-            .then(|| (idx, iface.to_owned()))
+        // Match the name as the file gives it (a repeated name means its first connection
+        // point) and end on that point's own name; a name the element does not have would give
+        // a wire with no pin to end on.
+        let k = file_names.get(idx)?.iter().position(|n| n == iface)?;
+        Some((idx, out.devices.get(idx)?.interfaces.get(k)?.clone()))
     };
     for (name, a, b) in raw_links {
         match (resolve(&a), resolve(&b)) {
@@ -781,6 +783,45 @@ mod tests {
         assert_eq!(imp.links[0].name, "ok");
         assert_eq!(imp.warnings.len(), 1, "{:?}", imp.warnings);
         assert!(imp.warnings[0].contains("\"typo\"") && imp.warnings[0].contains("{e1}:A9"));
+        Ok(())
+    }
+
+    #[test]
+    fn link_by_name_to_a_repeated_connection_point_uses_the_names_in_the_file() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="M1" ID="e1">
+    <ExternalInterface Name="PE" ID="i1"/>
+    <ExternalInterface Name="PE" ID="i2"/>
+    <ExternalInterface Name="U" ID="i3"/>
+  </InternalElement>
+  <InternalElement Name="X1" ID="e2">
+    <ExternalInterface Name="1" ID="i4"/>
+  </InternalElement>
+  <InternalLink Name="first" RefPartnerSideA="e1:PE" RefPartnerSideB="e2:1"/>
+  <InternalLink Name="marked" RefPartnerSideA="e1:PE'" RefPartnerSideB="e2:1"/>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(imp.links.len(), 1);
+        assert_eq!(imp.links[0].a, (0, "PE".to_string()));
+        assert_eq!(imp.warnings.len(), 1, "{:?}", imp.warnings);
+        assert!(imp.warnings[0].contains("\"marked\""));
+
+        // A name that really has a mark in the file ends on its own connection point, even
+        // when a repeat of the plain name is marked the same way.
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="M1" ID="e1">
+    <ExternalInterface Name="PE" ID="i1"/>
+    <ExternalInterface Name="PE'" ID="i2"/>
+    <ExternalInterface Name="PE" ID="i3"/>
+  </InternalElement>
+  <InternalElement Name="X1" ID="e2">
+    <ExternalInterface Name="1" ID="i4"/>
+  </InternalElement>
+  <InternalLink Name="a" RefPartnerSideA="e1:PE'" RefPartnerSideB="e2:1"/>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(imp.devices[0].interfaces, ["PE", "PE'", "PE''"]);
+        assert_eq!(imp.links[0].a, (0, "PE'".to_string()));
         Ok(())
     }
 
