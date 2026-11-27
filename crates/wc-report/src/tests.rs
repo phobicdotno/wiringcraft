@@ -381,6 +381,38 @@ fn cable_list_names_a_part_missing_from_the_library_copy_by_its_id() {
 }
 
 #[test]
+fn cable_list_lists_a_cable_of_the_devices_file_without_drawn_cores() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w5 = DeviceTag::parse("-W5").unwrap();
+    p.devices.insert(
+        w5.clone(),
+        Device {
+            description: "Pump cable".into(),
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    // A terminal named like a cable is no cable.
+    p.devices.insert(DeviceTag::parse("-X1.W1").unwrap(), Device::default());
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows.len(), 2);
+    assert_eq!(t.rows[0][..4], ["-W1", "", "", "1"]);
+    assert_eq!(t.rows[1], ["-W5", "LAPP.1119203", "Pump cable", "", "", "", ""]);
+    assert!(t.row_pages.get(1).is_none_or(String::is_empty));
+}
+
+#[test]
 fn check_names_a_cable_core_on_two_connections() {
     let (mut p, s, parts) = fixture();
     let found = |p: &Project| {

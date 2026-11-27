@@ -497,7 +497,7 @@ fn location_of(tag: &DeviceTag) -> String {
 }
 
 /// Whether a device tag names a cable by its IEC 81346-2 letter code (`-W1`, `-WD3`).
-fn is_cable_tag(tag: &DeviceTag) -> bool {
+pub(crate) fn is_cable_tag(tag: &DeviceTag) -> bool {
     tag.product.last().is_some_and(|p| {
         p.strip_prefix('W').is_some_and(|rest| {
             rest.chars()

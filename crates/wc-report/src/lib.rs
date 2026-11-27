@@ -938,7 +938,8 @@ fn cable_core_label(c: &wc_core::CableCore) -> String {
 /// Cable list: every cable with its type, then one row per core with the wire's two ends. Each
 /// row links to the page its core is drawn on ([`Table::row_pages`]). Overview pages
 /// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
-/// and would list each core twice.
+/// and would list each core twice. A cable of the devices file with no cores drawn yet (`-W5`,
+/// named by the cable letter code) gets one row of its own with empty core cells.
 pub fn cable_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Cable list",
@@ -964,7 +965,16 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             ));
         }
     }
+    // Cables listed before their cores are drawn; `-X1.W1` is a terminal, not a cable.
+    for tag in i.project.devices.keys() {
+        if tag.product.len() == 1 && marking::is_cable_tag(tag) {
+            cores.entry(tag.clone()).or_default();
+        }
+    }
     for (cable, mut list) in cores {
+        if list.is_empty() {
+            list.push(Default::default());
+        }
         list.sort_by_key(|a| natural_key(&a.0));
         let device = i.project.devices.get(&cable);
         let part_id = device.and_then(|d| d.part.as_ref());
