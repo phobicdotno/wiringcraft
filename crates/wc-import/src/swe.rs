@@ -2373,12 +2373,12 @@ pub fn build_with(
     }
 
     // Each wire record names its two terminals; they must be connected on the drawing too.
-    let roles: BTreeMap<&str, SymbolRole> = built.symbols.iter().map(|s| (s.id.as_str(), s.role)).collect();
+    let by_id: BTreeMap<&str, &wc_core::Symbol> = built.symbols.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut probe = wc_core::Project::new("");
     // Schematic pages only: a line diagram's potential names could join nets no schematic joins.
     probe.pages = built.pages.iter().filter(|pg| !pg.overview).cloned().collect();
     let mut net_of: BTreeMap<PinRef, usize> = BTreeMap::new();
-    for (n, net) in nets_linked(&probe, |id| roles.get(id).copied()).into_iter().enumerate() {
+    for (n, net) in nets_linked(&probe, |id| by_id.get(id).copied()).into_iter().enumerate() {
         for pin in net.pins {
             net_of.insert(pin, n);
         }

@@ -94,7 +94,7 @@ impl Macro {
     /// fill declared placeholders, every placeholder the texts use is declared, symbol ids are
     /// unique and wires only end on the macro's own symbols.
     pub fn check(&self) -> Result<()> {
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let mut names: Vec<&str> = Vec::new();
         for p in &self.placeholders {
             let n = p.name.trim();
@@ -165,7 +165,7 @@ impl Macro {
     /// without a value is an error.
     pub fn apply(&self, set: Option<&str>, overrides: &BTreeMap<String, String>) -> Result<Macro> {
         self.check()?;
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let chosen = match set.map(str::trim).filter(|s| !s.is_empty()) {
             Some(name) => match self.value_set(name) {
                 Some(v) => Some(v),
@@ -287,7 +287,7 @@ impl Macro {
     /// Rename declared placeholder `old` to `new` (names matched without regard to case): its
     /// declaration, its values in the value sets and its uses in the texts.
     pub fn rename_declared(&mut self, old: &str, new: &str) -> Result<()> {
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let new = new.trim();
         if new.is_empty() {
             return bad(format!("placeholder {} needs a new name", old.trim()));
@@ -824,7 +824,13 @@ mod tests {
         undeclared.value_sets.iter_mut().for_each(|v| {
             v.values.remove("current");
         });
-        assert!(err_of(undeclared.check()).contains("{{current}} is used"));
+        let err = err_of(undeclared.check());
+        // The name is quoted (escaped), so odd characters in it cannot reach a terminal raw.
+        assert!(
+            err.contains("{{current}} is used") && err.contains(&format!("macro {:?}:", undeclared.name)),
+            "{err}"
+        );
+        assert!(err.contains("macro \""), "{err}");
 
         let mut twice = starter()?;
         twice.placeholders.push(Placeholder {
@@ -881,7 +887,12 @@ mod tests {
         assert!(m.value_sets.iter().all(|v| !v.values.keys().any(|k| key(k) == "kw")));
         m.check()?;
         assert!(err_of(m.rename_declared("power", "Part")).contains("there already"));
-        assert!(err_of(m.rename_declared("volts", "v")).contains("no placeholder volts"));
+        let err = err_of(m.rename_declared("volts", "v"));
+        assert!(
+            err.contains("no placeholder volts") && err.contains(&format!("macro {:?}:", m.name)),
+            "{err}"
+        );
+        assert!(err.contains("macro \""), "{err}");
 
         // A set giving the placeholder under two spellings keeps the value placing used.
         let mut twice = starter()?;

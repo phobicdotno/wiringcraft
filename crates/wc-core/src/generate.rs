@@ -132,6 +132,9 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
             match symbol(&s.symbol) {
                 Some(def) => {
                     pts.push(s.at);
+                    if let Some(tag) = &s.tag {
+                        tag_points(s, &def, tag, &mut pts);
+                    }
                     for g in &def.graphics {
                         drawn_points(&g.placed(s.at, s.rotation, s.mirror), &mut pts);
                     }
@@ -159,6 +162,24 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
         pts.extend(copies.first().map(|m| m.anchor));
     }
     bounds_of(&pts)
+}
+
+/// The height the PDF and the canvas draw a device tag's lines at.
+const TAG_HEIGHT: f64 = 2.5;
+
+/// Points round a placed symbol's device tag as [`crate::tag::tag_lines`] lays it out: one line
+/// per `=function`, `+location` and `-product`, centred on the tag position, right-aligned (left
+/// where the placement turns that side round). The product line is measured three digits longer,
+/// as placing a copy can give it a higher number than the macro's own.
+fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::DeviceTag, pts: &mut Vec<Point>) {
+    let (align, mut lines) = crate::tag::tag_lines(s, def, tag);
+    // The product line is the last one; a copy's number can be up to three digits longer.
+    if let Some((_, product)) = lines.last_mut() {
+        product.push_str("999");
+    }
+    for (at, line) in &lines {
+        pts.extend(text_corners(*at, line, TAG_HEIGHT, align, 0.0));
+    }
 }
 
 /// Points round what a shape draws: a text as wide as it is drawn ([`text_corners`]), and a
@@ -245,7 +266,7 @@ pub fn generate(
     let (gw, gh) = (max.x - min.x + slack_x, max.y - min.y + slack_y);
     if gw > x1 - x0 || gh > y1 - y0 {
         return Err(Error::Invalid(format!(
-            "macro {} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
+            "macro {:?} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
             first.name,
             max.x - min.x,
             max.y - min.y,
@@ -262,10 +283,11 @@ pub fn generate(
     let mut work = project.clone();
     // After the last page in page order (see `Project::sort_pages`): its first number, one up.
     // `12.3` gives `13`, `A7` gives `A8`, so every new page sorts after every page there is.
+    // Numbers are taken as `sort_pages` takes them, untrimmed: ` 4 ` gives ` 5`.
     let last = work
         .pages
         .iter()
-        .map(|p| natural_key(p.number.trim()))
+        .map(|p| natural_key(&p.number))
         .max()
         .and_then(|key| key.into_iter().next());
     let (prefix, mut next_number) = last.unwrap_or_default();
@@ -432,6 +454,22 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_name_with_control_characters_is_shown_escaped() -> Result<()> {
+        let mut m = starter()?;
+        m.name = "evil\u{1b}[31m".into();
+        let typo = err_of(rows_from_table(&m, &table(&[&["nmae"], &["x"]]), &[]));
+        let set = err_of(apply_rows(
+            &m,
+            &rows_from_table(&m, &table(&[&["set"], &["nope"]]), &[])?,
+            None,
+        ));
+        for err in [typo, set] {
+            assert!(!err.contains('\u{1b}') && err.contains("\\u{1b}"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn copies_fill_pages_in_rows_and_get_their_own_tags() -> Result<()> {
         let m = starter()?;
         let mut project = Project::new("x");
@@ -492,9 +530,19 @@ mod tests {
         assert!((max.x - (20.0 + width)).abs() < 1e-9, "{max:?}");
         // The copies stay apart on the page: the second starts past the long label.
         let mut project = Project::new("x");
-        let copies = [long.clone(), short, long];
+        // A later copy's longer label sets the pitch for all of them.
+        let copies = [short.clone(), long, short];
         let ext = extent(&copies, |_| None);
         generate(&mut project, &copies, ext, PageSize::A3, "Fans")?;
+        // Every label stays inside the frame.
+        let (fx0, fx1) = (FRAME_MARGIN, PageSize::A3.mm().0 - FRAME_MARGIN);
+        for page in &project.pages {
+            for g in &page.graphics {
+                let mut pts = Vec::new();
+                drawn_points(g, &mut pts);
+                assert!(pts.iter().all(|p| p.x >= fx0 && p.x <= fx1), "{g:?}");
+            }
+        }
         let xs: Vec<f64> = project
             .pages
             .iter()
@@ -546,6 +594,45 @@ mod tests {
         let ext = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
         let width = crate::font::text_width_mm(words, 5.0);
         assert!(ext.1.x >= at.x + width - 1e-9, "{ext:?} {at:?}");
+        // Copies placed with it keep their texts apart.
+        let copies = [one.clone(), one.clone(), one];
+        let mut project = Project::new("x");
+        generate(&mut project, &copies, ext, PageSize::A3, "Stops")?;
+        let mut xs: Vec<f64> = project
+            .pages
+            .iter()
+            .flat_map(|p| p.symbols.iter().filter(|s| s.symbol == "wc.coil").map(|s| s.at.x))
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        xs.dedup();
+        assert!(
+            xs.len() == 3 && xs.windows(2).all(|w| w[1] - w[0] >= width + GAP - 1e-9),
+            "{xs:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_symbol_s_device_tag_counts_as_drawn() -> Result<()> {
+        let one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let s = one.symbols.first().ok_or(Error::Invalid("no symbol".into()))?;
+        let tag = s.tag.clone().ok_or(Error::Invalid("no tag".into()))?;
+        // The tag sits 30 mm left of the symbol, right-aligned: it grows further left.
+        let def = Symbol {
+            id: "wc.coil".into(),
+            pins: Vec::new(),
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: Default::default(),
+            graphics: Vec::new(),
+            tag_at: Point::new(-30.0, 0.0),
+            description: String::new(),
+            source: String::new(),
+        };
+        let (min, _) = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
+        let width = crate::font::text_width_mm(&format!("-{}999", tag.product.join(".")), TAG_HEIGHT);
+        assert!(min.x <= s.at.x - 30.0 - width + 1e-9, "{min:?}");
         Ok(())
     }
 
@@ -570,6 +657,23 @@ mod tests {
         let (lmin, lmax) = bounds_of(&label);
         assert!(lmax.x > 201.0 && lmin.x < 200.0, "{lmin:?} {lmax:?}");
         assert!(min.x <= lmin.x && min.y <= lmin.y && max.x >= lmax.x && max.y >= lmax.y);
+        // Copies placed with it keep their labels apart.
+        let mut project = Project::new("x");
+        generate(&mut project, &[c.clone(), c], (min, max), PageSize::A3, "Dims")?;
+        let mut boxes = Vec::new();
+        for g in project.pages.iter().flat_map(|p| &p.graphics) {
+            for part in g.dimension_parts().unwrap_or_default() {
+                if matches!(part, Shape::Text { .. }) {
+                    let mut pts = Vec::new();
+                    drawn_points(&part, &mut pts);
+                    boxes.push(bounds_of(&pts));
+                }
+            }
+        }
+        assert_eq!(boxes.len(), 2);
+        let [(a0, a1), (b0, b1)] = [boxes[0], boxes[1]];
+        let apart = a1.x <= b0.x || b1.x <= a0.x || a1.y <= b0.y || b1.y <= a0.y;
+        assert!(apart, "{boxes:?}");
         Ok(())
     }
 
@@ -577,7 +681,12 @@ mod tests {
     fn new_pages_come_after_every_page_with_free_ids() -> Result<()> {
         let one = starter()?.apply(Some("small"), &BTreeMap::new())?;
         let ext = extent(std::slice::from_ref(&one), |_| None);
-        for (numbers, want) in [(&["1", "12.3", "4"][..], "13"), (&["A7", "3"], "A8"), (&[], "1")] {
+        for (numbers, want) in [
+            (&["1", "12.3", "4"][..], "13"),
+            (&["A7", "3"], "A8"),
+            (&[" 4 ", "2"], " 5"),
+            (&[], "1"),
+        ] {
             let mut project = Project::new("x");
             for (i, n) in numbers.iter().enumerate() {
                 // Ids differing only in case from the next free one are skipped.

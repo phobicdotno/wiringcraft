@@ -10,7 +10,7 @@ use wc_core::project::LibrarySource;
 use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Wire, store};
 use wc_import::run::{
     self, escape_field, kicad_prefix, load, page_mut, put_file_back, put_files_back, read_file, read_kicad, save,
-    snapshot_project, vendored_bytes, write_kicad,
+    snapshot_project, terminal_numbers_with, vendored_bytes, write_kicad,
 };
 #[cfg(test)]
 use wc_import::run::{
@@ -1436,11 +1436,12 @@ enum ImportCmd {
         /// The CSV file from the configurator.
         file: PathBuf,
     },
-    /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later). Ids are
+    /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later, or an old
+    /// `.lib` of KiCad 5 and before). Ids are
     /// `<prefix>.<symbol name>`; the first pin becomes the origin. Fails when no symbol
     /// could be imported.
     SymbolKicad {
-        /// The `.kicad_sym` file.
+        /// The `.kicad_sym` or old `.lib` file.
         file: PathBuf,
         /// The library folder to write into.
         #[arg(long)]
@@ -2442,7 +2443,7 @@ struct FoundMacro {
 
 /// Make sure the symbols and parts `m` (an applied macro) uses are in the project, as
 /// `macro place` needs them.
-fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro) -> Res<()> {
+fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, again: &str) -> Res<()> {
     // A pinned symbol or part keeps its pinned version: a missing copy is put
     // back from a library that still has that version, never from a newer one.
     // One without a pin is taken from the library and pinned, also when a copy
@@ -2457,13 +2458,49 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro) -> 
         .map(|id| id.trim())
         .filter(|id| !id.is_empty())
         .collect();
+    // The library is opened only when an item needs it, so a macro whose
+    // symbols and parts all have their pinned copies works without it.
+    let mut lib: Option<wc_library::Library> = None;
+    // A symbol the project already places but has no readable copy of comes
+    // back with the macro, and can turn placed items into terminals. A strip
+    // that renumbers is refused here, before any copy is written, as the
+    // imports do. A symbol that cannot be fetched is reported by the loop below.
+    if p.meta.follows_terminals() {
+        let mut brings: Vec<wc_core::Symbol> = Vec::new();
+        for id in symbols.iter().copied() {
+            let placed = p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == id));
+            if !placed || store::read_vendored_symbol(dir, id).is_ok() {
+                continue;
+            }
+            let pin = p.lock.symbols.get(id);
+            // A pinned copy that is there but cannot be read is not replaced.
+            if pin.is_some() && store::vendor_path(dir, ItemKind::Symbol, id).is_ok_and(|f| f.exists()) {
+                continue;
+            }
+            if lib.is_none() {
+                lib = wc_library::Library::open(dir, p).ok();
+            }
+            let Some(lib) = &lib else { break };
+            let found = match pin {
+                Some(pin) => lib
+                    .find_version(ItemKind::Symbol, id, &pin.source, |s: &wc_core::Symbol| {
+                        if s.id == id && s.hash() == pin.hash {
+                            Ok(())
+                        } else {
+                            Err(String::new())
+                        }
+                    })
+                    .ok(),
+                None => lib.symbol(id).ok().map(|(s, _)| s),
+            };
+            brings.extend(found);
+        }
+        terminal_numbers_with(dir, p, &brings, "macro", again)?;
+    }
     let items = symbols
         .into_iter()
         .map(|id| (ItemKind::Symbol, id))
         .chain(parts.into_iter().map(|id| (ItemKind::Part, id)));
-    // The library is opened only when an item needs it, so a macro whose
-    // symbols and parts all have their pinned copies works without it.
-    let mut lib: Option<wc_library::Library> = None;
     for (kind, id) in items {
         let what = match kind {
             ItemKind::Symbol => "symbol",
@@ -3363,7 +3400,16 @@ fn run(mut cli: Cli) -> Res<()> {
                 moved: Point::new(0.0, 0.0),
             };
             // The reason may name points from the project file: escaped for the terminal.
-            let plan = wc_core::box_edit::plan(&p, &old, &edit).map_err(|err| escape_field(&err.to_string()))?;
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            for m in missing {
+                // Its wires' ends on pins have no place, so the check of new joins skips them.
+                eprintln!(
+                    "warning: symbol {} has no readable vendored copy (run `wiringcraft lib lock`)",
+                    escape_field(&m)
+                );
+            }
+            let plan = wc_core::box_edit::plan(&p, &old, &edit, &|id| symbols.get(id))
+                .map_err(|err| escape_field(&err.to_string()))?;
             let Some(plan) = plan else {
                 // Nothing changes: the files stay as they are.
                 return Ok(());
@@ -3611,7 +3657,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let rows = wc_core::generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(e)?;
                     let copies = wc_core::generate::apply_rows(&m, &rows, set.as_deref()).map_err(e)?;
                     for copy in &copies {
-                        take_macro_items(dir, &mut p, copy)?;
+                        take_macro_items(dir, &mut p, copy, "generate the pages again")?;
                     }
                     let extent = wc_core::generate::extent(&copies, |id| store::read_vendored_symbol(dir, id).ok());
                     let title = title.unwrap_or_else(|| m.name.clone());
@@ -3659,7 +3705,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
-                    take_macro_items(dir, &mut p, &m)?;
+                    take_macro_items(dir, &mut p, &m, "place the macro again")?;
                     let page_id = page_mut(&mut p, &page)?.id.clone();
                     let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(e)?;
                     save(dir, &p)?;
@@ -4260,7 +4306,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 &mut p,
                 rule,
                 overwrite,
-                |id| symbols.get(id).map(|s| s.role),
+                |id| symbols.get(id),
                 |page, end| match end {
                     wc_core::Endpoint::Point { at } => Some(*at),
                     wc_core::Endpoint::Pin { item, pin } => {
@@ -4508,7 +4554,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     .iter()
                     .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
             );
-            let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id).map(|s| s.role));
+            let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id));
             for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
                     .pins
@@ -10545,6 +10591,92 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_that_brings_a_missing_terminal_symbol_does_not_guess_where_jumpers_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = |id: &str| wc_core::Symbol {
+            source: String::new(),
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        // A library that has the symbol the project lost, and a project macro that uses it.
+        let lib = tmp.path().join("lib");
+        wc_library::write_symbol(&lib, &term("test.missing")).unwrap();
+        cli(&dir, &["lib", "add", "mine", "folder", lib.to_str().unwrap()]).unwrap();
+        std::fs::create_dir_all(dir.join("macros")).unwrap();
+        std::fs::write(
+            dir.join("macros/one.json"),
+            r#"{"name": "One", "anchor": {"x": 0.0, "y": 0.0},
+            "symbols": [{"id": "s1", "symbol": "test.missing", "at": {"x": 10.0, "y": 10.0}, "tag": "-K1"}]}"#,
+        )
+        .unwrap();
+        let mut p = load(&dir).unwrap();
+        // Three terminals tagged with only the strip; the first one's symbol has no copy in the
+        // project, and placing the macro would restore it. Jumper 1-2 is b-c if it was numbered
+        // without that symbol, a-b if with it.
+        store::write_vendored_symbol(&dir, &term("test.term")).unwrap();
+        p.pages[0].symbols.extend([
+            placed("a", "test.missing", 10.0),
+            placed("b", "test.term", 20.0),
+            placed("c", "test.term", 30.0),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let page = p.pages[0].id.clone();
+        let place = || cli(&dir, &["macro", "place", &page, "one", "--at", "100,100"]);
+        // Without a pin the library's current version would be taken, with one the pinned version
+        // put back: neither is written.
+        for pinned in [false, true] {
+            if pinned {
+                let mut p = load(&dir).unwrap();
+                p.lock.symbols.insert(
+                    "test.missing".into(),
+                    wc_core::LockEntry {
+                        source: "mine".into(),
+                        hash: term("test.missing").hash(),
+                    },
+                );
+                store::save(&dir, &p).unwrap();
+            }
+            let before = load(&dir).unwrap();
+            let err = place().unwrap_err();
+            assert!(err.contains("jumpers and rail order of -X1"), "{err}");
+            assert!(
+                err.contains("no readable copy of test.missing that the macro brings"),
+                "{err}"
+            );
+            assert!(
+                store::read_vendored_symbol(&dir, "test.missing").is_err(),
+                "nothing written"
+            );
+            assert_eq!(load(&dir).unwrap(), before, "nothing saved");
+        }
+        // With the file back the numbering is known, and the macro is placed.
+        store::write_vendored_symbol(&dir, &term("test.missing")).unwrap();
+        place().unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+        assert_eq!(p.pages[0].symbols.len(), 4);
+    }
+
+    #[test]
     fn an_import_that_brings_a_missing_terminal_symbol_does_not_guess_a_rail_order() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -12089,8 +12221,21 @@ mod tests {
         let pg = p.page("p1").unwrap();
         let sym = store::read_vendored_symbol(&dir, &pg.symbols[0].symbol).unwrap();
         let at = wc_pdf::pin_position(&pg.symbols[0], &sym, "IN").unwrap();
-        // Another wire ends freely where IN is, not joined to it.
-        cli(&dir, &["wire", "p1", &format!("{},{}", at.x, at.y), "0,90"]).unwrap();
+        // A wire between two other boxes runs straight past IN, not joined to it (a pin on a
+        // segment is no T). A free end where IN is would be: it lies on the end of IN's wire.
+        for y in [at.y - 25.0, at.y + 25.0] {
+            let place = format!("{},{}", at.x, y);
+            cli(
+                &dir,
+                &["box", "p1", "--at", &place, "--size", "10,10", "--pin", "X:left:0"],
+            )
+            .unwrap();
+        }
+        let ids: Vec<String> = load(&dir).unwrap().page("p1").unwrap().symbols[1..]
+            .iter()
+            .map(|s| format!("{}:X", s.id))
+            .collect();
+        cli(&dir, &["wire", "p1", &ids[0], &ids[1]]).unwrap();
         let before = load(&dir).unwrap();
         let err = cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap_err();
         assert!(err.contains("would be joined"), "{err}");

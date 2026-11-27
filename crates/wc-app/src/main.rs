@@ -1394,7 +1394,11 @@ impl App {
                 for a in IMPORT_VIEW_CONTROLS {
                     let info = a.info();
                     let on = import_view_control_on(*a, &self.prefs, self.show_layers);
-                    if ui.selectable_label(on, info.label).on_hover_text(info.tip).clicked() {
+                    if ui
+                        .selectable_label(on, info.label)
+                        .on_hover_text(chrome::tip_hint(ui.ctx().os(), info.tip))
+                        .clicked()
+                    {
                         actions.push(*a);
                     }
                 }
@@ -2601,29 +2605,33 @@ impl App {
                         clip.wires.len(),
                         clip.graphics.len()
                     ));
-                    egui::Grid::new("macro")
+                    let enter = egui::Grid::new("macro")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
                             ui.label("Name");
-                            ui.add(
+                            let n = ui.add(
                                 egui::TextEdit::singleline(name)
                                     .hint_text("Motor starter DOL")
                                     .desired_width(320.0),
                             );
                             ui.end_row();
                             ui.label("Description");
-                            ui.add(egui::TextEdit::singleline(description).desired_width(320.0));
+                            let d = ui.add(egui::TextEdit::singleline(description).desired_width(320.0));
                             ui.end_row();
-                        });
+                            (n.lost_focus() || d.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter))
+                        })
+                        .inner;
                     if let Some(e) = error {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
                     }
                     ui.horizontal(|ui| {
-                        if ui
+                        if (ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
                             .on_disabled_hover_text("Give the macro a name first.")
                             .clicked()
+                            || enter)
+                            && !name.trim().is_empty()
                             && let Some(open) = &mut self.open
                         {
                             match open.save_macro(clip, name, description) {
@@ -2634,7 +2642,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2958,7 +2966,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2990,7 +2998,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -3062,7 +3070,7 @@ impl App {
                              (not its comments or history), recorded as a git repository. {name} and {date} in \
                              its title block and page titles become this project's name and today's date."
                         })
-                        .color(t.faint),
+                        .color(t.muted),
                     );
                     ui.horizontal(|ui| {
                         if let Ok(d) = target
@@ -3075,7 +3083,7 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.start_new_project(&d, &n, b.as_deref())));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -3131,7 +3139,7 @@ impl App {
                     });
                     ui.label(
                         RichText::new("Texts without a translation are printed as drawn and listed as warnings.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                            .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -3202,7 +3210,7 @@ impl App {
                         });
                     ui.label(
                         RichText::new("These fields fill the title block on every page.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                            .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.add_space(8.0);
                     ui.label(RichText::new("Locations").strong());
@@ -3349,7 +3357,7 @@ impl App {
                             let current = o.project.meta.logo.as_ref().map(|l| l.file.clone());
                             ui.label(
                                 RichText::new(current.as_deref().unwrap_or("none"))
-                                    .color(theme::Theme::of(ui.ctx()).faint),
+                                    .color(theme::Theme::of(ui.ctx()).muted),
                             );
                             if ui
                                 .button("Logo...")
@@ -3378,7 +3386,7 @@ impl App {
                              Add free text on the cover with the Text tool. Drag the logo on the \
                              cover to move it, or its bottom-right corner to size it.",
                         )
-                        .color(theme::Theme::of(ui.ctx()).faint),
+                        .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3421,7 +3429,7 @@ impl App {
                             "Every page shows each change at once. The layout is kept in \
                              project.toml; a project on the built-in layout leaves it out.",
                         )
-                        .color(theme::Theme::of(ui.ctx()).faint),
+                        .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3478,7 +3486,7 @@ impl App {
                             "The PLC cards report shows each change at once. The racks are kept \
                              in project.toml.",
                         )
-                        .color(t.faint),
+                        .color(t.muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3707,7 +3715,7 @@ impl App {
                             }
                             ui.label(
                                 RichText::new(format!("{} rows", table.rows.len()))
-                                    .color(theme::Theme::of(ui.ctx()).faint),
+                                    .color(theme::Theme::of(ui.ctx()).muted),
                             );
                         });
                     } else {
@@ -3795,7 +3803,7 @@ impl App {
                 }
                 Dialog::Comment(at, text, focused) => {
                     ui.label(
-                        RichText::new(format!("As {}", state::author_name())).color(theme::Theme::of(ui.ctx()).faint),
+                        RichText::new(format!("As {}", state::author_name())).color(theme::Theme::of(ui.ctx()).muted),
                     );
                     let r = ui.add(egui::TextEdit::multiline(text).desired_width(360.0).desired_rows(4));
                     if !*focused {
@@ -3887,7 +3895,7 @@ impl App {
                     if versions.is_empty() {
                         ui.label(format!("Page {page} has no recorded versions yet."));
                         ui.label(
-                            RichText::new("Record a version (Versions menu) to start its history.").color(t.faint),
+                            RichText::new("Record a version (Versions menu) to start its history.").color(t.muted),
                         );
                     }
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
@@ -3896,7 +3904,7 @@ impl App {
                                 ui.label(
                                     RichText::new(&v.commit[..v.commit.len().min(8)])
                                         .monospace()
-                                        .color(t.faint),
+                                        .color(t.muted),
                                 );
                                 ui.label(RichText::new(&v.subject).strong());
                             });
@@ -3912,7 +3920,7 @@ impl App {
                                 ui.label(
                                     RichText::new("   no changes to symbols or wires")
                                         .small()
-                                        .color(t.faint),
+                                        .color(t.muted),
                                 );
                             }
                             ui.add_space(6.0);
@@ -5487,7 +5495,7 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
         .auto_shrink([false, true])
         .show(ui, |ui| {
             if t.rows.is_empty() {
-                ui.label(RichText::new("Nothing to list yet.").color(theme.faint));
+                ui.label(RichText::new("Nothing to list yet.").color(theme.muted));
                 return;
             }
             egui::Grid::new(("report", t.title.as_str()))
@@ -8797,6 +8805,157 @@ mod nudge_tests {
             assert!(app.importing.is_some(), "the import still runs");
             assert_eq!(seen.get("Grid"), Some(&grid), "grid {grid}, dark {dark}: {seen:?}");
             assert_eq!(seen.get("Dark mode"), Some(&dark), "grid {grid}, dark {dark}: {seen:?}");
+        }
+    }
+
+    /// Escape cancels the Open project, Save as, New project and Save as macro dialogs, as it
+    /// does the other small dialogs.
+    #[test]
+    fn escape_cancels_the_path_and_macro_dialogs() {
+        let dialogs: [fn() -> Dialog; 4] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+            || Dialog::NewProject {
+                location: prefs::FolderField::typed(""),
+                name: String::new(),
+                base: String::new(),
+                error: None,
+            },
+            || Dialog::SaveMacro {
+                clip: Default::default(),
+                name: "M".into(),
+                description: String::new(),
+                error: None,
+            },
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            assert!(app.dialog.is_some());
+            let escape = egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            app_frame(&mut app, &ctx, vec![escape], false);
+            assert!(app.dialog.is_none(), "Escape cancels");
+        }
+    }
+
+    /// Escape that cancels one of those dialogs is used up there: a shape half drawn in the
+    /// symbol editor behind it is kept.
+    #[test]
+    fn escape_on_a_path_or_macro_dialog_keeps_a_half_drawn_symbol_shape() {
+        let dialogs: [fn() -> Dialog; 4] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+            || Dialog::NewProject {
+                location: prefs::FolderField::typed(""),
+                name: String::new(),
+                base: String::new(),
+                error: None,
+            },
+            || Dialog::SaveMacro {
+                clip: Default::default(),
+                name: "M".into(),
+                description: String::new(),
+                error: None,
+            },
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+            ed.set_tool(symbol_editor::Tool::Line);
+            ed.click(Point::new(0.0, 0.0));
+            ed.owner = app.open.as_ref().map(|o| o.dir.clone());
+            assert!(ed.drawing_shape());
+            app.symbol_editor = Some(ed);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            ctx.memory_mut(|m| m.stop_text_input());
+            let escape = egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            app_frame(&mut app, &ctx, vec![escape], false);
+            assert!(app.dialog.is_none(), "Escape cancels");
+            assert!(
+                app.symbol_editor
+                    .as_ref()
+                    .is_some_and(symbol_editor::SymbolEditor::drawing_shape),
+                "the half drawn shape is kept"
+            );
+        }
+    }
+
+    /// Enter in either field of Save as macro saves the macro when it has a name, and does
+    /// nothing while the name is blank.
+    #[test]
+    fn enter_in_a_macro_field_saves_only_a_named_macro() {
+        let key = |key: Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        // Tab to the next widget and say what took the focus: its kind and its text.
+        let tab = |app: &mut App, ctx: &egui::Context| {
+            let out = app_frame_output(app, ctx, vec![key(Key::Tab)], false);
+            out.platform_output.events.iter().find_map(|e| match e {
+                egui::output::OutputEvent::FocusGained(w) => Some((w.typ, w.current_text_value.clone())),
+                _ => None,
+            })
+        };
+        for (name, in_description) in [("Starter", false), ("Starter", true), ("  ", false), ("  ", true)] {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            // The selected coil is what the macro holds.
+            let clip = app.open.as_ref().unwrap().copy(app.ed.page, &app.ed.selection);
+            assert!(!clip.is_empty());
+            app.dialog = Some(Dialog::SaveMacro {
+                clip,
+                name: name.into(),
+                description: String::new(),
+                error: None,
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            // Tab past the menus to the Name field, and on to Description if asked.
+            let mut tabs = 0;
+            while tab(&mut app, &ctx) != Some((egui::WidgetType::TextEdit, Some(name.to_owned()))) {
+                tabs += 1;
+                assert!(tabs < 200, "no Name field to tab to");
+            }
+            if in_description {
+                assert_eq!(
+                    tab(&mut app, &ctx),
+                    Some((egui::WidgetType::TextEdit, Some(String::new()))),
+                    "Description follows Name"
+                );
+            }
+            // A frame with the field focused, so Enter makes it lose the focus.
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, vec![key(Key::Enter)], false);
+            let saved = app.ed.message.starts_with("Saved macro");
+            if name.trim().is_empty() {
+                assert!(app.dialog.is_some(), "a blank name is not saved ({in_description})");
+                assert!(!saved, "{}", app.ed.message);
+            } else {
+                assert!(app.dialog.is_none(), "Enter saves ({in_description})");
+                assert!(saved, "{}", app.ed.message);
+            }
         }
     }
 

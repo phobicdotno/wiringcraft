@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The file extensions the import takes, for the file picker's filter.
-pub const EXTENSIONS: &[&str] = &["dxf", "svg", "kicad_sym", "elmt"];
+pub const EXTENSIONS: &[&str] = &["dxf", "svg", "kicad_sym", "lib", "elmt"];
 
 /// The largest file read; a bigger one fails without being read whole.
 const MAX_LEN: usize = 16 << 20;
@@ -176,7 +176,8 @@ fn read(file: &Path) -> Result<FileSymbols, String> {
             let (s, w) = wc_import::svg::symbol_with_warnings(&text, &id, &display_name).map_err(|e| e.to_string())?;
             Ok((vec![(s, display_name)], w))
         }
-        Some("kicad_sym") => {
+        // `.lib`: an old KiCad library (KiCad 5 and before); another kind of `.lib` is refused.
+        Some("kicad_sym" | "lib") => {
             let text = read_text(file, MAX_LEN)?;
             let prefix = format!("kicad.{}", stem(file));
             let (symbols, w) = wc_import::kicad::symbols(&text, &prefix, 1.0).map_err(|e| e.to_string())?;
@@ -278,6 +279,8 @@ mod tests {
 
     const DXF: &str = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n0\nPOINT\n8\nPIN\n10\n10\n20\n0\n0\nENDSEC\n0\nEOF\n";
 
+    const OLD_KICAD: &str = "EESchema-LIBRARY Version 2.4\nDEF LAMP H 0 40 Y Y 1 L N\nF0 \"H\" 0 100 50 H V C CNN\nDRAW\nX 1 1 0 0 100 R 50 50 1 1 P\nENDDRAW\nENDDEF\n";
+
     #[test]
     fn a_mixed_set_of_files_goes_into_the_library_and_a_bad_one_does_not_stop_the_rest() {
         let src = tempfile::tempdir().unwrap();
@@ -297,6 +300,8 @@ mod tests {
                 r#"(kicad_symbol_lib (symbol "Orphan" (extends "Missing")))"#,
             ),
             write("Lamp Red.elmt", ELMT),
+            // An old KiCad library (before KiCad 6), read as the new format.
+            write("Old Lamps.lib", OLD_KICAD),
             write("Line.dxf", DXF),
             write("notes.txt", "hello"),
             // Same id as Coil.svg: refused, the first one stays.
@@ -304,10 +309,16 @@ mod tests {
         ];
         let out = import(&files, lib.path(), false);
         let symbols = lib.path().join("symbols");
-        for id in ["svg.coil", "kicad.relays.k", "qet.lamp_red", "dxf.line"] {
+        for id in [
+            "svg.coil",
+            "kicad.relays.k",
+            "kicad.old_lamps.lamp",
+            "qet.lamp_red",
+            "dxf.line",
+        ] {
             assert!(symbols.join(format!("{id}.json")).is_file(), "{id}: {out:?}");
         }
-        assert_eq!(out.written.len(), 4, "{out:?}");
+        assert_eq!(out.written.len(), 5, "{out:?}");
         assert_eq!(out.failed.len(), 3, "{out:?}");
         assert!(out.failed.iter().any(|f| f.contains("broken.svg")));
         assert!(
@@ -317,7 +328,7 @@ mod tests {
         );
         assert!(out.failed.iter().any(|f| f.contains("same id svg.coil")));
         let report = out.report(lib.path());
-        assert!(report.starts_with("Imported 4 symbols"), "{report}");
+        assert!(report.starts_with("Imported 5 symbols"), "{report}");
         // The warning names its file, in the outcome and in the report.
         assert!(
             out.warnings

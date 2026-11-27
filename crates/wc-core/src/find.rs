@@ -352,6 +352,9 @@ pub fn replace_renaming(
         return Ok((0, BTreeMap::new()));
     }
     let mut p = project.clone();
+    // Terminals renamed by their numbered tags (`-X1.3` to `-X2.3`) take their strip's jumpers
+    // and layout along, though no device or symbol is tagged with the strip itself.
+    let terminals = crate::project::terminal_numbers(&p, |_| None);
     let mut changed = 0usize;
     let mut renames: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
     let stale = || "The project changed since the search; search again.".to_owned();
@@ -482,7 +485,8 @@ pub fn replace_renaming(
             let (mut old, mut new) = (from.clone(), to.clone());
             old.product.push(spare.clone());
             new.product.push(spare.clone());
-            if !p.devices.contains_key(&old) || renames.contains_key(&old) {
+            // Every spare of the layout moves, with device data or without.
+            if renames.contains_key(&old) {
                 continue;
             }
             let held = (p.devices.contains_key(&new) || drawn.contains_key(&new) || cables.contains(&new))
@@ -549,7 +553,102 @@ pub fn replace_renaming(
             numbers.entry(new_strip).or_default().insert(old_n, new_n);
         }
     }
-    for l in &mut p.meta.strips {
+    renumber_layouts(&mut p.meta.strips, &numbers);
+    // Jumpers follow the terminals they were on before the renames, not the strip names
+    // rename_device gave them: a jumper taken from -X to -X1 would otherwise be matched with
+    // the terminals the old -X1 had, and follow them on to -X11 into that strip's jumper. The
+    // terminals of a renamed strip that are not drawn go with the strip.
+    let mut before = terminals.clone();
+    let mut carried = crate::project::TerminalNumbers::new();
+    for j in &project.meta.jumpers {
+        let Some(to) = renames.get(&j.strip) else {
+            continue;
+        };
+        for t in &j.terminals {
+            if terminals.values().any(|(s, n)| s == &j.strip && n == t) {
+                continue;
+            }
+            let key = (String::new(), format!("jumper {} {t}", j.strip));
+            let n = numbers.get(to).and_then(|m| m.get(t)).unwrap_or(t);
+            before.insert(key.clone(), (j.strip.clone(), t.clone()));
+            carried.insert(key, (to.clone(), n.clone()));
+        }
+    }
+    p.meta.jumpers = project.meta.jumpers.clone();
+    // A spare of a strip that moves only through its numbered terminals goes with the layout:
+    // put back first, so the layout is not refused for the data at its new tag, then moved
+    // from wherever the layout took it to where its rename says.
+    let spares: Vec<(DeviceTag, DeviceTag)> = renames
+        .iter()
+        .filter(|(from, _)| {
+            let (strip, n) = from.terminal_parts();
+            // Not one whose old tag another rename takes: putting it back would overwrite that.
+            !renames.contains_key(&strip)
+                && !renames.values().any(|to| to == *from)
+                && n.is_some_and(|n| project.meta.strip_layout(&strip).is_some_and(|l| l.spares.contains(&n)))
+        })
+        .map(|(from, to)| (from.clone(), to.clone()))
+        .collect();
+    for (from, to) in &spares {
+        p.rename_device(to, from);
+    }
+    let moves = crate::project::follow_terminals_carrying(&mut p, &before, &carried, |_| None);
+    // A spare whose layout went to another strip is there now. When that is the strip its
+    // rename names, the layout takes the spare's new number too (`-X1.S1` -> `-X2.S2` while
+    // `-X1.3` -> `-X2.3` takes the layout to -X2).
+    let mut spare_numbers: BTreeMap<DeviceTag, BTreeMap<String, String>> = BTreeMap::new();
+    let mut back: Vec<(DeviceTag, DeviceTag)> = Vec::new();
+    for (from, to) in &spares {
+        let (strip, Some(n)) = from.terminal_parts() else {
+            continue;
+        };
+        let now = match moves.iter().find(|(old, _)| *old == strip) {
+            Some((_, dest)) => {
+                if let (to_strip, Some(m)) = to.terminal_parts()
+                    && &to_strip == dest
+                {
+                    spare_numbers.entry(dest.clone()).or_default().insert(n.clone(), m);
+                }
+                let mut now = dest.clone();
+                now.product.push(n);
+                now
+            }
+            None => from.clone(),
+        };
+        if &now != to && p.devices.contains_key(&now) {
+            back.push((now, to.clone()));
+        }
+    }
+    renumber_layouts(&mut p.meta.strips, &spare_numbers);
+    // Through placeholders, so spares moving onto each other's tags keep their own data.
+    let mut parked: Vec<(DeviceTag, DeviceTag, DeviceTag)> = Vec::new();
+    for (now, to) in back {
+        let temp = loop {
+            let t = DeviceTag::parse(&format!("-WCFIND{next}")).map_err(|e| e.to_string())?;
+            next += 1;
+            if !used.contains(&t) && !p.devices.contains_key(&t) {
+                break t;
+            }
+        };
+        used.insert(temp.clone());
+        p.rename_device(&now, &temp);
+        parked.push((temp, now, to));
+    }
+    for (temp, now, to) in &parked {
+        let dest = if p.devices.contains_key(to) { now } else { to };
+        p.rename_device(temp, dest);
+    }
+    *project = p;
+    Ok((changed, renames))
+}
+
+/// Give each layout in `numbers` its terminals' and spares' new numbers (old to new), all from
+/// one snapshot, so `S1` -> `S11` and `S11` -> `S1111` do not run into each other.
+fn renumber_layouts(
+    strips: &mut [crate::project::StripLayout],
+    numbers: &BTreeMap<DeviceTag, BTreeMap<String, String>>,
+) {
+    for l in strips {
         if let Some(map) = numbers.get(&l.strip) {
             for list in [&mut l.spares, &mut l.order] {
                 let mut out: Vec<String> = Vec::new();
@@ -563,8 +662,6 @@ pub fn replace_renaming(
             }
         }
     }
-    *project = p;
-    Ok((changed, renames))
 }
 
 #[cfg(test)]
@@ -935,6 +1032,197 @@ mod tests {
             Err("-X4.S1 is already used.".into())
         );
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn jumpers_follow_terminals_renamed_by_their_numbered_tags() {
+        let mut p = sample();
+        for (id, t) in [("t1", "-X1.1"), ("t2", "-X1.2")] {
+            p.pages[1].symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(40.0, 20.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag(t)),
+            });
+        }
+        let jumper = |strip: &str| crate::project::Jumper {
+            strip: tag(strip),
+            terminals: vec!["1".into(), "2".into()],
+            part: None,
+        };
+        p.meta.jumpers.push(jumper("-X1"));
+        let layout = |strip: &str| crate::project::StripLayout {
+            strip: tag(strip),
+            order: vec!["2".into(), "1".into()],
+            spares: vec!["S1".into()],
+        };
+        p.meta.strips.push(layout("-X1"));
+        p.devices.insert(
+            tag("-X1.S1"),
+            Device {
+                part: Some("WAGO.2002-1201".into()),
+                ..Default::default()
+            },
+        );
+        let opts = FindOptions { match_case: true };
+        let hits = find(&p, "X1", opts);
+        assert_eq!(replace(&mut p, &hits, "X1", "X2", opts), Ok(3));
+        assert_eq!(p.meta.jumpers, [jumper("-X2")], "the jumper follows its terminals");
+        assert_eq!(p.meta.strips, [layout("-X2")], "the layout follows its terminals");
+        assert_eq!(
+            p.devices.get(&tag("-X2.S1")).and_then(|d| d.part.as_deref()),
+            Some("WAGO.2002-1201"),
+            "the spare's part goes with it"
+        );
+        assert!(!p.devices.contains_key(&tag("-X1.S1")));
+    }
+
+    #[test]
+    fn a_spare_renamed_with_the_numbered_terminals_moving_its_strip_keeps_its_new_number() {
+        let mut p = sample();
+        p.pages[1].symbols.push(PlacedSymbol {
+            id: "t1".into(),
+            symbol: "wc.terminal".into(),
+            at: Point::new(40.0, 20.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag("-X1.3")),
+        });
+        // Nothing is tagged -X1 itself: only the numbered terminal moves the strip.
+        p.meta.strips.push(crate::project::StripLayout {
+            strip: tag("-X1"),
+            order: vec!["S1".into(), "3".into()],
+            spares: vec!["S1".into()],
+        });
+        p.devices.insert(
+            tag("-X1.S1"),
+            Device {
+                part: Some("A".into()),
+                ..Default::default()
+            },
+        );
+        let opts = FindOptions { match_case: true };
+        let hits: Vec<Hit> = find(&p, "1", opts)
+            .into_iter()
+            .filter(|h| h.kind == FindKind::Tag && ["-X1.3", "-X1.S1"].contains(&h.value.as_str()))
+            .collect();
+        let (_, renamed) = replace_renaming(&mut p, &hits, "1", "2", opts).unwrap_or_default();
+        assert_eq!(renamed.get(&tag("-X1.S1")), Some(&tag("-X2.S2")));
+        assert_eq!(
+            p.meta.strips,
+            [crate::project::StripLayout {
+                strip: tag("-X2"),
+                order: vec!["S2".into(), "3".into()],
+                spares: vec!["S2".into()],
+            }],
+            "the layout follows its terminal and the spare keeps its new number"
+        );
+        assert_eq!(
+            p.devices.get(&tag("-X2.S2")).and_then(|d| d.part.as_deref()),
+            Some("A"),
+            "the spare's part is where its rename says"
+        );
+        assert!(!p.devices.contains_key(&tag("-X1.S1")));
+        assert!(!p.devices.contains_key(&tag("-X2.S1")));
+    }
+
+    #[test]
+    fn jumpers_of_strips_renamed_in_a_chain_stay_apart() {
+        let mut p = sample();
+        // Each strip has a terminal tagged with just the strip and two numbered terminals.
+        for (id, t) in [
+            ("a", "-X"),
+            ("a1", "-X.1"),
+            ("a2", "-X.2"),
+            ("b", "-X1"),
+            ("b1", "-X1.1"),
+            ("b2", "-X1.2"),
+        ] {
+            p.pages[1].symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(40.0, 20.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag(t)),
+            });
+        }
+        let jumper = |strip: &str, part: &str| crate::project::Jumper {
+            strip: tag(strip),
+            terminals: vec!["1".into(), "2".into()],
+            part: Some(part.into()),
+        };
+        p.meta.jumpers = vec![jumper("-X", "A"), jumper("-X1", "B")];
+        let opts = FindOptions { match_case: true };
+        // -X becomes -X1 and -X1 becomes -X11, each with its numbered terminals.
+        let hits: Vec<Hit> = find(&p, "X", opts)
+            .into_iter()
+            .filter(|h| h.kind == FindKind::Tag)
+            .collect();
+        let (_, renamed) = replace_renaming(&mut p, &hits, "X", "X1", opts).unwrap_or_default();
+        assert_eq!(renamed.get(&tag("-X")), Some(&tag("-X1")));
+        assert_eq!(renamed.get(&tag("-X1")), Some(&tag("-X11")));
+        let mut jumpers = p.meta.jumpers.clone();
+        jumpers.sort_by(|a, b| a.strip.cmp(&b.strip));
+        assert_eq!(
+            jumpers,
+            [jumper("-X1", "A"), jumper("-X11", "B")],
+            "each jumper goes with its own terminals"
+        );
+    }
+
+    #[test]
+    fn a_spare_without_data_may_not_move_onto_a_cable_tag() {
+        let mut p = sample();
+        p.meta.strips.push(crate::project::StripLayout {
+            strip: tag("-X1"),
+            order: Vec::new(),
+            spares: vec!["S1".into()],
+        });
+        p.devices.insert(tag("-X1"), Device::default());
+        p.devices.insert(
+            tag("-X2.S1"),
+            Device {
+                description: "Cable".into(),
+                ..Default::default()
+            },
+        );
+        let opts = FindOptions { match_case: true };
+        let hits: Vec<Hit> = find(&p, "X1", opts)
+            .into_iter()
+            .filter(|h| h.kind == FindKind::Tag && h.value == "-X1")
+            .collect();
+        let before = p.clone();
+        assert_eq!(
+            replace(&mut p, &hits, "X1", "X2", opts),
+            Err("-X2.S1 is already used.".into())
+        );
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn spares_renamed_onto_each_others_tags_keep_their_own_data() {
+        let mut p = sample();
+        let part = |s: &str| Device {
+            part: Some(s.into()),
+            ..Default::default()
+        };
+        // Tags are renamed by whole parts: X -> X1 takes -X1.S1 to -X11.S1 and -X.S1 onto it.
+        for (strip, data) in [("-X1", "A"), ("-X", "B")] {
+            p.meta.strips.push(crate::project::StripLayout {
+                strip: tag(strip),
+                order: Vec::new(),
+                spares: vec!["S1".into()],
+            });
+            p.devices.insert(tag(&format!("{strip}.S1")), part(data));
+        }
+        let opts = FindOptions { match_case: true };
+        let hits: Vec<Hit> = find(&p, "S1", opts);
+        assert_eq!(replace(&mut p, &hits, "X", "X1", opts), Ok(2));
+        assert_eq!(p.devices.get(&tag("-X11.S1")), Some(&part("A")));
+        assert_eq!(p.devices.get(&tag("-X1.S1")), Some(&part("B")));
     }
 
     #[test]
