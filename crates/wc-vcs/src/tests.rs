@@ -877,8 +877,9 @@ fn a_path_that_is_not_utf8_is_read_in_quoted_form() {
 }
 
 /// Two file names that differ only in a byte that is not UTF-8 (both would read as `a\u{fffd}.txt`
-/// lossily) stay two entries in the change list and in a merge's conflict list.
-#[cfg(unix)]
+/// lossily) stay two entries in the change list and in a merge's conflict list. Not on macOS:
+/// its file systems refuse such names ("Illegal byte sequence"), so they never reach git there.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn names_that_differ_in_a_byte_that_is_not_utf8_stay_apart() -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
