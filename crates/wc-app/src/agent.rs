@@ -21,7 +21,7 @@ use wc_core::{DeviceTag, Endpoint, Page};
 
 use crate::actions::Action;
 use crate::screenshot::{self, Shot};
-use crate::state::{Open, Selection};
+use crate::state::{Open, PageKind, Selection};
 use crate::{App, Dialog};
 use wc_agent::{Pending, Started};
 
@@ -233,7 +233,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, graphic, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
             json!({}),
             &[],
         ),
@@ -396,8 +396,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_page",
-            "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check), make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark), or set the page's own title-block fields (get_page lists them).",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
+            "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check) or as a graphic page (drawings only: symbols and wires are refused on it, and a page that has some cannot become one; overview and graphic exclude each other), make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark), or set the page's own title-block fields (get_page lists them).",
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}, "overview": {"type": "boolean"}, "graphic": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
             &[],
         ),
         tool(
@@ -438,7 +438,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
-            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), cover (true for the cover page; leaving it out keeps the page's current value), title_block (the page's own title-block fields such as revision and date, which win over the project's; leaving it out keeps the page's current ones), symbols, wires, graphics, underlay."}}),
+            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), graphic (true for a graphic page, which holds no symbols or wires; leaving it out keeps the page's current value), cover (true for the cover page; leaving it out keeps the page's current value), title_block (the page's own title-block fields such as revision and date, which win over the project's; leaving it out keeps the page's current ones), symbols, wires, graphics, underlay."}}),
             &["content"],
         ),
         tool(
@@ -662,7 +662,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "run_command",
             "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
-             Project and pages: new (a project folder, --template), page (add, list, remove, overview, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
+             Project and pages: new (a project folder, --template), page (add, list, remove, overview, graphic, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
              Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, delete (symbols and wires by id), device (part, description), number-wires, macro (list, place, show, edit: a project macro's placeholders and value sets), find (text in pages, --replace, --match-case). \
              Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
              Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
@@ -1092,7 +1092,7 @@ impl Open {
         let (w, h) = p.size.mm();
         json!({
             "id": p.id, "number": p.number, "title": p.title, "size": p.size,
-            "overview": p.overview, "cover": p.cover,
+            "overview": p.overview, "graphic": p.graphic, "cover": p.cover,
             "title_block": p.title_block,
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
@@ -1894,7 +1894,7 @@ impl App {
                 let cur = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 let number = s(v, "number").unwrap_or(&cur.number).to_owned();
                 let title = s(v, "title").unwrap_or(&cur.title).to_owned();
-                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), cur.overview, None)?;
+                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), PageKind::of(&cur), None)?;
                 let p = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 self.go_to(i);
                 Ok(format!("Added page {} ({}), id {}.", p.number, p.title, p.id))
@@ -1922,12 +1922,22 @@ impl App {
                     ),
                     Some(_) => return Err("title_block must be an object of field names and texts.".into()),
                 };
+                let overview = v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview);
+                let graphic = v.get("graphic").and_then(Value::as_bool).unwrap_or(cur.graphic);
+                let kind = match (overview, graphic) {
+                    (true, true) => {
+                        return Err("A page cannot be both an overview and a graphic page.".into());
+                    }
+                    (true, false) => PageKind::Overview,
+                    (false, true) => PageKind::Graphic,
+                    (false, false) => PageKind::Schematic,
+                };
                 let i = open.set_page_props(
                     page,
                     s(v, "number").unwrap_or(&cur.number),
                     s(v, "title").unwrap_or(&cur.title),
                     size.unwrap_or(cur.size),
-                    v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview),
+                    kind,
                     fields.as_ref(),
                 )?;
                 if let Some(cover) = v.get("cover").and_then(Value::as_bool) {
@@ -2035,7 +2045,21 @@ impl App {
                     let own = open.project.pages.get(page).and_then(|p| p.revision_table);
                     content["revision_table"] = json!(own);
                 }
+                // Nor does one without `graphic` unmark a graphic page.
+                if content.get("graphic").is_none() {
+                    let own = open.project.pages.get(page).is_some_and(|p| p.graphic);
+                    content["graphic"] = json!(own);
+                }
                 let new: Page = serde_json::from_value(content).map_err(|e| format!("Not a page: {e}"))?;
+                if new.graphic && new.overview {
+                    return Err("A page cannot be both a graphic page and a line diagram.".into());
+                }
+                if new.graphic && !(new.symbols.is_empty() && new.wires.is_empty()) {
+                    return Err(format!(
+                        "Page {} is a graphic page, which holds drawings only; remove its symbols and wires first.",
+                        new.number
+                    ));
+                }
                 open.ensure_page_symbols(&new)?;
                 open.checkpoint();
                 for s in &new.symbols {
@@ -2446,7 +2470,7 @@ impl App {
             .map(|p| {
                 json!({
                     "id": p.id, "number": p.number, "title": p.title, "size": p.size,
-                    "overview": p.overview, "cover": p.cover,
+                    "overview": p.overview, "graphic": p.graphic, "cover": p.cover,
                     "symbols": p.symbols.len(), "wires": p.wires.len(), "graphics": p.graphics.len()
                 })
             })
@@ -2696,6 +2720,9 @@ impl App {
         let page = self.page_of(v, "page")?;
         let via = points(v, "via")?.unwrap_or_default();
         let open = need_open(self.open.as_mut())?;
+        if let Some(why) = open.graphic_reason(page, "Wires") {
+            return Err(why);
+        }
         let from = open.endpoint(page, v.get("from"))?;
         let to = open.endpoint(page, v.get("to"))?;
         if from == to {
@@ -7055,7 +7082,7 @@ mod tests {
             "99",
             "Renamed",
             schematic.size,
-            false,
+            Some(PageKind::Schematic),
             &Default::default(),
         );
         assert!(refused.is_err_and(|e| e.contains("Ola")));
@@ -10147,6 +10174,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page2(&a).graphics, vec![line(5.0)]);
+    }
+
+    #[test]
+    fn edit_page_json_keeps_a_graphic_page_free_of_symbols_and_wires() {
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let pg = &mut a.open.as_mut().unwrap().project.pages[1];
+            pg.symbols.clear();
+            pg.wires.clear();
+            pg.graphic = true;
+        }
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        // Left out, `graphic` keeps the mark; a wire on the graphic page is refused.
+        content.as_object_mut().unwrap().remove("graphic");
+        content["wires"] =
+            json!([{"id": "w1", "from": {"at": {"x": 0.0, "y": 0.0}}, "to": {"at": {"x": 10.0, "y": 0.0}}}]);
+        let err = call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap_err();
+        assert!(err.contains("graphic page"), "{err}");
+        assert!(page2(&a).wires.is_empty() && page2(&a).graphic);
+        // Drawings only are taken, and the page stays graphic.
+        content["wires"] = json!([]);
+        content["title"] = json!("Layout");
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(page2(&a).graphic);
+        assert_eq!(page2(&a).title, "Layout");
+        // A page properties dialog opened before the mark, its type left as it was, keeps it.
+        let size = page2(&a).size;
+        let o = a.open.as_mut().unwrap();
+        crate::confirm_page_props(o, &a.ed, "p0002", "2", "Layout", size, None, &Default::default()).unwrap();
+        assert!(page2(&a).graphic, "an unchanged type keeps the page's mark");
     }
 
     #[test]

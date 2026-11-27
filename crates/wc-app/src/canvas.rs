@@ -2935,6 +2935,10 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
         ed.wire = Some((start, draft));
         return;
     }
+    if let Some(why) = open.graphic_reason(ed.page, "Wires") {
+        ed.message = why;
+        return;
+    }
     open.add_wire(ed.page, start, end, via);
     ed.message = "Wire added.".into();
 }

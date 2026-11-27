@@ -1241,6 +1241,9 @@ enum PageCmd {
         /// cover page, so any other page loses the mark.
         #[arg(long)]
         cover: bool,
+        /// A graphic page: free drawings only, with no symbols or wires.
+        #[arg(long, conflicts_with = "overview")]
+        graphic: bool,
     },
     /// List the pages: id, number, title, and how many symbols and wires each has.
     List,
@@ -1248,6 +1251,15 @@ enum PageCmd {
     Remove {
         /// The page's id or number.
         id: String,
+    },
+    /// Mark a page as a graphic page (free drawings only, no symbols or wires), or with `--off`
+    /// as a normal page again. A page that still holds symbols or wires is refused.
+    Graphic {
+        /// The page's id or number.
+        id: String,
+        /// Make it a normal page again.
+        #[arg(long)]
+        off: bool,
     },
     /// Mark a page as an overview (line diagram), or with `--off` as a normal page again.
     Overview {
@@ -1794,6 +1806,17 @@ fn output_guard() -> Option<&'static wc_core::guard::ProjectFiles> {
 
 /// The index of the page named by `key`: its id, or else its page number, as `comment` takes
 /// it. An id wins over another page's number.
+/// Refuse to put `what` (a symbol, a wire, ...) on a graphic page, which holds drawings only.
+fn refuse_graphic(pg: &Page, what: &str) -> Res<()> {
+    if pg.graphic {
+        return Err(format!(
+            "page {:?} is a graphic page, which holds drawings only; {what} goes on a schematic page",
+            pg.id
+        ));
+    }
+    Ok(())
+}
+
 fn page_index(p: &Project, key: &str) -> Res<usize> {
     p.pages
         .iter()
@@ -3069,6 +3092,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     size,
                     overview,
                     cover,
+                    graphic,
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.page(&id).is_some() {
@@ -3077,6 +3101,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let number = p.free_page_number(&number, None).map_err(e)?;
                     let mut page = Page::new(id, number, title);
                     page.overview = overview;
+                    page.graphic = graphic;
                     page.size = PageSize::parse(&size)?;
                     p.pages.push(page);
                     if cover {
@@ -3094,12 +3119,15 @@ fn run(mut cli: Cli) -> Res<()> {
                             escape_field(&pg.title),
                             pg.symbols.len(),
                             pg.wires.len(),
-                            match (pg.cover, pg.overview) {
-                                (true, true) => ", cover, overview",
-                                (true, false) => ", cover",
-                                (false, true) => ", overview",
-                                (false, false) => "",
-                            }
+                            [
+                                (pg.cover, ", cover"),
+                                (pg.overview, ", overview"),
+                                (pg.graphic, ", graphic")
+                            ]
+                            .iter()
+                            .filter(|(on, _)| *on)
+                            .map(|(_, label)| *label)
+                            .collect::<String>()
                         );
                     }
                     return Ok(());
@@ -3112,9 +3140,35 @@ fn run(mut cli: Cli) -> Res<()> {
                     }
                     p.pages.remove(i);
                 }
+                PageCmd::Graphic { id, off } => {
+                    let i = page_index(&p, &id)?;
+                    if let Some(page) = p.pages.get_mut(i) {
+                        if !off && (!page.symbols.is_empty() || !page.wires.is_empty()) {
+                            return Err(format!(
+                                "page {:?} has {} symbol(s) and {} wire(s); a graphic page holds drawings only, so move or remove them first",
+                                page.id,
+                                page.symbols.len(),
+                                page.wires.len()
+                            ));
+                        }
+                        if !off && page.overview {
+                            return Err(format!(
+                                "page {:?} is an overview; make it a normal page first (page overview --off)",
+                                page.id
+                            ));
+                        }
+                        page.graphic = !off;
+                    }
+                }
                 PageCmd::Overview { id, off } => {
                     let i = page_index(&p, &id)?;
                     if let Some(page) = p.pages.get_mut(i) {
+                        if !off && page.graphic {
+                            return Err(format!(
+                                "page {:?} is a graphic page; make it a normal page first (page graphic --off)",
+                                page.id
+                            ));
+                        }
                         page.overview = !off;
                     }
                 }
@@ -3189,7 +3243,7 @@ fn run(mut cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             // Check the inputs before taking the symbol, so a bad page, tag or turn leaves no copy
             // behind.
-            page_mut(&mut p, &page)?;
+            refuse_graphic(page_mut(&mut p, &page)?, "a symbol")?;
             let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
             let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if store::read_vendored_symbol(dir, &symbol).is_err() {
@@ -3224,6 +3278,7 @@ fn run(mut cli: Cli) -> Res<()> {
             let pins = pins.iter().map(|s| parse_box_pin(s)).collect::<Res<Vec<_>>>()?;
             let lock = p.lock.symbols.clone();
             let pg = page_mut(&mut p, &page)?;
+            refuse_graphic(pg, "a black box")?;
             // The first item id whose box symbol is free too: a box deleted from the page keeps
             // its symbol file and lock entry, and its id must not be taken over.
             let (id, symbol_id, symbol_path) = {
@@ -3505,6 +3560,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 None => None,
             };
             let pg = page_mut(&mut p, &page)?;
+            refuse_graphic(pg, "a wire")?;
             let from = parse_end(dir, pg, &from)?;
             let to = parse_end(dir, pg, &to)?;
             // A wire from a pin or point to itself has no length, so refuse it as the app does.
@@ -3671,10 +3727,15 @@ fn run(mut cli: Cli) -> Res<()> {
                                 .map(|id| (ItemKind::Part, id)),
                         );
                     }
+                    // A part whose name is no file name (`ACME R24`) is not taken from a library
+                    // and stays a name on the device, as `macro place` leaves it: nothing to put back.
                     let vendored: Vec<(PathBuf, Option<Vec<u8>>)> = item_ids
                         .iter()
+                        .filter(|(kind, id)| *kind == ItemKind::Symbol || store::vendor_path(dir, *kind, id).is_ok())
                         .map(|(kind, id)| vendored_bytes(dir, *kind, id))
                         .collect::<Res<_>>()?;
+                    // A link would become a plain file on the rollback, or be removed (#614).
+                    refuse_linked_files(&vendored, "macro generate")?;
                     let undo_vendored = |err: String| -> String {
                         let failed = put_files_back(&vendored);
                         if failed.is_empty() {
@@ -3701,7 +3762,12 @@ fn run(mut cli: Cli) -> Res<()> {
                     refuse_linked_files(&before, "macro generate").map_err(undo_vendored)?;
                     // The symbol and part copies go back with the project's files, as they were
                     // before this run.
-                    before.extend(vendored.iter().cloned());
+                    // `put_files_back` puts the last entry back first, so the state from before
+                    // this run (the copies, read before any was taken) goes last in that order: a
+                    // `box.*` symbol the save snapshot also holds ends as it was before the run.
+                    let mut earliest = vendored.clone();
+                    earliest.append(&mut before);
+                    let before = earliest;
                     if let Err(err) = save(dir, &p) {
                         let failed = put_files_back(&before);
                         if failed.is_empty() {
@@ -3739,6 +3805,10 @@ fn run(mut cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
+                    // A graphic page takes a macro of drawings only; checked before anything is taken.
+                    if !m.symbols.is_empty() || !m.wires.is_empty() {
+                        refuse_graphic(page_mut(&mut p, &page)?, "a macro with symbols or wires")?;
+                    }
                     take_macro_items(dir, &mut p, &m, "place the macro again")?;
                     let page_id = page_mut(&mut p, &page)?.id.clone();
                     let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(e)?;
@@ -6184,7 +6254,7 @@ fn refuse_linked_files<T>(files: &[(PathBuf, T)], command: &str) -> Result<(), S
         return Ok(());
     }
     Err(format!(
-        "{} {} a link; {command} does not replace project files that are links (copy each target over its link first)",
+        "{} {} a link; {command} does not replace project files that are links (copy each target over its link first, or remove a link whose target is gone)",
         linked.join(", "),
         if linked.len() == 1 { "is" } else { "are" }
     ))
@@ -8955,6 +9025,13 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("no-such-page"), "{err}");
         assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
+
+        // A graphic page takes no symbol, and nothing is copied for one.
+        cli(&dir, &["page", "graphic", page.as_str()]).unwrap();
+        let err = cli(&dir, &args).unwrap_err();
+        assert!(err.contains("graphic page") && err.contains("2 symbol(s)"), "{err}");
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
+        cli(&dir, &["page", "graphic", page.as_str(), "--off"]).unwrap();
 
         // A copy that cannot be written after `aa.good` was copied takes that copy away again.
         let blocked = store::vendor_path(&dir, ItemKind::Symbol, "zz.bad").unwrap();

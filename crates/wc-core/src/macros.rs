@@ -170,7 +170,8 @@ impl Macro {
             Some(name) => match self.value_set(name) {
                 Some(v) => Some(v),
                 None => {
-                    let known: Vec<&str> = self.value_sets.iter().map(|v| v.name.as_str()).collect();
+                    // Quoted, so a control character in a declared name is shown escaped.
+                    let known: Vec<String> = self.value_sets.iter().map(|v| format!("{:?}", v.name)).collect();
                     return bad(if known.is_empty() {
                         format!("it has no value sets, so {name:?} cannot be chosen")
                     } else {
@@ -179,7 +180,7 @@ impl Macro {
                 }
             },
             None if !self.value_sets.is_empty() => {
-                let known: Vec<&str> = self.value_sets.iter().map(|v| v.name.as_str()).collect();
+                let known: Vec<String> = self.value_sets.iter().map(|v| format!("{:?}", v.name)).collect();
                 return bad(format!("choose a value set: {}", known.join(", ")));
             }
             None => None,
@@ -200,7 +201,7 @@ impl Macro {
         }
         for (k, v) in overrides {
             if !self.placeholders.iter().any(|p| key(&p.name) == key(k)) {
-                return bad(format!("{k} is not a placeholder"));
+                return bad(format!("{k:?} is not a placeholder"));
             }
             values.insert(key(k), v.clone());
         }
@@ -681,7 +682,7 @@ mod tests {
 
         let none = BTreeMap::new();
         let err = err_of(m.apply(None, &none));
-        assert!(err.contains("choose a value set: 0.75 kW, 3 kW"), "{err}");
+        assert!(err.contains("choose a value set: \"0.75 kW\", \"3 kW\""), "{err}");
         assert!(m.apply(Some("5 kW"), &none).is_err());
 
         let small = m.apply(Some("0.75 KW"), &none)?;
@@ -1285,7 +1286,7 @@ mod edge_tests {
             name: "Big".into(),
             ..Default::default()
         });
-        assert!(err_of(with_sets.apply(Some(" "), &bridge)).contains("choose a value set: Big"));
+        assert!(err_of(with_sets.apply(Some(" "), &bridge)).contains("choose a value set: \"Big\""));
         Ok(())
     }
 

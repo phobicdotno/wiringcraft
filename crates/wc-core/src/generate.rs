@@ -70,11 +70,12 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
                 format!("it has {}", known.join(", "))
             };
             return bad(format!(
-                "column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set)"
+                "line {}: column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set)",
+                line(0)
             ));
         };
         if column != Column::Unnamed && !seen.insert(key(name)) {
-            return bad(format!("the table has two columns {name:?}"));
+            return bad(format!("line {}: the table has two columns {name:?}", line(0)));
         }
         columns.push(column);
     }
@@ -179,14 +180,7 @@ fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::
     // Each product level as it is or, when wider, as its letters with the largest number: a
     // renumbered tag (`-K` placed as `-K1000`) and a level under a renumbered parent (`-K.1`
     // placed as `-K1000.1`) are both within it.
-    let mut widest = tag.clone();
-    for level in &mut widest.product {
-        let letters: String = level.chars().take_while(|c| !c.is_ascii_digit()).collect();
-        let numbered = format!("{letters}9999");
-        if crate::font::text_width_mm(&numbered, TAG_HEIGHT) > crate::font::text_width_mm(level, TAG_HEIGHT) {
-            *level = numbered;
-        }
-    }
+    let widest = widest_tag(tag, TAG_HEIGHT);
     for t in [tag, &widest] {
         let (align, lines) = crate::tag::tag_lines(s, def, t);
         for (at, line) in &lines {
@@ -195,7 +189,21 @@ fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::
     }
 }
 
-/// Points round a wire's label (its number, potential and cable core) as the PDF draws it: on
+/// `tag` with each product level as it is or, when wider at `height`, as its letters with the
+/// largest number placing can give it.
+fn widest_tag(tag: &crate::tag::DeviceTag, height: f64) -> crate::tag::DeviceTag {
+    let mut widest = tag.clone();
+    for level in &mut widest.product {
+        let letters: String = level.chars().take_while(|c| !c.is_ascii_digit()).collect();
+        let numbered = format!("{letters}9999");
+        if crate::font::text_width_mm(&numbered, height) > crate::font::text_width_mm(level, height) {
+            *level = numbered;
+        }
+    }
+    widest
+}
+
+/// Points round a wire's label (its potential and cable core; placing clears its number) as the PDF draws it: on
 /// the middle of its first segment, 2 mm high, right-aligned left of a vertical segment and
 /// centred above a horizontal one. A wire without a label, or whose first end is on a pin that
 /// is not there, adds nothing.
@@ -205,20 +213,41 @@ fn wire_label_points(
     symbol: &impl Fn(&str) -> Option<Symbol>,
     pts: &mut Vec<Point>,
 ) {
-    let core = w.cable.as_ref().map(|c| {
-        if c.core.is_empty() {
-            c.cable.to_string()
-        } else {
-            format!("{}:{}", c.cable, c.core)
+    // A core follows its cable to the tag placing gives it (`-W1` placed as `-W1000`), so the
+    // label is measured with the cable tag as it is and at its widest.
+    let cores: Vec<Option<String>> = match &w.cable {
+        None => vec![None],
+        Some(c) => [c.cable.clone(), widest_tag(&c.cable, 2.0)]
+            .iter()
+            .map(|t| {
+                Some(if c.core.is_empty() {
+                    t.to_string()
+                } else {
+                    format!("{t}:{}", c.core)
+                })
+            })
+            .collect(),
+    };
+    for core in &cores {
+        // Placing clears a wire's number (`placement::place`), so only what is left is drawn.
+        let label: Vec<&str> = [w.potential.as_deref(), core.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !label.is_empty() {
+            label_points(m, w, symbol, &label.join(" "), pts);
         }
-    });
-    let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref(), core.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect();
-    if label.is_empty() {
-        return;
     }
+}
+
+/// Points round `text` drawn as `w`'s label (see [`wire_label_points`]).
+fn label_points(
+    m: &Macro,
+    w: &crate::project::Wire,
+    symbol: &impl Fn(&str) -> Option<Symbol>,
+    text: &str,
+    pts: &mut Vec<Point>,
+) {
     let end = |e: &Endpoint| match e {
         Endpoint::Point { at } => Some(*at),
         Endpoint::Pin { item, pin } => {
@@ -233,11 +262,10 @@ fn wire_label_points(
         return;
     };
     let mid = Point::new((p.x + q.x) / 2.0, (p.y + q.y) / 2.0);
-    let text = label.join(" ");
     if (p.x - q.x).abs() < (p.y - q.y).abs() {
         pts.extend(text_corners(
             Point::new(mid.x - 1.0, mid.y + 0.8),
-            &text,
+            text,
             2.0,
             Align::Right,
             0.0,
@@ -245,7 +273,7 @@ fn wire_label_points(
     } else {
         pts.extend(text_corners(
             Point::new(mid.x, mid.y - 1.0),
-            &text,
+            text,
             2.0,
             Align::Center,
             0.0,
@@ -268,11 +296,54 @@ fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
             Some(parts) if !parts.is_empty() => parts.iter().for_each(|p| drawn_points(p, pts)),
             _ => pts.extend([*a, *b]),
         },
+        // Only the swept part, as the PDF draws it (`Pen::arc`): `center + radius (cos, sin)`
+        // from `start` on through `end - start` degrees, one more turn when that is 0 or less
+        // (90 to 0 sweeps three quarters, equal angles a full circle), through each quarter-turn
+        // angle on the way. A sweep of a full turn or more draws the circle.
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } if arc_sweep(*start, *end).is_some_and(|s| s.abs() < 360.0) => {
+            let sweep = arc_sweep(*start, *end).unwrap_or(360.0);
+            // Taken round to one turn first, so a large angle still steps by quarter turns. A
+            // negative sweep (`end` more than a turn before `start`) is drawn backwards: the
+            // same points as the arc from its end forwards.
+            let from = start.rem_euclid(360.0);
+            let (lo, len) = if sweep < 0.0 {
+                (from + sweep, -sweep)
+            } else {
+                (from, sweep)
+            };
+            let at = |deg: f64| {
+                let r = deg.to_radians();
+                Point::new(center.x + radius * r.cos(), center.y + radius * r.sin())
+            };
+            pts.extend([at(lo), at(lo + len)]);
+            let first = (lo / 90.0).floor() as i32 + 1;
+            for k in first..first + 4 {
+                let q = f64::from(k) * 90.0;
+                if q < lo + len {
+                    pts.push(at(q));
+                }
+            }
+        }
         _ => {
             let (a, b) = g.bounds();
             pts.extend([a, b]);
         }
     }
+}
+
+/// The degrees an arc from `start` to `end` turns through as the PDF draws it: `end - start`,
+/// one more turn when that is 0 or less (still negative for `end` more than a turn before
+/// `start`, which is drawn backwards). `None` for angles that are not finite.
+fn arc_sweep(start: f64, end: f64) -> Option<f64> {
+    let sweep = end - start;
+    sweep
+        .is_finite()
+        .then_some(if sweep <= 0.0 { sweep + 360.0 } else { sweep })
 }
 
 /// The corners of the box a text is drawn in: `at` on its baseline, as wide as the PDF draws it
@@ -505,6 +576,21 @@ mod tests {
             .flat_map(|m| m.devices.values().map(|d| d.description.clone()))
             .collect();
         assert_eq!(descriptions, ["Motor 0.75 kW", "Motor 5.5 kW"]);
+        Ok(())
+    }
+
+    #[test]
+    fn declared_value_set_names_are_shown_escaped() -> Result<()> {
+        let mut m = starter()?;
+        let Some(first) = m.value_sets.first_mut() else {
+            return Err(Error::Invalid("the starter has value sets".into()));
+        };
+        first.name = "Bad\u{1b}[31m".into();
+        let rows = rows_from_table(&m, &table(&[&["set", "kW"], &["Nope", "1"]]), &[1, 4])?;
+        let err = err_of(apply_rows(&m, &rows, None));
+        assert!(err.contains("line 4"), "{err}");
+        assert!(err.contains("\"Bad\\u{1b}[31m\""), "{err}");
+        assert!(!err.contains('\u{1b}'), "{err:?}");
         Ok(())
     }
 
@@ -807,6 +893,130 @@ mod tests {
             "{min:?} {max:?}"
         );
         assert!(min.x < plain_min.x && max.x >= plain_max.x);
+        Ok(())
+    }
+
+    #[test]
+    fn an_arc_counts_as_its_sweep_and_a_wire_number_not_at_all() -> Result<()> {
+        let mut pts = Vec::new();
+        drawn_points(
+            &Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 150.0,
+                start: 0.0,
+                end: 90.0,
+            },
+            &mut pts,
+        );
+        let (min, max) = bounds_of(&pts);
+        assert!((min.x - 0.0).abs() < 1e-9 && (min.y - 0.0).abs() < 1e-9, "{min:?}");
+        assert!((max.x - 150.0).abs() < 1e-9 && (max.y - 150.0).abs() < 1e-9, "{max:?}");
+        let mut pts = Vec::new();
+        drawn_points(
+            &Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 10.0,
+                start: 45.0,
+                end: 225.0,
+            },
+            &mut pts,
+        );
+        let (min, max) = bounds_of(&pts);
+        assert!(
+            (min.x + 10.0).abs() < 1e-9 && (max.y - 10.0).abs() < 1e-9,
+            "{min:?} {max:?}"
+        );
+        assert!(max.x < 10.0 && min.y > -10.0, "{min:?} {max:?}");
+        let arc = |start: f64, end: f64| {
+            let mut pts = Vec::new();
+            drawn_points(
+                &Shape::Arc {
+                    center: Point::new(0.0, 0.0),
+                    radius: 10.0,
+                    start,
+                    end,
+                },
+                &mut pts,
+            );
+            bounds_of(&pts)
+        };
+        let close = |a: (Point, Point), b: (Point, Point)| {
+            (a.0.x - b.0.x).abs() < 1e-6
+                && (a.0.y - b.0.y).abs() < 1e-6
+                && (a.1.x - b.1.x).abs() < 1e-6
+                && (a.1.y - b.1.y).abs() < 1e-6
+        };
+        let circle = (Point::new(-10.0, -10.0), Point::new(10.0, 10.0));
+        // 90 to 0 wraps round through 180 and 270: three quarters, as wide and high as the circle.
+        assert!(close(arc(90.0, 0.0), circle), "{:?}", arc(90.0, 0.0));
+        // Equal angles draw a full circle.
+        assert!(close(arc(30.0, 30.0), circle), "{:?}", arc(30.0, 30.0));
+        // Large angles end, and measure as the same quarter as small ones.
+        assert!(close(arc(3600.0, 3690.0), arc(0.0, 90.0)), "{:?}", arc(3600.0, 3690.0));
+        // 405 to -135 sweeps -180 degrees, backwards from 45 through 0 and -90 to -135.
+        assert!(close(arc(405.0, -135.0), arc(-135.0, 45.0)), "{:?}", arc(405.0, -135.0));
+        let (min, max) = arc(405.0, -135.0);
+        assert!(
+            (max.x - 10.0).abs() < 1e-6 && (min.y + 10.0).abs() < 1e-6,
+            "{min:?} {max:?}"
+        );
+        let huge = arc(2.2204913818014264e18, 2.2204913818014264e18 + 1e6);
+        assert!(huge.0.x.is_finite() && huge.1.x.is_finite());
+        // A wire with only a number adds nothing: placing clears the number.
+        let mut one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let wire = crate::project::Wire {
+            id: "wn".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(10.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        one.wires = vec![wire.clone()];
+        let plain = extent(std::slice::from_ref(&one), |_| None);
+        one.wires = vec![crate::project::Wire {
+            number: Some("A-VERY-LONG-SOURCE-WIRE-NUMBER-0001".into()),
+            ..wire
+        }];
+        assert_eq!(extent(std::slice::from_ref(&one), |_| None), plain);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cable_core_label_counts_with_the_cable_tag_placing_can_give() -> Result<()> {
+        let mut one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        // A 10 mm horizontal wire, a core of `-W1`, which placing can renumber to `-W9999`.
+        one.wires = vec![crate::project::Wire {
+            id: "wc".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(10.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: Some(crate::project::CableCore {
+                cable: DeviceTag::parse("-W1")?,
+                core: "BN".into(),
+            }),
+            route: Default::default(),
+            spec: Default::default(),
+        }];
+        let (min, max) = extent(std::slice::from_ref(&one), |_| None);
+        let half = crate::font::text_width_mm("-W9999:BN", 2.0) / 2.0;
+        assert!(
+            min.x <= 5.0 - half + 1e-9 && max.x >= 5.0 + half - 1e-9,
+            "{min:?} {max:?}"
+        );
         Ok(())
     }
 
