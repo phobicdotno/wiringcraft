@@ -328,7 +328,13 @@ impl Part {
         };
         let m = norm(manufacturer);
         let o = norm(order_number);
-        if m.is_empty() { o } else { format!("{m}.{o}") }
+        if m.is_empty() {
+            o
+        } else if o.is_empty() {
+            m
+        } else {
+            format!("{m}.{o}")
+        }
     }
 }
 
@@ -399,5 +405,8 @@ mod tests {
     fn ids_are_safe() {
         assert_eq!(Part::make_id("Acme Corp", "AB 12/34"), "acme-corp.ab-12-34");
         assert_eq!(Part::make_id("", "X1"), "x1");
+        // No order number: no trailing dot.
+        assert_eq!(Part::make_id("Acme", ""), "acme");
+        assert_eq!(Part::make_id("Acme", " / "), "acme");
     }
 }
