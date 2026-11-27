@@ -4200,3 +4200,28 @@ fn an_underlay_corner_that_is_not_a_number_leaves_the_underlay_out() {
         assert_eq!(report.warnings.len(), 1, "{bad}: {:?}", report.warnings);
     }
 }
+
+#[test]
+fn a_cross_reference_at_a_position_that_is_not_a_number_has_no_link() {
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    // `1e308` is finite in mm but overflows to `inf` once turned into points.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e308] {
+        let mut project = Project::new("x");
+        let mut p1 = Page::new("p1", "1", "A");
+        p1.symbols.push(place("s1", "coil", 50.0, "-K1"));
+        let mut p2 = Page::new("p2", "2", "B");
+        let mut contact = place("s1", "no", 50.0, "-K1");
+        contact.at = Point::new(bad, 60.0);
+        p2.symbols.push(contact);
+        project.pages = vec![p1, p2];
+        let mut symbols = BTreeMap::new();
+        symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+        symbols.insert("no".to_string(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+        let (pdf, _) = export(&project, &symbols, &Options::default());
+        let text = String::from_utf8_lossy(&pdf);
+        // The contact's link back to its coil is left out, instead of a `NaN` rectangle that
+        // readers refuse; the coil's link to the contact stays.
+        assert!(!text.contains("NaN") && !text.contains("inf"), "{bad}: {text}");
+        assert_eq!(text.matches("/Subtype /Link").count(), 1, "{bad}");
+    }
+}
