@@ -415,6 +415,11 @@ enum Cmd {
         /// given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
+        /// Draw the project's texts in this language from `translations.toml`, such as `nb`,
+        /// or in two (`nb,en`), as `pdf --lang` does. Texts without a translation are drawn as
+        /// they are and listed as warnings.
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks) as a table, CSV or Markdown,
     /// or save it as an Excel workbook (`--format xlsx --out <file>`, one sheet per report).
@@ -1827,6 +1832,21 @@ fn translated(dir: &Path, p: &Project, lang: &str) -> Res<(Project, Vec<wc_core:
         .ok_or_else(|| format!("bad language {lang:?}: use a code such as nb, or two as nb,en"))?;
     let dict = Dictionary::load(dir).map_err(e)?;
     Ok(translate(p, &dict, &langs))
+}
+
+/// `p` with its texts in `lang` (see [`translated`]), warning about each text that has no
+/// translation; `p` as it is without a language.
+fn in_language(dir: &Path, p: Project, lang: Option<String>) -> Res<Project> {
+    let Some(lang) = lang else { return Ok(p) };
+    let (p, missing) = translated(dir, &p, &lang)?;
+    for m in &missing {
+        eprintln!(
+            "warning: no translation for {:?} ({})",
+            escape_field(&m.text),
+            escape_field(&m.used.join(", "))
+        );
+    }
+    Ok(p)
 }
 
 /// One check rule on a line: its kind, then each value it sets as `key=value` (keys it does
@@ -3766,21 +3786,7 @@ fn run(mut cli: Cli) -> Res<()> {
             reports,
             lang,
         } => {
-            let p = load(dir)?;
-            let p = match lang {
-                Some(lang) => {
-                    let (p, missing) = translated(dir, &p, &lang)?;
-                    for m in &missing {
-                        eprintln!(
-                            "warning: no translation for {:?} ({})",
-                            escape_field(&m.text),
-                            escape_field(&m.used.join(", "))
-                        );
-                    }
-                    p
-                }
-                None => p,
-            };
+            let p = in_language(dir, load(dir)?, lang)?;
             check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
@@ -3886,6 +3892,7 @@ fn run(mut cli: Cli) -> Res<()> {
             format,
             pages,
             date,
+            lang,
         } => {
             let render: fn(&wc_pdf::PageDrawing) -> String = match format.to_ascii_lowercase().as_str() {
                 "svg" => wc_pdf::svg,
@@ -3893,7 +3900,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 other => return Err(format!("unknown drawing format {other:?}: use svg or dxf")),
             };
             let ext = format.to_ascii_lowercase();
-            let p = load(dir)?;
+            let p = in_language(dir, load(dir)?, lang)?;
             check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
@@ -8484,7 +8491,7 @@ mod tests {
     }
 
     #[test]
-    fn pdf_prints_the_texts_in_the_language_asked_for_and_translations_lists_what_is_missing() {
+    fn pdf_and_drawing_print_the_texts_in_the_language_asked_for_and_translations_lists_what_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
@@ -8523,6 +8530,21 @@ mod tests {
         assert!(nb.contains(&hex("Pumper")) && !nb.contains(&hex("Pumps")));
         assert!(pdf(&["--lang", "nb,en"]).contains(&hex("Pumper / Pumps")));
         assert!(cli(&dir, &["pdf", "x.pdf", "--lang", "nb,en,de"]).is_err());
+        // The SVG and DXF drawings take the language too.
+        for ext in ["svg", "dxf"] {
+            let out = tmp.path().join(format!("drawn-{ext}"));
+            let draw = |args: &[&str]| {
+                let mut all = vec!["drawing", out.to_str().unwrap(), "--format", ext, "--page", "p9"];
+                all.extend_from_slice(args);
+                cli(&dir, &all).unwrap();
+                std::fs::read_to_string(out.join(format!("9.{ext}"))).unwrap()
+            };
+            assert!(draw(&[]).contains("Pumps"), "{ext}");
+            let nb = draw(&["--lang", "nb"]);
+            assert!(nb.contains("Pumper") && !nb.contains("Pumps"), "{ext}");
+            assert!(draw(&["--lang", "nb,en"]).contains("Pumper / Pumps"), "{ext}");
+        }
+        assert!(cli(&dir, &["drawing", "d", "--lang", "nb,en,de"]).is_err());
 
         // The new project's cover page title and the device description have none yet.
         let err = cli(&dir, &["translations", "--lang", "nb"]).unwrap_err();
