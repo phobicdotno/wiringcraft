@@ -1,9 +1,10 @@
-//! Vector PDF export of schematic pages.
+//! Vector PDF export: schematic pages, report tables, panel layouts, PLC card sheets and
+//! network topology sheets.
 //!
 //! Output is plain PDF 1.7 written by hand (no dependencies): lines and curves stay vectors,
 //! text uses the standard Helvetica font so tags are searchable, every page gets a bookmark,
-//! and cross-references between a coil and its contacts are clickable links. The same pages
-//! also export as SVG and DXF (`vector`).
+//! and cross-references between a coil and its contacts are clickable links. The schematic
+//! pages also export as SVG and DXF (`vector`).
 
 mod layout;
 mod picture;
@@ -17,10 +18,13 @@ use wc_core::{Project, Symbol};
 
 pub use layout::{
     CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, cover_logo_box, cover_logo_default,
-    fit_picture, frame_marks, junctions, logo_boxes, pin_position, title_logo_box, title_logo_boxes, xref_marks,
+    fit_picture, frame_marks, jumper_points, junctions, logo_boxes, pin_position, tag_lines, title_logo_box,
+    title_logo_boxes, xref_marks,
 };
 pub use picture::{Pictures, read_picture, read_pictures};
-pub use vector::{PageDrawing, Picture, dxf, page_drawings, page_file_stem, page_lines, panel_file_stem, svg};
+pub use vector::{
+    PageDrawing, Picture, dxf, dxf_warnings, page_drawings, page_file_stem, page_lines, panel_file_stem, svg,
+};
 pub use writer::{Layer, Prim, Stroke, text_width_mm};
 
 #[derive(Debug, Clone)]

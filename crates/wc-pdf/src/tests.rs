@@ -221,6 +221,11 @@ fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
     // Beyond U+FFFF there is no four-digit code; a five-digit one would be misread.
     assert_eq!(vector::dxf_text("ok \u{1F600}"), "ok ?");
     assert_eq!(vector::dxf_text("Ålesund\n"), "\\U+00C5lesund");
+    // `^` and the character after it would be read as one control character (`^J` a line
+    // feed); a caret at the end starts nothing (#1250).
+    assert_eq!(vector::dxf_text("x^2 A^J"), "x\\U+005E2 A\\U+005EJ");
+    assert_eq!(vector::dxf_text("up^"), "up^");
+    assert_eq!(vector::dxf_text("^\t^"), "\\U+005E^");
 }
 
 #[test]
@@ -293,6 +298,27 @@ fn svg_texts_keep_their_spaces() {
     };
     assert!(text.starts_with("<text xml:space=\"preserve\" "), "{text}");
     assert!(text.ends_with(">  L1  L2</text>"), "{text}");
+}
+
+#[test]
+fn svg_leaves_out_characters_xml_does_not_allow() {
+    // U+FFFE and U+FFFF are not allowed anywhere in XML: one of them makes viewers refuse the
+    // whole file, so they are left out like control characters.
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.text((10.0, 10.0), 3.0, 0, "K1\u{FFFE} \u{FFFF}24V\u{7}");
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1\u{FFFF}".into(),
+        title: "Main\u{FFFE}".into(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let s = svg(&page);
+    assert!(!s.contains(['\u{FFFE}', '\u{FFFF}']), "{s}");
+    assert!(s.contains("<title>1 Main</title>"), "{s}");
+    assert!(s.contains(">K1 24V</text>"), "{s}");
 }
 
 #[test]
@@ -394,6 +420,53 @@ fn dxf_keeps_a_filled_path_that_is_not_convex_as_a_closed_outline() {
     let d = dxf(&page);
     assert!(!d.contains("0\nSOLID\n"), "{d}");
     assert!(d.contains("0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n1\n"), "{d}");
+}
+
+#[test]
+fn dxf_strokes_wider_than_the_default_pen_keep_their_width() {
+    let stroke = |points: Vec<(f64, f64)>, width: f64| crate::writer::Prim::Path {
+        points,
+        closed: false,
+        filled: false,
+        ink: crate::writer::Stroke {
+            rgb: (0.0, 0.0, 0.0),
+            width,
+        },
+        layer: None,
+    };
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: vec![
+            stroke(vec![(0.0, 0.0), (10.0, 0.0)], 0.25),
+            stroke(vec![(0.0, 10.0), (10.0, 10.0)], 0.35),
+            stroke(vec![(0.0, 20.0), (10.0, 20.0), (10.0, 30.0)], 0.5),
+        ],
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let d = dxf(&page);
+    // A thin stroke stays a plain LINE.
+    assert!(
+        d.contains("0\nLINE\n8\n0\n62\n7\n10\n0\n20\n100\n11\n10\n21\n100\n"),
+        "{d}"
+    );
+    assert_eq!(d.matches("0\nLINE\n").count(), 1, "{d}");
+    // A wide two-point stroke is a two-vertex polyline with its width on each part.
+    assert!(
+        d.contains(
+            "0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n0\n40\n0.35\n41\n0.35\n\
+             0\nVERTEX\n8\n0\n10\n0\n20\n90\n40\n0.35\n41\n0.35\n\
+             0\nVERTEX\n8\n0\n10\n10\n20\n90\n40\n0.35\n41\n0.35\n0\nSEQEND\n"
+        ),
+        "{d}"
+    );
+    // A longer one carries its width too.
+    assert!(d.contains("70\n0\n40\n0.5\n41\n0.5\n0\nVERTEX\n"), "{d}");
+    assert_eq!(d.matches("0\nVERTEX\n").count(), 5, "{d}");
+    assert!(d.contains("$ACADVER\n1\nAC1009\n") && !d.contains("LWPOLYLINE") && !d.contains("\n370\n"));
 }
 
 #[test]
@@ -924,6 +997,53 @@ fn the_logo_shows_in_every_title_block_and_on_the_cover_stored_once() {
         String::from_utf8_lossy(&pdf).contains(&brand),
         "shown again without a logo"
     );
+}
+
+#[test]
+fn a_logo_cover_box_that_is_not_a_number_takes_the_default_place() {
+    let mut png = Vec::new();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, image::Rgb([200, 30, 30])));
+    assert!(
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p0", "0", "Cover");
+    cover.cover = true;
+    project.pages = vec![cover.clone()];
+    let mut underlays = BTreeMap::new();
+    underlays.insert("pictures/logo.png".to_string(), png);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    let (default_pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let default_box = cover_logo_box(&project, &cover);
+    let cover_svg = |project: &Project| {
+        let (pages, _) = page_drawings(project, &BTreeMap::new(), &opts);
+        let Some(page) = pages.first() else {
+            unreachable!("the cover page is drawn")
+        };
+        svg(page)
+    };
+    let default_svg = cover_svg(&project);
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/logo.png".into(),
+            cover: Some((Point::new(bad, 40.0), Point::new(140.0, 60.0))),
+        });
+        assert_eq!(cover_logo_box(&project, &cover), default_box, "{bad}");
+        let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // Drawn as if no box were set, instead of `NaN` in the page.
+        assert!(pdf == default_pdf, "{bad}: the PDF differs from the default place");
+        assert_eq!(cover_svg(&project), default_svg, "{bad}");
+    }
 }
 
 #[test]
@@ -2190,7 +2310,7 @@ fn svg_drawings_leave_out_a_missing_or_damaged_picture() {
 }
 
 #[test]
-fn page_lines_leave_out_pictures_without_warning() {
+fn page_lines_say_which_pictures_they_leave_out() {
     let mut project = Project::new("Lines");
     let mut p1 = Page::new("p1", "1", "One");
     p1.underlay = Some(wc_core::Underlay {
@@ -2203,13 +2323,66 @@ fn page_lines_leave_out_pictures_without_warning() {
         file: "pictures/logo.png".into(),
         cover: None,
     });
-    // No picture bytes are given: a DXF export does not read them, so none may be missed.
+    // No picture bytes are given: a DXF export does not read them, so none is called missing,
+    // but the user is told the DXF has neither the underlay nor the logo.
     let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(pages.len(), 1);
     assert!(pages[0].pictures.is_empty());
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: the underlay underlays/p1.png is left out: DXF has no pictures (the SVG export shows it)"
+                .to_string(),
+            "the logo pictures/logo.png is left out: DXF has no pictures (the SVG export shows it)".to_string(),
+        ]
+    );
+    // Without a logo or an underlay, nothing is said.
+    let mut plain = project.clone();
+    plain.meta.logo = None;
+    plain.pages[0].underlay = None;
+    let (_, quiet) = crate::page_lines(&plain, &BTreeMap::new(), &Options::default());
+    assert!(quiet.warnings.is_empty(), "{:?}", quiet.warnings);
     let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(svg_report.warnings.len(), 2, "{:?}", svg_report.warnings);
+}
+
+#[test]
+fn page_lines_say_which_texts_lose_a_character_beyond_u_ffff() {
+    let mut project = Project::new("Wide");
+    let mut p1 = Page::new("p1", "1", "One");
+    for text in ["Pump \u{1F600}", "Pump \u{1F600}", "Ålesund"] {
+        p1.graphics.push(Shape::Text {
+            at: Point::new(50.0, 50.0),
+            text: text.into(),
+            height: 3.0,
+            align: Default::default(),
+            angle: 0.0,
+        });
+    }
+    project.pages = vec![p1];
+    let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert!(dxf(&pages[0]).contains("\nPump ?\n"));
+    // Named once, however often the text is on the page; Å has a code and is not named.
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: the text \"Pump \u{1F600}\" is written as \"Pump ?\" in the DXF: a DXF has no code for \
+             characters beyond U+FFFF, such as emoji (the SVG export keeps them)"
+                .to_string()
+        ]
+    );
+    // For a log, the same warning without the text.
+    assert_eq!(
+        dxf_warnings(&pages[0], false),
+        vec![
+            "page 1: a text is written with \"?\" in the DXF: a DXF has no code for characters beyond \
+             U+FFFF, such as emoji (the SVG export keeps them)"
+                .to_string()
+        ]
+    );
+    // The SVG export keeps the character, so it says nothing.
+    let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    assert!(svg_report.warnings.is_empty(), "{:?}", svg_report.warnings);
 }
 
 #[test]
@@ -2414,6 +2587,66 @@ fn an_unlisted_revision_is_reported_only_for_the_page_that_has_the_cloud() -> Re
         orphan.warnings.iter().any(|w| w.contains("revision A")),
         "{:?}",
         orphan.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn cloud_warnings_are_given_once_per_page_with_a_count() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    project.pages = vec![Page::new("p1", "1", "Power")];
+    project.add_revision("A", "", "", "").map_err(|e| e.to_string())?;
+    project.add_revision("B", "", "", "").map_err(|e| e.to_string())?;
+    for x in [20.0, 60.0, 100.0] {
+        project
+            .add_cloud("p1", Point::new(x, 50.0), Point::new(x + 30.0, 80.0), Some("B"))
+            .map_err(|e| e.to_string())?;
+    }
+    project
+        .add_cloud("p1", Point::new(20.0, 100.0), Point::new(50.0, 130.0), Some("A"))
+        .map_err(|e| e.to_string())?;
+    // Revision B is removed: its three clouds give one warning, the cloud of A none.
+    project.meta.revisions.pop();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let unlisted: Vec<&String> = report
+        .warnings
+        .iter()
+        .filter(|w| w.contains("which the project does not list"))
+        .collect();
+    assert_eq!(
+        unlisted,
+        ["page 1: 3 clouds carry revision B, which the project does not list"],
+        "{:?}",
+        report.warnings
+    );
+    // Two clouds without area give one warning as well.
+    for c in project.pages[0].clouds.iter_mut().take(2) {
+        c.max = c.min;
+    }
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let flat: Vec<&String> = report.warnings.iter().filter(|w| w.contains("no area")).collect();
+    assert_eq!(
+        flat,
+        ["page 1: 2 revision clouds have no area"],
+        "{:?}",
+        report.warnings
+    );
+    // A letter the PDF cannot print, on two clouds, is reported once for them.
+    project.meta.revisions[0].letter = "Ж".into();
+    for c in project.pages[0].clouds.iter_mut().skip(2) {
+        c.revision = "Ж".into();
+    }
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let unprintable: Vec<&String> = report
+        .warnings
+        .iter()
+        .filter(|w| w.contains("cannot print revision"))
+        .collect();
+    assert_eq!(
+        unprintable,
+        ["page 1: the PDF cannot print revision Ж on 2 clouds; it can read like another letter"],
+        "{:?}",
+        report.warnings
     );
     Ok(())
 }
@@ -2826,6 +3059,30 @@ fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
 }
 
 #[test]
+fn a_very_long_heading_is_cut_quickly_and_keeps_its_counter() {
+    let title = "Cable list for the north basin pump station ".repeat(2_300);
+    let title = format!("{}\u{e9}", &title[..99_999]);
+    assert_eq!(title.chars().count(), 100_000);
+    let counter = " (2 / 3)";
+    let heading = layout::fit_heading(&title, counter, 180.0);
+    assert!(heading.ends_with(&format!("...{counter}")), "{heading:?}");
+    assert!(writer::text_width_mm(&heading, 4.0) <= 180.0, "{heading:?}");
+    // The cut is the longest start that fits: one more character would not.
+    let Some(kept) = heading.strip_suffix(&format!("...{counter}")) else {
+        unreachable!("the heading ends with the counter")
+    };
+    let Some(next) = title[kept.len()..].chars().next() else {
+        unreachable!("the title was cut")
+    };
+    let longer = format!("{kept}{next}...{counter}");
+    assert!(writer::text_width_mm(&longer, 4.0) > 180.0, "{longer:?}");
+    // A short heading is left as it is.
+    assert_eq!(layout::fit_heading("Cables", counter, 180.0), "Cables (2 / 3)");
+    // No room at all for the title leaves only "..." before the counter.
+    assert_eq!(layout::fit_heading(&title, counter, 1.0), format!("...{counter}"));
+}
+
+#[test]
 fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
     let mut project = Project::new("x");
     let mut page = Page::new("p1", "1", "Cabinet");
@@ -3143,6 +3400,34 @@ fn layer_names_are_text_strings() {
 }
 
 #[test]
+fn a_missing_symbol_is_warned_about_once_per_page_with_its_placements() {
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "A");
+    for (k, x) in [40.0, 80.0, 120.0].into_iter().enumerate() {
+        p1.symbols.push(place(&format!("r{k}"), "relay", x, &format!("-K{k}")));
+    }
+    p1.symbols.push(place("t1", "lamp", 160.0, "-P1"));
+    let mut p2 = Page::new("p2", "2", "B");
+    p2.symbols.push(place("r9", "relay", 40.0, "-K9"));
+    project.pages = vec![p1, p2];
+    let (pdf, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: symbol \"lamp\" is not in the project's library copy".to_string(),
+            "page 1: symbol \"relay\" is not in the project's library copy (3 placements)".to_string(),
+            "page 2: symbol \"relay\" is not in the project's library copy".to_string(),
+        ]
+    );
+    // Every placement is still drawn as a box with a question mark.
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(text.matches(&format!("{} Tj", writer::pdf_text("?"))).count(), 5);
+    // The SVG and DXF exports warn the same way.
+    let (_, lines) = page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(lines.warnings, report.warnings);
+}
+
+#[test]
 fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
     // Helvetica's WinAnsi has no Ω or Cyrillic: they print as '?', so say so (Latin-1, the
     // euro and dashes print, and an arrow prints as '>' on purpose).
@@ -3196,4 +3481,369 @@ fn document_properties_show_drawn_by_and_the_description() {
     project.meta.title_block.remove("description");
     let dict = info(&project);
     assert!(!dict.contains("/Author") && !dict.contains("/Subject"), "{dict}");
+}
+
+#[test]
+fn a_long_report_or_plc_card_heading_is_cut_to_the_frame_and_keeps_its_counter() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let long = "Device list for the north basin pumping station, the second pump hall and its \
+                cabinets, with every spare and every terminal named on the drawings, listed \
+                again for the south basin, its pump hall, its cabinets and every spare there";
+    let table = wc_report::Table {
+        title: long.into(),
+        columns: vec!["Tag".into()],
+        ..Default::default()
+    };
+    let card = wc_report::PlcCardSheet {
+        card: long.into(),
+        ..Default::default()
+    };
+    let page = Page::new("r", "R1", "Report");
+    let (w, _) = page.size.mm();
+    let right = w - layout::MARGIN - 6.0;
+    let headings = |drawn: &writer::Drawn| -> Vec<(f64, String)> {
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { at, height, text, .. } if (*height - 4.0).abs() < 1e-9 => {
+                    Some((at.0 + writer::text_width_mm(text, 4.0), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let report = layout::draw_table_page(&project, &page, 0, 3, &table, &[], (2, 3), "");
+    let card_sheet = layout::draw_card_page(&project, &page, 0, 3, &card, 0, (2, 3), "");
+    for (what, drawn, start) in [
+        ("report", &report, "Device list"),
+        ("card", &card_sheet, "PLC card Device"),
+    ] {
+        let found: Vec<(f64, String)> = headings(drawn)
+            .into_iter()
+            .filter(|(_, t)| t.starts_with(start))
+            .collect();
+        let [(end, text)] = found.as_slice() else {
+            unreachable!("one {what} heading, got {found:?}")
+        };
+        assert!(
+            *end <= right + 1e-6,
+            "{what} heading {text:?} ends at {end} mm, past {right} mm"
+        );
+        assert!(
+            text.ends_with("... (2 / 3)"),
+            "{what} heading {text:?} is cut and keeps its counter"
+        );
+    }
+    // A short title is drawn whole.
+    let short = wc_report::Table {
+        title: "Devices".into(),
+        ..table
+    };
+    let drawn = layout::draw_table_page(&project, &page, 0, 1, &short, &[], (1, 1), "");
+    assert!(
+        headings(&drawn).iter().any(|(_, t)| t == "Devices"),
+        "{:?}",
+        headings(&drawn)
+    );
+}
+
+#[test]
+fn a_jumper_is_drawn_as_a_bar_with_dots_through_its_terminals() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("term".to_string(), sym("term", SymbolRole::Terminal, ["1", "2"]));
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = Project::new("Jumpers");
+    let mut p1 = Page::new("p1", "1", "Terminals");
+    p1.symbols.push(place("t2", "term", 80.0, "-X1.2"));
+    p1.symbols.push(place("t1", "term", 60.0, "-X1.1"));
+    // A device drawn with a terminal's tag is no bar end.
+    p1.symbols.push(place("k1", "coil", 120.0, "-X1.1"));
+    project.pages = vec![p1];
+    let Some(x1) = DeviceTag::parse("-X1").ok() else {
+        unreachable!("-X1 is a tag")
+    };
+    let Ok(()) = project.meta.add_jumper(&x1, &["1".into(), "2".into()]) else {
+        unreachable!("two terminals of the strip")
+    };
+    let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    let prims = &pages[0].prims;
+    let bar = prims.iter().any(|p| {
+        matches!(p, writer::Prim::Path { points, ink, .. }
+            if points == &[(60.0, 60.0), (80.0, 60.0)] && (ink.width - 0.6).abs() < 1e-9)
+    });
+    assert!(bar, "a bar from -X1.1 to -X1.2: {prims:?}");
+    let dots: Vec<(f64, f64)> = prims
+        .iter()
+        .filter_map(|p| match p {
+            writer::Prim::Arc {
+                center,
+                radius,
+                filled: true,
+                ..
+            } if (radius - 0.9).abs() < 1e-9 => Some(*center),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dots,
+        [(60.0, 60.0), (80.0, 60.0)],
+        "a dot on each terminal, none on the coil"
+    );
+    assert!(
+        svg(&pages[0]).contains("<polyline points=\"60,60 80,60\""),
+        "the SVG draws it too"
+    );
+}
+
+#[test]
+fn a_cable_list_page_names_the_cable_its_first_cores_belong_to() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let row = |cells: [&str; 7]| cells.iter().map(|c| (*c).to_owned()).collect::<Vec<String>>();
+    let table = wc_report::Table {
+        title: "Cable list".into(),
+        columns: ["Cable", "Type", "Description", "Core", "Page", "From", "To"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect(),
+        rows: vec![
+            row(["-W1", "Lapp 1119304", "Motor feed", "1", "1", "-X1.1", "-M1:U"]),
+            row(["", "", "", "2", "1", "-X1.2", "-M1:V"]),
+            row(["", "", "", "3", "1", "-X1.3", "-M1:W"]),
+        ],
+        ..Default::default()
+    };
+    let page = Page::new("r", "R2", "Cable list");
+    let texts = |lines: &[layout::TableLine]| -> Vec<String> {
+        layout::draw_table_page(&project, &page, 0, 2, &table, lines, (2, 2), "")
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // The second page starts at core 2: it names -W1, its type and description once.
+    let second = texts(&[layout::TableLine::Row(1), layout::TableLine::Row(2)]);
+    for value in ["-W1", "Lapp 1119304", "Motor feed"] {
+        assert_eq!(
+            second.iter().filter(|t| t.as_str() == value).count(),
+            1,
+            "{value} on {second:?}"
+        );
+    }
+    // The first page names it on its first row only, as before.
+    let first = texts(&[layout::TableLine::Row(0), layout::TableLine::Row(1)]);
+    assert_eq!(first.iter().filter(|t| t.as_str() == "-W1").count(), 1, "{first:?}");
+}
+
+#[test]
+fn a_mirrored_or_upside_down_symbol_prints_its_tag_away_from_the_drawing() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_string(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let tag = "=PUMP.STATION+CABINET-K1";
+    // Where each tag line starts and ends on the page, from left to right.
+    let spans = |rotation: wc_core::geom::Rotation, mirror: bool| -> Vec<(f64, f64)> {
+        let mut project = Project::new("x");
+        let mut page = Page::new("p1", "1", "Control");
+        let mut s = place("s1", "coil", 100.0, tag);
+        s.rotation = rotation;
+        s.mirror = mirror;
+        page.symbols.push(s);
+        project.pages = vec![page.clone()];
+        let xref = CrossRefs::build(&project, &symbols);
+        let mut warnings = Vec::new();
+        let drawn = layout::draw_page(
+            &project,
+            &page,
+            0,
+            1,
+            &symbols,
+            &xref,
+            &Options::default(),
+            &mut warnings,
+        );
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { at, height, text, .. }
+                    if (*height - 2.5).abs() < 1e-9 && ["=PUMP", "+CAB", "-K1"].iter().any(|w| text.starts_with(w)) =>
+                {
+                    Some((at.0, at.0 + writer::text_width_mm(text, 2.5)))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    // The symbol is a line at x = 100, its tag 5 mm to its left (to its right when mirrored or
+    // turned half round), and each line is wider than that gap.
+    for (rotation, mirror, left_of_drawing) in [
+        (wc_core::geom::Rotation::R0, false, true),
+        (wc_core::geom::Rotation::R0, true, false),
+        (wc_core::geom::Rotation::R180, false, false),
+        (wc_core::geom::Rotation::R180, true, true),
+    ] {
+        let lines = spans(rotation, mirror);
+        assert_eq!(lines.len(), 3, "{rotation:?} {mirror}: {lines:?}");
+        for (a, b) in lines {
+            if left_of_drawing {
+                assert!(
+                    (b - 95.0).abs() < 1e-6,
+                    "{rotation:?} {mirror}: ends at the tag: {a}..{b}"
+                );
+            } else {
+                assert!(
+                    (a - 105.0).abs() < 1e-6,
+                    "{rotation:?} {mirror}: starts at the tag: {a}..{b}"
+                );
+            }
+        }
+    }
+
+    // A mirrored contact's reference to its coil sits under its tag, aligned the same way.
+    let mut project = Project::new("x");
+    let mut page = Page::new("p1", "1", "Control");
+    page.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    let mut contact = place("s2", "no", 100.0, "-K1");
+    contact.mirror = true;
+    page.symbols.push(contact);
+    project.pages = vec![page.clone()];
+    let xref = CrossRefs::build(&project, &symbols);
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(&page, &symbols, &xref, &mut warnings);
+    let Some(back) = marks.iter().find(|m| m.text.starts_with('>')) else {
+        unreachable!("the contact points at its coil: {marks:?}")
+    };
+    assert_eq!(back.align, wc_core::geom::Align::Left);
+    assert_eq!(back.at, Point::new(105.0, 60.0 + 8.0 + 1.2 + 3.0));
+}
+
+#[test]
+fn a_long_panel_name_or_card_rack_is_cut_to_the_frame() {
+    use wc_core::panel::Panel;
+    let project = Project::new("x");
+    let long = "Main distribution cabinet for the north basin pumping station, the second pump \
+                hall and its cabinets, with every spare listed again for the south basin";
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let (w, _) = page.size.mm();
+    let ends = |drawn: &writer::Drawn, height: f64, start: &str| -> Vec<(f64, String)> {
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text {
+                    at, height: h, text, ..
+                } if (*h - height).abs() < 1e-9 && text.starts_with(start) => {
+                    Some((at.0 + writer::text_width_mm(text, height), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let long = long.repeat(3);
+    let panel = Panel::new("main", &long, 600.0, 800.0);
+    let drawn = layout::draw_panel_page(&project, &page, 0, 1, &panel, &BTreeMap::new(), "");
+    let found = ends(&drawn, 2.5, "Main distribution");
+    let [(end, text)] = found.as_slice() else {
+        unreachable!("one panel caption, got {found:?}")
+    };
+    let right = w - layout::MARGIN - 10.0;
+    assert!(
+        *end <= right + 1e-6,
+        "caption {text:?} ends at {end} mm, past {right} mm"
+    );
+    assert!(text.contains("...  ·  plate 600 x 800 mm  ·  scale 1:"), "{text:?}");
+    assert!(text.ends_with("  ·  0 device(s)"), "{text:?}");
+
+    let card = wc_report::PlcCardSheet {
+        card: "DI1".into(),
+        rack: long.clone(),
+        ..Default::default()
+    };
+    let drawn = layout::draw_card_page(&project, &page, 0, 1, &card, 0, (1, 1), "");
+    let found = ends(&drawn, 2.5, "Rack Main");
+    let [(end, text)] = found.as_slice() else {
+        unreachable!("one card line, got {found:?}")
+    };
+    let right = w - layout::MARGIN - 6.0;
+    assert!(
+        *end <= right + 1e-6,
+        "card line {text:?} ends at {end} mm, past {right} mm"
+    );
+    assert!(text.ends_with("..."), "{text:?}");
+}
+
+#[test]
+fn a_graphic_that_is_not_a_number_is_left_out_of_every_export() {
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    let mut project = Project::new("x");
+    let mut clean = Page::new("p1", "1", "Mains");
+    clean.graphics.push(Shape::Line {
+        a: Point::new(20.0, 20.0),
+        b: Point::new(60.0, 20.0),
+    });
+    project.pages = vec![clean.clone()];
+    let (clean_pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let svg_of = |project: &Project| {
+        let (pages, _) = page_drawings(project, &BTreeMap::new(), &Options::default());
+        let Some(page) = pages.first() else {
+            unreachable!("the page is drawn")
+        };
+        (svg(page), dxf(page))
+    };
+    let (clean_svg, clean_dxf) = svg_of(&project);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut page = clean.clone();
+        page.graphics.extend([
+            Shape::Line {
+                a: Point::new(bad, 10.0),
+                b: Point::new(50.0, 50.0),
+            },
+            Shape::Rect {
+                min: Point::new(10.0, 10.0),
+                max: Point::new(30.0, bad),
+            },
+            Shape::Circle {
+                center: Point::new(bad, 40.0),
+                radius: 5.0,
+                filled: true,
+            },
+            Shape::Circle {
+                center: Point::new(40.0, 40.0),
+                radius: bad,
+                filled: false,
+            },
+            Shape::Arc {
+                center: Point::new(40.0, 40.0),
+                radius: 5.0,
+                start: bad,
+                end: 90.0,
+            },
+            Shape::Polyline {
+                points: vec![Point::new(1.0, 1.0), Point::new(bad, 2.0), Point::new(3.0, 1.0)],
+                closed: true,
+                filled: true,
+            },
+            Shape::Text {
+                at: Point::new(bad, 30.0),
+                text: "lost".into(),
+                height: 3.0,
+                align: Default::default(),
+                angle: 0.0,
+            },
+        ]);
+        project.pages = vec![page];
+        let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+        // Left out, instead of `NaN` or `inf` in the page, which readers refuse.
+        assert!(
+            pdf == clean_pdf,
+            "{bad}: the PDF differs from the page without the bad shapes"
+        );
+        assert_eq!(svg_of(&project), (clean_svg.clone(), clean_dxf.clone()), "{bad}");
+    }
 }

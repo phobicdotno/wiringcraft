@@ -337,14 +337,22 @@ impl SymbolEditor {
         }
     }
 
-    /// Edit an existing symbol, saving back into the source it came from when that is one of
-    /// `targets`.
-    pub fn edit(symbol: Symbol, source: &str, targets: Vec<Target>) -> Self {
+    /// Edit an existing symbol, read from file `file_id` of `source`, saving back into that
+    /// source when it is one of `targets`. Only that file may be replaced by a save: a file that
+    /// declares another id than its name does not make the editor take the file of that id for
+    /// its own (#1265).
+    pub fn edit(file_id: &str, symbol: Symbol, source: &str, targets: Vec<Target>) -> Self {
         let mut e = Self::new(targets);
         let from = e.targets.iter().position(|(n, _)| n == source);
         e.target = from.unwrap_or(0);
         e.opened_from = from.and_then(|i| e.targets.get(i)).map(|(_, root)| root.clone());
-        e.opened_as = Some(symbol.id.clone());
+        if symbol.id != file_id {
+            e.message = format!(
+                "The file of symbol {file_id} declares id {}; saving writes it as {}, not over {file_id}.",
+                symbol.id, symbol.id
+            );
+        }
+        e.opened_as = Some(file_id.to_owned());
         e.pin_name = symbol.pins.last().map_or_else(|| "1".into(), |p| next_name(&p.name));
         e.symbol = symbol;
         e.tool = Tool::Select;
@@ -474,16 +482,26 @@ impl SymbolEditor {
             Tool::Arc => {
                 self.clicks.push(p);
                 if let [c, s, e] = self.clicks[..] {
-                    self.clicks.clear();
                     let radius = ((s.x - c.x).powi(2) + (s.y - c.y).powi(2)).sqrt();
                     if radius == 0.0 || e == c {
+                        self.clicks.clear();
                         return;
                     }
+                    let (start, end) = (angle(c, s), angle(c, e));
+                    // An end in the start's direction would make a full circle: keep the
+                    // centre and start and wait for another end, as dragging an end does.
+                    let turn = (end - start).rem_euclid(360.0);
+                    if !(1e-9..=360.0 - 1e-9).contains(&turn) {
+                        self.clicks.pop();
+                        self.message = "The arc would end where it starts; click another end.".into();
+                        return;
+                    }
+                    self.clicks.clear();
                     self.add_shape(Shape::Arc {
                         center: c,
                         radius,
-                        start: angle(c, s),
-                        end: angle(c, e),
+                        start,
+                        end,
                     });
                 }
             }
@@ -775,10 +793,12 @@ impl SymbolEditor {
         }
         let mut names = std::collections::BTreeSet::new();
         for p in &s.pins {
-            if p.name.trim().is_empty() {
+            // Spaces around a name are dropped on save, so `A1` and `A1 ` are one name.
+            let name = p.name.trim();
+            if name.is_empty() {
                 out.push("Every pin needs a name.".into());
-            } else if !names.insert(p.name.as_str()) {
-                out.push(format!("Two pins are called {}.", p.name));
+            } else if !names.insert(name) {
+                out.push(format!("Two pins are called {name}."));
             }
         }
         // Two pins on one point would connect each other's wires.
@@ -805,6 +825,9 @@ impl SymbolEditor {
             .ok_or("No library folder is chosen.")?
             .clone();
         self.symbol.id = self.symbol.id.trim().to_owned();
+        for p in &mut self.symbol.pins {
+            p.name = p.name.trim().to_owned();
+        }
         let id = self.symbol.id.clone();
         let file = root.join("symbols").join(format!("{id}.json"));
         let same =
@@ -944,7 +967,7 @@ impl SymbolEditor {
                     Ok((s, source)) => {
                         let choices = std::mem::take(&mut self.choices);
                         let owner = self.owner.take();
-                        *self = Self::edit(s, &source, std::mem::take(&mut self.targets));
+                        *self = Self::edit(&id, s, &source, std::mem::take(&mut self.targets));
                         self.choices = choices;
                         self.owner = owner;
                     }
@@ -1496,7 +1519,7 @@ mod tests {
         assert_eq!(wires.len(), 1, "A2 of the upper coil meets A1 of the lower one");
 
         // Opened again, changed and saved: same file, new hash; a new symbol with that id is refused.
-        let mut again = SymbolEditor::edit(back, &source, vec![("mine".into(), lib.clone())]);
+        let mut again = SymbolEditor::edit(&back.id.clone(), back, &source, vec![("mine".into(), lib.clone())]);
         again.set_tool(Tool::Line);
         again.click(Point::new(-5.0, 0.0));
         again.click(Point::new(5.0, 0.0));
@@ -1811,6 +1834,31 @@ mod tests {
     }
 
     #[test]
+    fn an_arc_end_clicked_in_the_start_direction_draws_no_circle() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Arc);
+        // The end on the start itself, then further out on the same line from the centre.
+        for p in [(0.0, 0.0), (5.0, 0.0), (5.0, 0.0), (10.0, 0.0)] {
+            e.click(Point::new(p.0, p.1));
+        }
+        assert!(e.symbol.graphics.is_empty());
+        assert!(e.undo.is_empty());
+        assert!(!e.message.is_empty());
+        assert_eq!(e.clicks, [Point::new(0.0, 0.0), Point::new(5.0, 0.0)]);
+        // Another end still finishes the arc from the same centre and start.
+        e.click(Point::new(0.0, 5.0));
+        assert_eq!(
+            e.symbol.graphics,
+            [Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 5.0,
+                start: 0.0,
+                end: 90.0
+            }]
+        );
+    }
+
+    #[test]
     fn escape_cancels_a_handle_drag() {
         let mut e = SymbolEditor::new(Vec::new());
         e.set_tool(Tool::Circle);
@@ -1863,7 +1911,12 @@ mod tests {
         // An opened symbol (from an import, say) with pin A2 on top of pin A1.
         let mut symbol = drawn.symbol;
         symbol.pins[1].at = symbol.pins[0].at;
-        let mut e = SymbolEditor::edit(symbol, "mine", vec![("mine".into(), tmp.path().join("lib"))]);
+        let mut e = SymbolEditor::edit(
+            &symbol.id.clone(),
+            symbol,
+            "mine",
+            vec![("mine".into(), tmp.path().join("lib"))],
+        );
         assert_eq!(e.problems(), ["Pins A1 and A2 are at the same place."]);
         assert!(e.save().is_err_and(|m| m.contains("Pins A1 and A2")));
         // Moving A2 off A1 clears it.
@@ -1871,6 +1924,25 @@ mod tests {
         e.nudge(Point::new(SNAP, 0.0));
         assert!(e.problems().is_empty(), "{:?}", e.problems());
         e.save()?;
+        Ok(())
+    }
+
+    #[test]
+    fn pin_names_are_saved_without_spaces_around_them() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let mut e = SymbolEditor::new(vec![("mine".into(), tmp.path().join("lib"))]);
+        draw_coil(&mut e);
+        e.symbol.id = "my.coil".into();
+        e.symbol.name = "Coil".into();
+        // A2 renamed in its Name field to A1 with a space after it.
+        e.symbol.pins[1].name = "A1 ".into();
+        assert_eq!(e.problems(), ["Two pins are called A1."]);
+        e.symbol.pins[1].name = " A2 ".into();
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        let saved = e.save()?;
+        assert_eq!(saved.symbol.pins[1].name, "A2");
+        let back: Symbol = serde_json::from_str(&std::fs::read_to_string(&saved.path)?)?;
+        assert!(back.pin("A2").is_some(), "{:?}", back.pins);
         Ok(())
     }
 
@@ -2400,7 +2472,7 @@ mod tests {
 
         // Opened from A, then pointed at B: B's own symbol stays.
         let (s, _) = (first.symbol.clone(), ());
-        let mut e = SymbolEditor::edit(s, "a", targets);
+        let mut e = SymbolEditor::edit(&s.id.clone(), s, "a", targets);
         e.target = 1;
         assert!(e.save().is_err_and(|m| m.contains("already has")));
         let kept: Symbol = wc_core::store::read_json(&b.join("symbols").join("test.coil.json"))?;
@@ -2408,6 +2480,34 @@ mod tests {
         // Back to A it saves.
         e.target = 0;
         assert_eq!(e.save()?.source, "a");
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_declaring_another_id_does_not_overwrite_that_ids_file() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let lib = tmp.path().join("lib");
+        let targets = vec![("mine".to_owned(), lib.clone())];
+        let mut coil = SymbolEditor::new(targets.clone());
+        draw_coil(&mut coil);
+        coil.save()?;
+        // test.other.json holds a copy of the coil that still declares id test.coil.
+        let mut copy = coil.symbol.clone();
+        copy.name = "Copied coil".into();
+        let copied = lib.join("symbols").join("test.other.json");
+        std::fs::write(&copied, wc_core::store::to_json(&copy)?)?;
+
+        let mut e = SymbolEditor::edit("test.other", copy, "mine", targets);
+        assert!(e.message.contains("declares id test.coil"), "{}", e.message);
+        e.symbol.name = "Changed copy".into();
+        assert!(e.save().is_err_and(|m| m.contains("already has a symbol test.coil")));
+        let kept: Symbol = wc_core::store::read_json(&lib.join("symbols").join("test.coil.json"))?;
+        assert_eq!(kept.name, coil.symbol.name, "the coil's own file stays");
+        // Given an id of its own, it saves as a new symbol.
+        e.symbol.id = "test.other".into();
+        e.save()?;
+        let saved: Symbol = wc_core::store::read_json(&copied)?;
+        assert_eq!((saved.id.as_str(), saved.name.as_str()), ("test.other", "Changed copy"));
         Ok(())
     }
 }

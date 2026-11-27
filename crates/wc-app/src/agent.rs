@@ -101,6 +101,14 @@ pub struct Assistant {
     /// refused once someone else changed the page's drawings (a session sync, the user).
     /// Shared, so the copy a tool call keeps to put back costs nothing.
     graphics_read: HashMap<(PathBuf, String), Arc<[Shape]>>,
+    /// The message box's id, so its keyboard is not taken for a field with a typed value.
+    pub input_id: Option<egui::Id>,
+    /// A field of the window other than the message box has the keyboard this frame: a value
+    /// typed in it may not be entered yet (set by `App::update` before the tools run).
+    pub typed_field: bool,
+    /// `open_project` was refused for a typed value: the field gives up the keyboard in the
+    /// next frame, so the panels enter the value before the assistant asks again (#1091).
+    pub enter_typed: bool,
 }
 
 impl Default for Assistant {
@@ -127,6 +135,9 @@ impl Assistant {
             clipboard: screenshot::Clipboard::default(),
             command_base: None,
             graphics_read: HashMap::new(),
+            input_id: None,
+            typed_field: false,
+            enter_typed: false,
         }
     }
 
@@ -164,6 +175,20 @@ impl Assistant {
         self.command_base.is_some()
     }
 }
+
+/// Why a changing tool waits while the unsaved-changes question is open.
+const UNSAVED_ASKED: &str = "the person is being asked whether to save the open project's unsaved \
+                             changes; wait for their answer.";
+
+/// What `open_project` says while a field still has a value typed and not entered yet.
+const OPEN_TYPED: &str = "Not opened yet: a value typed in a field of the window was not entered yet. \
+                          It is entered now; call open_project again (the person may then be asked \
+                          whether to save the changes).";
+
+/// What `open_project` says while the person is asked about the open project's unsaved changes.
+const OPEN_ASKED: &str = "Not opened yet: the open project has unsaved changes, and the person was \
+                          asked whether to save them first. It opens when they answer; wait for them \
+                          and do not ask to open it again.";
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
@@ -208,7 +233,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person).",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
             json!({}),
             &[],
         ),
@@ -418,11 +443,16 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "set_device",
-            "Set a device's description, part (from find_parts; empty string removes it) and properties (empty value removes one), or rename its tag everywhere (symbols, cables, panel layouts).",
+            "Set a device's description, part (from find_parts; empty string removes it), accessories and properties (empty value removes one), or rename its tag everywhere (symbols, cables, panel layouts).",
             json!({
                 "tag": {"type": "string"},
                 "description": {"type": "string"},
                 "part": {"type": "string"},
+                "accessories": {
+                    "type": "array",
+                    "description": "The device's whole new list of accessories (its parts after the main part, from find_parts), in order; an empty list removes them all. qty defaults to 1.",
+                    "items": {"type": "object", "properties": {"part": {"type": "string"}, "qty": {"type": "integer", "minimum": 1}}, "required": ["part"]}
+                },
                 "properties": {"type": "object", "additionalProperties": {"type": "string"}},
                 "rename_to": {"type": "string"}
             }),
@@ -625,7 +655,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_action",
-            "Run any toolbar or menu command by name, exactly as if the user clicked it. Commands that open a dialog show it to the user. Prefer the specific tools above; use this for view commands (ZoomIn, ZoomOut, ZoomFit, ToggleGrid, ToggleTheme, ToggleChrome) and anything they do not cover.",
+            "Run any toolbar or menu command by name, exactly as if the user clicked it. Commands that open a dialog show it to the user. Prefer the specific tools above; use this for view commands (ZoomIn, ZoomOut, ZoomFit, ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme, ToggleChrome) and anything they do not cover. The Toggle commands and LiveCheck flip a setting: get_state's `view` says how each is set.",
             json!({"action": {"type": "string", "enum": actions}}),
             &["action"],
         ),
@@ -709,6 +739,44 @@ fn strip_list(open: &Open, only: Option<&DeviceTag>) -> Vec<Value> {
 
 fn need_s<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
     s(v, key).ok_or_else(|| format!("`{key}` is missing."))
+}
+
+/// The report `text` names, as the assistant may write it: trimmed, in any case, with `_` for
+/// `-` (`plc_cards`). A miss names the reports there are, so the next try can pick one.
+fn report_kind(text: &str) -> Result<wc_report::Kind, String> {
+    let name = text.trim().to_lowercase().replace('_', "-");
+    wc_report::Kind::parse(&name).ok_or_else(|| {
+        let names: Vec<&str> = wc_report::Kind::ALL.iter().map(|k| k.name()).collect();
+        format!("Unknown report {text:?}: use one of {}.", names.join(", "))
+    })
+}
+
+/// `set_device`'s `accessories`: a list of `{part, qty}`, qty 1 when left out (a null qty is
+/// refused). An entry that is
+/// not one refuses the whole list, so no accessory is dropped or changed by a mistake.
+fn accessories(list: &Value) -> Result<Vec<wc_core::DevicePart>, String> {
+    let shape = "accessories must be a list of {part, qty} (qty a whole number of 1 or more)";
+    let list = list.as_array().ok_or(shape)?;
+    list.iter()
+        .map(|a| {
+            let part = a.get("part").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+            if part.is_empty() {
+                return Err(format!("{shape}: an entry has no part."));
+            }
+            let qty = match a.get("qty") {
+                None => 1,
+                Some(q) => q
+                    .as_u64()
+                    .and_then(|q| u32::try_from(q).ok())
+                    .filter(|q| *q >= 1)
+                    .ok_or_else(|| format!("{shape}: qty {q} of {part} is not one."))?,
+            };
+            Ok(wc_core::DevicePart {
+                part: part.to_owned(),
+                qty,
+            })
+        })
+        .collect()
 }
 
 fn need_num(v: &Value, key: &str) -> Result<f64, String> {
@@ -2085,7 +2153,7 @@ impl App {
                 Ok(clip_text(lines.join("\n"), 40_000))
             }
             "get_report" => {
-                let kind = wc_report::Kind::parse(need_s(v, "kind")?).ok_or("Unknown report.")?;
+                let kind = report_kind(need_s(v, "kind")?)?;
                 let open = need_open(self.open.as_mut())?;
                 let inputs = wc_report::Inputs {
                     project: &open.project,
@@ -2214,6 +2282,13 @@ impl App {
             }
             "open_project" => {
                 let path = PathBuf::from(need_s(v, "path")?);
+                // A value typed in a field is entered when the field gives up the keyboard, as
+                // Ctrl+O and a window close wait a frame for it: opening now would drop it on a
+                // clean project without asking (#1091).
+                if self.assistant.typed_field && self.open.is_some() {
+                    self.assistant.enter_typed = true;
+                    return Err(OPEN_TYPED.into());
+                }
                 if v.get("create").and_then(Value::as_bool).unwrap_or(false) {
                     self.new_project(&path, s(v, "name").unwrap_or_default(), s(v, "base"));
                 } else {
@@ -2223,6 +2298,11 @@ impl App {
                 }
                 if let Some(m) = self.take_message() {
                     return Err(m);
+                }
+                // The open project has unsaved changes: the person is asked whether to save them
+                // first, and the project opens when they answer (#1019).
+                if matches!(&self.dialog, Some(Dialog::Unsaved(crate::Leave::Open(_)))) {
+                    return Ok(OPEN_ASKED.into());
                 }
                 match &self.open {
                     Some(o) if o.dir == path => Ok(format!("Opened {}.", o.project.meta.name)),
@@ -2291,10 +2371,19 @@ impl App {
     }
 
     fn tool_state(&self) -> Result<String, String> {
+        // The drawing aids the Toggle commands flip, so the assistant sets one knowingly.
+        let view = json!({
+            "grid": self.prefs.show_grid,
+            "auto_wire": self.prefs.auto_wire,
+            "live_check": self.prefs.live_check,
+            "theme": self.prefs.theme,
+            "chrome": self.prefs.chrome,
+        });
         let Some(open) = &self.open else {
             return Ok(pretty(&json!({
                 "open": false,
                 "recent_projects": self.prefs.recent,
+                "view": view,
                 "session": Value::Null,
             })));
         };
@@ -2336,6 +2425,7 @@ impl App {
             "strips": strip_list(open, None),
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
+            "view": view,
             "selection": self
                 .ed
                 .selection
@@ -2719,11 +2809,8 @@ impl App {
                 let warnings = open.edit_black_box(page, id, (width, height), &pins, &renamed, &removed)?;
                 // A wire being drawn from a point of the box that was renamed, moved or taken off
                 // would be saved on a stale point: it is dropped, to be started again.
-                let point_changed = |pin: &str| {
-                    renamed.contains_key(pin)
-                        || renamed.values().any(|to| to == pin)
-                        || old.iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
-                };
+                let point_changed =
+                    |pin: &str| crate::black_box_tool::point_changed(pin, &old, &pins, &renamed, &removed);
                 let shown = open.project.pages.get(self.ed.page);
                 let dropped = matches!(
                     &self.ed.wire,
@@ -2823,6 +2910,16 @@ impl App {
     fn tool_set_device(&mut self, v: &Value) -> Result<String, String> {
         let mut t = tag(need_s(v, "tag")?)?;
         let open = need_open(self.open.as_mut())?;
+        // The accessories are checked before any field is applied, so a refused list leaves the
+        // project as it was.
+        let list = v
+            .get("accessories")
+            .filter(|l| !l.is_null())
+            .map(accessories)
+            .transpose()?;
+        if let Some(list) = &list {
+            open.check_parts(list.iter().map(|a| a.part.as_str()))?;
+        }
         let mut done = Vec::new();
         if let Some(to) = s(v, "rename_to") {
             let to = tag(to)?;
@@ -2850,6 +2947,15 @@ impl App {
                 "part removed".into()
             } else {
                 format!("part {p}")
+            });
+        }
+        if let Some(list) = list {
+            let n = list.len();
+            open.set_device_accessories(&t, list)?;
+            done.push(if n == 0 {
+                "accessories removed".into()
+            } else {
+                format!("{n} accessor{}", if n == 1 { "y" } else { "ies" })
             });
         }
         if let Some(map) = v.get("properties").and_then(Value::as_object) {
@@ -3376,9 +3482,7 @@ impl App {
     fn tool_report_layouts(&mut self, v: &Value) -> Result<String, String> {
         use crate::report_layout_form::Form;
         let action = need_s(v, "action")?;
-        let kind = s(v, "kind")
-            .map(|k| wc_report::Kind::parse(k.trim()).ok_or_else(|| format!("Unknown report {k:?}.")))
-            .transpose()?;
+        let kind = s(v, "kind").map(report_kind).transpose()?;
         let open = need_open(self.open.as_mut())?;
         let builtin = |open: &crate::state::Open, kind| {
             let inputs = wc_report::Inputs {
@@ -3478,12 +3582,9 @@ impl App {
                 .unwrap_or(1);
             let id = format!("panel{n}");
             let name = s(v, "name").map(str::to_owned).unwrap_or_else(|| format!("Panel {n}"));
-            let panel = wc_core::panel::Panel::with_rails(
-                id.clone(),
-                name,
-                num(v, "width").unwrap_or(600.0),
-                num(v, "height").unwrap_or(800.0),
-            );
+            let (width, height) = (num(v, "width").unwrap_or(600.0), num(v, "height").unwrap_or(800.0));
+            crate::panels::check_plate_size(width, height)?;
+            let panel = wc_core::panel::Panel::with_rails(id.clone(), name, width, height);
             open.checkpoint();
             open.project.panels.push(panel);
             open.project.panels.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3535,6 +3636,11 @@ impl App {
                 content["id"] = json!(id);
                 let new: wc_core::panel::Panel =
                     serde_json::from_value(content).map_err(|e| format!("Not a panel layout: {e}"))?;
+                crate::panels::check_plate_size(new.width, new.height)?;
+                // Rails, ducts and devices must lie on the plate, as everywhere else they are placed.
+                new.clone()
+                    .resize(new.width, new.height)
+                    .map_err(|e| format!("Not replaced: {e}."))?;
                 open.checkpoint();
                 open.project.panels[pi] = new;
                 self.ed.panel_pick = None;
@@ -3570,9 +3676,8 @@ impl App {
             }
             "branch" => {
                 let name = need_s(v, "name")?;
-                git.create_branch(name)
-                    .and_then(|()| git.switch(name))
-                    .map_err(|e| e.to_string())?;
+                // Switches too, keeping changes not yet recorded (a second `switch` would refuse them).
+                git.create_branch(name).map_err(|e| e.to_string())?;
                 open.branch = name.to_owned();
                 Ok(format!("Now on branch {name}."))
             }
@@ -3613,6 +3718,11 @@ impl App {
             return Started::Done(Err(format!(
                 "{name} was not run: an import is running in the app; wait until it is done."
             )));
+        }
+        // While the person is asked whether to save the open project's unsaved changes, a
+        // change would land in what they are answering about: only the reading tools run.
+        if matches!(self.dialog, Some(Dialog::Unsaved(_))) && !READ_TOOLS.contains(&name) {
+            return Started::Done(Err(format!("{name} was not run: {UNSAVED_ASKED}")));
         }
         match name {
             "run_command" => match self.command_start(v) {
@@ -4130,6 +4240,42 @@ mod tests {
         assert_eq!(row.description, new.description);
     }
 
+    /// Save in the unsaved-changes question while an assistant command runs waits, as Save
+    /// does: nothing was saved, so the window does not close (#1019).
+    #[test]
+    fn save_and_close_stays_open_while_a_command_runs() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        open.save().unwrap();
+        assert!(!open.dirty);
+        a.save_and_leave(crate::Leave::Close);
+        assert_eq!(a.ed.message, App::SAVE_WAITS);
+        assert_eq!(a.closing, crate::Closing::No, "the window stays open");
+    }
+
+    /// Asked to open a project while the open one has unsaved changes, the assistant hears
+    /// that the person is asked first, not that the open failed (#1019).
+    #[test]
+    fn open_project_over_unsaved_changes_says_the_person_is_asked() {
+        let (tmp, mut a) = app(vec![]);
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let first = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().dirty = true;
+        let r = a.agent_tool("open_project", &json!({ "path": other.display().to_string() }));
+        assert_eq!(r, Ok(OPEN_ASKED.to_owned()));
+        assert!(matches!(a.dialog, Some(Dialog::Unsaved(crate::Leave::Open(_)))));
+        assert_eq!(a.open.as_ref().unwrap().dir, first);
+        // While the question is open only the reading tools run, also later in the same answer.
+        let placed = a.agent_start("place_symbol", &json!({ "symbol": "wc.coil", "x": 20, "y": 20 }));
+        assert!(
+            matches!(&placed, Started::Done(Err(e)) if e.contains(UNSAVED_ASKED)),
+            "an edit waits for the answer"
+        );
+        assert!(matches!(a.agent_start("get_state", &json!({})), Started::Done(Ok(_))));
+    }
+
     fn app(answers: Vec<Value>) -> (tempfile::TempDir, App) {
         let (tmp, open) = crate::state::tests::project();
         let mut prefs = crate::prefs::Prefs::default();
@@ -4147,6 +4293,7 @@ mod tests {
             assistant: Assistant::with_transport(Arc::new(Script(Mutex::new(answers)))),
             open_url: Vec::new(),
             logged: Default::default(),
+            log_instead: None,
             share: Default::default(),
             symbol_editor: None,
             find: None,
@@ -4158,6 +4305,7 @@ mod tests {
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
+            closing: crate::Closing::No,
         };
         (tmp, app)
     }
@@ -5111,6 +5259,20 @@ mod tests {
     }
 
     #[test]
+    fn versions_branch_works_with_changes_not_yet_recorded() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let git = wc_vcs::Git::new(&dir);
+        git.init().unwrap();
+        std::fs::write(dir.join("notes.txt"), "not recorded yet").unwrap();
+        let said = call(&mut a, "versions", json!({"action": "branch", "name": "draft"})).unwrap();
+        assert!(said.contains("Now on branch draft"), "{said}");
+        assert_eq!(a.open.as_ref().unwrap().branch, "draft");
+        assert_eq!(git.current_branch().as_deref(), Some("draft"));
+        assert!(dir.join("notes.txt").exists(), "the change came along");
+    }
+
+    #[test]
     fn number_wires_refuses_an_unknown_rule() {
         let (_tmp, mut a) = app(vec![]);
         let place = |a: &mut App, symbol: &str, x: i32| -> String {
@@ -5279,6 +5441,85 @@ mod tests {
         // An empty list removes every rack.
         call(&mut a, "plc_racks", json!({"action": "replace", "racks": []})).unwrap();
         assert_eq!(read(&mut a), json!([]));
+    }
+
+    #[test]
+    fn set_device_replaces_and_removes_accessories_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let tag = DeviceTag::parse("-K1").unwrap();
+        let got = |a: &App| -> Vec<wc_core::DevicePart> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .devices
+                .get(&tag)
+                .map(|d| d.accessories.clone())
+                .unwrap_or_default()
+        };
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        // A list that is not one, or a part that does not exist, changes nothing.
+        for bad in [
+            json!("example.ex-tb-2-5"),
+            json!([{"qty": 2}]),
+            json!([{"part": "example.ex-tb-2-5", "qty": 0}]),
+            json!([{"part": "example.ex-tb-2-5", "qty": "2"}]),
+            json!([{"part": "example.ex-tb-2-5", "qty": null}]),
+            json!([{"part": "no.such"}]),
+        ] {
+            let r = call(&mut a, "set_device", json!({"tag": "-K1", "accessories": bad.clone()}));
+            assert!(r.is_err(), "{bad}: {r:?}");
+            // Nor does it let the call's other fields through.
+            let r = call(
+                &mut a,
+                "set_device",
+                json!({"tag": "-K1", "description": "New", "part": "example.ex-tb-2-5", "properties": {"k": "v"}, "accessories": bad.clone()}),
+            );
+            assert!(r.is_err(), "{bad} with other fields: {r:?}");
+        }
+        assert!(got(&a).is_empty());
+        assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+
+        let said = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "accessories": [{"part": "example.ex-tb-2-5", "qty": 3}, {"part": " example.ex-tb-2-5 "}]}),
+        )
+        .unwrap();
+        assert!(said.contains("2 accessories"), "{said}");
+        let want = [
+            wc_core::DevicePart {
+                part: "example.ex-tb-2-5".into(),
+                qty: 3,
+            },
+            wc_core::DevicePart {
+                part: "example.ex-tb-2-5".into(),
+                qty: 1,
+            },
+        ];
+        assert_eq!(got(&a), want);
+        let listed: Value =
+            serde_json::from_str(&call(&mut a, "get_devices", json!({"query": "-K1"})).unwrap()).unwrap();
+        assert_eq!(listed[0]["accessories"][0]["qty"], json!(3), "{listed}");
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1, "one undo step");
+
+        // A null qty on a device that has accessories is refused and keeps the list it has.
+        let r = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "accessories": [{"part": "example.ex-tb-2-5", "qty": null}]}),
+        );
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(got(&a), want);
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1, "no new step");
+
+        // An empty list removes them, and undo brings them back.
+        let said = call(&mut a, "set_device", json!({"tag": "-K1", "accessories": []})).unwrap();
+        assert!(said.contains("accessories removed"), "{said}");
+        assert!(got(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(got(&a), want);
     }
 
     #[test]
@@ -5742,6 +5983,7 @@ mod tests {
                 share_undo: false,
                 share_redo: false,
                 show_layers: false,
+                symbol_editor: None,
             }
             .enabled(act)
         };
@@ -5958,6 +6200,39 @@ mod tests {
     }
 
     #[test]
+    fn cut_leaves_a_wire_the_copy_left_out_on_the_page_and_selected() {
+        use crate::state::Selection;
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        o.project.pages[0].graphics.push(wc_core::Shape::Line {
+            a: Point::new(50.0, 50.0),
+            b: Point::new(80.0, 50.0),
+        });
+        // A wire ending on a symbol that is not on the page: the copy leaves it out.
+        o.add_wire(
+            0,
+            wc_core::Endpoint::Point {
+                at: Point::new(50.0, 60.0),
+            },
+            wc_core::Endpoint::Pin {
+                item: "gone".into(),
+                pin: "1".into(),
+            },
+            vec![],
+        );
+        let w = o.project.pages[0].wires.last().unwrap().id.clone();
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Wire(w.clone())];
+        a.run(Action::Cut);
+        assert_eq!(a.ed.message, "Cut 1 item.");
+        let pg = &a.open.as_ref().unwrap().project.pages[0];
+        assert!(pg.graphics.is_empty(), "the cut line is gone");
+        assert!(pg.wires.iter().any(|x| x.id == w), "the wire not copied stays");
+        assert_eq!(a.ed.selection, [Selection::Wire(w)]);
+        assert!(a.clipboard.wires.is_empty());
+    }
+
+    #[test]
     fn page_up_and_page_down_open_the_previous_and_next_page() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);
@@ -6010,6 +6285,7 @@ mod tests {
                 share_undo: false,
                 share_redo: false,
                 show_layers: false,
+                symbol_editor: None,
             }
             .enabled(act)
         };
@@ -6318,6 +6594,7 @@ mod tests {
                 share_undo: false,
                 share_redo: false,
                 show_layers: false,
+                symbol_editor: None,
             }
             .enabled(act)
         };
@@ -6514,6 +6791,79 @@ mod tests {
             "the editor redid the delete"
         );
         assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
+    }
+
+    #[test]
+    fn menu_delete_undo_and_redo_go_to_the_symbol_editor_while_it_is_open() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        a.ed.page = page;
+        a.ed.selection = a.open.as_ref().unwrap().select_all(page);
+        assert!(!a.ed.selection.is_empty());
+        let menu = vec![Action::Delete, Action::Undo, Action::Redo, Action::ZoomIn];
+        assert_eq!(
+            a.route_menu_to_symbol_editor(menu.clone()),
+            menu,
+            "closed: the project gets them"
+        );
+
+        let mut ed = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(crate::symbol_editor::Tool::Line);
+        ed.click(Point::new(0.0, 0.0));
+        ed.click(Point::new(10.0, 0.0));
+        ed.set_tool(crate::symbol_editor::Tool::Select);
+        ed.click(Point::new(5.0, 0.0));
+        a.symbol_editor = Some(ed);
+        let before = a.open.as_ref().unwrap().project.clone();
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+                symbol_editor: a.symbol_editor.as_ref(),
+            }
+            .enabled(act)
+        };
+        assert!(status(&a, Action::Delete), "the editor's line can be deleted");
+        assert!(!status(&a, Action::Redo), "the editor has nothing to redo");
+
+        // Edit > Delete, then Edit > Undo and Edit > Redo.
+        for act in a.route_menu_to_symbol_editor(vec![Action::Delete]) {
+            a.run(act);
+        }
+        assert!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
+            "the editor deleted its line"
+        );
+        assert!(!status(&a, Action::Delete), "nothing is selected in the editor now");
+        for act in a.route_menu_to_symbol_editor(vec![Action::Undo, Action::ZoomIn]) {
+            assert_eq!(act, Action::ZoomIn);
+        }
+        assert_eq!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.len(),
+            1,
+            "the editor undid"
+        );
+        assert!(status(&a, Action::Redo));
+        assert!(a.route_menu_to_symbol_editor(vec![Action::Redo]).is_empty());
+        assert!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
+            "the editor redid"
+        );
+
+        let o = a.open.as_ref().unwrap();
+        assert_eq!(o.project, before, "the schematic behind the editor was not touched");
+        assert_eq!(o.undo_mark(), undo_before, "and got no undo step");
+        assert!(!a.ed.selection.is_empty(), "its selection stays");
     }
 
     #[test]
@@ -7707,6 +8057,44 @@ mod tests {
         assert!(m.starts_with("Export failed:"), "{m}");
         assert!(m.contains(wc_pdf::NOTHING_TO_EXPORT), "{m}");
         assert!(!crate::export_file(open, "pdf").exists());
+    }
+
+    #[test]
+    fn get_state_tells_how_the_drawing_aids_are_set() {
+        let (_tmp, mut a) = app(vec![]);
+        let view = |a: &mut App| -> Value {
+            let state: Value = serde_json::from_str(&call(a, "get_state", json!({})).unwrap()).unwrap();
+            state["view"].clone()
+        };
+        assert_eq!(
+            view(&mut a),
+            json!({"grid": true, "auto_wire": true, "live_check": true, "theme": "light", "chrome": "classic"})
+        );
+        for (action, key, flipped) in [
+            ("ToggleAutoWire", "auto_wire", json!(false)),
+            ("ToggleGrid", "grid", json!(false)),
+            ("LiveCheck", "live_check", json!(false)),
+            ("ToggleTheme", "theme", json!("dark")),
+            ("ToggleChrome", "chrome", json!("ribbon")),
+        ] {
+            let before = view(&mut a);
+            call(&mut a, "run_action", json!({"action": action})).unwrap();
+            let after = view(&mut a);
+            assert_eq!(after[key], flipped, "{action}");
+            for other in ["grid", "auto_wire", "live_check", "theme", "chrome"] {
+                if other != key {
+                    assert_eq!(after[other], before[other], "{action} leaves {other}");
+                }
+            }
+        }
+        call(&mut a, "run_action", json!({"action": "ToggleAutoWire"})).unwrap();
+        assert_eq!(view(&mut a)["auto_wire"], json!(true), "and back on");
+
+        // Without a project the settings are still told.
+        a.open = None;
+        let closed = view(&mut a);
+        assert_eq!(closed["auto_wire"], json!(true));
+        assert_eq!(closed["grid"], json!(false));
     }
 
     #[test]
@@ -9514,6 +9902,44 @@ mod tests {
     }
 
     #[test]
+    fn a_dxf_warning_shows_the_drawing_text_but_the_log_does_not_get_it() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.pages.truncate(1);
+        open.project.pages[0].number = "1".into();
+        open.project.pages[0].graphics.push(wc_core::Shape::Text {
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            text: "Secret pump \u{1F600}".into(),
+            height: 3.0,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let open = a.open.as_ref().unwrap();
+        let dir = open.dir.join("export").join("drawings");
+        let (shown, logged) = crate::export_drawings_logged(open, &dir);
+        a.show_message_logged_as(shown, logged);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("a message box shows")
+        };
+        assert!(m.contains("the text \"Secret pump \u{1F600}\" is written as"), "{m}");
+        let new = a.new_messages();
+        let [(crate::applog::Level::Warn, text)] = new.as_slice() else {
+            unreachable!("one message box is logged: {new:?}")
+        };
+        assert!(!text.contains("Secret"), "drawing text stays out of the log: {text}");
+        assert!(
+            text.contains("page 1: a text is written with \"?\" in the DXF"),
+            "{text}"
+        );
+        // Another message box is logged as it is.
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(
+            a.new_messages(),
+            [(crate::applog::Level::Warn, "Export failed".to_owned())]
+        );
+    }
+
+    #[test]
     fn the_report_gets_the_log_only_when_chosen() {
         let (request, copy) = crate::report_request("line one\nline two\n", false);
         assert!(request.detail.is_empty() && copy.is_none());
@@ -9768,6 +10194,31 @@ mod tests {
             );
             call(&mut a, "get_report", json!({"kind": kind.name()})).unwrap();
         }
+    }
+
+    #[test]
+    fn report_kinds_read_as_the_assistant_writes_them() {
+        let (_tmp, mut a) = app(vec![]);
+        let want = call(&mut a, "get_report", json!({"kind": "plc-cards"})).unwrap();
+        for kind in ["plc_cards", " PLC-Cards ", "Plc_Cards"] {
+            assert_eq!(
+                call(&mut a, "get_report", json!({"kind": kind})).unwrap(),
+                want,
+                "{kind}"
+            );
+        }
+        let err = call(&mut a, "get_report", json!({"kind": "bom"})).unwrap_err();
+        assert!(
+            err.contains("\"bom\"") && err.contains("plc-cards") && err.contains("networks"),
+            "{err}"
+        );
+        let layout = call(&mut a, "report_layouts", json!({"action": "get", "kind": "plc_cards"})).unwrap();
+        assert_eq!(
+            layout,
+            call(&mut a, "report_layouts", json!({"action": "get", "kind": "plc-cards"})).unwrap()
+        );
+        let err = call(&mut a, "report_layouts", json!({"action": "get", "kind": "bom"})).unwrap_err();
+        assert!(err.contains("plc-cards"), "{err}");
     }
 
     #[test]
@@ -11055,6 +11506,66 @@ mod tests {
             a.agent_start("todo", &json!({"action": "file"})),
             Started::Done(Err(_))
         ));
+    }
+
+    #[test]
+    fn panels_new_and_replace_refuse_a_plate_size_or_item_off_the_plate() {
+        let (_tmp, mut a) = app(vec![]);
+        let project = a.open.as_ref().unwrap().project.clone();
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        for (w, h) in [(-600.0, 800.0), (0.0, 800.0), (600.0, 5.0), (600.0, 1e9)] {
+            let r = call(&mut a, "panels", json!({"action": "new", "width": w, "height": h}));
+            assert!(r.as_ref().is_err_and(|e| e.contains("plate width and height")), "{r:?}");
+            assert_eq!(
+                a.open.as_ref().unwrap().project,
+                project,
+                "no layout added for {w} x {h}"
+            );
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark, "no undo step for {w} x {h}");
+        }
+        call(&mut a, "panels", json!({"action": "new", "width": 600, "height": 800})).unwrap();
+        let project = a.open.as_ref().unwrap().project.clone();
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        let rail = json!({"kind": "rail", "at": {"x": 10.0, "y": 100.0}, "length": 100.0});
+        let off =
+            json!({"kind": "device", "tag": "-K1", "at": {"x": 550.0, "y": 100.0}, "width": 90.0, "height": 90.0});
+        for content in [
+            json!({"name": "P", "width": -1.0, "height": 800.0, "items": [rail]}),
+            json!({"name": "P", "width": 600.0, "height": 800.0, "items": [rail, off]}),
+        ] {
+            let r = call(&mut a, "panels", json!({"action": "replace", "content": content}));
+            assert!(r.is_err(), "{r:?}");
+            assert_eq!(a.open.as_ref().unwrap().project, project, "the layout stays as it was");
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark, "no undo step");
+        }
+        let r = call(
+            &mut a,
+            "panels",
+            json!({"action": "replace", "content": {"name": "P", "width": 600.0, "height": 800.0, "items": [off]}}),
+        );
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("-K1")),
+            "names what sticks out: {r:?}"
+        );
+        let long_rail = json!({"kind": "rail", "at": {"x": 550.0, "y": 100.0}, "length": 100.0});
+        let back_rail = json!({"kind": "rail", "at": {"x": 50.0, "y": 100.0}, "length": -100.0});
+        let duct = json!({"kind": "duct", "min": {"x": 10.0, "y": 700.0}, "max": {"x": 590.0, "y": 840.0}});
+        let back_duct = json!({"kind": "duct", "min": {"x": 650.0, "y": 100.0}, "max": {"x": 590.0, "y": 140.0}});
+        for (item, name) in [
+            (long_rail, "rail at 550,100"),
+            (back_rail, "rail at 50,100"),
+            (duct, "duct 10,700"),
+            (back_duct, "duct 650,100"),
+        ] {
+            let content = json!({"name": "P", "width": 600.0, "height": 800.0, "items": [item]});
+            let r = call(&mut a, "panels", json!({"action": "replace", "content": content}));
+            assert!(r.as_ref().is_err_and(|e| e.contains(name)), "{name} sticks out: {r:?}");
+            assert_eq!(a.open.as_ref().unwrap().project, project, "the layout stays as it was");
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark, "no undo step");
+        }
+        let ok = json!({"name": "P", "width": 600.0, "height": 800.0, "items": [rail]});
+        call(&mut a, "panels", json!({"action": "replace", "content": ok})).unwrap();
+        assert_eq!(a.open.as_ref().unwrap().project.panels[0].items.len(), 1);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::plc_rack::PlcRack;
-use wc_core::project::PageSize;
+use wc_core::project::{PageNumberError, PageSize};
 use wc_core::route::{self, Axis, Route};
 use wc_core::template::PageTemplate;
 use wc_core::{DevicePart, DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
@@ -607,6 +607,10 @@ pub struct Open {
     /// putting it back.
     #[cfg(test)]
     block_after_snapshot: Option<PathBuf>,
+    /// Tests: a part copy that a refused [`Open::ensure_parts`] takes back turns into a folder
+    /// with a file in it first, so removing it fails.
+    #[cfg(test)]
+    block_copy_removal: bool,
     /// Tests: a file whose backup read fails, though the file is a plain readable one.
     #[cfg(test)]
     unreadable: Option<PathBuf>,
@@ -687,6 +691,8 @@ impl Open {
             fail_part_writes: Default::default(),
             #[cfg(test)]
             block_after_snapshot: None,
+            #[cfg(test)]
+            block_copy_removal: false,
             #[cfg(test)]
             unreadable: None,
             #[cfg(test)]
@@ -1163,6 +1169,65 @@ impl Open {
         Ok(())
     }
 
+    /// Check that every part can be used (taken from the library when needed) without pinning
+    /// any of them, so a change can be refused before anything else of it is applied.
+    pub fn check_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let lock = self.project.lock.clone();
+        let r = self.ensure_parts(ids);
+        self.project.lock = lock;
+        r
+    }
+
+    /// [`Open::ensure_part`] for every part, all or none: when one cannot be used, the copies
+    /// and loaded parts the earlier ones got here are taken back (those there before are kept),
+    /// and so is the lock.
+    fn ensure_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let lock = self.project.lock.clone();
+        // What this call added: the parts loaded here and the copies written that were not there.
+        let (mut loaded, mut copies) = (Vec::new(), Vec::new());
+        let mut r = Ok(());
+        for id in ids {
+            let was_loaded = self.parts.contains_key(id);
+            let missing = store::vendor_path(&self.dir, ItemKind::Part, id)
+                .ok()
+                .filter(|path| !path.try_exists().unwrap_or(true));
+            r = self.ensure_part(id);
+            if !was_loaded && self.parts.contains_key(id) {
+                loaded.push(id.to_owned());
+            }
+            copies.extend(missing.filter(|path| path.exists()));
+            if r.is_err() {
+                break;
+            }
+        }
+        if r.is_err() {
+            for id in loaded {
+                self.parts.remove(&id);
+            }
+            let mut left = Vec::new();
+            for path in copies {
+                #[cfg(test)]
+                if self.block_copy_removal {
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::create_dir(&path).and_then(|()| std::fs::write(path.join("x"), ""));
+                }
+                if let Err(e) = std::fs::remove_file(&path) {
+                    left.push(format!("{} ({e})", path.display()));
+                }
+            }
+            self.project.lock = lock;
+            if !left.is_empty() {
+                r = r.map_err(|e| {
+                    format!(
+                        "{e}; these part copies taken into the project could not be removed: {}",
+                        left.join("; ")
+                    )
+                });
+            }
+        }
+        r
+    }
+
     /// Replace a device's accessories (its parts after the main part). New parts are taken from
     /// the library into the project; a quantity of 0 is taken as 1. One undo step.
     pub fn set_device_accessories(&mut self, tag: &DeviceTag, accessories: Vec<DevicePart>) -> Result<(), String> {
@@ -1174,13 +1239,8 @@ impl Open {
             return Ok(());
         }
         let lock = self.project.lock.clone();
-        for a in &accessories {
-            if let Err(e) = self.ensure_part(&a.part) {
-                // Parts taken before this one are not pinned without a change that uses them.
-                self.project.lock = lock;
-                return Err(e);
-            }
-        }
+        // Parts taken before one that cannot be used are taken back, copy and pin.
+        self.ensure_parts(accessories.iter().map(|a| a.part.as_str()))?;
         self.checkpoint_with_lock(lock);
         self.project.devices.entry(tag.clone()).or_default().accessories = accessories;
         Ok(())
@@ -3369,17 +3429,16 @@ impl Open {
         overview: bool,
         fields: Option<&BTreeMap<String, String>>,
     ) -> Result<usize, String> {
-        let number = number.trim();
-        if number.is_empty() {
-            return Err("The page number cannot be empty.".into());
-        }
         let Some(current) = self.project.pages.get(page) else {
             return Err("No such page.".into());
         };
         let id = current.id.clone();
-        if self.project.pages.iter().any(|p| p.number == number && p.id != id) {
-            return Err(format!("Page {number} already exists."));
-        }
+        let number = match self.project.free_page_number(number, Some(&id)) {
+            Ok(number) => number,
+            Err(PageNumberError::Empty) => return Err("The page number cannot be empty.".into()),
+            Err(PageNumberError::Taken { number, .. }) => return Err(format!("Page {number} already exists.")),
+        };
+        let number = number.as_str();
         let mut own = current.clone();
         for (k, v) in fields.into_iter().flatten() {
             own.set_title_field(k, v);
@@ -9831,6 +9890,70 @@ pub(crate) mod tests {
         );
         assert!(o.undo());
         assert!(o.project.devices.get(&tag).is_none_or(|d| d.accessories.is_empty()));
+    }
+
+    #[test]
+    fn a_refused_accessory_list_takes_no_part_into_the_project() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let a = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        let id = o
+            .part_library
+            .iter()
+            .map(|(id, _)| id.clone())
+            .find(|id| !o.parts.contains_key(id))
+            .unwrap();
+        let copy = store::vendor_path(&o.dir, ItemKind::Part, &id).unwrap();
+        assert!(!copy.exists());
+        let list = vec![
+            DevicePart {
+                part: id.clone(),
+                qty: 1,
+            },
+            DevicePart {
+                part: "no.such.part".into(),
+                qty: 1,
+            },
+        ];
+        assert!(o.check_parts(list.iter().map(|a| a.part.as_str())).is_err());
+        assert!(!copy.exists(), "no copy left by a refused check");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused check");
+        assert!(o.set_device_accessories(&tag, list).is_err());
+        assert!(!copy.exists(), "no copy left by a refused change");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused change");
+        assert!(!o.project.lock.parts.contains_key(&id));
+        let good = vec![DevicePart {
+            part: id.clone(),
+            qty: 1,
+        }];
+        o.check_parts(good.iter().map(|a| a.part.as_str())).unwrap();
+        o.set_device_accessories(&tag, good).unwrap();
+        assert!(copy.exists());
+        assert!(o.parts.contains_key(&id));
+        assert!(o.project.lock.parts.contains_key(&id));
+    }
+
+    #[test]
+    fn a_part_copy_that_cannot_be_taken_back_is_named_with_its_reason() {
+        let (_tmp, mut o) = project();
+        let id = o
+            .part_library
+            .iter()
+            .map(|(id, _)| id.clone())
+            .find(|id| !o.parts.contains_key(id))
+            .unwrap();
+        let copy = store::vendor_path(&o.dir, ItemKind::Part, &id).unwrap();
+        let ids = [id.as_str(), "no.such.part"];
+        let plain = o.check_parts(ids).unwrap_err();
+        assert!(!plain.contains("could not be removed"), "{plain}");
+        o.block_copy_removal = true;
+        let e = o.check_parts(ids).unwrap_err();
+        assert!(e.starts_with(&plain), "the lookup error is kept: {e}");
+        assert!(e.contains("could not be removed"), "{e}");
+        assert!(e.contains(&copy.display().to_string()), "the copy is named: {e}");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused check");
+        assert!(!o.project.lock.parts.contains_key(&id));
     }
 
     #[test]

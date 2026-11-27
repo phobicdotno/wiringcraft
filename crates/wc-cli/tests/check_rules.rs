@@ -51,7 +51,7 @@ fn check_runs_the_rules_in_project_toml() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     let lib = tmp.path().join("lib");
     std::fs::create_dir_all(lib.join("symbols"))?;
     let symbols = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols");
@@ -82,15 +82,15 @@ fn check_runs_the_rules_in_project_toml() -> TestResult {
         "a rule with severity error fails the check: {stdout}"
     );
     assert!(
-        stdout.contains("warning page 1: -M1 has no cable (check rule 1)"),
+        stdout.contains("warning page 2: -M1 has no cable (check rule 1)"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("error   page 1: -X2 does not match -X#.# (check rule 2)"),
+        stdout.contains("error   page 2: -X2 does not match -X#.# (check rule 2)"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("warning page 1: -X1.1:2 has 2 wires, at most 1 allowed (check rule 3)"),
+        stdout.contains("warning page 2: -X1.1:2 has 2 wires, at most 1 allowed (check rule 3)"),
         "{stdout}"
     );
     assert!(!stdout.contains("-X1.1 does not match"), "{stdout}");
@@ -120,11 +120,11 @@ fn check_runs_the_rules_in_project_toml() -> TestResult {
     )?;
     let house = String::from_utf8_lossy(&run(&dir, &["check", "--all"])?.stdout).into_owned();
     assert!(
-        house.contains("warning page 1: -X1.1 does not match -?# (check rule 1 \"short-tags\" of library mine)"),
+        house.contains("warning page 2: -X1.1 does not match -?# (check rule 1 \"short-tags\" of library mine)"),
         "{house}"
     );
     assert!(
-        house.contains("note    page 1: -X1.1:2 has 2 wires, at most 1 allowed (check rule 2 of library mine)"),
+        house.contains("note    page 2: -X1.1:2 has 2 wires, at most 1 allowed (check rule 2 of library mine)"),
         "{house}"
     );
     // The project turns one off by name and one by number.

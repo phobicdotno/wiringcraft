@@ -429,10 +429,11 @@ pub fn check_with_unreadable(
 
     wire_numbers(i, &wire_net, &mut out);
 
-    // Panel layouts: devices covering each other, sticking out of the plate, or whose tag is
-    // no longer in the project. Outlines that only touch do not overlap. A tag is in the project
-    // when it is drawn on a page or listed in the devices file; unlike `all_tags`, a tag drawn
-    // only as interruption points still counts, so its plate entry is not called stale.
+    // Panel layouts: rails and ducts sticking out of the plate, and devices covering each
+    // other, sticking out of the plate, or whose tag is no longer in the project. Outlines that
+    // only touch do not overlap. A tag is in the project when it is drawn on a page or listed in
+    // the devices file; unlike `all_tags`, a tag drawn only as interruption points still counts,
+    // so its plate entry is not called stale.
     let index = p.tag_index();
     for panel in &p.panels {
         let warn = |message: String| Finding {
@@ -450,11 +451,34 @@ pub fn check_with_unreadable(
                 _ => None,
             })
             .collect();
+        let on_plate = |min: Point, max: Point| wc_core::panel::outline_on_plate(panel.width, panel.height, min, max);
+        // Rails and ducts too, named as a plate resize names them.
+        for it in &panel.items {
+            let (min, max) = it.bounds();
+            let what = match it {
+                wc_core::panel::PanelItem::Rail { at, .. } => format!("rail at {},{}", at.x, at.y),
+                wc_core::panel::PanelItem::Duct { min, max } => {
+                    format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y)
+                }
+                wc_core::panel::PanelItem::Device { .. } => continue,
+            };
+            // `bounds` sorts a duct's corners with `min`/`max`, which drop a NaN, so the
+            // corners as written must be numbers too.
+            let written_finite = match it {
+                wc_core::panel::PanelItem::Duct { min, max } => {
+                    [min.x, min.y, max.x, max.y].iter().all(|v| v.is_finite())
+                }
+                _ => true,
+            };
+            if !written_finite || !on_plate(min, max) {
+                out.push(warn(format!("{what} sticks out of the plate")));
+            }
+        }
         for (n, (tag, min, max)) in devices.iter().enumerate() {
             if !index.contains_key(*tag) && !p.devices.contains_key(*tag) {
                 out.push(warn(format!("{tag} is on the plate but no longer in the project")));
             }
-            if min.x < -eps || min.y < -eps || max.x > panel.width + eps || max.y > panel.height + eps {
+            if !on_plate(*min, *max) {
                 out.push(warn(format!("{tag} sticks out of the plate")));
             }
             for (other, omin, omax) in &devices[n + 1..] {
@@ -928,20 +952,29 @@ pub fn check_table(i: &Inputs<'_>) -> Table {
 }
 
 /// Wires whose two ends are on the same pin of the same symbol: they connect nothing, yet show
-/// in the wire list and silence the pin's open-pin note.
+/// in the wire list and silence the pin's open-pin note. Wire ids need not be unique, so a wire
+/// that shares its id with others on the page says which of them it is: otherwise two such wires
+/// would give the same finding and the check would show only one.
 fn same_pin_wires(i: &Inputs<'_>, out: &mut Vec<Finding>) {
     for page in &i.project.pages {
-        for w in &page.wires {
+        for (n, w) in page.wires.iter().enumerate() {
             if let (Endpoint::Pin { item, pin }, Endpoint::Pin { item: item2, pin: pin2 }) = (&w.from, &w.to)
                 && item == item2
                 && pin == pin2
             {
+                let same_id = page.wires.iter().filter(|x| x.id == w.id).count();
+                let which = if same_id > 1 {
+                    let k = page.wires.iter().take(n).filter(|x| x.id == w.id).count() + 1;
+                    format!(" (wire {k} of {same_id} with id {} on this page)", w.id)
+                } else {
+                    String::new()
+                };
                 out.push(at(
                     page,
                     &w.id,
                     Severity::Warning,
                     format!(
-                        "wire{} starts and ends on {}",
+                        "wire{} starts and ends on {}{which}",
                         w.number.as_ref().map(|n| format!(" {n}")).unwrap_or_default(),
                         crate::pin_label(i.project, &page.id, item, pin)
                     ),

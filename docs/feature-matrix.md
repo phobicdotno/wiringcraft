@@ -81,7 +81,7 @@ For the other areas, the chapter to read in each help is:
 | Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new <dir> --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |
-| Multi-language project texts and translation dictionary | yes | yes | yes: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two), `wiringcraft translations --lang nb` lists missing texts; in the app, File, Translations edits the texts with a column per language (missing ones marked) and the PDF export asks for the language; Undo and Redo take back and bring back translation edits made in the app or by its assistant (#589; not in a shared session, whose history does not hold the file), and refuse the step when another program changed the file since, so that change is not written over (#657) | done: CLI (#276), app (#451) |
+| Multi-language project texts and translation dictionary | yes | yes | yes: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two; `wiringcraft drawing --lang` too, for SVG and DXF), `wiringcraft translations --lang nb` lists missing texts; in the app, File, Translations edits the texts with a column per language (missing ones marked) and the PDF export asks for the language; Undo and Redo take back and bring back translation edits made in the app or by its assistant (#589; not in a shared session, whose history does not hold the file), and refuse the step when another program changed the file since, so that change is not written over (#657) | done: CLI (#276), app (#451) |
 
 ## 2. Editing on the sheet
 
@@ -154,7 +154,7 @@ For the other areas, the chapter to read in each help is:
 | Terminals and terminal strips | yes | yes | yes | done |
 | Terminal plan report | yes | yes | yes | done |
 | Terminal strip editor (reorder, add spares) | yes | yes | yes: rail order and spare terminals in the project file, levels and jumpers edited there; app window (drag or arrows, tick terminals to jumper them), `strip` CLI commands; terminal plan and WAGO configurator follow it | done (#263) |
-| Jumpers (bridges) between terminals | yes | yes | yes: project file, one net, terminal plan column, CLI and app; jumpers from the SolidWorks Electrical terminal strip editor are imported (#247) | done (#108) |
+| Jumpers (bridges) between terminals | yes | yes | yes: project file, one net, terminal plan column, CLI and app; drawn as a bar on the page in the editor and in the PDF, SVG and DXF exports (#1213); jumpers from the SolidWorks Electrical terminal strip editor are imported (#247) | done (#108) |
 | Multi-level terminals | yes | yes | yes: `Level` device property, terminal plan column, one WAGO marker per block | done (#124) |
 | Terminal and wire marking export (label printers) | yes | yes | yes: WAGO smartScript CSV with lines, engraving text, language and one-strip export ([docs](wago-marking.md)) | done (#57, #129) |
 | SolidWorks terminal strips on import | - | - | yes: terminal strips with their terminals, the from/to terminals of each wire, and the jumpers of the terminal strip editor | done (#70, #247) |
@@ -194,7 +194,7 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817); in the app's panel view a rail or duct is dragged to move it, kept on the plate, one undo step per drag; a picked rail's right end or a duct's bottom-right corner is dragged to change its length or size, snapped, kept on the plate, one undo step per drag, and a rail is never shortened past the devices on it (#813, #983); a panel layout's name and plate width and height are changed in its properties in the app (#894) | done |
+| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817); in the app's panel view a rail or duct is dragged to move it, kept on the plate, one undo step per drag; a picked rail's right end or a duct's bottom-right corner is dragged to change its length or size, snapped, kept on the plate, one undo step per drag, and a rail is never shortened past the devices on it (#813, #983); a panel layout's name and plate width and height are changed in its properties in the app, refusing a size that would leave rails, ducts or devices sticking out (#894, #1196) | done |
 | Place devices onto rails from the schematic | add-on | yes | yes: `panel arrange` (Page menu → Arrange devices in the app), or one device at a time with Place in the panel layout's "Not on the plate yet" list in the app (first DIN rail with room, else a free spot; #928) or with `panel device <panel> <tag> --at x,y [--rotate 90]` (or `--remove`); `panel show` lists each device with its place, size and turn (#507); `panel edit <panel> [--name ...] [--width W] [--height H]` renames a layout or changes its plate size, keeping rails, ducts and devices where they are and refusing a size that would leave any of them sticking out (#734) | done |
 | Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | yes: `import footprint-dxf`, or Attach footprint drawing in the app's panel layout properties, stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. A device can be turned in quarter steps (Rotate 90° in its properties, or R on the layout); its box, its drawing and its STEP block turn with it (#485) | done (#312, #485) |
 | 3D model export (STEP) | add-on | yes | yes | done |
@@ -207,7 +207,7 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| Project check with errors and warnings | yes | yes | yes, in the app and the CLI; it also warns about panel layout devices that overlap, stick out of the plate or are no longer in the project | done (#733) |
+| Project check with errors and warnings | yes | yes | yes, in the app and the CLI; it also warns about panel layout devices that overlap, stick out of the plate or are no longer in the project, and rails or ducts that stick out of the plate | done (#733, #1158) |
 | Online check while drawing | yes | partly | yes: the check runs again shortly after each edit, off the window thread; problems are ringed on the canvas and counted in the status bar (File → Check while drawing turns it off) | done (#269) |
 | User-defined check rules | yes | no | yes: `[[rule]]` tables in `project.toml` (a cable on matching devices, a tag pattern, at most N wires per pin), run with the built-in check in the app and `wiringcraft check`; added, changed, reordered and deleted in the Rules dialog next to the check list (one undo step); house rules in a library source's `rules.toml` run for every project using it, named by source, and a project turns one off with `rules_off = ["source:2"]` or by name; listed, replaced from a TOML or JSON file and turned off or on with `wiringcraft rules list/set/off/on`, with the dialog's checks; see `wc_core::check_rule` | done (#274, #429, #430, #587) |
 
@@ -243,7 +243,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | Scripting API | yes (C# scripts, API) | yes (API) | yes: the `wiringcraft` command line | done |
 | Generating schematics from tables or configurators | add-on (Cogineer) | no | partly: the assistant draws from plain words | later |
-| AI assistant that edits the open project | no | no | yes | done |
+| AI assistant that edits the open project | no | no | yes: its `get_state` also tells how the grid, auto-wiring, checking while drawing, theme and menu style are set, so it switches one knowingly | done |
 | Log file for bug reports | yes | yes | yes | done (#48) |
 
 ## 16. Other disciplines

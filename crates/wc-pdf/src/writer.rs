@@ -537,7 +537,9 @@ impl Pen {
     }
 
     pub fn polyline(&mut self, pts: &[(f64, f64)], closed: bool) {
-        let Some(first) = pts.first() else { return };
+        let Some(first) = pts.first().filter(|_| all_finite(pts)) else {
+            return;
+        };
         self.path(pts.to_vec(), closed, false);
         let (x, y) = self.p(first.0, first.1);
         let _ = writeln!(self.ops, "{x:.2} {y:.2} m");
@@ -550,7 +552,9 @@ impl Pen {
 
     /// A closed outline filled with the pen colour.
     pub fn polygon_filled(&mut self, pts: &[(f64, f64)]) {
-        let Some(first) = pts.first() else { return };
+        let Some(first) = pts.first().filter(|_| all_finite(pts)) else {
+            return;
+        };
         self.path(pts.to_vec(), true, true);
         let (x, y) = self.p(first.0, first.1);
         let _ = writeln!(self.ops, "{x:.2} {y:.2} m");
@@ -596,6 +600,9 @@ impl Pen {
     }
 
     pub fn rect(&mut self, min: (f64, f64), max: (f64, f64)) {
+        if !all_finite(&[min, max]) {
+            return;
+        }
         self.path(Self::corners(min, max), true, false);
         let (x, y) = self.p(min.0, max.1);
         let _ = writeln!(
@@ -607,6 +614,9 @@ impl Pen {
     }
 
     pub fn fill_rect(&mut self, min: (f64, f64), max: (f64, f64)) {
+        if !all_finite(&[min, max]) {
+            return;
+        }
         self.path(Self::corners(min, max), true, true);
         let (x, y) = self.p(min.0, max.1);
         let _ = writeln!(
@@ -619,6 +629,9 @@ impl Pen {
 
     /// Arc from `start` to `end` degrees, angles measured clockwise on the page from +x.
     pub fn arc(&mut self, c: (f64, f64), r: f64, start: f64, end: f64, filled: bool) {
+        if !all_finite(&[c, (r, start), (end, 0.0)]) {
+            return;
+        }
         let mut sweep = end - start;
         if sweep <= 0.0 {
             sweep += 360.0;
@@ -678,7 +691,7 @@ impl Pen {
 
     /// Text turned by `angle` degrees counter-clockwise around its anchor.
     pub fn text_at_angle(&mut self, at: (f64, f64), height_mm: f64, align: u8, angle: f64, s: &str) {
-        if s.is_empty() {
+        if s.is_empty() || !all_finite(&[at, (height_mm, 0.0)]) {
             return;
         }
         let size = height_mm * PT_PER_MM / 0.72; // cap height to font size
@@ -716,6 +729,13 @@ impl Pen {
 }
 
 pub use wc_core::font::text_width_mm;
+
+/// Whether every number is finite. `nan` and `inf` are valid TOML numbers, so a hand-edited
+/// project can hold them; a shape with one is left out rather than written as `NaN` or `inf`,
+/// which PDF readers refuse (and the SVG and DXF would draw at the page corner).
+fn all_finite(pts: &[(f64, f64)]) -> bool {
+    pts.iter().all(|(x, y)| x.is_finite() && y.is_finite())
+}
 
 /// A page label prefix as a PDF text string: printable ASCII as a literal string with `(`, `)`
 /// and `\` escaped, anything else as UTF-16BE hex with a byte order mark.

@@ -205,19 +205,31 @@ impl Shape {
                 }
             }
             // Text keeps its reading direction when its symbol turns, so it stays readable.
+            // Where the placement reverses that direction (a mirror, or half a turn), left and
+            // right alignment swap, so the text still grows away from the drawing.
             Shape::Text {
                 at,
                 text,
                 height,
                 align,
                 angle,
-            } => Shape::Text {
-                at: t(*at),
-                text: text.clone(),
-                height: *height,
-                align: *align,
-                angle: *angle,
-            },
+            } => {
+                let r = angle.to_radians();
+                let d = Point::new(r.cos(), -r.sin());
+                let turned = d.transform(rotation, mirror);
+                let reversed = d.x * turned.x + d.y * turned.y < -0.5;
+                Shape::Text {
+                    at: t(*at),
+                    text: text.clone(),
+                    height: *height,
+                    align: match (align, reversed) {
+                        (Align::Left, true) => Align::Right,
+                        (Align::Right, true) => Align::Left,
+                        (a, _) => *a,
+                    },
+                    angle: *angle,
+                }
+            }
             // A mirror turns left of a→b into right of it.
             Shape::Dimension { a, b, offset, height } => Shape::Dimension {
                 a: t(*a),
@@ -513,6 +525,41 @@ mod tests {
         // Height and offset have defaults.
         let bare = serde_json::from_str::<Shape>(r#"{"kind":"dimension","a":{"x":0,"y":0},"b":{"x":5,"y":0}}"#).ok();
         assert_eq!(bare, Some(dim((0.0, 0.0), (5.0, 0.0), 0.0)));
+    }
+
+    #[test]
+    fn a_mirrored_or_upside_down_text_grows_away_from_the_drawing() {
+        let text = |at: (f64, f64), align: Align, angle: f64| Shape::Text {
+            at: Point::new(at.0, at.1),
+            text: "13".into(),
+            height: 2.0,
+            align,
+            angle,
+        };
+        // A pin designation just right of a contact line, left-aligned.
+        let t = text((1.2, 2.5), Align::Left, 0.0);
+        let at = Point::default();
+        assert_eq!(t.placed(at, Rotation::R0, true), text((-1.2, 2.5), Align::Right, 0.0));
+        assert_eq!(
+            t.placed(at, Rotation::R180, false),
+            text((-1.2, -2.5), Align::Right, 0.0)
+        );
+        // Mirrored and turned half round, it reads the same way as before.
+        assert_eq!(t.placed(at, Rotation::R180, true), text((1.2, -2.5), Align::Left, 0.0));
+        // A quarter turn moves it along its reading direction, not against it.
+        assert_eq!(t.placed(at, Rotation::R90, false), text((-2.5, 1.2), Align::Left, 0.0));
+        assert_eq!(t.placed(at, Rotation::R90, true), text((-2.5, -1.2), Align::Left, 0.0));
+        let right = text((-1.2, 2.5), Align::Right, 0.0);
+        assert_eq!(right.placed(at, Rotation::R0, true), text((1.2, 2.5), Align::Left, 0.0));
+        let centre = text((0.0, 2.5), Align::Center, 0.0);
+        assert_eq!(centre.placed(at, Rotation::R0, true), centre);
+        // A text that reads upwards only swaps when the placement turns it end over end.
+        let up = text((1.2, 2.5), Align::Left, 90.0);
+        assert_eq!(up.placed(at, Rotation::R0, true), text((-1.2, 2.5), Align::Left, 90.0));
+        assert_eq!(
+            up.placed(at, Rotation::R180, false),
+            text((-1.2, -2.5), Align::Right, 90.0)
+        );
     }
 
     #[test]

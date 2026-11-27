@@ -1,6 +1,6 @@
 //! SVG symbol import. Pins are marked by `id="pin:NAME"`, `data-pin="NAME"` or
 //! `class="pin"` (named by order). One SVG user unit is one millimetre unless the root element
-//! gives a width in mm together with a viewBox.
+//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -29,6 +29,14 @@ impl M {
     fn p(&self, x: f64, y: f64) -> Point {
         let [a, b, c, d, e, f] = self.0;
         Point::new(a * x + c * y + e, b * x + d * y + f)
+    }
+    /// The turn of a text drawn with this transform, in whole degrees from 0 to 360: the
+    /// direction of its x axis. Negated, since SVG's y runs down and a text angle turns
+    /// counter-clockwise on the page.
+    fn text_angle(&self) -> f64 {
+        let [a, b, ..] = self.0;
+        // `+ 0.0` turns a -0 from an unturned text into 0.
+        (-b.atan2(a).to_degrees()).round().rem_euclid(360.0) + 0.0
     }
     fn scale(&self) -> f64 {
         let [a, b, ..] = self.0;
@@ -179,8 +187,12 @@ fn font_size(v: &str) -> Option<f64> {
 }
 
 /// Elements whose content a browser never draws in place: definitions, markers, clip paths,
-/// masks and patterns. A `<symbol>` is drawn only through `<use>`, which is not imported.
-const NOT_DRAWN: [&str; 6] = ["defs", "symbol", "marker", "clipPath", "mask", "pattern"];
+/// masks and patterns, and the tooltip and notes elements (`<title>`, `<desc>`, `<metadata>`),
+/// whose words never join a label. A `<symbol>` is drawn only through `<use>`, which is not
+/// imported.
+const NOT_DRAWN: [&str; 9] = [
+    "defs", "symbol", "marker", "clipPath", "mask", "pattern", "title", "desc", "metadata",
+];
 
 /// Whether an element is drawn at all, and whether it is visible, from its parent's
 /// `(drawn, visible)`. `display:none` and the containers in [`NOT_DRAWN`] hide everything under
@@ -194,6 +206,31 @@ fn shown(e: &BytesStart, tag: &str, (drawn, visible): (bool, bool)) -> (bool, bo
         _ => visible,
     };
     (drawn, visible)
+}
+
+/// Font size and text alignment set on an element or passed down from its parents, as a fill
+/// is. `None` is set nowhere above: the size falls back to 3.5, the alignment to the left.
+#[derive(Clone, Copy, Default)]
+struct Font {
+    size: Option<f64>,
+    align: Option<Align>,
+}
+
+/// The font of an element from its parent's: its own `font-size` and `text-anchor` (from
+/// `style` first, then the attribute) win, and a value that is not read (`inherit`, `em`, ...)
+/// keeps the parent's.
+fn font(e: &BytesStart, parent: Font) -> Font {
+    let value = |name| presentation(e, name).map(|v| split_important(&v).0.trim().to_ascii_lowercase());
+    let align = match value("text-anchor").as_deref() {
+        Some("start") => Some(Align::Left),
+        Some("middle") => Some(Align::Center),
+        Some("end") => Some(Align::Right),
+        _ => parent.align,
+    };
+    Font {
+        size: value("font-size").and_then(|s| font_size(&s)).or(parent.size),
+        align,
+    }
 }
 
 /// Whether a fill paints the shape: not `none`, `transparent` or white (`#fff`, `white`,
@@ -221,6 +258,25 @@ fn is_white_rgb(f: &str) -> bool {
     parts.len() == 3 && parts.iter().all(|p| matches!(*p, "255" | "100%"))
 }
 
+/// A length in an absolute unit (`mm`, `cm`, `Q`, `in`, `pt`, `pc`) in millimetres. A bare
+/// number, `px` and relative units give `None`: the user unit then stays one millimetre. Units
+/// are matched in any letter case, as CSS reads them (`160q` is `160Q`).
+fn length_mm(v: &str) -> Option<f64> {
+    let v = v.trim().to_ascii_lowercase();
+    let (n, per) = [
+        ("mm", 1.0),
+        ("cm", 10.0),
+        ("q", 0.25),
+        ("in", 25.4),
+        ("pt", 25.4 / 72.0),
+        ("pc", 25.4 / 6.0),
+    ]
+    .into_iter()
+    .find_map(|(unit, per)| v.strip_suffix(unit).map(|n| (n, per)))?;
+    let mm = n.trim().parse::<f64>().ok()? * per;
+    mm.is_finite().then_some(mm)
+}
+
 fn num(e: &BytesStart, name: &str) -> f64 {
     attr(e, name).and_then(|v| numbers(&v).first().copied()).unwrap_or(0.0)
 }
@@ -228,10 +284,11 @@ fn num(e: &BytesStart, name: &str) -> f64 {
 /// Path data to polylines. Curves and elliptical arcs are flattened into short straight segments.
 /// The arguments of an arc command: groups of seven, whose fourth and fifth (the large-arc and
 /// sweep flags) are one `0` or `1` each and may run into the next argument without a separator
-/// (`0110 20` is the flags 0 and 1 and the end x 10). Reading stops at the first argument that is
+/// (`0110 20` is the flags 0 and 1 and the end x 10); arguments are parted by white space and at
+/// most one comma. Reading stops at the first argument that is
 /// not well formed, or at an arc with no arguments or a group cut short, as SVG stops drawing a
-/// path at an error: the arguments read before it come back with `false`.
-fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
+/// path at an error: the arguments read before it come back with the reason.
+fn arc_numbers(s: &str) -> (Vec<f64>, Option<String>) {
     let b = s.as_bytes();
     let at = |i: usize| b.get(i).copied();
     let digits = |i: &mut usize| {
@@ -244,15 +301,25 @@ fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
     let mut out = Vec::new();
     let mut i = 0;
     loop {
-        while at(i).is_some_and(|c| c.is_ascii_whitespace() || c == b',') {
+        // Between arguments: white space with at most one comma.
+        let mut commas = 0;
+        while let Some(c) = at(i).filter(|c| c.is_ascii_whitespace() || *c == b',') {
+            commas += usize::from(c == b',');
             i += 1;
+        }
+        if commas > 1 {
+            let n = out.len() + 1;
+            return (out, Some(format!("arc argument {n} comes after more than one comma")));
         }
         let Some(first) = at(i) else { break };
         if matches!(out.len() % 7, 3 | 4) {
             match first {
                 b'0' => out.push(0.0),
                 b'1' => out.push(1.0),
-                _ => return (out, false),
+                _ => {
+                    let n = out.len() + 1;
+                    return (out, Some(format!("arc argument {n} is a flag that is not 0 or 1")));
+                }
             }
             i += 1;
             continue;
@@ -267,32 +334,166 @@ fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
             digits(&mut i)
         };
         if !whole && !fraction {
-            return (out, false);
+            let n = out.len() + 1;
+            return (out, Some(format!("arc argument {n} is not a number")));
         }
         if matches!(at(i), Some(b'e' | b'E')) {
-            let mark = i;
             i += 1;
             if matches!(at(i), Some(b'+' | b'-')) {
                 i += 1;
             }
+            // An `e` or sign without digits after it is not a number, as `5e` or `5e+`.
             if !digits(&mut i) {
-                i = mark;
+                let n = out.len() + 1;
+                return (out, Some(format!("arc argument {n} is not a number")));
             }
         }
         match s.get(start..i).and_then(|t| t.parse::<f64>().ok()) {
             Some(v) if v.is_finite() => out.push(v),
-            _ => return (out, false),
+            _ => {
+                let n = out.len() + 1;
+                return (out, Some(format!("arc argument {n} is not a finite number")));
+            }
         }
     }
     // An arc without arguments, or with a group of seven cut short, is an error too.
-    let complete = !out.is_empty() && out.len() % 7 == 0;
-    (out, complete)
+    let error = if out.is_empty() {
+        Some("an arc has no arguments".to_owned())
+    } else if out.len() % 7 != 0 {
+        let n = out.len();
+        Some(format!("an arc is cut short after argument {n} (an arc takes 7)"))
+    } else {
+        None
+    };
+    (out, error)
+}
+
+/// The most points in the filled outlines of one `<path>` with several closed sub-paths; a
+/// bigger fill would take too long to cut into triangles for the canvas, so it stays outlines.
+const MAX_HOLE_FILL_POINTS: usize = 20_000;
+
+/// Whether `pt` lies on an edge of the loop (within a hair).
+fn on_edge(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+    lp.iter().zip(lp.iter().cycle().skip(1)).any(|(&a, &b)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((pt.0 - a.0) * dx + (pt.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (cx, cy) = (a.0 + t * dx - pt.0, a.1 + t * dy - pt.1);
+        cx * cx + cy * cy <= 1e-18_f64.max(len2 * 1e-20)
+    })
+}
+
+/// The closed sub-paths of one filled `<path>` as filled outlines with their holes cut in (see
+/// [`crate::dxf::with_holes_kept`]), so a ring or a letter O keeps its hole open, and the
+/// indices of the sub-paths that are not an edge of the fill (too few points, or inside one
+/// that runs the same way under `nonzero`), to be drawn as outlines. With `nonzero` a sub-path
+/// inside another one that runs the same way adds to it rather than cutting a hole, so only the
+/// outlines where the fill starts or stops are kept; with `evenodd` every nested outline
+/// switches it. Nesting is read from a point of each sub-path that is on no other one (a hole
+/// may touch the outline around it), so sub-paths that cross each other are taken as nested or
+/// apart, not as overlapping. `None` when the sub-paths are too many or too big to work out.
+fn solid_parts(rings: &[Vec<Point>], even_odd: bool) -> Option<(Vec<Vec<Point>>, Vec<usize>)> {
+    use crate::dxf::{Loop, NESTING_BUDGET, area2, inside, with_holes_kept};
+    let mut left_out: Vec<usize> = Vec::new();
+    let mut loops: Vec<(usize, Loop)> = Vec::new();
+    for (i, r) in rings.iter().enumerate() {
+        let l: Loop = r.iter().map(|p| (p.x, p.y)).collect();
+        if l.len() >= 3 {
+            loops.push((i, l));
+        } else {
+            left_out.push(i);
+        }
+    }
+    // Start each loop at a point on no other loop, so the nesting tests (here and in
+    // `with_holes_kept`, which read the first point) are not thrown by a touching edge.
+    let mut work = 0usize;
+    let all: Vec<Loop> = loops.iter().map(|(_, l)| l.clone()).collect();
+    for (n, (_, lp)) in loops.iter_mut().enumerate() {
+        let mut start = None;
+        for (v, &pt) in lp.iter().enumerate() {
+            let mut clear = true;
+            for (k, other) in all.iter().enumerate() {
+                if k == n {
+                    continue;
+                }
+                work = work.saturating_add(other.len());
+                if work > NESTING_BUDGET {
+                    return None;
+                }
+                if on_edge(pt, other) {
+                    clear = false;
+                    break;
+                }
+            }
+            if clear {
+                start = Some(v);
+                break;
+            }
+        }
+        lp.rotate_left(start?);
+    }
+    if !even_odd {
+        // Biggest first, so the loop around another comes before it.
+        loops.sort_by(|a, b| area2(&b.1).abs().total_cmp(&area2(&a.1).abs()));
+        // The winding number inside each loop (but outside the loops in it): its own turn plus
+        // those of every loop around it.
+        let mut winding: Vec<i64> = Vec::with_capacity(loops.len());
+        let mut keep: Vec<bool> = Vec::with_capacity(loops.len());
+        for (i, (_, lp)) in loops.iter().enumerate() {
+            let pt = *lp.first()?;
+            let mut around = None;
+            for k in (0..i).rev() {
+                let other = &loops.get(k)?.1;
+                work = work.saturating_add(other.len());
+                if work > NESTING_BUDGET {
+                    return None;
+                }
+                if inside(pt, other) {
+                    around = Some(k);
+                    break;
+                }
+            }
+            let turn = if area2(lp) >= 0.0 { 1 } else { -1 };
+            let outside = around.and_then(|k| winding.get(k).copied()).unwrap_or(0);
+            let w = outside + turn;
+            // An outline is an edge of the fill only where the fill starts or stops there.
+            keep.push((w != 0) != (outside != 0));
+            winding.push(w);
+        }
+        let mut kept = keep.into_iter();
+        loops.retain(|(i, _)| {
+            let k = kept.next().unwrap_or(false);
+            if !k {
+                left_out.push(*i);
+            }
+            k
+        });
+    }
+    let only: Vec<Loop> = loops.iter().map(|(_, l)| l.clone()).collect();
+    let (solid, _) = with_holes_kept(&only, 0)?;
+    if solid.iter().map(Vec::len).sum::<usize>() > MAX_HOLE_FILL_POINTS {
+        return None;
+    }
+    left_out.sort_unstable();
+    Some((
+        solid
+            .into_iter()
+            .map(|l| l.into_iter().map(|(x, y)| Point::new(x, y)).collect())
+            .collect(),
+        left_out,
+    ))
 }
 
 /// A point of path data, before its transform.
 type Xy = [f64; 2];
 
-fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
+/// The polylines of path data, and why drawing stopped early, if it did: the reason and the
+/// number of the command in the path, counted from 1.
+fn path(d: &str, m: &M) -> (Vec<(Vec<Point>, bool)>, Option<String>) {
     let mut out: Vec<(Vec<Point>, bool)> = Vec::new();
     let mut cur: Vec<Point> = Vec::new();
     let (mut x, mut y, mut sx, mut sy) = (0.0, 0.0, 0.0, 0.0);
@@ -300,7 +501,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
         if cmd.eq_ignore_ascii_case(&'A') {
             arc_numbers(buf)
         } else {
-            (numbers(buf), true)
+            (numbers(buf), None)
         }
     };
     // Tokenise into (command, numbers).
@@ -308,14 +509,18 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
     let mut buf = String::new();
     let mut cmd = ' ';
     // An argument error ends the path: what came before it is drawn, nothing after it.
-    let mut broken = false;
+    let mut stopped: Option<String> = None;
+    let stop_at = |n: usize, cmd: char, why: String| format!("stopped at command {n} ({cmd}): {why}");
     for c in d.chars() {
-        if c.is_ascii_alphabetic() && c != 'e' && c != 'E' {
+        // In an arc, a letter that is no command stays with the arguments, so that the arc
+        // reports the argument it spoils.
+        let in_arc = cmd.eq_ignore_ascii_case(&'A') && !"MmZzLlHhVvCcSsQqTtAa".contains(c);
+        if c.is_ascii_alphabetic() && c != 'e' && c != 'E' && !in_arc {
             if cmd != ' ' {
-                let (v, ok) = args(cmd, &buf);
+                let (v, error) = args(cmd, &buf);
                 cmds.push((cmd, v));
-                if !ok {
-                    broken = true;
+                if let Some(why) = error {
+                    stopped = Some(stop_at(cmds.len(), cmd, why));
                     break;
                 }
             }
@@ -325,8 +530,10 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
             buf.push(c);
         }
     }
-    if cmd != ' ' && !broken {
-        cmds.push((cmd, args(cmd, &buf).0));
+    if cmd != ' ' && stopped.is_none() {
+        let (v, error) = args(cmd, &buf);
+        cmds.push((cmd, v));
+        stopped = error.map(|why| stop_at(cmds.len(), cmd, why));
     }
     let flush = |cur: &mut Vec<Point>, out: &mut Vec<(Vec<Point>, bool)>, closed: bool| {
         if cur.len() >= 2 {
@@ -480,7 +687,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
         quad_ctrl = next_quad;
     }
     flush(&mut cur, &mut out, false);
-    out
+    (out, stopped)
 }
 
 /// Straight segments per Bezier curve.
@@ -500,14 +707,18 @@ struct Arc {
 }
 
 impl Arc {
-    /// The points after the start, the last one the end point. Radii too small to reach the end
-    /// point are scaled up; a zero radius, or values that are not finite, give a straight line
-    /// (SVG 1.1, appendix F.6).
+    /// The points after the start, the last one the end point; none when the end point is the
+    /// start. Radii too small to reach the end point are scaled up; a zero radius, or values that
+    /// are not finite, give a straight line (SVG 1.1, appendix F.6).
     fn points(&self) -> Vec<(f64, f64)> {
         let ((x1, y1), (x2, y2)) = (self.from, self.to);
         let line = vec![(x2, y2)];
         let (mut rx, mut ry) = (self.radii.0.abs(), self.radii.1.abs());
-        if (x1 == x2 && y1 == y2) || rx == 0.0 || ry == 0.0 {
+        // Coinciding end points draw nothing (as if the arc were left out).
+        if x1 == x2 && y1 == y2 {
+            return Vec::new();
+        }
+        if rx == 0.0 || ry == 0.0 {
             return line;
         }
         let (sin, cos) = self.rotation.to_radians().sin_cos();
@@ -560,16 +771,35 @@ impl Arc {
 
 /// Import an SVG symbol.
 pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
+    symbol_with_warnings(text, id, name).map(|(s, _)| s)
+}
+
+/// Like [`symbol`], with one warning per path that stopped drawing at bad data, naming the path
+/// and why it stopped.
+pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core::Symbol, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let mut path_count = 0usize;
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<M> = vec![M::ID];
     // Whether each open element's fill paints, passed to its children; kept in step with `stack`.
     // A bool, not the fill text, so deep nesting under a long fill value keeps no copies of it.
     let mut fills: Vec<bool> = vec![false];
+    // Whether each open element's `fill-rule` is `evenodd` (else `nonzero`, the default),
+    // passed to its children; kept in step with `stack`.
+    let mut even_odd_rules: Vec<bool> = vec![false];
     // `(drawn, visible)` of each open element (see [`shown`]); kept in step with `stack`.
     let mut shows: Vec<(bool, bool)> = vec![(true, true)];
+    // The font of each open element (see [`font`]); kept in step with `stack`.
+    let mut fonts: Vec<Font> = vec![Font::default()];
     let mut shapes = Vec::new();
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
-    let mut pending_text: Option<(Point, f64, Align)> = None;
+    // Where a `<text>` still waiting for its words starts, and its angle.
+    let mut pending_text: Option<(Point, f64)> = None;
+    // The open `<text>`'s own `x` and `y`, for a `<tspan>` that sets only one of them.
+    let mut text_xy: Option<(f64, f64)> = None;
+    // The label the open `<text>` is writing into (an index in `shapes`), and whether a space
+    // comes before its next words.
+    let mut label: Option<(usize, bool)> = None;
     let mut seen_root = false;
     let mut depth_guard = 0usize;
     loop {
@@ -578,37 +808,59 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
             Event::End(e) => {
-                // A `<text>` with no words in it must not hand its place to later text.
-                if e.local_name().as_ref() == b"text" {
+                // A `<text>` with no words in it must not hand its place to later text. A
+                // `<text>` that is not drawn (one in another namespace inside `<metadata>`, say)
+                // never took the state, so its end leaves the open `<text>`'s state alone.
+                if e.local_name().as_ref() == b"text" && shows.last().is_none_or(|s| s.0) {
                     pending_text = None;
+                    text_xy = None;
+                    label = None;
                 }
                 if stack.len() > 1 {
                     stack.pop();
                     fills.pop();
+                    even_odd_rules.pop();
                     shows.pop();
+                    fonts.pop();
                 }
                 (None, false)
             }
             Event::Text(t) => {
-                // Only text for a pending label is read; other text is ignored. A hidden run
+                // Only text in a `<text>` is read; other text is ignored. A hidden run
                 // (a `<tspan>` with `display="none"` or `visibility="hidden"`) is skipped and
-                // leaves the label waiting for a visible one.
+                // leaves the label waiting for a visible one. The first run's own element (the
+                // `<text>` or a `<tspan>` in it) gives the size and alignment; later runs on the
+                // same line (`K<tspan>1</tspan>`) are added to its words, with one space where
+                // the file has white space between them.
                 let shown_run = shows.last().copied().unwrap_or((true, true)) == (true, true);
-                if let (Some((at, h, align)), true) = (pending_text, shown_run) {
-                    let s = t
-                        .unescape()
-                        .map_err(|e| Error::Format(format!("SVG: {e}")))?
-                        .trim()
-                        .to_owned();
-                    // Skip the line breaks and indents between `<text>` and a `<tspan>`.
-                    if !s.is_empty() {
+                if (pending_text.is_some() || label.is_some()) && shown_run {
+                    let raw = t.unescape().map_err(|e| Error::Format(format!("SVG: {e}")))?;
+                    let s = raw.trim().to_owned();
+                    let space_after = raw.ends_with(char::is_whitespace);
+                    if let Some((i, space)) = label
+                        && pending_text.is_none()
+                    {
+                        if s.is_empty() {
+                            label = Some((i, space || !raw.is_empty()));
+                        } else if let Some(Shape::Text { text, .. }) = shapes.get_mut(i) {
+                            if space || raw.starts_with(char::is_whitespace) {
+                                text.push(' ');
+                            }
+                            text.push_str(&s);
+                            label = Some((i, space_after));
+                        }
+                    } else if let (Some((at, angle)), false) = (pending_text, s.is_empty()) {
+                        // Skip the line breaks and indents between `<text>` and a `<tspan>`.
                         pending_text = None;
+                        label = Some((shapes.len(), space_after));
+                        let f = fonts.last().copied().unwrap_or_default();
+                        let sc = stack.last().copied().unwrap_or(M::ID).scale();
                         shapes.push(Shape::Text {
                             at,
                             text: s,
-                            height: h,
-                            align,
-                            angle: 0.0,
+                            height: f.size.unwrap_or(3.5) * sc * 0.72,
+                            align: f.align.unwrap_or(Align::Left),
+                            angle,
                         });
                     }
                 }
@@ -630,28 +882,42 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             presentation(&e, "fill").as_deref(),
             fills.last().copied().unwrap_or(false),
         );
+        let parent_even_odd = even_odd_rules.last().copied().unwrap_or(false);
+        let even_odd = match presentation(&e, "fill-rule").map(|v| split_important(&v).0.to_ascii_lowercase()) {
+            Some(v) if v == "evenodd" => true,
+            Some(v) if v == "nonzero" => false,
+            _ => parent_even_odd,
+        };
         let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
         if tag == "svg" && !seen_root {
             seen_root = true;
             // width="40mm" with viewBox="0 0 80 160" means 0.5 mm per unit.
             if let (Some(w), Some(vb)) = (attr(&e, "width"), attr(&e, "viewBox")) {
                 let vbn = numbers(&vb);
-                if w.trim_end().ends_with("mm") && vbn.len() == 4 && vbn[2] > 0.0 {
-                    let wmm = numbers(&w).first().copied().unwrap_or(vbn[2]);
+                if let (Some(wmm), 4) = (length_mm(&w), vbn.len())
+                    && vbn[2] > 0.0
+                {
                     let s = wmm / vbn[2];
                     m = m.mul(&M([s, 0.0, 0.0, s, -vbn[0] * s, -vbn[1] * s]));
                 }
             }
         }
         let show = shown(&e, &tag, shows.last().copied().unwrap_or((true, true)));
-        // An invisible `<text>` still sets up its label: a `<tspan>` in it can be visible again,
-        // and each run of words is checked on its own.
-        if !show.0 || (!show.1 && tag != "text") {
+        // Every `<path>` counts, hidden or not, so a warning names its place in the file.
+        if tag == "path" {
+            path_count += 1;
+        }
+        let fnt = font(&e, fonts.last().copied().unwrap_or_default());
+        // An invisible `<text>` or `<tspan>` still sets up its label and place: a `<tspan>` in
+        // it can be visible again, and each run of words is checked on its own.
+        if !show.0 || (!show.1 && tag != "text" && tag != "tspan") {
             // Hidden: no shapes, pins or text, but its children still need its state.
             if !empty {
                 stack.push(m);
                 fills.push(filled);
+                even_odd_rules.push(even_odd);
                 shows.push(show);
+                fonts.push(fnt);
             }
             continue;
         }
@@ -734,20 +1000,73 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 })
             }
             "path" => {
-                let parts = path(&attr(&e, "d").unwrap_or_default(), &m);
+                let (parts, stopped) = path(&attr(&e, "d").unwrap_or_default(), &m);
+                if let Some(why) = stopped {
+                    let which = match attr(&e, "id") {
+                        Some(i) => {
+                            // The id is the file's text: control characters (an ESC that would
+                            // drive a terminal) are written as escapes.
+                            let i: String = i
+                                .chars()
+                                .map(|c| {
+                                    if c.is_control() {
+                                        c.escape_default().to_string()
+                                    } else {
+                                        c.to_string()
+                                    }
+                                })
+                                .collect();
+                            format!("path {path_count} (id \"{i}\")")
+                        }
+                        None => format!("path {path_count}"),
+                    };
+                    warnings.push(format!("{which} is drawn only in part: {why}"));
+                }
+                let first = parts.first().and_then(|(pts, _)| pts.first().copied());
                 // Shapes have no holes or fill rule, so a `d` with several closed sub-paths
-                // (a ring, a letter O) would have its holes painted over. Such paths stay
-                // outlines; a single closed sub-path is filled.
-                let filled = filled && parts.iter().filter(|(_, closed)| *closed).count() <= 1;
-                let mut first = None;
-                for (pts, closed) in parts {
-                    first.get_or_insert(pts[0]);
-                    if pin_name.is_none() {
-                        // Only a closed sub-path is filled; an open one stays a line.
+                // (a ring, a letter O) has its holes cut into the solid parts around them
+                // (see [`solid_parts`]). An open sub-path stays a line.
+                let rings = parts.iter().filter(|(_, closed)| *closed).count();
+                let solid = if filled && rings > 1 && pin_name.is_none() {
+                    let closed: Vec<Vec<Point>> = parts
+                        .iter()
+                        .filter(|(_, closed)| *closed)
+                        .map(|(pts, _)| pts.clone())
+                        .collect();
+                    let solid = solid_parts(&closed, even_odd);
+                    if solid.is_none() {
+                        warnings.push(format!(
+                            "path {path_count} is drawn as outlines: its holes are too many or too big to fill"
+                        ));
+                    }
+                    solid
+                } else {
+                    None
+                };
+                if pin_name.is_none() {
+                    let mut ring = 0usize;
+                    for (pts, closed) in parts {
+                        if closed {
+                            ring += 1;
+                            // A closed sub-path in the fill is drawn by it; the others (too few
+                            // points, or not an edge of the fill) keep their outline.
+                            if let Some((_, left_out)) = &solid
+                                && left_out.binary_search(&(ring - 1)).is_err()
+                            {
+                                continue;
+                            }
+                        }
                         shapes.push(Shape::Polyline {
                             points: pts,
                             closed,
-                            filled: filled && closed,
+                            filled: filled && closed && rings <= 1,
+                        });
+                    }
+                    for pts in solid.map(|(fill, _)| fill).unwrap_or_default() {
+                        shapes.push(Shape::Polyline {
+                            points: pts,
+                            closed: true,
+                            filled: true,
                         });
                     }
                 }
@@ -757,16 +1076,25 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 None
             }
             "text" => {
-                // Read from `style` first (Inkscape writes them there), then the attribute.
-                let value = |name| presentation(&e, name).map(|v| split_important(&v).0.trim().to_ascii_lowercase());
-                let size = value("font-size").and_then(|s| font_size(&s)).unwrap_or(3.5);
-                let align = match value("text-anchor").as_deref() {
-                    Some("middle") => Align::Center,
-                    Some("end") => Align::Right,
-                    _ => Align::Left,
-                };
+                // The size and alignment are read when its words come (see `fonts`).
                 if !empty {
-                    pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), size * sc * 0.72, align));
+                    let xy = (num(&e, "x"), num(&e, "y"));
+                    pending_text = Some((m.p(xy.0, xy.1), m.text_angle()));
+                    text_xy = Some(xy);
+                    label = None;
+                }
+                None
+            }
+            // A `<tspan>` placed with its own `x` or `y` (a new line, as Inkscape writes one)
+            // starts a label of its own there; the other coordinate is the text's.
+            "tspan" => {
+                if let Some((tx, ty)) = text_xy
+                    && (attr(&e, "x").is_some() || attr(&e, "y").is_some())
+                {
+                    let x = attr(&e, "x").map_or(tx, |_| num(&e, "x"));
+                    let y = attr(&e, "y").map_or(ty, |_| num(&e, "y"));
+                    pending_text = Some((m.p(x, y), m.text_angle()));
+                    label = None;
                 }
                 None
             }
@@ -791,13 +1119,23 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         if !empty {
             stack.push(m);
             fills.push(filled);
+            even_odd_rules.push(even_odd);
             shows.push(show);
+            fonts.push(fnt);
         }
     }
     if !seen_root {
         return Err(Error::Format("not an SVG file".into()));
     }
-    make_symbol(id, name, shapes, pins)
+    let empty = shapes.is_empty() && pins.is_empty();
+    match make_symbol(id, name, shapes, pins) {
+        Ok(s) => Ok((s, warnings)),
+        // Nothing drawn because a path stopped at bad data: say why.
+        Err(Error::Format(m)) if empty && !warnings.is_empty() => {
+            Err(Error::Format(format!("{m}: {}", warnings.join("; "))))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Mirrors the previous control point `prev` through the current point `cur`, the implied
@@ -845,6 +1183,50 @@ mod tests {
                 .any(|g| matches!(g, Shape::Text { text, .. } if text == "K"))
         );
         assert!(s.graphics.len() >= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn viewbox_width_in_other_absolute_units_is_converted_to_mm() -> Result<()> {
+        // Each width is 40 mm over a viewBox 80 wide: 0.5 mm per unit.
+        for w in [
+            "40mm",
+            "4cm",
+            "40mm ",
+            "160Q",
+            "160q",
+            "4CM",
+            "113.38582677165354pt",
+            "9.448818897637796pc",
+        ] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" viewBox="10 0 80 160">
+                    <circle id="pin:1" cx="10" cy="0" r="1"/><circle id="pin:2" cx="90" cy="160" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            let (a, b) = (pin_at(&s, "1"), pin_at(&s, "2"));
+            assert!(
+                ((b.x - a.x) - 40.0).abs() < 1e-3 && ((b.y - a.y) - 80.0).abs() < 1e-3,
+                "{w}: {a:?} {b:?}"
+            );
+        }
+        // One inch over 100 units: 0.254 mm per unit.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1in" viewBox="0 0 100 100">
+            <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="100" cy="0" r="1"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.u", "U")?;
+        assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 25.4).abs() < 1e-3);
+        // No unit, or px, keeps one unit per millimetre.
+        for w in ["40", "40px"] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" viewBox="0 0 80 160">
+                    <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="80" cy="0" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 80.0).abs() < 1e-3, "{w}");
+        }
         Ok(())
     }
 
@@ -1252,15 +1634,151 @@ mod tests {
         Ok(())
     }
 
+    /// The filled outlines of an SVG, as DXF-style points for [`crate::dxf::inside`].
+    fn solid_outlines(svg: &str) -> Result<Vec<Vec<(f64, f64)>>> {
+        let s = symbol(svg, "svg.holes", "Holes")?;
+        Ok(s.graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Polyline {
+                    points, filled: true, ..
+                } => Some(points.iter().map(|p| (p.x, p.y)).collect()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Whether a point is painted by any of the filled outlines.
+    fn painted(outlines: &[Vec<(f64, f64)>], pt: (f64, f64)) -> bool {
+        outlines.iter().any(|o| crate::dxf::inside(pt, o))
+    }
+
     #[test]
-    fn path_with_several_closed_subpaths_stays_outlines() -> Result<()> {
+    fn path_with_a_hole_is_filled_around_it() -> Result<()> {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
             <path fill="black" d="M0 0H10V10H0Z M3 3V7H7V3Z"/>
             <path fill="black" d="M0 0H10V10H0Z M20 0 L30 0"/>
         </svg>"##;
-        // The square with a hole: both outlines, unfilled. One closed sub-path plus an open
-        // line: the closed one is filled.
-        assert_eq!(fills_of(svg)?, vec![false, false, true, false]);
+        // The square with a hole running the other way: one filled outline. One closed
+        // sub-path plus an open line: the closed one filled, the line not.
+        assert_eq!(fills_of(svg)?, vec![true, true, false]);
+        let first = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <path fill="black" d="M0 0H10V10H0Z M3 3V7H7V3Z"/>
+        </svg>"##;
+        let o = solid_outlines(first)?;
+        assert_eq!(o.len(), 1);
+        assert!(painted(&o, (1.0, 1.0)), "the ring is painted");
+        assert!(!painted(&o, (5.0, 5.0)), "the hole stays open");
+        Ok(())
+    }
+
+    #[test]
+    fn fill_rule_decides_a_hole_that_runs_the_same_way() -> Result<()> {
+        // Both squares run the same way: nonzero (the default) paints the inner one too,
+        // evenodd leaves it open, also when the rule comes from a group's style.
+        let same = "M0 0H10V10H0Z M3 3H7V7H3Z";
+        let nonzero = format!(r##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="black" d="{same}"/></svg>"##);
+        let o = solid_outlines(&nonzero)?;
+        assert_eq!(o.len(), 1);
+        assert!(painted(&o, (5.0, 5.0)), "nonzero: no hole");
+        assert!(painted(&o, (1.0, 1.0)));
+        for svg in [
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="black" fill-rule="evenodd" d="{same}"/></svg>"##
+            ),
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg"><g style="fill-rule:evenodd"><path fill="black" d="{same}"/></g></svg>"##
+            ),
+        ] {
+            let o = solid_outlines(&svg)?;
+            assert_eq!(o.len(), 1, "{svg}");
+            assert!(!painted(&o, (5.0, 5.0)), "evenodd: a hole ({svg})");
+            assert!(painted(&o, (1.0, 1.0)), "{svg}");
+        }
+        // A child's own rule wins over its group's.
+        let back = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg"><g fill-rule="evenodd"><path fill="black" fill-rule="nonzero" d="{same}"/></g></svg>"##
+        );
+        assert!(painted(&solid_outlines(&back)?, (5.0, 5.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn path_with_an_island_in_its_hole_and_a_part_apart() -> Result<()> {
+        // A ring with a dot in its hole, and a square of its own beside it.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <path fill="black" fill-rule="evenodd"
+                d="M0 0H10V10H0Z M2 2H8V8H2Z M4 4H6V6H4Z M20 0H24V4H20Z"/>
+        </svg>"##;
+        let o = solid_outlines(svg)?;
+        assert_eq!(o.len(), 3, "ring, island and the square apart");
+        assert!(painted(&o, (1.0, 1.0)));
+        assert!(!painted(&o, (3.0, 3.0)), "the hole");
+        assert!(painted(&o, (5.0, 5.0)), "the island in it");
+        assert!(painted(&o, (22.0, 2.0)), "the square apart");
+        assert!(!painted(&o, (15.0, 2.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_hole_that_touches_the_outline_around_it_stays_open() -> Result<()> {
+        // The triangle starts on the square's right edge.
+        for rule in ["nonzero", "evenodd"] {
+            for d in ["M0 0H10V10H0Z M10 5L7 3L7 7Z", "M0 0H10V10H0Z M10 5L7 7L7 3Z"] {
+                let svg = format!(
+                    r##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="black" fill-rule="{rule}" d="{d}"/></svg>"##
+                );
+                let o = solid_outlines(&svg)?;
+                assert!(painted(&o, (2.0, 5.0)), "{rule} {d}");
+                if rule == "evenodd" || d.ends_with("L7 3L7 7Z") {
+                    // A hole: evenodd always, nonzero when it runs the other way.
+                    assert!(!painted(&o, (8.0, 5.0)), "{rule} {d}");
+                } else {
+                    assert!(painted(&o, (8.0, 5.0)), "nonzero, same way: no hole ({d})");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sub_paths_left_out_of_the_fill_keep_their_outline() -> Result<()> {
+        // A closed two-point line, and (nonzero) a square inside one that runs the same way:
+        // neither is an edge of the fill, so both stay outlines beside the one filled shape.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <path fill="black" d="M0 0H10V10H0Z M20 0L30 0Z M3 3H7V7H3Z"/>
+        </svg>"##;
+        let mut fills = fills_of(svg)?;
+        fills.sort_unstable();
+        assert_eq!(fills, vec![false, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_huge_fill_with_holes_stays_outlines_and_warns() -> Result<()> {
+        let mut d = String::from("M0 0");
+        for i in 1..=MAX_HOLE_FILL_POINTS {
+            d.push_str(&format!(" L{} {}", i as f64 * 0.01, if i % 2 == 0 { 0.0 } else { 0.5 }));
+        }
+        d.push_str(" V-100 H0 Z M1 -50 H2 V-49 H1 Z");
+        let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="black" d="{d}"/></svg>"##);
+        let (s, warnings) = symbol_with_warnings(&svg, "svg.huge", "Huge")?;
+        assert!(
+            s.graphics
+                .iter()
+                .all(|g| !matches!(g, Shape::Polyline { filled: true, .. })),
+            "no fill"
+        );
+        assert!(warnings.iter().any(|w| w.contains("drawn as outlines")), "{warnings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn unfilled_path_with_several_sub_paths_stays_outlines() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <path fill="none" d="M0 0H10V10H0Z M3 3V7H7V3Z"/>
+        </svg>"##;
+        assert_eq!(fills_of(svg)?, vec![false, false]);
         Ok(())
     }
 
@@ -1323,6 +1841,36 @@ mod tests {
     }
 
     #[test]
+    fn turned_text_keeps_its_angle() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text transform="rotate(-90 5 5)" x="5" y="5">K1</text>
+            <g transform="rotate(-90 5 5)"><text x="5" y="5">K2</text></g>
+            <text x="5" y="5">K3</text>
+            <text transform="rotate(90)" x="0" y="0">K4</text>
+        </svg>"#;
+        let s = symbol(svg, "svg.turn", "Turn")?;
+        let texts: Vec<(&str, f64, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, angle, at, .. } => Some((text.as_str(), *angle, *at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 4);
+        let want = [("K1", 90.0), ("K2", 90.0), ("K3", 0.0), ("K4", 270.0)];
+        for ((text, angle, _), (w_text, w_angle)) in texts.iter().zip(want) {
+            assert_eq!((*text, *angle), (w_text, w_angle));
+        }
+        // Turned round its own anchor, the text stays where it was.
+        for (_, _, at) in &texts[..3] {
+            assert!((at.x - 5.0).abs() < 1e-9 && (at.y - 5.0).abs() < 1e-9, "{at:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn text_size_and_alignment_in_style() -> Result<()> {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
             <circle id="pin:1" cx="0" cy="0" r="0.5"/>
@@ -1356,6 +1904,47 @@ mod tests {
         assert!((e.0 - 0.8 * a.0).abs() < 1e-9, "6pt is 8px");
         assert_eq!(e.1, Align::Center);
         assert_eq!(f.0, d.0, "em is not read: the fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn text_size_and_alignment_from_group_and_tspan() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text font-size="10" x="0" y="0">REF</text>
+            <g style="font-size:10px;text-anchor:end"><text x="0" y="5">G</text></g>
+            <g font-size="4" text-anchor="end"><text style="font-size:10px;text-anchor:start" x="0" y="10">W</text></g>
+            <text x="0" y="15"><tspan style="font-size:10px;text-anchor:middle">T</tspan></text>
+            <g font-size="10"><g><text font-size="inherit" x="0" y="20">N</text></g></g>
+            <g font-size="10"><text transform="scale(2)" x="0" y="25">S</text></g>
+            <text x="0" y="30" text-anchor="end"><tspan>A</tspan></text>
+        </svg>"#;
+        let s = symbol(svg, "svg.text", "Text")?;
+        let texts: Vec<(&str, f64, Align)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text {
+                    text, height, align, ..
+                } => Some((text.as_str(), *height, *align)),
+                _ => None,
+            })
+            .collect();
+        let h = |name: &str| texts.iter().find(|t| t.0 == name).map(|t| (t.1, t.2));
+        let (Some(r), Some(g), Some(w), Some(t), Some(n), Some(sc), Some(a)) =
+            (h("REF"), h("G"), h("W"), h("T"), h("N"), h("S"), h("A"))
+        else {
+            unreachable!("all texts come in: {texts:?}");
+        };
+        assert_eq!(g, (r.0, Align::Right), "a parent group's size and alignment");
+        assert_eq!(w, (r.0, Align::Left), "the text's own values win over its group's");
+        assert_eq!(t, (r.0, Align::Center), "a tspan holding the words sets them");
+        assert_eq!(n.0, r.0, "inherited through nested groups and `inherit`");
+        assert!(
+            (sc.0 - 2.0 * r.0).abs() < 1e-9,
+            "an inherited size scales with the text"
+        );
+        assert_eq!(a.1, Align::Right, "a tspan without values keeps the text's");
         Ok(())
     }
 
@@ -1432,6 +2021,84 @@ mod tests {
     }
 
     #[test]
+    fn words_after_a_tspan_stay_in_the_label() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="0">-K<tspan font-weight="bold">1</tspan></text>
+            <text x="0" y="5">Relay <tspan>coil</tspan>
+              <tspan>A1</tspan></text>
+            <text x="1" y="10"><tspan x="1" y="10">Line one</tspan><tspan x="1" y="14">Line two</tspan></text>
+            <text x="2" y="20">Top<tspan y="24">Low</tspan></text>
+        </svg>"#;
+        let s = symbol(svg, "svg.runs", "Runs")?;
+        let o = pin_at(&s, "1");
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), Point::new(at.x + o.x, at.y + o.y))),
+                _ => None,
+            })
+            .collect();
+        let words: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        assert_eq!(
+            words,
+            vec!["-K1", "Relay coil A1", "Line one", "Line two", "Top", "Low"],
+            "no words are lost"
+        );
+        assert!(
+            near(texts[3].1, Point::new(1.0, 14.0)),
+            "a tspan line starts at its own place"
+        );
+        assert!(near(texts[5].1, Point::new(2.0, 24.0)), "a missing x is the text's");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hidden_tspan_places_its_visible_words_and_notes_stay_out() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="0">A<tspan y="10" visibility="hidden"><tspan visibility="visible">B</tspan></tspan></text>
+            <text x="0" y="20">C<tspan><title>tooltip</title>D</tspan><desc>note</desc></text>
+            <text x="0" y="30">E<tspan y="40" display="none"><tspan visibility="visible">F</tspan></tspan></text>
+        </svg>"#;
+        let s = symbol(svg, "svg.hidden", "Hidden")?;
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        let words: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        assert_eq!(words, vec!["A", "B", "CD", "E"]);
+        assert!(near(texts[1].1, Point::new(0.0, 10.0)), "the hidden tspan's y places B");
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_inside_metadata_does_not_end_the_open_text() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="5"><metadata><text xmlns="urn:notes">note</text></metadata>Relay</text>
+        </svg>"#;
+        let s = symbol(svg, "svg.meta", "Meta")?;
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts[0].0, "Relay");
+        assert!(near(texts[0].1, Point::new(0.0, 5.0)));
+        Ok(())
+    }
+
+    #[test]
     fn hostile_svgs() {
         assert!(symbol("", "x", "x").is_err());
         assert!(symbol("<html></html>", "x", "x").is_err());
@@ -1441,7 +2108,7 @@ mod tests {
 
     /// The points of the one polyline in `d`, untransformed.
     fn one_line(d: &str) -> Vec<Point> {
-        let lines = path(d, &M::ID);
+        let (lines, _) = path(d, &M::ID);
         assert_eq!(lines.len(), 1, "{d}: {lines:?}");
         lines.into_iter().next().map(|(pts, _)| pts).unwrap_or_default()
     }
@@ -1512,7 +2179,13 @@ mod tests {
         );
         // A flag that is not 0 or 1 ends the arguments, and the path: the line before the arc
         // stays, nothing after it is drawn.
-        assert_eq!(arc_numbers("5 5 0 2 1 10 0"), (vec![5.0, 5.0, 0.0], false));
+        assert_eq!(
+            arc_numbers("5 5 0 2 1 10 0"),
+            (
+                vec![5.0, 5.0, 0.0],
+                Some("arc argument 4 is a flag that is not 0 or 1".to_owned())
+            )
+        );
         assert_eq!(
             one_line("M 0 0 L 1 0 A 5 5 0 2 1 10 0 L 20 0"),
             [Point::new(0.0, 0.0), Point::new(1.0, 0.0)]
@@ -1527,6 +2200,113 @@ mod tests {
     }
 
     #[test]
+    fn a_path_cut_short_gives_one_warning_with_the_reason() -> Result<()> {
+        let svg = r#"<svg>
+            <path d="M 0 0 L 10 0"/>
+            <path id="arm" d="M 0 0 L 1 0 A 5 5 0 0 1 10 L 20 0"/>
+        </svg>"#;
+        let (s, warnings) = symbol_with_warnings(svg, "svg.cut", "Cut")?;
+        assert_eq!(
+            warnings,
+            [
+                "path 2 (id \"arm\") is drawn only in part: stopped at command 3 (A): an arc is cut short \
+                 after argument 6 (an arc takes 7)"
+            ]
+        );
+        // What came before the error is still drawn.
+        assert_eq!(s.graphics.len(), 2);
+        // The other reasons, and a well-formed file gives none.
+        assert_eq!(
+            path("M 0 0 A 5 . 0 0 1 10 0", &M::ID).1.as_deref(),
+            Some("stopped at command 2 (A): arc argument 2 is not a number")
+        );
+        assert_eq!(
+            path("M 0 0 a", &M::ID).1.as_deref(),
+            Some("stopped at command 2 (a): an arc has no arguments")
+        );
+        assert_eq!(
+            path("M 0 0 A 5 5 0 0 1 1e999 0", &M::ID).1.as_deref(),
+            Some("stopped at command 2 (A): arc argument 6 is not a finite number")
+        );
+        assert!(
+            symbol_with_warnings("<svg><path d=\"M 0 0 A 5 5 0 0 1 10 0\"/></svg>", "x", "x")?
+                .1
+                .is_empty()
+        );
+        // A hidden path still counts, so the bad one after it is path 2, and a hidden bad path
+        // gives no warning.
+        for svg in [
+            r#"<svg><defs><path d="M 0 0 L 1 0"/></defs><path d="M 0 0 L 1 0 A"/></svg>"#,
+            r#"<svg><path display="none" d="M 0 0 L 1 0 A"/><path d="M 0 0 L 1 0 A"/></svg>"#,
+        ] {
+            let (_, warnings) = symbol_with_warnings(svg, "x", "x")?;
+            assert_eq!(
+                warnings,
+                ["path 2 is drawn only in part: stopped at command 3 (A): an arc has no arguments"],
+                "{svg}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_arc_arguments_name_the_argument() {
+        let why = |d: &str| path(d, &M::ID).1;
+        // An exponent without digits spoils its own argument, not the next one.
+        assert_eq!(
+            arc_numbers("5e 5 0 0 1 10 0"),
+            (vec![], Some("arc argument 1 is not a number".to_owned()))
+        );
+        assert_eq!(
+            arc_numbers("5 5e+ 0 0 1 10 0"),
+            (vec![5.0], Some("arc argument 2 is not a number".to_owned()))
+        );
+        assert_eq!(
+            arc_numbers("5 5 0 0 1 2e+0 0"),
+            (vec![5.0, 5.0, 0.0, 0.0, 1.0, 2.0, 0.0], None)
+        );
+        // A letter that is no command is a bad argument of the arc.
+        assert_eq!(
+            why("M 0 0 A 5 5 0 0 1 10x 0 L 20 0").as_deref(),
+            Some("stopped at command 2 (A): arc argument 7 is not a number")
+        );
+        assert_eq!(why("M 0 0 A 5 5 0 0 1 10 0 L 20 0"), None);
+        // One comma between arguments, not two; compact flags still read.
+        assert_eq!(
+            arc_numbers("5,,5 0 0 1 10 0"),
+            (
+                vec![5.0],
+                Some("arc argument 2 comes after more than one comma".to_owned())
+            )
+        );
+        assert_eq!(
+            arc_numbers("5 , 5 0 0110 20"),
+            (vec![5.0, 5.0, 0.0, 0.0, 1.0, 10.0, 20.0], None)
+        );
+        // An arc back to its start draws nothing.
+        assert_eq!(one_line("M 0 0 L 10 0 A 5 5 0 0 1 10 0").len(), 2);
+        // A drawing left empty by a stopped path says why.
+        let Err(err) = symbol("<svg><path d=\"M 0 0 A 5 5 0 0 1 10\"/></svg>", "x", "x") else {
+            unreachable!("an empty drawing is an error");
+        };
+        assert_eq!(
+            err.to_string(),
+            "the drawing is empty: path 1 is drawn only in part: stopped at command 2 (A): an arc is cut \
+             short after argument 6 (an arc takes 7)"
+        );
+        // An id that decodes to a control character comes out escaped, not raw.
+        let Err(err) = symbol("<svg><path id=\"&#27;[2J\" d=\"M 0 0 A\"/></svg>", "x", "x") else {
+            unreachable!("an empty drawing is an error");
+        };
+        let msg = err.to_string();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert!(
+            msg.contains("(id \"\\u{1b}[2J\")") && msg.contains("an arc has no arguments"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn hostile_arcs_do_not_panic() {
         for d in [
             "M 0 0 A 0 0 0 0 1 10 0",
@@ -1536,7 +2316,7 @@ mod tests {
             "M 0 0 A 1e-300 1e-300 0 0 1 1e300 0",
             "M 0 0 A 5 5 0 0 1",
         ] {
-            let _ = path(d, &M::ID);
+            let _ = path(d, &M::ID).0;
         }
         // A zero radius is a straight line.
         assert_eq!(one_line("M 0 0 A 0 5 0 0 1 10 0").len(), 2);
@@ -1553,6 +2333,8 @@ mod tests {
             "M 9e307 0 C -1e308 0 -1e308 0 9e307 0 S 0 0 0 0",
             "M 0 9e307 Q 0 -1e308 0 9e307 T 0 0",
             "M 0 9e307 C 0 -1e308 0 -1e308 0 9e307 S 0 0 0 0",
+            "M 0 0 Q -1e308 0 5e307 0 T 5e307 0",
+            "M 0 0 C 0 0 -1e308 0 5e307 0 S 5e307 0 5e307 0",
         ] {
             let pts = one_line(d);
             assert!(!pts.is_empty(), "{d}");

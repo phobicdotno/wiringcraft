@@ -70,6 +70,8 @@ pub struct Editor {
     pub place_turn: (Rotation, bool),
     /// A wire being drawn: its start and the bends so far.
     pub wire: Option<(Endpoint, Vec<Point>)>,
+    /// The id of the page that wire was started on: on another page it is dropped.
+    pub wire_page: Option<String>,
     pub view: View,
     pub cursor: Option<Point>,
     drag: Option<Drag>,
@@ -148,6 +150,7 @@ impl Default for Editor {
             drag: None,
             shape_points: Vec::new(),
             shape_page: None,
+            wire_page: None,
             finish_shape: false,
             cancel_drag: false,
             last_shape_click: None,
@@ -408,10 +411,27 @@ fn convex(pts: &[Pos2]) -> bool {
     true
 }
 
+/// How many corner tests [`triangulate`] may spend on one outline. Ear tests look only at the
+/// corners in the grid cells under the ear, so ordinary fills of tens of thousands of points
+/// stay far below this; only a pathological outline (every corner piled into a few cells) runs
+/// out, and is then drawn as its outline instead of freezing the editor on its first paint.
+const TRIANGULATE_BUDGET: usize = 20_000_000;
+
 /// Triangles (vertex indexes) covering a simple polygon, by ear clipping. A polygon with a hole
-/// cut in along a bridge (its two sides on top of each other) comes out right too.
-fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
+/// cut in along a bridge (its two sides on top of each other) comes out right too. `None` when
+/// cutting it up would take more than [`TRIANGULATE_BUDGET`] corner tests.
+///
+/// The corners are kept in a ring that is walked round, clipping each ear as it comes (instead
+/// of searching from the start again), and an ear is checked only against the corners that are
+/// not convex (only those can lie inside it) in the grid cells its box covers, so a fill costs
+/// about its point count, not the square of it.
+fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
     let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let n = pts.len();
+    let mut out = Vec::new();
+    if n < 3 {
+        return Some(out);
+    }
     // Summed in f64 (each f32 product is exact there), so the winding does not cancel out.
     let area: f64 = pts
         .iter()
@@ -419,47 +439,131 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
         .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x))
         .sum();
     let turn = if area >= 0.0 { 1.0 } else { -1.0 };
-    let mut idx: Vec<usize> = (0..pts.len()).collect();
-    let mut out = Vec::new();
-    let mut guard = 0;
-    while idx.len() > 3 && guard < pts.len() * pts.len() {
-        guard += 1;
-        let n = idx.len();
-        let ear = (0..n).find(|&i| {
-            let (a, b, c) = (pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
-            if cross(a, b, c) * turn <= 0.0 {
-                return false;
-            }
-            // No other corner strictly inside the triangle.
-            idx.iter().all(|&k| {
-                let q = pts[k];
-                q == a || q == b || q == c || {
-                    let (d1, d2, d3) = (cross(a, b, q) * turn, cross(b, c, q) * turn, cross(c, a, q) * turn);
-                    d1 < 0.0 || d2 < 0.0 || d3 < 0.0
-                }
-            })
-        });
-        match ear {
-            Some(i) => {
-                out.push([idx[(i + n - 1) % n] as u32, idx[i] as u32, idx[(i + 1) % n] as u32]);
-                idx.remove(i);
-            }
-            // Only flat corners left (a bridge, collinear points): drop one and go on.
-            None => {
-                if let Some(i) =
-                    (0..n).find(|&i| cross(pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]).abs() < 1e-6)
-                {
-                    idx.remove(i);
-                } else {
-                    break;
-                }
-            }
+    let mut prev: Vec<usize> = (0..n).map(|i| (i + n - 1) % n).collect();
+    let mut next: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
+    let mut alive = vec![true; n];
+    // Every index below comes from the ring, so it is in range; an index that is not (a bug)
+    // gives `None`, and the shape is drawn as its outline rather than panicking.
+    let pt = |i: usize| pts.get(i).copied();
+    let link = |v: &[usize], i: usize| v.get(i).copied();
+    let set = |v: &mut [usize], i: usize, to: usize| v.get_mut(i).map(|x| *x = to);
+
+    // The corners that are not convex, bucketed in a square grid over the outline's box. A
+    // corner only ever turns from reflex to convex as ears are clipped, so the grid is built
+    // once; clipped corners are skipped when looked up.
+    let first = pt(0)?;
+    let (mut lo, mut hi) = (first, first);
+    for q in pts {
+        lo = lo.min(*q);
+        hi = hi.max(*q);
+    }
+    let corner = |prev: &[usize], next: &[usize], i: usize| -> Option<f32> {
+        Some(cross(pt(link(prev, i)?)?, pt(i)?, pt(link(next, i)?)?))
+    };
+    let mut reflex = Vec::new();
+    for i in 0..n {
+        if corner(&prev, &next, i)? * turn <= 0.0 {
+            reflex.push(i);
         }
     }
-    if let [a, b, c] = idx[..] {
-        out.push([a as u32, b as u32, c as u32]);
+    let side = ((reflex.len() as f32).sqrt().ceil() as usize).clamp(1, 1024);
+    let cell_w = ((hi.x - lo.x) / side as f32).max(f32::MIN_POSITIVE);
+    let cell_h = ((hi.y - lo.y) / side as f32).max(f32::MIN_POSITIVE);
+    let cell = |q: Pos2| {
+        let cx = (((q.x - lo.x) / cell_w) as usize).min(side - 1);
+        let cy = (((q.y - lo.y) / cell_h) as usize).min(side - 1);
+        (cx, cy)
+    };
+    let mut grid: Vec<Vec<usize>> = vec![Vec::new(); side * side];
+    for &i in &reflex {
+        let (cx, cy) = cell(pt(i)?);
+        grid.get_mut(cy * side + cx)?.push(i);
     }
-    out
+
+    let mut work = 0usize;
+    let mut left = n;
+    let mut ear = 0usize;
+    // A full walk round the ring without an ear ends at `stop`.
+    let mut stop = ear;
+    while left > 3 {
+        // Every step counts, so a walk that finds no ear is bounded too.
+        work += 1;
+        if work > TRIANGULATE_BUDGET {
+            return None;
+        }
+        let (ia, ic) = (link(&prev, ear)?, link(&next, ear)?);
+        let (a, b, c) = (pt(ia)?, pt(ear)?, pt(ic)?);
+        let is_ear = cross(a, b, c) * turn > 0.0 && {
+            // No other corner strictly inside the triangle.
+            let (c0x, c0y) = cell(a.min(b).min(c));
+            let (c1x, c1y) = cell(a.max(b).max(c));
+            let mut clear = true;
+            'cells: for cy in c0y..=c1y {
+                for cx in c0x..=c1x {
+                    // Empty cells count too: an ear with a box over most of the grid costs
+                    // its cells even with no corner in them.
+                    work += 1;
+                    if work > TRIANGULATE_BUDGET {
+                        return None;
+                    }
+                    for &k in grid.get(cy * side + cx)? {
+                        work += 1;
+                        if !alive.get(k).copied()? || k == ia || k == ear || k == ic {
+                            continue;
+                        }
+                        let q = pt(k)?;
+                        if q == a || q == b || q == c {
+                            continue;
+                        }
+                        let (d1, d2, d3) = (cross(a, b, q) * turn, cross(b, c, q) * turn, cross(c, a, q) * turn);
+                        if d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0 {
+                            clear = false;
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+            clear
+        };
+        if is_ear {
+            out.push([ia as u32, ear as u32, ic as u32]);
+            set(&mut next, ia, ic)?;
+            set(&mut prev, ic, ia)?;
+            *alive.get_mut(ear)? = false;
+            left -= 1;
+            // Go on from the corner after the ear, as earcut does.
+            ear = link(&next, ic)?;
+            stop = ear;
+            continue;
+        }
+        ear = link(&next, ear)?;
+        if ear == stop {
+            // Only flat corners left (a bridge, collinear points): drop one and go on.
+            let mut k = ear;
+            let mut flat = None;
+            for _ in 0..left {
+                work += 1;
+                if corner(&prev, &next, k)?.abs() < 1e-6 {
+                    flat = Some(k);
+                    break;
+                }
+                k = link(&next, k)?;
+            }
+            let Some(k) = flat else { break };
+            let (p, q) = (link(&prev, k)?, link(&next, k)?);
+            set(&mut next, p, q)?;
+            set(&mut prev, q, p)?;
+            *alive.get_mut(k)? = false;
+            left -= 1;
+            ear = q;
+            stop = ear;
+        }
+    }
+    if left == 3 {
+        let b = link(&next, ear)?;
+        out.push([ear as u32, b as u32, link(&next, b)? as u32]);
+    }
+    Some(out)
 }
 
 /// The outline of a filled polyline in drawing millimetres, as the key of [`TriCache`]: the same
@@ -479,8 +583,11 @@ impl std::hash::Hash for FillKey<'_> {
 #[derive(Default)]
 struct Triangulator;
 
-impl egui::util::cache::ComputerMut<FillKey<'_>, std::sync::Arc<[[u32; 3]]>> for Triangulator {
-    fn compute(&mut self, key: FillKey<'_>) -> std::sync::Arc<[[u32; 3]]> {
+/// The triangles of one fill, or `None` when it is too large to cut up (drawn as its outline).
+type FillTriangles = Option<std::sync::Arc<[[u32; 3]]>>;
+
+impl egui::util::cache::ComputerMut<FillKey<'_>, FillTriangles> for Triangulator {
+    fn compute(&mut self, key: FillKey<'_>) -> FillTriangles {
         #[cfg(test)]
         TRIANGULATIONS.with(|n| n.set(n.get() + 1));
         // In millimetres, not screen pixels, so panning and zooming keep the cached triangles.
@@ -492,13 +599,13 @@ impl egui::util::cache::ComputerMut<FillKey<'_>, std::sync::Arc<[[u32; 3]]>> for
             .iter()
             .map(|q| Pos2::new((q.x - o.x) as f32, (q.y - o.y) as f32))
             .collect();
-        triangulate(&pts).into()
+        triangulate(&pts).map(Into::into)
     }
 }
 
 /// Triangles of the filled polylines painted last frame, so a large fill is not cut up again on
-/// every frame. Shapes not painted in a frame drop out.
-type TriCache = egui::util::cache::FrameCache<std::sync::Arc<[[u32; 3]]>, Triangulator>;
+/// every frame (nor a too large one tried again). Shapes not painted in a frame drop out.
+type TriCache = egui::util::cache::FrameCache<FillTriangles, Triangulator>;
 
 #[cfg(test)]
 thread_local! {
@@ -524,17 +631,22 @@ pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke)
                 p.add(EShape::convex_polygon(pts, stroke.color, Stroke::NONE));
             } else if *filled {
                 // egui fills only convex paths itself, so cut the outline into triangles.
-                let mut mesh = egui::Mesh::default();
-                for p in &pts {
-                    mesh.colored_vertex(*p, stroke.color);
-                }
                 let tris = p
                     .ctx()
                     .memory_mut(|m| m.caches.cache::<TriCache>().get(FillKey(points)));
-                for &[a, b, c] in tris.iter() {
-                    mesh.add_triangle(a, b, c);
+                if let Some(tris) = tris {
+                    let mut mesh = egui::Mesh::default();
+                    for p in &pts {
+                        mesh.colored_vertex(*p, stroke.color);
+                    }
+                    for &[a, b, c] in tris.iter() {
+                        mesh.add_triangle(a, b, c);
+                    }
+                    p.add(EShape::mesh(mesh));
+                } else {
+                    // Too many points to cut up without stalling the editor: its outline at least.
+                    p.add(EShape::closed_line(pts, stroke));
                 }
-                p.add(EShape::mesh(mesh));
             } else if *closed {
                 p.add(EShape::closed_line(pts, stroke));
             } else {
@@ -1056,7 +1168,7 @@ pub fn show(
         wc_core::project::terminal_numbers(&open.project, |id| open.symbols.get(id).map(|s| s.role))
     };
     for j in &open.project.meta.jumpers {
-        let at = jumper_points(&page, &open.symbols, &numbers, j);
+        let at = wc_pdf::jumper_points(&page, &open.symbols, &numbers, j);
         if at.len() < 2 {
             continue;
         }
@@ -1095,26 +1207,14 @@ pub fn show(
             painter.circle_filled(xf.s(pos), xf.len(0.45).max(1.5), t.pin);
         }
         if let Some(tag) = &s.tag {
-            let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
-            let mut lines = Vec::new();
-            if !tag.function.is_empty() {
-                lines.push(format!("={}", tag.function.join(".")));
-            }
-            if !tag.location.is_empty() {
-                lines.push(format!("+{}", tag.location.join(".")));
-            }
-            lines.push(format!("-{}", tag.product.join(".")));
-            let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
-            for (i, l) in lines.iter().enumerate() {
-                text_mm(
-                    &painter,
-                    &xf,
-                    Point::new(ta.x, top + 3.0 * i as f64),
-                    2.5,
-                    Align2::RIGHT_BOTTOM,
-                    l,
-                    c,
-                );
+            let (align, lines) = wc_pdf::tag_lines(s, sym, tag);
+            let a = if align == Align::Left {
+                Align2::LEFT_BOTTOM
+            } else {
+                Align2::RIGHT_BOTTOM
+            };
+            for (at, l) in &lines {
+                text_mm(&painter, &xf, *at, 2.5, a, l, c);
             }
         }
         if selected && let Some((a, b)) = open.symbol_bounds(&page, &s.id) {
@@ -2172,8 +2272,9 @@ fn has_symbols(ed: &Editor) -> bool {
 }
 
 /// The edits the right-click menu offers for the selection, run as the toolbar runs them:
-/// Rotate, Mirror, Copy, Cut and Delete with a symbol selected; Copy, Cut and Delete with only
-/// free text or drawings (Rotate and Mirror turn symbols only); none otherwise.
+/// Rotate, Mirror, Copy, Cut, Duplicate and Delete with a symbol selected; Copy, Cut, Duplicate
+/// and Delete with only free text or drawings (Rotate and Mirror turn symbols only); none
+/// otherwise.
 fn edit_menu_actions(ed: &Editor) -> &'static [crate::actions::Action] {
     use crate::actions::Action;
     if has_symbols(ed) {
@@ -2182,10 +2283,11 @@ fn edit_menu_actions(ed: &Editor) -> &'static [crate::actions::Action] {
             Action::Mirror,
             Action::Copy,
             Action::Cut,
+            Action::Duplicate,
             Action::Delete,
         ]
     } else if ed.selection.iter().any(|s| matches!(s, Selection::Graphic(_))) {
-        &[Action::Copy, Action::Cut, Action::Delete]
+        &[Action::Copy, Action::Cut, Action::Duplicate, Action::Delete]
     } else {
         &[]
     }
@@ -2471,13 +2573,18 @@ fn shape_tool(
     }
 }
 
-/// A drawing started on another page does not go on this one: its clicks are dropped when
-/// the page shown changes (by id, so the same page moved in the navigator keeps them).
+/// A drawing or wire started on another page does not go on this one: its clicks are dropped
+/// when the page shown changes (by id, so the same page moved in the navigator keeps them).
 pub(crate) fn drop_draft_of_other_page(open: &Open, ed: &mut Editor) {
     let page_id = open.project.pages.get(ed.page).map(|p| p.id.as_str());
     if !ed.shape_points.is_empty() && ed.shape_page.as_deref() != page_id {
         ed.shape_points.clear();
         ed.message = shape_hint(ed.tool, 0).into();
+    }
+    // A wire started on the page left behind would end here from a pin or point of that page.
+    if ed.wire.is_some() && ed.wire_page.is_some() && ed.wire_page.as_deref() != page_id {
+        ed.wire = None;
+        ed.wire_page = None;
     }
 }
 
@@ -2735,6 +2842,7 @@ fn wire_tool(
         match ed.wire.take() {
             None => {
                 ed.wire = Some((end, Vec::new()));
+                ed.wire_page = Some(page.id.clone());
                 ed.message =
                     "Click bends, then a pin to finish (double-click ends on a free point, Esc cancels).".into();
             }
@@ -2766,42 +2874,25 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
     {
         via.push(Point::new(l.x, e.y));
     }
+    // A spot clicked twice is one bend: drop bends on the point before them or on the end, so
+    // the wire has no zero-length segment (and no junction dot on a plain bend, #1236).
+    let mut prev = open.end_pos(page, &start);
+    via.retain(|p| {
+        let keep = prev != Some(*p);
+        prev = Some(*p);
+        keep
+    });
+    if let Some(e) = open.end_pos(page, &end) {
+        while via.last() == Some(&e) {
+            via.pop();
+        }
+    }
     if start == end {
         ed.message = "A wire needs two different ends.".into();
         return;
     }
     open.add_wire(ed.page, start, end, via);
     ed.message = "Wire added.".into();
-}
-
-/// Where the jumper's bar passes on `page`: the terminal symbols of its terminals, in strip order.
-/// Other symbols with a terminal's tag (a device drawn with it) are no bar end.
-fn jumper_points(
-    page: &Page,
-    symbols: &std::collections::BTreeMap<String, wc_core::symbol::Symbol>,
-    numbers: &wc_core::project::TerminalNumbers,
-    j: &wc_core::project::Jumper,
-) -> Vec<Point> {
-    let mut at: Vec<(&str, Point)> = page
-        .symbols
-        .iter()
-        .filter(|s| {
-            symbols
-                .get(&s.symbol)
-                .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal)
-                && j.has(numbers, page, s, true)
-        })
-        .filter_map(|s| {
-            let n = match numbers.get(&(page.id.clone(), s.id.clone())) {
-                Some((_, n)) => n.as_str(),
-                None => j.terminal_of(s.tag.as_ref()?)?,
-            };
-            Some((n, s.at))
-        })
-        .collect();
-    let key = wc_core::project::natural_key;
-    at.sort_by(|a, b| key(a.0).cmp(&key(b.0)).then_with(|| a.0.cmp(b.0)));
-    at.into_iter().map(|(_, p)| p).collect()
 }
 
 #[cfg(test)]
@@ -4160,7 +4251,9 @@ mod tests {
             let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
             (d1 > 0.0 && d2 > 0.0 && d3 > 0.0) || (d1 < 0.0 && d2 < 0.0 && d3 < 0.0)
         };
-        let tris = triangulate(&pts);
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("a small outline is cut up")
+        };
         assert!(
             !tris.iter().any(|t| inside(Pos2::new(30.0, 40.0), *t)),
             "the notch is not filled"
@@ -4195,6 +4288,7 @@ mod tests {
         .map(|(x, y)| Pos2::new(*x, *y))
         .collect();
         let area: f32 = triangulate(&pts)
+            .unwrap_or_default()
             .iter()
             .map(|[a, b, c]| {
                 let (a, b, c) = (pts[*a as usize], pts[*b as usize], pts[*c as usize]);
@@ -4211,7 +4305,9 @@ mod tests {
             .iter()
             .map(|(x, y)| Pos2::new(*x, *y))
             .collect();
-        let tris = triangulate(&pts);
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("a small outline is cut up")
+        };
         assert_eq!(tris.len(), 4);
         let area: f32 = tris
             .iter()
@@ -4256,6 +4352,149 @@ mod tests {
         assert_eq!(runs() - start, 2);
     }
 
+    /// A closed zigzag round a circle of radius 100: every other corner pointing in, to radius
+    /// `inner`, so it is not convex.
+    fn star_to(n: usize, inner: f64) -> Vec<Point> {
+        (0..n)
+            .map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / n as f64;
+                let r = if i % 2 == 0 { 100.0 } else { inner };
+                Point::new(r * t.cos(), r * t.sin())
+            })
+            .collect()
+    }
+
+    fn star(n: usize) -> Vec<Point> {
+        star_to(n, 99.0)
+    }
+
+    fn screen(pts: &[Point]) -> Vec<Pos2> {
+        pts.iter().map(|q| Pos2::new(q.x as f32, q.y as f32)).collect()
+    }
+
+    /// The area the triangles cover and the outline's own area (shoelace), both in f64.
+    fn areas(pts: &[Pos2], tris: &[[u32; 3]]) -> (f64, f64) {
+        let at = |i: u32| (f64::from(pts[i as usize].x), f64::from(pts[i as usize].y));
+        let covered = tris
+            .iter()
+            .map(|&[a, b, c]| {
+                let (a, b, c) = (at(a), at(b), at(c));
+                ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs() / 2.0
+            })
+            .sum();
+        let outline = pts
+            .iter()
+            .zip(pts.iter().cycle().skip(1))
+            .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x))
+            .sum::<f64>()
+            .abs()
+            / 2.0;
+        (covered, outline)
+    }
+
+    #[test]
+    fn a_fill_of_a_few_thousand_points_is_still_cut_into_triangles() {
+        let pts = screen(&star(2_000));
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("2000 points fit in the budget")
+        };
+        assert_eq!(tris.len(), pts.len() - 2);
+    }
+
+    #[test]
+    fn a_fill_of_twenty_thousand_points_is_cut_into_triangles_covering_it() {
+        let pts = screen(&star(20_000));
+        let started = std::time::Instant::now();
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("20 000 points fit in the budget")
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(tris.len(), pts.len() - 2);
+        let (covered, outline) = areas(&pts, &tris);
+        assert!((covered - outline).abs() < outline * 1e-4, "{covered} vs {outline}");
+    }
+
+    #[test]
+    fn a_fill_of_a_hundred_thousand_points_is_filled_once_without_stalling() {
+        let shape = Shape::Polyline {
+            points: star(100_000),
+            closed: true,
+            filled: true,
+        };
+        let ctx = egui::Context::default();
+        let xf = Xf {
+            origin: Pos2::new(200.0, 200.0),
+            zoom: 1.0,
+        };
+        let paint = || {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                let p = ctx.layer_painter(egui::LayerId::background());
+                paint_shape(&p, &xf, &shape, Stroke::new(1.0_f32, Color32::BLACK));
+            });
+            out.shapes
+                .iter()
+                .any(|c| matches!(&c.shape, EShape::Mesh(m) if m.indices.len() == 3 * (100_000 - 2)))
+        };
+        let runs = || TRIANGULATIONS.with(|n| n.get());
+        let start = runs();
+        let started = std::time::Instant::now();
+        assert!(paint(), "the shape is filled");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(paint(), "and filled on the next frame too");
+        assert_eq!(runs() - start, 1, "from the cached triangles");
+    }
+
+    #[test]
+    fn a_fill_too_costly_to_cut_up_is_drawn_as_its_outline_without_stalling() {
+        // Every inward corner piled up next to the centre, under the box of every ear: each
+        // ear test has to look at all of them, so this runs out of budget.
+        let shape = Shape::Polyline {
+            points: star_to(100_000, 0.001),
+            closed: true,
+            filled: true,
+        };
+        let ctx = egui::Context::default();
+        let xf = Xf {
+            origin: Pos2::new(200.0, 200.0),
+            zoom: 1.0,
+        };
+        let paint = || {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                let p = ctx.layer_painter(egui::LayerId::background());
+                paint_shape(&p, &xf, &shape, Stroke::new(1.0_f32, Color32::BLACK));
+            });
+            out.shapes
+                .iter()
+                .any(|c| matches!(&c.shape, EShape::Path(path) if path.closed && path.points.len() == 100_000))
+        };
+        let runs = || TRIANGULATIONS.with(|n| n.get());
+        let start = runs();
+        let started = std::time::Instant::now();
+        assert!(paint(), "the outline is painted");
+        // Unbounded, this takes minutes; the budget keeps it to a fraction of that even in a
+        // debug build.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(paint(), "the outline is painted on the next frame too");
+        assert!(paint());
+        assert_eq!(
+            runs() - start,
+            1,
+            "a fill too costly to cut up is not tried again every frame"
+        );
+    }
+
     #[test]
     fn a_clockwise_outline_far_from_the_origin_fills_the_outline_not_its_notch() {
         // A clockwise L near (10000, 10000) mm: the notch is the square 10001..10002 on both axes.
@@ -4270,7 +4509,9 @@ mod tests {
         .iter()
         .map(|(x, y)| Point::new(*x, *y))
         .collect();
-        let tris = egui::util::cache::ComputerMut::compute(&mut Triangulator, FillKey(&pts));
+        let Some(tris) = egui::util::cache::ComputerMut::compute(&mut Triangulator, FillKey(&pts)) else {
+            unreachable!("a small outline is cut up")
+        };
         let at = |i: u32| {
             let q = pts[i as usize];
             (q.x - 10000.0, q.y - 10000.0)
@@ -4318,7 +4559,7 @@ mod tests {
         o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
         let j = &o.project.meta.jumpers[0];
         let numbers = wc_core::project::terminal_numbers(&o.project, |id| o.symbols.get(id).map(|s| s.role));
-        let at = jumper_points(&o.project.pages[page], &o.symbols, &numbers, j);
+        let at = wc_pdf::jumper_points(&o.project.pages[page], &o.symbols, &numbers, j);
         assert_eq!(
             at,
             [Point::new(20.0, 20.0), Point::new(40.0, 20.0)],
@@ -4596,6 +4837,84 @@ mod tests {
         assert_eq!(ed.wire, Some((Endpoint::Point { at: start }, vec![bend])));
     }
 
+    /// A bend clicked twice on the same spot leaves no zero-length segment in the finished
+    /// wire, so no junction dot shows on that plain bend (#1236).
+    #[test]
+    fn a_bend_clicked_twice_leaves_no_zero_length_segment() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+            ..Default::default()
+        };
+        let start = egui::pos2(500.0, 450.0);
+        let bend = start + Vec2::new(0.0, 90.0);
+        let end = bend + Vec2::new(90.0, 0.0);
+        click_at(&ctx, &mut o, &mut ed, start, 1.0);
+        // The start spot again, then the bend twice, each a separate single click.
+        click_at(&ctx, &mut o, &mut ed, start, 2.0);
+        click_at(&ctx, &mut o, &mut ed, bend, 3.0);
+        click_at(&ctx, &mut o, &mut ed, bend, 4.0);
+        click_at(&ctx, &mut o, &mut ed, end, 5.0);
+        click_at(&ctx, &mut o, &mut ed, end, 5.1);
+        assert!(ed.wire.is_none());
+        let page = o.project.pages[0].clone();
+        assert_eq!(page.wires.len(), 1, "{:?}", page.wires);
+        let w = &page.wires[0];
+        let pts = o.wire_points(&page, w).unwrap();
+        assert_eq!(pts.len(), 3, "start, one bend, end: {pts:?}");
+        assert!(pts.windows(2).all(|ab| ab[0] != ab[1]), "{pts:?}");
+        let lines = vec![pts.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>()];
+        assert!(wc_pdf::junctions(&lines).is_empty(), "{pts:?}");
+    }
+
+    /// A wire started on one page is dropped when another page is shown, also by a way that
+    /// sets the page shown directly (New page, Duplicate page, the device list), so its next
+    /// click does not end it on the new page (#1154).
+    #[test]
+    fn a_wire_started_on_one_page_is_dropped_on_another() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+            ..View::default()
+        };
+        let on = egui::pos2(500.0, 450.0);
+        click_at(&ctx, &mut o, &mut ed, on, 1.0);
+        painted(&ctx, &mut o, &mut ed, 1.5, vec![]);
+        assert!(ed.wire.is_some(), "kept while its page is shown");
+
+        // As Pages > New page does: the new page is shown with the wire tool still on.
+        ed.page = o.add_page();
+        painted(&ctx, &mut o, &mut ed, 2.0, vec![]);
+        assert!(ed.wire.is_none(), "the wire begun on the other page is dropped");
+        let end = on + Vec2::new(60.0, 40.0);
+        click_at(&ctx, &mut o, &mut ed, end, 3.0);
+        click_at(&ctx, &mut o, &mut ed, end, 3.1);
+        assert!(
+            o.project.pages[ed.page].wires.is_empty(),
+            "no wire from the other page's start: {:?}",
+            o.project.pages[ed.page].wires
+        );
+        assert!(o.project.pages[0].wires.is_empty());
+    }
+
     /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
     /// cross-reference shows under the coil), a review comment and a scanned sheet whose
     /// picture is missing (so its placeholder text shows).
@@ -4644,6 +4963,67 @@ mod tests {
             ..Editor::default()
         };
         (tmp, o, ed)
+    }
+
+    #[test]
+    fn a_mirrored_or_upside_down_symbol_shows_its_tag_away_from_the_drawing() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let mut ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let pin = crate::theme::Theme::of(&ctx).pin;
+        for (rotation, mirror, left_of_drawing) in [
+            (Rotation::R0, false, true),
+            (Rotation::R0, true, false),
+            (Rotation::R180, false, false),
+            (Rotation::R180, true, true),
+        ] {
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.rotation = rotation;
+            s.mirror = mirror;
+            s.tag = Some(wc_core::DeviceTag::parse("=PUMP.STATION+CABINET-K1").unwrap());
+            painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                time: Some(0.1),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut o, &mut ed, false, 1.0, true));
+            });
+            // The coil's pins sit on its centre line, the tag 12 mm beside it.
+            let pins: Vec<f32> = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    EShape::Circle(c) if c.fill == pin => Some(c.center.x),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pins.len(), 2, "{pins:?}");
+            let lines: Vec<Rect> = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    EShape::Text(t) if ["=PUMP", "+CAB", "-K1"].iter().any(|w| t.galley.text().starts_with(w)) => {
+                        Some(t.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 3, "{rotation:?} {mirror}");
+            for r in lines {
+                if left_of_drawing {
+                    assert!(r.max.x < pins[0], "{rotation:?} {mirror}: {r:?} left of {pins:?}");
+                } else {
+                    assert!(r.min.x > pins[0], "{rotation:?} {mirror}: {r:?} right of {pins:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -4792,11 +5172,11 @@ mod tests {
         assert_eq!(ed.selection, [sym("s2")], "one not selected becomes the only selection");
         assert!(selected_wires(&ed).is_empty());
         let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
-        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Duplicate", "Delete"]);
     }
 
     #[test]
-    fn right_click_on_text_or_a_drawing_offers_copy_cut_and_delete() {
+    fn right_click_on_text_or_a_drawing_offers_copy_cut_duplicate_and_delete() {
         let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
         // Not selected: it becomes the only selection, and the menu has the edits that work on it.
         let mut ed = Editor {
@@ -4806,7 +5186,7 @@ mod tests {
         assert!(labels(&ed).is_empty(), "wires alone keep only the route menu");
         right_clicked(&mut ed, Some(Selection::Graphic(2)));
         assert_eq!(ed.selection, [Selection::Graphic(2)]);
-        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Duplicate", "Delete"]);
         // Selected: the selection it is part of stays.
         let mut ed = Editor {
             selection: vec![
@@ -4825,10 +5205,69 @@ mod tests {
                 Selection::Wire("w1".into())
             ]
         );
-        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Duplicate", "Delete"]);
         // With a symbol among them, Rotate and Mirror come back.
         ed.selection.push(Selection::Symbol("s1".into()));
-        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Duplicate", "Delete"]);
+    }
+
+    /// Right-click a symbol through egui events, then click Duplicate in the menu: the command
+    /// is left for the app to run, as Ctrl+D runs it (#1122).
+    #[test]
+    fn duplicate_is_picked_from_the_right_click_menu_of_a_symbol() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        ed.selection.clear();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(100.0, 100.0),
+            fit: false,
+            ..View::default()
+        };
+        // Where page mm (0, 0) is on the screen, from the cursor seen on a grid point.
+        let probe = egui::pos2(400.0, 400.0);
+        painted(&ctx, &mut o, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
+        let seen = ed.cursor.unwrap();
+        let screen = |p: Point| probe + Vec2::new((p.x - seen.x) as f32, (p.y - seen.y) as f32) * 3.0;
+        let at = o.project.pages[ed.page].symbol(&coil).unwrap().at;
+        let on_coil = screen(at);
+        let button = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        painted(&ctx, &mut o, &mut ed, 1.0, vec![egui::Event::PointerMoved(on_coil)]);
+        painted(
+            &ctx,
+            &mut o,
+            &mut ed,
+            1.01,
+            vec![button(on_coil, egui::PointerButton::Secondary, true)],
+        );
+        painted(
+            &ctx,
+            &mut o,
+            &mut ed,
+            1.02,
+            vec![button(on_coil, egui::PointerButton::Secondary, false)],
+        );
+        assert_eq!(
+            ed.selection,
+            [Selection::Symbol(coil.clone())],
+            "the right-click selects it"
+        );
+        let texts = painted(&ctx, &mut o, &mut ed, 1.1, vec![]);
+        let item = texts.iter().find(|(t, _)| t == "Duplicate");
+        assert!(item.is_some(), "no Duplicate in the menu: {texts:?}");
+        let item = item.unwrap().1.center();
+        let left = |pressed| button(item, egui::PointerButton::Primary, pressed);
+        painted(&ctx, &mut o, &mut ed, 1.2, vec![egui::Event::PointerMoved(item)]);
+        painted(&ctx, &mut o, &mut ed, 1.21, vec![left(true)]);
+        painted(&ctx, &mut o, &mut ed, 1.22, vec![left(false)]);
+        assert_eq!(ed.menu_action, Some(crate::actions::Action::Duplicate));
     }
 
     #[test]

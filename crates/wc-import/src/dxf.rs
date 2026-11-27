@@ -157,9 +157,21 @@ fn parse(text: &str) -> Result<Drawing> {
                   block: &mut Option<(String, Vec<Entity>)>,
                   polyline: &mut Option<Entity>,
                   d: &mut Drawing| match e.kind.as_str() {
-        "POLYLINE" => *polyline = Some(e),
+        "POLYLINE" => {
+            // The header's own 10/20/30 point is a dummy (always the origin): the line's points
+            // are its VERTEX entities, so it must not become the first of them.
+            let mut e = e;
+            e.codes.retain(|(c, _)| !matches!(c, 10 | 20 | 30));
+            *polyline = Some(e);
+        }
         "VERTEX" => {
-            if let Some(p) = polyline.as_mut() {
+            // A spline frame control point (flag 16) of a spline-fitted polyline lies off the
+            // curve and is not drawn: the points on the curve are the other vertices.
+            let frame = e
+                .get(70)
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .is_some_and(|f| f & 16 != 0);
+            if let Some(p) = polyline.as_mut().filter(|_| !frame) {
                 p.codes.push((10, e.get(10).unwrap_or("0").into()));
                 p.codes.push((20, e.get(20).unwrap_or("0").into()));
                 if let Some(bulge) = e.get(42) {
@@ -688,7 +700,16 @@ fn shapes(
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
-                    mtext_plain(raw)
+                    // A text over 250 characters comes as code 3 chunks before the last one
+                    // (code 1): joined first, so a code split across two chunks still reads.
+                    let mut whole: String = e
+                        .codes
+                        .iter()
+                        .filter(|(c, _)| *c == 3)
+                        .map(|(_, v)| v.as_str())
+                        .collect();
+                    whole.push_str(raw);
+                    mtext_plain(&whole)
                 } else {
                     special_codes(raw)
                 };
@@ -1040,7 +1061,7 @@ const BRIDGE_BUDGET: usize = 4_000_000;
 
 /// The most vertex visits spent finding which loop of a hatch lies in which; past it the hatch
 /// is left unfilled.
-const NESTING_BUDGET: usize = 20_000_000;
+pub(crate) const NESTING_BUDGET: usize = 20_000_000;
 
 /// The most work (point pairs, wall edges collected and crossing tests) spent on all the bridges
 /// of one hatch together; past it the hatch is left unfilled.
@@ -1083,10 +1104,11 @@ const MISSING_BLOCK_NAMES: usize = 3;
 /// How many characters of a missing block's name the warning keeps.
 const MISSING_BLOCK_NAME_LEN: usize = 64;
 
-/// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
+
+/// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 /// The `skipped` key of a line whose ends are not numbers once placed.
 const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
@@ -1918,7 +1940,7 @@ fn loop_edges(lp: &[(f64, f64)]) -> impl Iterator<Item = ((f64, f64), (f64, f64)
 
 /// Twice the signed area of a loop (positive when counter-clockwise). Taken relative to its first
 /// point, so loops far from the origin keep their small area terms.
-fn area2(lp: &[(f64, f64)]) -> f64 {
+pub(crate) fn area2(lp: &[(f64, f64)]) -> f64 {
     let Some(&o) = lp.first() else { return 0.0 };
     loop_edges(lp)
         .map(|(a, b)| (a.0 - o.0) * (b.1 - o.1) - (b.0 - o.0) * (a.1 - o.1))
@@ -1942,7 +1964,7 @@ fn tally_work(n: usize) {
 }
 
 /// Whether `pt` lies inside the loop (even-odd rule).
-fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+pub(crate) fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
     tally_work(lp.len());
     let mut odd = false;
     for (b, a) in loop_edges(lp) {
@@ -1973,7 +1995,7 @@ fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
 }
 
 /// A closed boundary, as DXF points.
-type Loop = Vec<(f64, f64)>;
+pub(crate) type Loop = Vec<(f64, f64)>;
 
 /// [`with_holes_kept`] without the loops it kept.
 #[cfg(test)]
@@ -1988,7 +2010,7 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
 /// islands, Ignore every island; a loop of fewer than three points is dropped). `None` when the
 /// loops are too many or too big to work out within the budgets: a fill that covered the holes
 /// would be wrong.
-fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, Vec<bool>)> {
+pub(crate) fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, Vec<bool>)> {
     let mut kept = vec![false; loops.len()];
     let mut order: Vec<usize> = (0..loops.len())
         .filter(|&i| loops.get(i).is_some_and(|l| l.len() >= 3))
@@ -2204,6 +2226,11 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
+                // Codes with no argument: underline, overline and strike-through on and off,
+                // and the stacked-dimension wrap. Dropped, the text after them kept.
+                Some('L' | 'l' | 'O' | 'o' | 'K' | 'k' | 'X') => {}
+                // A non-breaking space and a column break read as a space.
+                Some('~' | 'N') => out.push(' '),
                 Some('U') => {
                     // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
                     // before `U+` (`\\U+00C5`) stays as written. Any other `\U` (no `+`, or not
@@ -3458,6 +3485,17 @@ mod tests {
     }
 
     #[test]
+    fn mtext_codes_without_an_argument_keep_the_text_after_them() {
+        assert_eq!(mtext_plain(r"\LMotor 1\l; Pump"), "Motor 1; Pump");
+        assert_eq!(mtext_plain(r"\OTop\o \KOld\k; New"), "Top Old; New");
+        assert_eq!(mtext_plain(r"A\~B; C"), "A B; C");
+        assert_eq!(mtext_plain(r"Col 1\NCol 2; x"), "Col 1 Col 2; x");
+        assert_eq!(mtext_plain(r"12\X3; y"), "123; y");
+        // Codes that take an argument still drop it.
+        assert_eq!(mtext_plain(r"{\H2.5;\C1;\LBig}"), "Big");
+    }
+
+    #[test]
     fn text_codes_become_characters() -> Result<()> {
         assert_eq!(
             special_codes(r"\U+00C5lesund 3%%c 20%%D %%p1 50%%% %%uline%%u"),
@@ -3507,6 +3545,25 @@ mod tests {
     }
 
     #[test]
+    fn a_long_mtext_keeps_its_first_chunks() -> Result<()> {
+        // Over 250 characters: code 3 chunks first, the last part as code 1; a `\U+00C5`
+        // split across two chunks.
+        let ents = "0\nMTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n3\nMotor M1 feeds the pump\\U+0\n\
+                    3\n0C5 in hall\\P\n1\nB2\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Motor M1 feeds the pump\u{c5} in hall B2"]);
+        Ok(())
+    }
+
+    #[test]
     fn a_page_exported_to_dxf_reads_back_its_accents() -> Result<()> {
         let mut project = wc_core::Project::new("Round trip");
         let mut drawn = wc_core::Page::new("p1", "1", "Page");
@@ -3530,6 +3587,44 @@ mod tests {
                 .any(|g| matches!(g, Shape::Text { text, .. } if text == "\u{c5}lesund")),
             "the import reads the character back"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_exported_to_dxf_reads_back_its_wide_wires() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        let at = |x: f64, y: f64| wc_core::Endpoint::Point { at: Point::new(x, y) };
+        drawn.wires.push(wc_core::Wire {
+            id: "w1".into(),
+            from: at(100.0, 50.0),
+            to: at(160.0, 50.0),
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("40\n0.35\n41\n0.35\n"), "the wire keeps its width");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        // The import moves the drawing to the page corner, so look for the wire by its shape:
+        // an open two-point polyline, level and 60 mm long.
+        let wire = p.graphics.iter().any(|g| match g {
+            Shape::Polyline {
+                points, closed: false, ..
+            } => match points.as_slice() {
+                [a, b] => (a.y - b.y).abs() < 1e-6 && ((a.x - b.x).abs() - 60.0).abs() < 1e-6,
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(wire, "the wide wire reads back as a line: {:?}", p.graphics);
         Ok(())
     }
 
@@ -3579,6 +3674,31 @@ mod tests {
 
     fn near(a: Point, b: Point) -> bool {
         a.distance(b) < 1e-6
+    }
+
+    #[test]
+    fn a_spline_fitted_polyline_leaves_out_its_frame_control_points() -> Result<()> {
+        // PEDIT > Spline: the frame control point (flag 16) at (5, 50) is off the curve; the
+        // curve-fit vertices (flag 8) are the line that is drawn.
+        // The header carries the usual dummy point at the origin, which is not a vertex.
+        let ents = "0\nPOLYLINE\n8\n0\n66\n1\n10\n0\n20\n0\n30\n0\n70\n4\n\
+                    0\nVERTEX\n8\n0\n10\n0\n20\n0\n70\n16\n\
+                    0\nVERTEX\n8\n0\n10\n5\n20\n50\n70\n16\n\
+                    0\nVERTEX\n8\n0\n10\n10\n20\n0\n70\n16\n\
+                    0\nVERTEX\n8\n0\n10\n0\n20\n0\n70\n8\n\
+                    0\nVERTEX\n8\n0\n10\n5\n20\n10\n70\n8\n\
+                    0\nVERTEX\n8\n0\n10\n10\n20\n0\n70\n8\n\
+                    0\nSEQEND\n";
+        let (shapes, _) = drawn(ents, "")?;
+        let [s] = shapes.as_slice() else {
+            unreachable!("one polyline: {shapes:?}")
+        };
+        let (points, closed, _) = poly(s);
+        assert!(!closed);
+        let want = [Point::new(0.0, 0.0), Point::new(5.0, -10.0), Point::new(10.0, 0.0)];
+        assert_eq!(points.len(), want.len(), "{points:?}");
+        assert!(points.iter().zip(want).all(|(a, b)| near(*a, b)), "{points:?}");
+        Ok(())
     }
 
     #[test]

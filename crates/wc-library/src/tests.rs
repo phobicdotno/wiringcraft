@@ -546,8 +546,9 @@ fn a_folder_source_with_a_rules_file_gives_its_rules_in_source_order() -> Result
     Ok(())
 }
 
-#[test]
-fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result<()> {
+/// A temporary project whose only library source is the starter library in `library/`.
+/// The temp dir is returned too, so it lives as long as the test holds it.
+fn starter_library() -> Result<(tempfile::TempDir, Library)> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
     let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
@@ -558,6 +559,12 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
         reference: None,
     }];
     let lib = Library::open(&tmp.path().join("p"), &project)?;
+    Ok((tmp, lib))
+}
+
+#[test]
+fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result<()> {
+    let (_tmp, lib) = starter_library()?;
     let ids = lib.index(ItemKind::Symbol);
     for id in ids.keys() {
         let (s, _) = lib.symbol(id)?;
@@ -629,16 +636,7 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
 
 #[test]
 fn every_starter_part_loads_under_its_file_name_and_names_a_starter_symbol() -> Result<()> {
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let symbols = lib.index(ItemKind::Symbol);
     let parts = lib.index(ItemKind::Part);
     assert!(!parts.is_empty(), "the starter library has no parts");
@@ -658,16 +656,7 @@ fn every_starter_part_loads_under_its_file_name_and_names_a_starter_symbol() -> 
 
 #[test]
 fn starter_solenoid_valve_coil_and_its_example_part_load() -> Result<()> {
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     // The solenoid valve coil (#724): its own tag (no contacts follow it), letter code M for an
     // actuator in IEC 81346-2, and the coil pins of a relay coil.
     let (valve, _) = lib.symbol("wc.coil.valve")?;
@@ -684,16 +673,7 @@ fn starter_solenoid_valve_coil_and_its_example_part_load() -> Result<()> {
 
 #[test]
 fn starter_photoelectric_sensor_and_its_example_part_load() -> Result<()> {
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     // The photoelectric sensor (#756): letter code B for a sensor in IEC 81346-2, and the same
     // three wires as the 3-wire proximity sensors.
     let (photo, _) = lib.symbol("wc.sensor.photo3")?;
@@ -711,16 +691,7 @@ fn starter_photoelectric_sensor_and_its_example_part_load() -> Result<()> {
 #[test]
 fn the_starter_key_switch_is_a_make_contact_tagged_s() -> Result<()> {
     // #767: a key-operated switch next to the push buttons and selector switch.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (s, _) = lib.symbol("wc.switch.key")?;
     assert_eq!(s.role, SymbolRole::Standalone);
     assert_eq!(s.letter_code, "S");
@@ -732,16 +703,7 @@ fn the_starter_key_switch_is_a_make_contact_tagged_s() -> Result<()> {
 #[test]
 fn the_starter_current_transformer_has_primary_and_secondary_terminals() -> Result<()> {
     // #769: a current transformer for panel ammeters and energy meters.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (ct, _) = lib.symbol("wc.transformer.current")?;
     assert_eq!(ct.role, SymbolRole::Standalone);
     assert_eq!(ct.letter_code, "T");
@@ -753,16 +715,7 @@ fn the_starter_current_transformer_has_primary_and_secondary_terminals() -> Resu
 #[test]
 fn the_starter_functional_earth_is_not_the_protective_earth() -> Result<()> {
     // #897: a plain (functional) earth for signal grounds, 0 V and screens.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (fe, _) = lib.symbol("wc.fe")?;
     let (pe, _) = lib.symbol("wc.pe")?;
     assert_eq!(fe.id, "wc.fe");
@@ -778,16 +731,7 @@ fn the_starter_functional_earth_is_not_the_protective_earth() -> Result<()> {
 #[test]
 fn the_starter_three_phase_transformer_has_primary_and_secondary_terminals() -> Result<()> {
     // #763: a 3-phase transformer next to the 1-phase control transformer.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (t, _) = lib.symbol("wc.transformer.3ph")?;
     assert_eq!(t.role, SymbolRole::Standalone);
     assert_eq!(t.letter_code, "T");
@@ -800,16 +744,7 @@ fn the_starter_three_phase_transformer_has_primary_and_secondary_terminals() -> 
 fn the_starter_fuse_switch_disconnector_has_three_poles_and_its_own_tag() -> Result<()> {
     // The 3-pole fuse switch disconnector (#725): Q in IEC 81346-2 (it switches and isolates;
     // the fuses ride on the switch), pins 1 to 6 like the 3-pole breaker, and an example part.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (fsd, _) = lib.symbol("wc.fuse.3p")?;
     assert_eq!(fsd.role, SymbolRole::Standalone);
     assert_eq!(fsd.letter_code, "Q");
@@ -928,16 +863,7 @@ fn lock_does_not_restore_another_version_or_an_item_gone_from_the_library() -> R
 #[test]
 fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
     // #765: panel ammeters and voltmeters on supply and motor circuits.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     for id in ["wc.meter.ammeter", "wc.meter.voltmeter"] {
         let (m, _) = lib.symbol(id)?;
         assert_eq!(m.role, SymbolRole::Standalone, "{id}");
@@ -952,16 +878,7 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
 #[test]
 fn the_starter_inductor_has_two_pins() -> Result<()> {
     // #770: an inductor for line and DC chokes on drives and in filters.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (l, _) = lib.symbol("wc.inductor")?;
     assert_eq!(l.role, SymbolRole::Standalone);
     assert_eq!(l.letter_code, "R");
@@ -973,16 +890,7 @@ fn the_starter_inductor_has_two_pins() -> Result<()> {
 
 #[test]
 fn starter_two_wire_proximity_sensor_and_its_example_part_load() -> Result<()> {
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     // The 2-wire proximity sensor (#757): letter code B for a sensor in IEC 81346-2, one wire
     // in and one out, so it sits in series with the load like a switch.
     let (prox, _) = lib.symbol("wc.sensor.prox2")?;
@@ -1001,16 +909,7 @@ fn starter_two_wire_proximity_sensor_and_its_example_part_load() -> Result<()> {
 #[test]
 fn the_starter_energy_meter_is_a_measuring_instrument_on_the_grid() -> Result<()> {
     // #930: a single-phase kWh meter, L and N in at the top and out at the bottom.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (m, _) = lib.symbol("wc.meter.energy")?;
     assert_eq!(m.id, "wc.meter.energy");
     assert_eq!(m.role, SymbolRole::Standalone);
@@ -1028,16 +927,7 @@ fn the_starter_energy_meter_is_a_measuring_instrument_on_the_grid() -> Result<()
 #[test]
 fn the_starter_dc_motor_has_plus_and_minus_pins() -> Result<()> {
     // #882: a DC motor next to the single- and three-phase ones.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (m, _) = lib.symbol("wc.motor.dc")?;
     assert_eq!(m.id, "wc.motor.dc");
     assert_eq!(m.role, SymbolRole::Standalone);
@@ -1054,16 +944,7 @@ fn the_starter_dc_motor_has_plus_and_minus_pins() -> Result<()> {
 #[test]
 fn the_starter_flow_switch_is_a_make_contact_tagged_b() -> Result<()> {
     // #896: a flow switch next to the pressure, float and temperature switches.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (s, _) = lib.symbol("wc.switch.flow")?;
     assert_eq!(s.id, "wc.switch.flow");
     assert_eq!(s.role, SymbolRole::Standalone);
@@ -1080,21 +961,40 @@ fn the_starter_flow_switch_is_a_make_contact_tagged_b() -> Result<()> {
 #[test]
 fn the_starter_battery_has_plus_and_minus_pins() -> Result<()> {
     // #764: a battery or cell for backup supplies and buffered 24 V DC circuits.
-    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
-    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
-    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
-    project.meta.libraries = vec![LibrarySource {
-        name: "starter".into(),
-        kind: "folder".into(),
-        location: starter.to_string_lossy().into(),
-        reference: None,
-    }];
-    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (_tmp, lib) = starter_library()?;
     let (b, _) = lib.symbol("wc.battery")?;
     assert_eq!(b.role, SymbolRole::Standalone);
     assert_eq!(b.letter_code, "G");
     assert_eq!(b.category, "power");
     let names: Vec<_> = b.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["+", "-"]);
+    Ok(())
+}
+
+#[test]
+fn the_starter_changeover_contact_has_its_pins_on_the_5_mm_grid() -> Result<()> {
+    // #1148: pins 12 and 14 sat 4 mm to the sides, so a wire drawn on the grid missed them.
+    let (_tmp, lib) = starter_library()?;
+    let (s, _) = lib.symbol("wc.contact.co")?;
+    let pins: Vec<_> = s.pins.iter().map(|p| (p.name.as_str(), p.at.x, p.at.y)).collect();
+    assert_eq!(pins, [("11", 0.0, 0.0), ("12", -5.0, 15.0), ("14", 5.0, 15.0)]);
+    Ok(())
+}
+
+#[test]
+fn every_starter_pin_sits_on_the_5_mm_grid() -> Result<()> {
+    // #1149: pins off the grid cannot be reached by a wire drawn on it.
+    let on_grid = |v: f64| ((v / 5.0).round() * 5.0 - v).abs() < 1e-9;
+    let (_tmp, lib) = starter_library()?;
+    let mut off = Vec::new();
+    for id in lib.index(ItemKind::Symbol).keys() {
+        let (s, _) = lib.symbol(id)?;
+        for p in &s.pins {
+            if !on_grid(p.at.x) || !on_grid(p.at.y) {
+                off.push(format!("{id} {} at ({}, {})", p.name, p.at.x, p.at.y));
+            }
+        }
+    }
+    assert!(off.is_empty(), "pins off the 5 mm grid: {off:?}");
     Ok(())
 }

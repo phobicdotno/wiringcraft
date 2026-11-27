@@ -1255,8 +1255,6 @@ pub fn eplan_tables(path: &Path) -> Result<(crate::eplan::Tables, Vec<String>), 
     Ok((tables, warnings))
 }
 
-/// Add imported symbols, parts, pages and devices to a project, pinning symbols and parts in
-/// the lockfile under `source`.
 /// The library symbols a SolidWorks import may draw, with the library each comes from: the
 /// project's own copy where it has one (so a repeated import matches it), otherwise the
 /// project's libraries. With `map`, the user's block map from that file. Also returns the
@@ -1894,8 +1892,7 @@ pub fn add_built(
     Ok((changed, joined))
 }
 
-/// The path and bytes of a vendored copy, kept before an import replaces it.
-/// The vendored file of an item and its bytes, none when there is no such file.
+/// The path of an item's vendored file and its bytes, none when there is no such file.
 pub fn vendored_bytes(dir: &Path, kind: ItemKind, id: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
     let path = store::vendor_path(dir, kind, id).map_err(|x| x.to_string())?;
     match std::fs::read(&path) {
