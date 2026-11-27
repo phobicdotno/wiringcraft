@@ -609,13 +609,19 @@ pub fn title_field_label(key: &str) -> &str {
 /// A location path as the project stores it (`L1.L3`), from what was typed (`+L1.L3` or
 /// `L1.L3`). Refused when it is not just the `+` part of a tag.
 pub fn location_path(s: &str) -> Result<String, String> {
-    let s = s.trim();
-    let s = s.strip_prefix('+').unwrap_or(s);
-    // A tag needs a product, so try it with one; a product or function in `s` is refused.
-    let tag = DeviceTag::parse(&format!("+{s}-X")).map_err(|e| format!("{s:?} is not a location: {e}"))?;
-    if !tag.function.is_empty() || tag.product != ["X"] {
-        return Err(format!("{s:?} is not a location: give only the + part of a tag"));
+    let typed = s.trim();
+    let s = typed.strip_prefix('+').unwrap_or(typed);
+    if s.contains(['-', '=']) {
+        return Err(format!("{typed:?} is not a location: give only the + part of a tag"));
     }
+    // Errors name the location with its `+`, as it would be written in a tag.
+    let shown = format!("+{s}");
+    // A tag needs a product, so try it with one. The error gives only the reason, since the
+    // tag it was found in is made up here.
+    let tag = DeviceTag::parse(&format!("+{s}-X")).map_err(|e| match e {
+        crate::Error::Tag(_, why) => format!("{shown:?} is not a location: {why}"),
+        e => format!("{shown:?} is not a location: {e}"),
+    })?;
     Ok(tag.location.join("."))
 }
 
@@ -2636,6 +2642,29 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_bad_location_is_named_as_typed_without_the_made_up_tag() {
+        let cases = [
+            ("+", "\"+\" is not a location: the location aspect (+) has no name"),
+            ("", "\"+\" is not a location: the location aspect (+) has no name"),
+            (
+                "A..B",
+                "\"+A..B\" is not a location: the location aspect (+) has an empty level",
+            ),
+            (
+                "+A B",
+                "\"+A B\" is not a location: only letters, digits, '.', '_' allowed",
+            ),
+            ("+A-K1", "\"+A-K1\" is not a location: give only the + part of a tag"),
+            ("=F1+A", "\"=F1+A\" is not a location: give only the + part of a tag"),
+            ("-K1", "\"-K1\" is not a location: give only the + part of a tag"),
+        ];
+        for (typed, want) in cases {
+            assert_eq!(location_path(typed), Err(want.to_owned()), "{typed:?}");
+        }
+        assert_eq!(location_path(" +L1.L3 "), Ok("L1.L3".to_owned()));
     }
 
     #[test]
