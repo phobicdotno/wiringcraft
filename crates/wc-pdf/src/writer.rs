@@ -693,9 +693,11 @@ impl Pen {
         self.text_at_angle(at, height_mm, align, 0.0, s);
     }
 
-    /// Text turned by `angle` degrees counter-clockwise around its anchor.
+    /// Text turned by `angle` degrees counter-clockwise around its anchor. Text whose height is
+    /// not above zero is left out, as the editor shows none: a negative font size would print
+    /// it upside down in the PDF and as an invalid size in the SVG and DXF.
     pub fn text_at_angle(&mut self, at: (f64, f64), height_mm: f64, align: u8, angle: f64, s: &str) {
-        if s.is_empty() || !all_finite(&[at, (height_mm, 0.0)]) {
+        if s.is_empty() || !all_finite(&[at, (height_mm, 0.0)]) || height_mm <= 0.0 {
             return;
         }
         let size = height_mm * PT_PER_MM / 0.72; // cap height to font size
