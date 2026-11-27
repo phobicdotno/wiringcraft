@@ -322,7 +322,7 @@ fn markdown_cell(s: &str) -> String {
             let mut tail = String::new();
             markdown_text(link.strip_prefix(body).unwrap_or_default(), &mut tail);
             let www = body.strip_prefix("www.");
-            if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') {
+            if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') && !has_delimiter(body) {
                 // A plain link stays as typed, a `\` inside it too.
                 out.push_str(body);
             } else if let Some((scheme, rest)) = body.split_once("://") {
@@ -356,6 +356,19 @@ fn markdown_cell(s: &str) -> String {
         rest = &rest[end + space..];
     }
     out
+}
+
+/// Whether a link word holds a character a viewer reads as markup before it makes the link:
+/// `*`, `~` or `` ` `` anywhere, or a `_` that is not between letters or digits
+/// (`/*draft*/` would show as emphasis inside the link; `a_b` is fine).
+fn has_delimiter(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let word_char = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+    chars.iter().enumerate().any(|(i, &c)| match c {
+        '*' | '~' | '`' => true,
+        '_' => !(i.checked_sub(1).is_some_and(|j| word_char(chars.get(j))) && word_char(chars.get(i + 1))),
+        _ => false,
+    })
 }
 
 /// Escapes the Markdown punctuation in plain cell text (see `markdown_cell`).

@@ -4373,6 +4373,17 @@ fn markdown_titles_show_markdown_characters_as_typed() {
     // A link ending in `#` keeps it without a backslash, which a viewer would take into it.
     assert_eq!(heading("See https://example.com/#"), "## See https://example.com/#");
     assert_eq!(heading("Parts list"), "## Parts list");
+    // Emphasis inside a link would show before the link is made: the word is written as text.
+    assert_eq!(
+        heading("See https://example.com/*draft*/x"),
+        "## See https\\://example.com/\\*draft\\*/x"
+    );
+    assert_eq!(
+        heading("https://example.com/_draft_/x"),
+        "## https\\://example.com/\\_draft\\_/x"
+    );
+    // A `_` between letters is not emphasis, so that link stays as typed.
+    assert_eq!(heading("https://example.com/a_b"), "## https://example.com/a_b");
 }
 
 #[test]
