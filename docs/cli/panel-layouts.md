@@ -14,7 +14,7 @@ running down the plate.
 
 | Command | What it does |
 |---|---|
-| `panel new <ID> [--name N] [--width W] [--height H]` | A new plate, 600 x 800 mm by default (200 to 5000 mm each way), with ducts around the edge and a 35 mm DIN rail in every 125 mm row between horizontal ducts. The name shows on the layout's page; left out, the id is used |
+| `panel new <ID> [--name N] [--width W] [--height H]` | A new plate, 600 x 800 mm by default (200 to 5000 mm each way), with ducts around the edge and a 35 mm DIN rail in every 125 mm row between horizontal ducts. A height below 205 mm gets no ducts or rails. The name shows on the layout's page; left out, the id is used |
 | `panel edit <ID> [--name N] [--width W] [--height H]` | Rename the layout or change the plate size. Rails, ducts and devices stay where they are; a size that would leave any of them off the plate is refused |
 | `panel show <ID>` | The plate, its numbered rails and ducts, and each device with its position, size and turn |
 | `panel list` | Every layout, its plate size and how many devices are on it |
@@ -146,8 +146,9 @@ wiringcraft import footprint-dxf mcb-front.dxf --part example.ex-mcb-1p-c10
 ```
 
 `import footprint-dxf` reads a maker's outline drawing: a DXF of the front view in mm at 1:1. It is
-drawn on layout pages in place of a plain box, and its extents give the part's size when the part
-has no `Width` and `Height`. It prints the size and the number of shapes read.
+drawn on layout pages in place of a plain box, and its extents give each dimension that the part's
+`Width` or `Height` does not set. A part with only `Width` takes its height from the drawing. It
+prints the size and the number of shapes read.
 
 ```sh
 wiringcraft import model-step contactor.step --part example.ex-ct-9-24dc
