@@ -278,20 +278,16 @@ pub fn changes(git: &Git, from: &str, to: Option<&str>) -> Result<Vec<Change>> {
     if let Some(t) = to {
         args.push(t);
     }
-    let text = git.run(&args)?;
+    // Paths read as bytes: a name that is not UTF-8 stays apart from every other name.
     let mut entries: Vec<(String, String)> = Vec::new();
-    let mut fields = text.split('\0');
+    let mut fields = git.run_paths(&args)?.into_iter();
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
-        if status.is_empty() || path.is_empty() {
-            continue;
-        }
-        entries.push((status.to_owned(), path.to_owned()));
+        entries.push((status, path));
     }
     if to.is_none() {
         // New files the user has not recorded yet are changes too.
-        let others = git.run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-        for path in others.split('\0').filter(|p| !p.is_empty()) {
-            entries.push(("A".to_owned(), path.to_owned()));
+        for path in git.run_paths(&["ls-files", "--others", "--exclude-standard", "-z"])? {
+            entries.push(("A".to_owned(), path));
         }
     }
     let mut out = Vec::new();

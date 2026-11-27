@@ -42,6 +42,34 @@ pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
     at.with_file_name(name)
 }
 
+/// A path from git's `-z` output as text: as it is when it is UTF-8. A name that is not (a
+/// Unix file name may hold any bytes) comes back in git's own quoted form, `"`, the name with
+/// `"` and `\` escaped and each byte that is not UTF-8 as a `\` and three octal digits, then
+/// `"` (`"pages/\377.page.json"`). Two names that differ in such a byte so stay two entries,
+/// where reading them lossily would give both the same text. The quoted form names no file:
+/// such an entry can be listed, not opened.
+pub(crate) fn path_text(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut out = String::from("\"");
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c => out.push(c),
+            }
+        }
+        for b in chunk.invalid() {
+            let _ = write!(out, "\\{b:03o}");
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A project folder's git repository.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -132,6 +160,23 @@ impl Git {
     }
 
     pub(crate) fn run(&self, args: &[&str]) -> Result<String> {
+        self.run_bytes(args)
+            .map(|out| String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// [`Git::run`] for `-z` output that lists paths: its NUL-ended fields, each read with
+    /// [`path_text`], so a name that is not UTF-8 never comes back as another name's text.
+    pub(crate) fn run_paths(&self, args: &[&str]) -> Result<Vec<String>> {
+        Ok(self
+            .run_bytes(args)?
+            .split(|&b| b == 0)
+            .filter(|field| !field.is_empty())
+            .map(path_text)
+            .collect())
+    }
+
+    /// [`Git::run`] with git's output as the bytes it printed.
+    fn run_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
         let out = Command::new("git")
             .args(args)
             .current_dir(&self.dir)
@@ -144,7 +189,7 @@ impl Git {
             .output()
             .map_err(Error::Spawn)?;
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            Ok(out.stdout)
         } else {
             let mut message = String::from_utf8_lossy(&out.stderr).trim().to_owned();
             if message.is_empty() {
@@ -552,13 +597,9 @@ impl Git {
             }),
             Err(e) => {
                 // `-z`: paths as they are (no quoting of accents, tabs or quotes), NUL-ended.
-                let conflicts: Vec<String> = self
-                    .run(&["diff", "--name-only", "--diff-filter=U", "-z"])
-                    .unwrap_or_default()
-                    .split('\0')
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_owned)
-                    .collect();
+                let conflicts = self
+                    .run_paths(&["diff", "--name-only", "--diff-filter=U", "-z"])
+                    .unwrap_or_default();
                 if conflicts.is_empty() {
                     Err(e)
                 } else {

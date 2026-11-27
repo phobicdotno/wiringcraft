@@ -814,3 +814,78 @@ fn a_new_branch_is_current_and_keeps_changes_not_yet_recorded() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_path_that_is_not_utf8_is_read_in_quoted_form() {
+    assert_eq!(git::path_text(b"pages/\xc3\xb8vre.page.json"), "pages/øvre.page.json");
+    assert_eq!(git::path_text(b"two words.txt"), "two words.txt");
+    assert_eq!(git::path_text(b"a\xffb"), r#""a\377b""#);
+    assert_eq!(git::path_text(b"a\xfeb"), r#""a\376b""#);
+    assert_eq!(git::path_text(b"\"x\\\xff"), r#""\"x\\\377""#);
+    assert_eq!(
+        git::path_text("ø\u{fffd}".as_bytes()),
+        "ø\u{fffd}",
+        "U+FFFD itself is UTF-8"
+    );
+}
+
+/// Two file names that differ only in a byte that is not UTF-8 (both would read as `a\u{fffd}.txt`
+/// lossily) stay two entries in the change list and in a merge's conflict list.
+#[cfg(unix)]
+#[test]
+fn names_that_differ_in_a_byte_that_is_not_utf8_stay_apart() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let names = [&b"a\xff.txt"[..], &b"a\xfe.txt"[..]];
+    let write = |text: &str| -> Result<()> {
+        for name in names {
+            let path = dir.join(std::ffi::OsStr::from_bytes(name));
+            std::fs::write(&path, text).map_err(|e| wc_core::Error::io("write", e))?;
+        }
+        Ok(())
+    };
+    let listed = vec![r#""a\377.txt""#.to_owned(), r#""a\376.txt""#.to_owned()];
+    std::fs::write(dir.join("base.txt"), "base\n").map_err(|e| wc_core::Error::io("write", e))?;
+    git.commit("base")?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    // Not recorded yet: listed as new files.
+    write("one\n")?;
+    let mut new: Vec<String> = changes(&git, &base, None)?
+        .into_iter()
+        .filter_map(|c| match c {
+            Change::File { path, status } if status == "added" => Some(path),
+            _ => None,
+        })
+        .collect();
+    new.sort();
+    let mut want = listed.clone();
+    want.sort();
+    assert_eq!(new, want);
+    // Recorded: listed between two versions.
+    git.commit("one")?;
+    let mut between: Vec<String> = changes(&git, &base, Some("HEAD"))?
+        .into_iter()
+        .filter_map(|c| match c {
+            Change::File { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    between.sort();
+    assert_eq!(between, want);
+    // Changed differently on two branches: two conflicts.
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    let MergeOutcome::Conflicts(mut conflicts) = git.merge("other")? else {
+        unreachable!("the merge conflicts")
+    };
+    conflicts.sort();
+    assert_eq!(conflicts, want);
+    Ok(())
+}
