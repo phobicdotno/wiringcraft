@@ -1539,3 +1539,175 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod reader_edge_tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn workbook(parts: &[(&str, &str)]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, body) in parts {
+            let _ = z.start_file(*name, zip::write::SimpleFileOptions::default());
+            let _ = z.write_all(body.as_bytes());
+        }
+        z.finish().map(Cursor::into_inner).unwrap_or_default()
+    }
+
+    fn sheet(text: &str) -> String {
+        format!(
+            r#"<worksheet><sheetData><row><c t="inlineStr"><is><t>{text}</t></is></c></row></sheetData></worksheet>"#
+        )
+    }
+
+    const WS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+
+    fn styled(xml: &str) -> Result<crate::csv::Rows> {
+        sheet_rows_styled(xml, &[], &Styles::default(), MAX_TEXT_BYTES)
+    }
+
+    #[test]
+    fn when_every_sheet_is_hidden_the_first_worksheet_is_read() -> Result<()> {
+        let rels = format!(
+            r#"<Relationships><Relationship Id="rId1" Type="{WS}" Target="worksheets/a.xml"/><Relationship Id="rId2" Type="{WS}" Target="worksheets/b.xml"/></Relationships>"#
+        );
+        let (a, b) = (sheet("first"), sheet("second"));
+        let bytes = workbook(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="A" state="veryHidden" r:id="rId1"/><sheet name="B" state="hidden" r:id="rId2"/></sheets></workbook>"#,
+            ),
+            ("xl/_rels/workbook.xml.rels", &rels),
+            ("xl/worksheets/a.xml", &a),
+            ("xl/worksheets/b.xml", &b),
+        ]);
+        assert_eq!(rows(&bytes)?.cells, vec![vec!["first".to_owned()]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sheet_marked_visible_is_not_taken_for_hidden() -> Result<()> {
+        let rels = format!(
+            r#"<Relationships><Relationship Id="rId1" Type="{WS}" Target="worksheets/a.xml"/><Relationship Id="rId2" Type="{WS}" Target="worksheets/b.xml"/></Relationships>"#
+        );
+        let (a, b) = (sheet("first"), sheet("second"));
+        let bytes = workbook(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="A" state="visible" r:id="rId1"/><sheet name="B" r:id="rId2"/></sheets></workbook>"#,
+            ),
+            ("xl/_rels/workbook.xml.rels", &rels),
+            ("xl/worksheets/a.xml", &a),
+            ("xl/worksheets/b.xml", &b),
+        ]);
+        assert_eq!(rows(&bytes)?.cells, vec![vec!["first".to_owned()]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_workbook_of_only_chart_sheets_is_an_error() {
+        let bytes = workbook(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Chart" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#,
+            ),
+            ("xl/chartsheets/sheet1.xml", "<chartsheet/>"),
+        ]);
+        let err = rows(&bytes).map(|_| ()).map_err(|e| e.to_string());
+        assert!(err.as_ref().is_err_and(|e| e.contains("no worksheet")), "{err:?}");
+    }
+
+    #[test]
+    fn a_missing_worksheet_part_is_an_error_naming_it() {
+        let bytes = workbook(&[("xl/workbook.xml", "<workbook/>")]);
+        let err = rows(&bytes).map(|_| ()).map_err(|e| e.to_string());
+        assert!(
+            err.as_ref().is_err_and(|e| e.contains("xl/worksheets/sheet1.xml")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn file_signatures_are_told_apart() {
+        assert!(is_xlsx(b"PK\x03\x04rest"));
+        assert!(!is_xlsx(b"PK\x05\x06"));
+        assert!(!is_xlsx(b"PK"));
+        assert!(!is_xlsx(b""));
+        assert!(is_legacy_xls(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0\0"));
+        assert!(!is_legacy_xls(b"\xD0\xCF\x11\xE0"));
+        assert!(!is_legacy_xls(b"PK\x03\x04"));
+    }
+
+    #[test]
+    fn column_letters_are_read_in_either_case_up_to_three() {
+        assert_eq!(column_of("b7"), Some(1));
+        assert_eq!(column_of("Z1"), Some(25));
+        assert_eq!(column_of("AA1"), Some(26));
+        assert_eq!(column_of("az9"), Some(51));
+        assert_eq!(column_of("XFE1"), None);
+        assert_eq!(column_of("AAAA1"), None);
+        assert_eq!(column_of(""), None);
+    }
+
+    #[test]
+    fn escapes_that_are_no_character_or_cut_short_stay_as_written() {
+        assert_eq!(unescape_xstring("_x00e9_"), "\u{e9}");
+        assert_eq!(unescape_xstring("_xD800_"), "_xD800_");
+        assert_eq!(unescape_xstring("a_x"), "a_x");
+        assert_eq!(unescape_xstring("_x00é_"), "_x00é_");
+        assert_eq!(unescape_xstring("_x0041__x0042_"), "AB");
+    }
+
+    #[test]
+    fn empty_and_phonetic_shared_strings_keep_the_indexes_aligned() -> Result<()> {
+        let strings = shared_strings(
+            r#"<sst><si/><si><t>漢字</t><rPh sb="0" eb="2"><t>かんじ</t></rPh></si><si><t><![CDATA[a&amp;b]]></t></si><si><t>last</t></si></sst>"#,
+        )?;
+        assert_eq!(strings, ["", "漢字", "a&amp;b", "last"]);
+        Ok(())
+    }
+
+    #[test]
+    fn cells_without_a_reference_follow_the_cell_before_them() -> Result<()> {
+        let out = styled(
+            r#"<worksheet><sheetData><row><c r="C1"><v>1</v></c><c><v>2</v></c><c r="F1"/><c><v>3</v></c></row></sheetData></worksheet>"#,
+        )?;
+        let blank = String::new;
+        assert_eq!(
+            out.cells,
+            vec![vec![
+                blank(),
+                blank(),
+                "1".to_owned(),
+                "2".into(),
+                blank(),
+                blank(),
+                "3".into()
+            ]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unusable_row_numbers_follow_the_row_before() -> Result<()> {
+        let out = styled(
+            r#"<worksheet><sheetData><row r="3"><c><v>1</v></c></row><row r="0"><c><v>2</v></c></row><row r="x"><c><v>3</v></c></row><row r=" 9 "><c><v>4</v></c></row></sheetData></worksheet>"#,
+        )?;
+        assert_eq!(out.numbers, [3, 4, 5, 9]);
+        Ok(())
+    }
+
+    #[test]
+    fn numbers_keep_fifteen_digits_and_odd_text_as_written() {
+        assert_eq!(number(" 12 "), "12");
+        assert_eq!(number("123456789012345678"), "123456789012346000");
+        assert_eq!(number("inf"), "inf");
+        assert_eq!(number("NaN"), "NaN");
+        assert_eq!(number("-1.5"), "-1.5");
+    }
+}
