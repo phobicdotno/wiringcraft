@@ -593,4 +593,240 @@ mod tests {
         let n = BufReader::new(s).read_line(&mut line).unwrap_or(0);
         assert_eq!(n, 0, "no answer without the token");
     }
+
+    fn queued(name: &str) -> (Bridge, Receiver<Result<String, String>>) {
+        let (tx, rx) = mpsc::channel();
+        let bridge = Bridge {
+            port: 0,
+            token: String::new(),
+            rx,
+            running: RefCell::new(None),
+        };
+        let (rtx, rrx) = mpsc::channel();
+        let _ = tx.send(ToolRequest {
+            name: name.into(),
+            input: json!({"n": 1}),
+            reply: rtx,
+            gave_up: Arc::new(AtomicBool::new(false)),
+        });
+        (bridge, rrx)
+    }
+
+    #[test]
+    fn small_methods_and_unknown_ones_echo_the_id() {
+        let mut call = |_: &str, _: &Value| -> Result<String, String> { Err("not called".into()) };
+        let mut ask = |method: &str| {
+            handle(
+                &json!({"jsonrpc": "2.0", "id": "abc", "method": method}),
+                &[],
+                "",
+                &mut call,
+            )
+            .unwrap_or_default()
+        };
+        let ping = ask("ping");
+        assert_eq!(ping["id"], "abc");
+        assert_eq!(ping["jsonrpc"], "2.0");
+        assert_eq!(ping["result"], json!({}));
+        assert_eq!(ask("resources/list")["result"], json!({"resources": []}));
+        assert_eq!(ask("prompts/list")["result"], json!({"prompts": []}));
+        let bad = ask("tools/frobnicate");
+        assert_eq!(bad["id"], "abc");
+        assert_eq!(bad["error"]["code"], -32601);
+        assert_eq!(bad["error"]["message"], "no method tools/frobnicate");
+        assert!(bad.get("result").is_none());
+        // A request with no method at all is an unknown method, not a crash.
+        let none = handle(&json!({"jsonrpc": "2.0", "id": 0}), &[], "", &mut call).unwrap_or_default();
+        assert_eq!(none["error"]["code"], -32601);
+        assert_eq!(none["id"], 0);
+    }
+
+    #[test]
+    fn initialize_names_the_server_and_lists_spec_fields() {
+        let specs = vec![
+            json!({"name": "a", "description": "first", "input_schema": {"type": "object", "required": ["x"]}}),
+            json!({"name": "b", "description": "second", "input_schema": {"type": "object"}}),
+        ];
+        let mut call = |_: &str, _: &Value| -> Result<String, String> { Ok(String::new()) };
+        let init = handle(&json!({"id": 1, "method": "initialize"}), &specs, "", &mut call).unwrap_or_default();
+        assert_eq!(init["result"]["serverInfo"]["name"], NAME);
+        assert_eq!(init["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(init["result"]["protocolVersion"], MCP_VERSION);
+        let list = handle(&json!({"id": 2, "method": "tools/list"}), &specs, "", &mut call).unwrap_or_default();
+        assert_eq!(
+            list["result"]["tools"],
+            json!([
+                {"name": "a", "description": "first", "inputSchema": {"type": "object", "required": ["x"]}},
+                {"name": "b", "description": "second", "inputSchema": {"type": "object"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_tool_call_without_arguments_gets_an_empty_object() {
+        let mut seen = Vec::new();
+        let mut call = |n: &str, a: &Value| {
+            seen.push((n.to_owned(), a.clone()));
+            Ok("done".to_owned())
+        };
+        for params in [
+            json!({"name": "get_state"}),
+            json!({"name": "get_state", "arguments": null}),
+        ] {
+            let r = handle(
+                &json!({"id": 5, "method": "tools/call", "params": params}),
+                &[],
+                "",
+                &mut call,
+            )
+            .unwrap_or_default();
+            assert_eq!(r["result"]["isError"], false);
+            assert_eq!(r["result"]["content"], json!([{"type": "text", "text": "done"}]));
+        }
+        assert_eq!(
+            seen,
+            vec![("get_state".to_owned(), json!({})), ("get_state".to_owned(), json!({}))]
+        );
+    }
+
+    /// Fails with a long message and names its calls for the panel.
+    struct Loud;
+    impl Tools for Loud {
+        fn specs(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn run(&mut self, _name: &str, _input: &Value) -> Result<String, String> {
+            Err("é".repeat(400))
+        }
+        fn describe(&self, name: &str, input: &Value) -> String {
+            format!("{name} with {input}")
+        }
+    }
+
+    #[test]
+    fn the_panel_line_is_cut_but_the_agent_gets_the_whole_answer() {
+        let (bridge, rrx) = queued("boom");
+        let entries = bridge.poll(&mut Loud);
+        let [Entry::Tool { what, ok, detail }] = entries.as_slice() else {
+            unreachable!("one tool entry")
+        };
+        assert_eq!(what, "boom with {\"n\":1}");
+        assert!(!ok);
+        // Cut by characters, not bytes, so a multi-byte letter is never split.
+        assert_eq!(detail.chars().count(), 300);
+        assert_eq!(rrx.try_recv().ok(), Some(Err("é".repeat(400))));
+    }
+
+    /// Hands every call to a worker whose result is already waiting, and marks what `finish` saw.
+    struct Ready(Option<Result<String, String>>);
+    impl Tools for Ready {
+        fn specs(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn run(&mut self, name: &str, _input: &Value) -> Result<String, String> {
+            Ok(name.to_owned())
+        }
+        fn start(&mut self, _name: &str, _input: &Value) -> Started {
+            let (tx, rx) = mpsc::channel();
+            if let Some(r) = self.0.take() {
+                let _ = tx.send(r);
+            }
+            Started::Running(Pending(rx))
+        }
+        fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
+            result.map(|t| format!("{name} {input} -> {t}"))
+        }
+    }
+
+    #[test]
+    fn a_worker_result_goes_through_finish() {
+        let (bridge, rrx) = queued("route");
+        let mut tools = Ready(Some(Ok("routed".into())));
+        // The poll starts the call on its "worker"; the next one finishes it.
+        let first = bridge.poll(&mut tools);
+        assert!(first.is_empty());
+        assert!(bridge.working());
+        let entries = bridge.poll_running(&mut tools);
+        assert!(
+            matches!(entries.as_slice(), [Entry::Tool { ok: true, detail, .. }] if detail == "route {\"n\":1} -> routed")
+        );
+        assert_eq!(rrx.try_recv().ok(), Some(Ok("route {\"n\":1} -> routed".to_owned())));
+        assert!(!bridge.working());
+        assert!(bridge.poll_running(&mut tools).is_empty());
+    }
+
+    #[test]
+    fn a_worker_that_vanishes_is_answered_with_an_error() {
+        let (bridge, rrx) = queued("route");
+        // No result was ever sent and the sender is gone: the call must still be answered.
+        let mut tools = Ready(None);
+        assert!(bridge.poll(&mut tools).is_empty());
+        let entries = bridge.poll(&mut tools);
+        assert!(matches!(entries.as_slice(), [Entry::Tool { ok: false, .. }]));
+        assert_eq!(
+            rrx.try_recv().ok(),
+            Some(Err("The tool stopped without an answer.".to_owned()))
+        );
+        assert!(!bridge.working());
+    }
+
+    #[test]
+    fn refuse_leaves_a_running_call_alone() {
+        let (bridge, rrx) = queued("route");
+        let mut tools = Ready(Some(Ok("routed".into())));
+        assert!(bridge.poll(&mut tools).is_empty());
+        bridge.refuse("stopped");
+        assert!(bridge.working());
+        assert!(matches!(
+            bridge.poll_running(&mut tools).as_slice(),
+            [Entry::Tool { ok: true, .. }]
+        ));
+        assert!(matches!(rrx.try_recv(), Ok(Ok(_))));
+    }
+
+    #[test]
+    fn the_server_entry_starts_this_program_as_the_bridge() {
+        let (_tx, rx) = mpsc::channel();
+        let bridge = Bridge {
+            port: 4321,
+            token: "secret".into(),
+            rx,
+            running: RefCell::new(None),
+        };
+        let entry = bridge.server_entry(std::path::Path::new("/opt/wc/wiringcraft-app"));
+        assert_eq!(
+            entry,
+            json!({
+                "name": NAME,
+                "command": "/opt/wc/wiringcraft-app",
+                "args": ["--mcp-bridge", "127.0.0.1:4321"],
+                "env": [{"name": TOKEN_VAR, "value": "secret"}],
+            })
+        );
+    }
+
+    #[test]
+    fn a_token_line_ending_in_crlf_is_accepted_and_the_next_line_kept() {
+        let started = Bridge::start(Vec::new(), String::new(), Arc::new(|| {}));
+        assert!(started.is_ok(), "starting the bridge: {:?}", started.as_ref().err());
+        let Ok(bridge) = started else { unreachable!() };
+        let connected = TcpStream::connect(("127.0.0.1", bridge.port));
+        assert!(connected.is_ok(), "connecting: {:?}", connected.as_ref().err());
+        let Ok(mut s) = connected else { unreachable!() };
+        // Token and first message in one write: the message must not be swallowed with the token.
+        let _ = s.write_all(
+            format!(
+                "{}\r\n{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}}\n",
+                bridge.token
+            )
+            .as_bytes(),
+        );
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut line = String::new();
+        let _ = BufReader::new(s).read_line(&mut line);
+        let reply: Value = serde_json::from_str(&line).unwrap_or_default();
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["result"], json!({}));
+    }
 }
