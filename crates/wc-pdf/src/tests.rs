@@ -229,6 +229,40 @@ fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
 }
 
 #[test]
+fn dxf_texts_keep_their_centre_and_right_alignment() {
+    // A CAD program draws texts in its own font: a centred or right-aligned text is written
+    // with its alignment and the point it lines up at, not only a left end worked out from the
+    // PDF font's widths (#1318).
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.text((10.0, 20.0), 2.5, 0, "left");
+    pen.text((50.0, 30.0), 2.5, 1, "middle");
+    pen.text_at_angle((80.0, 40.0), 2.5, 2, 90.0, "right");
+    let page = PageDrawing {
+        id: "p1".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let d = dxf(&page);
+    let entity = |text: &str| -> String {
+        let at = d.find(&format!("\n1\n{text}\n")).unwrap_or(d.len());
+        let start = d[..at].rfind("0\nTEXT\n").unwrap_or(at);
+        let end = d[at..].find("\n0\n").map_or(d.len(), |e| at + e);
+        d[start..end].to_owned()
+    };
+    let left = entity("left");
+    assert!(left.contains("10\n10\n20\n80\n"), "{left}");
+    assert!(!left.contains("\n72\n") && !left.contains("\n11\n"), "{left}");
+    let middle = entity("middle");
+    assert!(middle.contains("\n72\n1\n11\n50\n21\n70"), "{middle}");
+    let right = entity("right");
+    assert!(right.contains("\n50\n90\n72\n2\n11\n80\n21\n60"), "{right}");
+}
+
+#[test]
 fn page_files_are_named_after_the_page_number() {
     let page = |number: &str| PageDrawing {
         id: "p-7".into(),
