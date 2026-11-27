@@ -141,3 +141,29 @@ fn git_source_clones_then_updates() -> Result<()> {
     assert_eq!(read(&cache.join("git/pinned/lib.txt"))?, "v1");
     Ok(())
 }
+
+#[test]
+fn git_source_follows_a_changed_location() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let (old, new) = (tmp.path().join("old"), tmp.path().join("new"));
+    for (repo, text) in [(&old, "old"), (&new, "new")] {
+        std::fs::create_dir(repo).map_err(io)?;
+        run_git(repo, &["init", "-q", "-b", "main"])?;
+        commit_file(repo, text)?;
+    }
+    let sync = |loc: &Path| {
+        sync_one_in(
+            tmp.path(),
+            &src("lib", "git", &loc.to_string_lossy(), None),
+            Some(&cache),
+        )
+    };
+
+    sync(&old)?;
+    assert_eq!(read(&cache.join("git/lib/lib.txt"))?, "old");
+    // The user points the source at another repository: the next sync takes that one.
+    assert_eq!(sync(&new)?, format!("lib: updated from {}", new.display()));
+    assert_eq!(read(&cache.join("git/lib/lib.txt"))?, "new");
+    Ok(())
+}

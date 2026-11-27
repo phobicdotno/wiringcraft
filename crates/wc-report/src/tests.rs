@@ -225,6 +225,37 @@ fn wire_list_names_both_ends_and_inherits_potentials() {
 }
 
 #[test]
+fn wire_list_names_the_potential_of_a_wire_between_two_junctions() {
+    let (mut p, s, parts) = fixture();
+    let at = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+    // w5 runs from w1's free end to another free point, w6 from that point on: neither touches
+    // a pin, but both are in the 24V net through w1. w7 touches nothing and is in no net.
+    p.pages[0].wires.extend([
+        wire("w5", at(50.0, 20.0), at(70.0, 20.0), None, None),
+        wire("w6", at(70.0, 20.0), at(70.0, 0.0), None, None),
+        wire("w7", at(200.0, 0.0), at(210.0, 0.0), None, None),
+    ]);
+    let t = wire_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let potential = |from: &str, to: &str| t.rows.iter().find(|r| r[4] == from && r[5] == to).map(|r| r[2].clone());
+    assert_eq!(
+        potential("junction 50.0,20.0", "junction 70.0,20.0").as_deref(),
+        Some("24V")
+    );
+    assert_eq!(
+        potential("junction 70.0,20.0", "junction 70.0,0.0").as_deref(),
+        Some("24V")
+    );
+    assert_eq!(
+        potential("junction 200.0,0.0", "junction 210.0,0.0").as_deref(),
+        Some("")
+    );
+}
+
+#[test]
 fn wire_list_shows_section_colour_and_type() {
     let (mut p, s, parts) = fixture();
     let w = p
