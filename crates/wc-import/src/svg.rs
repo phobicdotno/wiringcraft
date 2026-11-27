@@ -47,7 +47,8 @@ impl M {
     /// and y are scaled apart (`preserveAspectRatio="none"`, `scale(2, 1)`).
     fn y_scale(&self) -> f64 {
         let [_, _, c, d, ..] = self.0;
-        (c * c + d * d).sqrt()
+        // hypot: a finite scale near f64::MAX must not overflow by being squared.
+        c.hypot(d)
     }
     /// Whether a circle stays a circle: x and y are scaled alike and stay at right angles
     /// (turns, mirrors and moves are fine; a `scale(2, 1)` or a skew is not).
@@ -1344,6 +1345,19 @@ mod tests {
             })
             .collect();
         assert!(heights.len() == 1 && (heights[0] - 1.8).abs() < 1e-9, "{heights:?}");
+        // A huge y scale that is still finite gives a finite height: 1e-200 units at 4e200 mm.
+        let huge = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-199" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/><text x="0" y="0" font-size="1e-200">K</text></svg>"#;
+        let s = symbol(huge, "svg.u", "U")?;
+        let heights: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { height, .. } => Some(*height),
+                _ => None,
+            })
+            .collect();
+        assert!(heights.len() == 1 && (heights[0] - 2.88).abs() < 1e-9, "{heights:?}");
         Ok(())
     }
 
