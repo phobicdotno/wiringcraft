@@ -424,3 +424,27 @@ fn symbol_kicad_reads_an_old_lib_library() -> TestResult {
     assert!(out.contains("kicad.old-lamps.lamp.json"), "{out}");
     Ok(())
 }
+
+#[test]
+fn symbol_kicad_takes_an_old_library_s_descriptions_from_its_dcm_file() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let lib = "EESchema-LIBRARY Version 2.4\nDEF LAMP H 0 40 N N 1 F N\nF0 \"H\" 100 0 50 H V L CNN\nF1 \"LAMP\" 100 -100 50 H V L CNN\nALIAS LAMP_RED\nDRAW\nC 0 0 70 0 1 10 N\nX X1 X1 0 200 130 D 50 50 1 1 P\nENDDRAW\nENDDEF\n";
+    std::fs::write(tmp.path().join("lamps.lib"), lib)?;
+    // Without the `.dcm` file there is no description.
+    run_ok(tmp.path(), &["import", "symbol-kicad", "lamps.lib", "--lib", "plain"])?;
+    assert_eq!(symbol(&tmp.path().join("plain"), "kicad.lamps.lamp")?.description, "");
+    let dcm = "EESchema-DOCLIB  Version 2.0\n#\n$CMP LAMP\nD Signal lamp, \"generic\"\nK light\n$ENDCMP\n#\n#End Doc Library\n";
+    std::fs::write(tmp.path().join("lamps.dcm"), dcm)?;
+    run_ok(tmp.path(), &["import", "symbol-kicad", "lamps.lib", "--lib", "lib"])?;
+    let lib = tmp.path().join("lib");
+    assert_eq!(
+        symbol(&lib, "kicad.lamps.lamp")?.description,
+        "Signal lamp, \"generic\""
+    );
+    // An alias with no record of its own takes its symbol's.
+    assert_eq!(
+        symbol(&lib, "kicad.lamps.lamp_red")?.description,
+        "Signal lamp, \"generic\""
+    );
+    Ok(())
+}

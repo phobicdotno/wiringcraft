@@ -80,7 +80,7 @@ wiringcraft import symbol-kicad [OPTIONS] --lib <LIB> <FILE>
 
 | Option | Meaning |
 |---|---|
-| `<FILE>` | The `.kicad_sym` file (KiCad 6 or later), or an old `.lib` library (KiCad 5 and before, `EESchema-LIBRARY`), told apart by its first line |
+| `<FILE>` | The `.kicad_sym` file (KiCad 6 or later), or an old `.lib` library (KiCad 5 and before, `EESchema-LIBRARY`), told apart by its first line. An old library's descriptions are read from the `.dcm` file of the same name beside it, when there is one |
 | `--lib <LIB>` | The library folder to write into |
 | `--prefix <PREFIX>` | Id prefix (default `kicad.<file name>`) |
 | `--scale <SCALE>` | Multiply coordinates, e.g. 2 to put KiCad's 2.54 mm pin grid near a 5 mm grid (default 1) |

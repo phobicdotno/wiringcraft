@@ -180,7 +180,13 @@ fn read(file: &Path) -> Result<FileSymbols, String> {
         Some("kicad_sym" | "lib") => {
             let text = read_text(file, MAX_LEN)?;
             let prefix = format!("kicad.{}", stem(file));
-            let (symbols, w) = wc_import::kicad::symbols(&text, &prefix, 1.0).map_err(|e| e.to_string())?;
+            // An old library keeps its descriptions beside it, in a `.dcm` file of the same name.
+            let dcm = file.with_extension("dcm");
+            let docs = (wc_import::kicad_legacy::is_legacy(&text) && dcm.is_file())
+                .then(|| read_text(&dcm, MAX_LEN).map_err(|e| format!("{}: {e}", dcm.display())))
+                .transpose()?;
+            let (symbols, w) =
+                wc_import::kicad::symbols_described(&text, docs.as_deref(), &prefix, 1.0).map_err(|e| e.to_string())?;
             Ok((symbols.into_iter().map(|i| (i.symbol, i.kicad_name)).collect(), w))
         }
         Some("elmt") => {
@@ -290,6 +296,11 @@ mod tests {
             std::fs::write(&p, text).unwrap();
             p
         };
+        // Beside the old library, not picked: its descriptions.
+        write(
+            "Old Lamps.dcm",
+            "EESchema-DOCLIB  Version 2.0\n$CMP LAMP\nD Pilot lamp\n$ENDCMP\n",
+        );
         let files = vec![
             write("Coil.svg", SVG),
             write("broken.svg", "<svg"),
@@ -318,6 +329,8 @@ mod tests {
         ] {
             assert!(symbols.join(format!("{id}.json")).is_file(), "{id}: {out:?}");
         }
+        let lamp = std::fs::read_to_string(symbols.join("kicad.old_lamps.lamp.json")).unwrap();
+        assert!(lamp.contains("Pilot lamp"), "{lamp}");
         assert_eq!(out.written.len(), 5, "{out:?}");
         assert_eq!(out.failed.len(), 3, "{out:?}");
         assert!(out.failed.iter().any(|f| f.contains("broken.svg")));
