@@ -80,8 +80,10 @@ pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
     for n in &project.meta.networks {
         let nodes = n.nodes.iter().map(|x| x.device.parse::<DeviceTag>().ok());
         let cables = n.links.iter().map(|l| l.cable.parse::<DeviceTag>().ok());
-        let ends = n.ports().into_iter().flat_map(|(a, b, _)| [a.device, b.device]);
-        used.extend(nodes.chain(cables).flatten().chain(ends));
+        // Each end on its own, so a link with one end that cannot be read still takes the other.
+        let ends = n.links.iter().flat_map(|l| [&l.from, &l.to]);
+        let ends = ends.map(|e| crate::network::Port::parse(e).ok().map(|p| p.device));
+        used.extend(nodes.chain(cables).chain(ends).flatten());
     }
     used
 }
@@ -275,20 +277,28 @@ mod tests {
                 device: "-K2".into(),
                 ..Default::default()
             }],
-            links: vec![crate::network::Link {
-                from: "-K2:X1P1".into(),
-                to: "-K3:X1P1".into(),
-                cable: "-W1".into(),
-                ..Default::default()
-            }],
+            links: vec![
+                crate::network::Link {
+                    from: "-K3:X1P1".into(),
+                    to: "-K4:X1P1".into(),
+                    cable: "-W1".into(),
+                    ..Default::default()
+                },
+                // The other end cannot be read; -K5 is still taken.
+                crate::network::Link {
+                    from: "-K5:X1P2".into(),
+                    to: String::new(),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         });
         let used = used_tags(&p);
-        for t in ["-K2", "-K3", "-W1"] {
+        for t in ["-K2", "-K3", "-K4", "-K5", "-W1"] {
             assert!(used.contains(&tag(t)), "{t}");
         }
         assert_eq!(free_tag_like(&used, &tag("-W1")), Some(tag("-W2")));
-        assert_eq!(free_tag_like(&used, &tag("-K1")), Some(tag("-K4")));
+        assert_eq!(free_tag_like(&used, &tag("-K1")), Some(tag("-K6")));
     }
 
     #[test]
