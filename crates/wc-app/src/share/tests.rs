@@ -1308,6 +1308,30 @@ fn an_edit_on_a_page_the_undo_restored_is_kept_where_they_do_not_overlap() -> Te
 }
 
 #[test]
+fn a_page_marked_graphic_on_one_side_and_overview_on_the_other_is_a_clash() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    // The marks take no symbols or wires off; an empty page could take either one.
+    for p in [&mut base, &mut auth, &mut local] {
+        p.pages[0].symbols.clear();
+        p.pages[0].wires.clear();
+    }
+    auth.pages[0].overview = true;
+    local.pages[0].graphic = true;
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    assert!(
+        local.pages[0].overview && !local.pages[0].graphic,
+        "the session's page is kept"
+    );
+    // One side's graphic mark alone is merged.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    auth.pages[0].title = "Restored".into();
+    local.pages[0].graphic = true;
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+    assert!(local.pages[0].graphic && local.pages[0].title == "Restored");
+    Ok(())
+}
+
+#[test]
 fn a_cloud_and_the_revision_table_drawn_here_are_kept_beside_the_sessions_edit() -> TestResult {
     use wc_core::geom::Point;
     let (mut base, mut auth, mut local) = three_copies()?;

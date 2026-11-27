@@ -60,6 +60,10 @@ someone resolves it. Kept in `comments/<page id>.comments.json`. See `wiringcraf
 shows the project's name and title-block fields, so editing them once updates the cover and
 every title block. A new project starts with one.
 
+**Graphic page.** A page for free drawings only, such as sketches, notes and pictures
+(`page graphic`). Symbols and wires are refused on it, and `check` warns about any it still
+holds, so nothing on it is evaluated electrically.
+
 **Cross-reference.** The page and column reference shown between symbols with the same tag,
 for example from a relay coil to its contacts. It uses the page template's reference columns.
 
