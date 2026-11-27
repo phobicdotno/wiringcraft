@@ -5226,13 +5226,81 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
     Ok(())
 }
 
-/// One recorded change as a line of text, with a file name from git escaped by [`escape_field`]
-/// so a control character in it cannot steer the terminal.
+/// One recorded change as a line of text, with each name in it (a file name from git, a page's
+/// number or title, a tag, a symbol) escaped by [`escape_field`], so a control character in a
+/// recorded file cannot steer the terminal. A renamed page's titles are printed quoted, which
+/// escapes them already.
 fn change_line(c: &wc_vcs::Change) -> String {
-    match c {
-        wc_vcs::Change::File { path, status } => format!("{} {status}", escape_field(path)),
-        c => c.to_string(),
-    }
+    use wc_vcs::Change as C;
+    let x = |s: &String| escape_field(s);
+    let c = match c {
+        C::PageAdded { page, title } => C::PageAdded {
+            page: x(page),
+            title: x(title),
+        },
+        C::PageRemoved { page, title } => C::PageRemoved {
+            page: x(page),
+            title: x(title),
+        },
+        C::PageRenamed { page, from, to } => C::PageRenamed {
+            page: x(page),
+            from: from.clone(),
+            to: to.clone(),
+        },
+        C::PageRenumbered { page, from } => C::PageRenumbered {
+            page: x(page),
+            from: x(from),
+        },
+        C::PageSettingChanged { page, what } => C::PageSettingChanged {
+            page: x(page),
+            what: x(what),
+        },
+        C::SymbolAdded { page, item, what } => C::SymbolAdded {
+            page: x(page),
+            item: x(item),
+            what: x(what),
+        },
+        C::SymbolRemoved { page, item, what } => C::SymbolRemoved {
+            page: x(page),
+            item: x(item),
+            what: x(what),
+        },
+        C::SymbolMoved { page, item, what } => C::SymbolMoved {
+            page: x(page),
+            item: x(item),
+            what: x(what),
+        },
+        C::SymbolRetagged { page, item, from, to } => C::SymbolRetagged {
+            page: x(page),
+            item: x(item),
+            from: x(from),
+            to: x(to),
+        },
+        C::SymbolReplaced { page, item, from, to } => C::SymbolReplaced {
+            page: x(page),
+            item: x(item),
+            from: x(from),
+            to: x(to),
+        },
+        C::WireAdded { page, wire } => C::WireAdded {
+            page: x(page),
+            wire: x(wire),
+        },
+        C::WireRemoved { page, wire } => C::WireRemoved {
+            page: x(page),
+            wire: x(wire),
+        },
+        C::WireChanged { page, wire } => C::WireChanged {
+            page: x(page),
+            wire: x(wire),
+        },
+        C::GraphicsChanged { page } => C::GraphicsChanged { page: x(page) },
+        C::File { path, status } => C::File {
+            path: x(path),
+            status: x(status),
+        },
+    };
+    c.to_string()
 }
 
 /// Who is writing a comment: the --author option, WIRINGCRAFT_USER, git's user.name, the login.
