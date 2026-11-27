@@ -159,6 +159,20 @@ pub fn place(
         .chain(cables)
         .collect();
     olds.sort_by_key(|t| t.product.len());
+    // A device the group holds only as a part or terminal (`-K2.1` without `-K2`) is taken too,
+    // so another device of the group does not land on it and absorb that part.
+    let own: BTreeSet<&DeviceTag> = olds.iter().copied().collect();
+    let held: Vec<DeviceTag> = olds
+        .iter()
+        .flat_map(|t| {
+            (1..t.product.len()).map(|n| DeviceTag {
+                product: t.product[..n].to_vec(),
+                ..(*t).clone()
+            })
+        })
+        .filter(|parent| !own.contains(parent))
+        .collect();
+    used.extend(held);
     // Two passes: first every tag that keeps its own number (on its own or on its strip's new
     // tag), then the ones whose number is taken there, so a taken number never pushes another
     // terminal off a number that was free (#1780).
@@ -350,6 +364,44 @@ mod tests {
             .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
             .collect();
         assert_eq!(new_tags, [Some("-K2".to_string()), Some("-K2.1".to_string())]);
+    }
+
+    #[test]
+    fn a_pasted_device_does_not_land_on_a_device_the_group_holds_only_as_a_part() {
+        // The project draws only -K1.1; the group holds device -K7 and the part -K2.1 alone.
+        let mut p = Project::new("t");
+        let mut page = Page::new("p1", "1", "One");
+        page.symbols.push(symbol("s1", "-K1.1"));
+        p.pages.push(page);
+        let symbols = [symbol("a", "-K7"), symbol("b", "-K2.1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        // -K1 is held by -K1.1 and -K2 by the pasted -K2.1, so -K7 becomes -K3.
+        assert_eq!(new_tags, [Some("-K3".to_string()), Some("-K2.1".to_string())]);
     }
 
     #[test]
