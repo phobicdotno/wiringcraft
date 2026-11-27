@@ -357,15 +357,17 @@ impl Doc {
                 .iter()
                 .filter_map(|l| {
                     let target = index.get(&l.target_page_id)?;
-                    // A link placed at a position that is not a number (a hand-edited
-                    // project) is left out, like the text it covers, instead of a `NaN` rect.
-                    if !all_finite(&[l.min, l.max]) {
-                        return None;
-                    }
                     let x0 = l.min.0 * PT_PER_MM;
                     let x1 = l.max.0 * PT_PER_MM;
                     let y0 = h - l.max.1 * PT_PER_MM;
                     let y1 = h - l.min.1 * PT_PER_MM;
+                    // A link placed at a position that is not a number (a hand-edited
+                    // project) is left out, like the text it covers, instead of a `NaN` rect.
+                    // The check is on the points, as a huge finite mm value such as `1e308`
+                    // turns into `inf` once converted.
+                    if !all_finite(&[(x0, y0), (x1, y1)]) {
+                        return None;
+                    }
                     Some(format!(
                         "<< /Type /Annot /Subtype /Link /Rect [{x0:.2} {y0:.2} {x1:.2} {y1:.2}] /Border [0 0 0] /Dest [{} 0 R /Fit] >>",
                         page_obj(*target)
@@ -735,11 +737,15 @@ impl Pen {
 
 pub use wc_core::font::text_width_mm;
 
-/// Whether every number is finite. `nan` and `inf` are valid TOML numbers, so a hand-edited
-/// project can hold them; a shape with one is left out rather than written as `NaN` or `inf`,
-/// which PDF readers refuse (and the SVG and DXF would draw at the page corner).
+/// Whether every number is finite, with room to spare. `nan` and `inf` are valid TOML numbers,
+/// so a hand-edited project can hold them; a shape with one is left out rather than written as
+/// `NaN` or `inf`, which PDF readers refuse (and the SVG and DXF would draw at the page corner).
+/// A huge finite value such as `1e308` is left out too, as it overflows to `inf` once turned
+/// into points (or into a width from two corners).
 fn all_finite(pts: &[(f64, f64)]) -> bool {
-    pts.iter().all(|(x, y)| x.is_finite() && y.is_finite())
+    /// Far beyond any page, and far from where `f64` arithmetic overflows.
+    const LIMIT: f64 = 1e300;
+    pts.iter().all(|(x, y)| x.abs() < LIMIT && y.abs() < LIMIT)
 }
 
 /// A page label prefix as a PDF text string: printable ASCII as a literal string with `(`, `)`

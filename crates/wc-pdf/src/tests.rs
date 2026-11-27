@@ -3972,7 +3972,8 @@ fn an_underlay_corner_that_is_not_a_number_leaves_the_underlay_out() {
 #[test]
 fn a_cross_reference_at_a_position_that_is_not_a_number_has_no_link() {
     // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
-    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    // `1e308` is finite in mm but overflows to `inf` once turned into points.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e308] {
         let mut project = Project::new("x");
         let mut p1 = Page::new("p1", "1", "A");
         p1.symbols.push(place("s1", "coil", 50.0, "-K1"));
