@@ -1559,3 +1559,147 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod path_and_root_tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn project() -> io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join("pages"))?;
+        std::fs::write(dir.path().join("pages").join("p1.page.json"), "page one")?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn normalize_works_out_dots_by_name() {
+        assert_eq!(normalize(Path::new("a/./b/../c")), PathBuf::from("a/c"));
+        assert_eq!(normalize(Path::new("./a/b/..")), PathBuf::from("a"));
+        // `..` above the root stays at the root.
+        #[cfg(unix)]
+        assert_eq!(normalize(Path::new("/a/../../b")), PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn real_keeps_the_missing_part_by_name() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let found = dir.path().canonicalize()?;
+        let missing = dir.path().join("no").join("such.csv");
+        assert_eq!(real(&missing), found.join("no").join("such.csv"));
+        assert_eq!(real(dir.path()), found);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_follows_a_link_and_works_out_dots_above_it() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let link = out.path().join("link");
+        std::os::unix::fs::symlink(p.path().join("pages"), &link)?;
+        let pages = p.path().join("pages").canonicalize()?;
+        assert_eq!(real(&link.join("new.csv")), pages.join("new.csv"));
+        // `link/..` is the folder above where the link points, not `out`.
+        assert_eq!(real(&link.join("..")), p.path().canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
+    fn holds_tells_project_paths_from_others() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        assert!(g.unknown.is_none(), "{:?}", g.unknown);
+        assert!(g.holds(&p.path().join("pages").join("p1.page.json"))?);
+        assert!(g.holds(&p.path().join("not-yet.csv"))?);
+        assert!(g.holds(&p.path().join("pages").join("..").join("x.csv"))?);
+        assert!(!g.holds(&out.path().join("list.csv"))?);
+        assert!(!g.holds(out.path())?);
+        // `..` out of the project leaves it.
+        assert!(!g.holds(&p.path().join("pages").join("..").join("..").join("x.csv"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_hard_link_to_a_page_is_held_but_one_to_git_is_not() -> TestResult {
+        let p = project()?;
+        std::fs::create_dir_all(p.path().join(".git"))?;
+        std::fs::write(p.path().join(".git").join("HEAD"), "ref")?;
+        let out = tempfile::tempdir()?;
+        let page_link = out.path().join("page.json");
+        let git_link = out.path().join("head");
+        std::fs::hard_link(p.path().join("pages").join("p1.page.json"), &page_link)?;
+        std::fs::hard_link(p.path().join(".git").join("HEAD"), &git_link)?;
+        let g = ProjectFiles::new(p.path());
+        assert!(g.same_file(&page_link)?);
+        assert!(g.holds(&page_link)?);
+        assert!(!g.same_file(&git_link)?);
+        assert!(!g.holds(&git_link)?);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_identity_is_an_error_only_for_an_existing_file() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let file = out.path().join("there.csv");
+        std::fs::write(&file, "x")?;
+        let mut g = ProjectFiles::new(p.path());
+        g.unknown = Some("pages: no access".into());
+        let e = g.same_file(&file).err().ok_or("an unknown identity passed")?;
+        assert!(e.to_string().contains("pages: no access"), "{e}");
+        assert!(!g.same_file(&out.path().join("missing.csv"))?);
+        assert!(!g.same_file(out.path())?);
+        // The write is refused with the reason, and the file is left as it was.
+        let e = g
+            .write(&file, b"new")
+            .err()
+            .ok_or("an unknown identity was written over")?;
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("could not be told apart"), "{e}");
+        assert_eq!(std::fs::read_to_string(&file)?, "x");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_pages_folder_is_a_root_and_a_dangling_link_hides_nothing() -> TestResult {
+        let p = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        std::fs::write(elsewhere.path().join("p1.page.json"), "page one")?;
+        std::os::unix::fs::symlink(elsewhere.path(), p.path().join("pages"))?;
+        std::os::unix::fs::symlink(p.path().join("gone"), p.path().join("dangling"))?;
+        let g = ProjectFiles::new(p.path());
+        assert!(g.unknown.is_none(), "{:?}", g.unknown);
+        assert!(g.roots.contains(&elsewhere.path().canonicalize()?));
+        let target = elsewhere.path().join("list.csv");
+        assert!(g.holds(&target)?);
+        assert!(g.write(&target, b"x").is_err());
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_path_that_names_no_file_is_invalid_input() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let e = g.write(&out.path().join(".."), b"x").err().ok_or("`..` was written")?;
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        Ok(())
+    }
+
+    #[test]
+    fn staging_names_are_hidden_and_distinct() {
+        let a = staging_name("list.csv");
+        let b = staging_name("list.csv");
+        assert_ne!(a, b);
+        for n in [&a, &b] {
+            assert!(n.starts_with(".list.csv."), "{n}");
+            assert!(n.ends_with(".wc-tmp"), "{n}");
+        }
+    }
+}

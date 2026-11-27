@@ -915,3 +915,180 @@ mod assembly;
 
 #[cfg(test)]
 mod tests;
+
+/// Units, curve shapes and parser corners the main suite does not reach.
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    fn step(unit: &str, data: &str) -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\n{unit}\n{data}\nENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    }
+
+    const MM: &str = "#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));";
+
+    /// The two opposite corners of a box as vertex points (ids 1 to 4).
+    fn corners(a: [f64; 3], b: [f64; 3]) -> String {
+        format!(
+            "#1=CARTESIAN_POINT('',({:?},{:?},{:?}));#2=VERTEX_POINT('',#1);\n\
+             #3=CARTESIAN_POINT('',({:?},{:?},{:?}));#4=VERTEX_POINT('',#3);\n",
+            a[0], a[1], a[2], b[0], b[1], b[2]
+        )
+    }
+
+    fn size(text: &str) -> (ModelSize, Vec<String>) {
+        match model_size(text) {
+            Ok(found) => found,
+            Err(err) => unreachable!("a usable model: {err}"),
+        }
+    }
+
+    fn close(s: &ModelSize, w: f64, h: f64, d: f64) -> bool {
+        (s.width - w).abs() < 1e-9 && (s.height - h).abs() < 1e-9 && (s.depth - d).abs() < 1e-9
+    }
+
+    #[test]
+    fn si_prefixes_scale_the_metre() {
+        for (prefix, side, mm) in [
+            ("CENTI", 2.0, 20.0),
+            ("DECI", 0.5, 50.0),
+            ("MICRO", 4000.0, 4.0),
+            ("KILO", 0.0001, 100.0),
+        ] {
+            let unit = format!("#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.{prefix}.,.METRE.));");
+            let (s, warnings) = size(&step(&unit, &corners([0.0; 3], [side; 3])));
+            assert!(close(&s, mm, mm, mm), "{prefix}: {s:?}");
+            assert!(warnings.is_empty(), "{prefix}: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_prefix_or_a_non_metre_si_unit_is_no_length_unit() {
+        for unit in [
+            "#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.EXA.,.METRE.));",
+            "#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT($,.GRAM.));",
+            // Not a length unit at all.
+            "#900=(PLANE_ANGLE_UNIT()NAMED_UNIT(*)SI_UNIT($,.RADIAN.));",
+        ] {
+            let (s, warnings) = size(&step(unit, &corners([0.0; 3], [1.0, 2.0, 3.0])));
+            assert!(close(&s, 1.0, 2.0, 3.0), "{unit}: {s:?}");
+            assert!(
+                warnings.iter().any(|w| w.contains("millimetres are assumed")),
+                "{unit}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn feet_and_short_unit_names_are_known_without_a_measure() {
+        for (name, mm) in [(" Foot ", 304.8), ("ft", 304.8), ("in", 25.4)] {
+            // The measure #901 does not exist: the name alone gives the unit.
+            let unit = format!("#900=(CONVERSION_BASED_UNIT('{name}',#901)LENGTH_UNIT()NAMED_UNIT(*));");
+            let (s, warnings) = size(&step(&unit, &corners([0.0; 3], [1.0, 1.0, 1.0])));
+            assert!(close(&s, mm, mm, mm), "{name}: {s:?}");
+            assert!(warnings.is_empty(), "{name}: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn two_different_length_units_warn_and_the_first_is_used() {
+        let units = "#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));\n\
+                     #901=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT($,.METRE.));";
+        let (s, warnings) = size(&step(units, &corners([0.0; 3], [1.0, 2.0, 3.0])));
+        assert!(close(&s, 1.0, 2.0, 3.0), "{s:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("names 2 length units; the first (1 mm)")),
+            "{warnings:?}"
+        );
+
+        // The same unit written twice is one unit.
+        let twice = "#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));\n\
+                     #901=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));";
+        let (_, warnings) = size(&step(twice, &corners([0.0; 3], [1.0, 2.0, 3.0])));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_circle_without_a_positive_radius_is_left_out_and_a_typed_radius_is_read() {
+        let circle = |radius: &str| {
+            format!(
+                "{}#5=CARTESIAN_POINT('',(0.,0.,0.));#8=AXIS2_PLACEMENT_3D('',#5,$,$);#9=CIRCLE('',#8,{radius});",
+                corners([0.0; 3], [1.0, 2.0, 3.0])
+            )
+        };
+        for radius in ["0.", "-50.", "$"] {
+            let (s, _) = size(&step(MM, &circle(radius)));
+            assert!(close(&s, 1.0, 2.0, 3.0), "{radius}: {s:?}");
+        }
+        // A radius of 10 about the origin in the xy plane: x and y from -10 to 10.
+        let (s, _) = size(&step(MM, &circle("POSITIVE_LENGTH_MEASURE(10.)")));
+        assert!(close(&s, 20.0, 20.0, 3.0), "{s:?}");
+    }
+
+    #[test]
+    fn tessellated_coordinates_do_not_count_next_to_vertices() {
+        let data = format!(
+            "{}#20=COORDINATES_LIST('',2,((0.,0.,0.),(500.,500.,500.)));",
+            corners([0.0; 3], [1.0, 2.0, 3.0])
+        );
+        let (s, _) = size(&step(MM, &data));
+        assert!(close(&s, 1.0, 2.0, 3.0), "{s:?}");
+    }
+
+    #[test]
+    fn bezier_and_uniform_curves_count_their_control_points() {
+        // The end points are vertices, so loose points are not measured: only the curve's
+        // middle control point gives the height.
+        for kind in ["BEZIER_CURVE", "UNIFORM_CURVE", "QUASI_UNIFORM_CURVE"] {
+            let data = format!(
+                "#1=CARTESIAN_POINT('',(0.,0.,0.));#2=CARTESIAN_POINT('',(4.,9.,0.));#3=CARTESIAN_POINT('',(8.,0.,2.));\n\
+                 #5=VERTEX_POINT('',#1);#6=VERTEX_POINT('',#3);\n\
+                 #4={kind}('',2,(#1,#2,#3),.UNSPECIFIED.,.F.,.F.);"
+            );
+            let (s, _) = size(&step(MM, &data));
+            assert!(close(&s, 8.0, 9.0, 2.0), "{kind}: {s:?}");
+        }
+    }
+
+    #[test]
+    fn the_file_may_be_wrapped_in_white_space() {
+        let text = format!("\n\t  {}\n\n  ", step(MM, &corners([0.0; 3], [1.0, 2.0, 3.0])));
+        let (s, _) = size(&text);
+        assert!(close(&s, 1.0, 2.0, 3.0), "{s:?}");
+    }
+
+    #[test]
+    fn binary_values_and_quoted_quotes_parse() {
+        let mut inst = Parser {
+            s: b"CARTESIAN_POINT('it''s',(1.,-2.5E1,+3.),\"0A1F\",*)",
+            i: 0,
+        };
+        let Some(records) = inst.instance() else {
+            unreachable!("a readable instance")
+        };
+        let Some((name, args)) = records.first() else {
+            unreachable!("one record")
+        };
+        assert_eq!(name, "CARTESIAN_POINT");
+        assert_eq!(args.first(), Some(&Value::Str("it's".into())));
+        assert_eq!(args.get(1).and_then(coords), Some([1.0, -25.0, 3.0]));
+        assert_eq!(args.get(2), Some(&Value::Unset));
+        assert_eq!(args.get(3), Some(&Value::Unset));
+
+        // Anything after the instance makes it unreadable.
+        let mut trailing = Parser {
+            s: b"CARTESIAN_POINT('',(1.,2.,3.)) junk",
+            i: 0,
+        };
+        assert!(trailing.instance().is_none());
+    }
+
+    #[test]
+    fn references_inside_strings_are_not_links() {
+        assert_eq!(refs_in("FOO('#12 and ''#13''',#7,(#8,#9),#)"), vec![7, 8, 9]);
+    }
+}
