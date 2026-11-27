@@ -502,3 +502,347 @@ fn an_unreadable_macro_file_is_named_escaped() -> TestResult {
     assert!(err.contains("p\\u{1b}[2J"), "{err:?}");
     Ok(())
 }
+
+#[test]
+fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let pages_before = wc_core::store::load(&dir)?.pages.len();
+
+    // A typo in a column name is refused before anything changes.
+    let typo = tmp.path().join("typo.csv");
+    std::fs::write(&typo, "kw;sectoin\n1;2\n")?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", typo.to_str().ok_or("path")?],
+    ) else {
+        return Err("generated from a table with an unknown column".into());
+    };
+    assert!(
+        err.contains("\"sectoin\"") && err.contains("\"kW\", \"part\", \"section\""),
+        "{err}"
+    );
+    // A row without a value set names its line, and nothing is placed.
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "Set;kW;Section\n3 kW;;\n\n0.75 kW;0.8;\n;5.5;4 mm²\n")?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    ) else {
+        return Err("generated a row without a value set".into());
+    };
+    assert!(err.contains("line 5") && err.contains("choose a value set"), "{err}");
+    assert_eq!(wc_core::store::load(&dir)?.pages.len(), pages_before);
+
+    let out = wiringcraft(
+        &dir,
+        &[
+            "macro",
+            "generate",
+            "starter",
+            "--table",
+            table.to_str().ok_or("path")?,
+            "--set",
+            "3 kW",
+            "--title",
+            "Motors",
+            "--size",
+            "A4",
+        ],
+    )?;
+    assert_eq!(out, "p0002\n3 copies of Motor starter on 1 page\n");
+    let p = wc_core::store::load(&dir)?;
+    let page = p.page("p0002").ok_or("page")?;
+    assert_eq!((page.number.as_str(), page.title.as_str()), ("3", "Motors"));
+    assert_eq!(page.size, wc_core::PageSize::A4);
+    let rows: Vec<(String, String, Option<String>)> = page
+        .symbols
+        .iter()
+        .map(|s| {
+            let tag = s.tag.clone().ok_or("tag")?;
+            let device = p.devices.get(&tag).ok_or("device")?;
+            Ok((tag.to_string(), device.description.clone(), device.part.clone()))
+        })
+        .collect::<Result<_, &str>>()?;
+    assert_eq!(
+        rows,
+        [
+            ("-Q1".into(), "Starter 3 kW".into(), Some("SIE.3RV2011-1GA10".into())),
+            ("-Q2".into(), "Starter 0.8 kW".into(), Some("SIE.3RV2011-1AA10".into())),
+            ("-Q3".into(), "Starter 5.5 kW".into(), Some("SIE.3RV2011-1GA10".into())),
+        ]
+    );
+    let sections: Vec<Option<&str>> = page.wires.iter().map(|w| w.spec.section.as_deref()).collect();
+    assert_eq!(sections, [Some("2.5 mm²"), Some("1.5 mm²"), Some("4 mm²")]);
+    // Side by side, on the grid, in the same row.
+    let xs: Vec<f64> = page.symbols.iter().map(|s| s.at.x).collect();
+    let ys: Vec<f64> = page.symbols.iter().map(|s| s.at.y).collect();
+    assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
+    assert!(ys.windows(2).all(|w| w[0] == w[1]), "{ys:?}");
+    assert!(xs.iter().chain(&ys).all(|v| v % 5.0 == 0.0), "{xs:?} {ys:?}");
+    assert!(p.lock.symbols.contains_key("wc.coil"));
+    Ok(())
+}
+
+#[test]
+fn a_generation_whose_save_fails_leaves_the_project_as_it_was() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let table = tmp.path().join("motors.csv");
+    // Thirty rows: more than one small page holds.
+    std::fs::write(&table, format!("set\n{}", "3 kW\n".repeat(30)))?;
+    let args = [
+        "macro",
+        "generate",
+        "starter",
+        "--table",
+        table.to_str().ok_or("path")?,
+        "--size",
+        "100x110",
+    ];
+    // A folder where the second new page's file goes makes the save fail after the first.
+    let before = wc_core::store::load(&dir)?;
+    // (the store writes `<file>.tmp` and renames it into place).
+    let blocker = dir.join("pages/p0003.page.json.tmp");
+    std::fs::create_dir_all(&blocker)?;
+    assert!(wiringcraft(&dir, &args).is_err(), "the save failed");
+    assert!(
+        !dir.join("pages/p0002.page.json").exists(),
+        "the first new page is taken back"
+    );
+    let vendored = dir.join("vendor/symbols/wc.coil.json");
+    assert!(!vendored.exists(), "the symbol copy taken for it is taken back too");
+    std::fs::remove_dir(&blocker)?;
+    assert_eq!(wc_core::store::load(&dir)?.pages, before.pages);
+    // A copy the project has that differs from the library's, unpinned, is replaced by a run;
+    // a run that fails leaves it as it was.
+    std::fs::create_dir_all(dir.join("vendor/symbols"))?;
+    let own = std::fs::read_to_string(lib.join("symbols/wc.coil.json"))?.replace("\"Relay coil\"", "\"Own coil\"");
+    std::fs::write(&vendored, &own)?;
+    std::fs::create_dir_all(&blocker)?;
+    assert!(wiringcraft(&dir, &args).is_err(), "the save failed");
+    assert_eq!(
+        std::fs::read_to_string(&vendored)?,
+        own,
+        "the project's copy is put back"
+    );
+    std::fs::remove_dir(&blocker)?;
+    std::fs::remove_file(&vendored)?;
+    let out = wiringcraft(&dir, &args)?;
+    assert!(out.starts_with("p0002 p0003"), "{out}");
+    assert!(out.contains("30 copies"), "{out}");
+    let p = wc_core::store::load(&dir)?;
+    let placed: usize = p.pages.iter().map(|pg| pg.symbols.len()).sum();
+    assert_eq!(placed, 30, "one copy per row");
+    Ok(())
+}
+
+#[test]
+fn a_generation_keeps_a_part_name_that_is_no_file_name() -> TestResult {
+    // `ACME R24` is no library id (it has a space): like `macro place`, generation keeps it as
+    // the device's part name instead of refusing the whole table.
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "set,part\n3 kW,ACME R24\n")?;
+    let out = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )?;
+    assert!(out.contains("1 copy"), "{out}");
+    let p = wc_core::store::load(&dir)?;
+    let parts: Vec<Option<&str>> = p.devices.values().map(|d| d.part.as_deref()).collect();
+    assert!(parts.contains(&Some("ACME R24")), "{parts:?}");
+    assert!(
+        !p.lock.parts.contains_key("ACME R24"),
+        "a name no library has stays unpinned"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_generation_whose_save_fails_takes_back_a_new_black_box_symbol_copy() -> TestResult {
+    // A `box.*` symbol copy is also in the save's own snapshot (the save removes unused ones):
+    // after a failed save it must end as it was before the run, absent.
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    let boxed = std::fs::read_to_string(coil)?.replace("\"wc.coil\"", "\"box.p9.s1\"");
+    std::fs::write(lib.join("symbols/box.p9.s1.json"), boxed)?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER.replace("wc.coil", "box.p9.s1"))?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, format!("set\n{}", "3 kW\n".repeat(30)))?;
+    let args = [
+        "macro",
+        "generate",
+        "starter",
+        "--table",
+        table.to_str().ok_or("path")?,
+        "--size",
+        "100x110",
+    ];
+    let blocker = dir.join("pages/p0003.page.json.tmp");
+    std::fs::create_dir_all(&blocker)?;
+    assert!(wiringcraft(&dir, &args).is_err(), "the save failed");
+    assert!(
+        !dir.join("vendor/symbols/box.p9.s1.json").exists(),
+        "the black box symbol copy taken for the run is taken back"
+    );
+    assert!(!dir.join("pages/p0002.page.json").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_generation_refuses_project_files_that_are_links() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    // The cover page is a link to a file kept elsewhere: a save would put a plain file there.
+    let cover = dir.join("pages/p0001.page.json");
+    let kept = tmp.path().join("cover.page.json");
+    std::fs::rename(&cover, &kept)?;
+    std::os::unix::fs::symlink(&kept, &cover)?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "set\n3 kW\n")?;
+    let err = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )
+    .err()
+    .ok_or("a linked page is refused")?
+    .to_string();
+    assert!(err.contains("is a link; macro generate"), "{err}");
+    assert!(
+        std::fs::symlink_metadata(&cover)?.file_type().is_symlink(),
+        "the link stays"
+    );
+    assert!(!dir.join("pages/p0002.page.json").exists(), "nothing is written");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_generation_refuses_a_symbol_copy_that_is_a_dangling_link() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    // The coil's copy is a link to a file that is not there: a rollback would remove it.
+    let copy = wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Symbol, "wc.coil")?;
+    std::fs::create_dir_all(copy.parent().ok_or("parent")?)?;
+    std::os::unix::fs::symlink(tmp.path().join("gone.json"), &copy)?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "set\n3 kW\n")?;
+    let err = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )
+    .err()
+    .ok_or("a linked symbol copy is refused")?
+    .to_string();
+    assert!(err.contains("is a link; macro generate"), "{err}");
+    assert!(
+        std::fs::symlink_metadata(&copy)?.file_type().is_symlink(),
+        "the link stays"
+    );
+    assert!(!dir.join("pages/p0002.page.json").exists(), "nothing is written");
+    Ok(())
+}
+
+#[test]
+fn a_table_cut_short_inside_a_quoted_cell_places_nothing() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    std::fs::create_dir_all(dir.join("macros"))?;
+    std::fs::write(dir.join("macros/starter.json"), STARTER)?;
+    let table = tmp.path().join("cut.csv");
+    std::fs::write(&table, "set;kW\n3 kW;\"4\n\"\n3 kW;\"5")?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    ) else {
+        return Err("generated from a table cut short".into());
+    };
+    assert!(err.contains("line 4") && err.contains("not closed"), "{err}");
+    Ok(())
+}

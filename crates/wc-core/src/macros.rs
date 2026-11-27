@@ -94,7 +94,7 @@ impl Macro {
     /// fill declared placeholders, every placeholder the texts use is declared, symbol ids are
     /// unique and wires only end on the macro's own symbols.
     pub fn check(&self) -> Result<()> {
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let mut names: Vec<&str> = Vec::new();
         for p in &self.placeholders {
             let n = p.name.trim();
@@ -165,12 +165,13 @@ impl Macro {
     /// without a value is an error.
     pub fn apply(&self, set: Option<&str>, overrides: &BTreeMap<String, String>) -> Result<Macro> {
         self.check()?;
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let chosen = match set.map(str::trim).filter(|s| !s.is_empty()) {
             Some(name) => match self.value_set(name) {
                 Some(v) => Some(v),
                 None => {
-                    let known: Vec<&str> = self.value_sets.iter().map(|v| v.name.as_str()).collect();
+                    // Quoted, so a control character in a declared name is shown escaped.
+                    let known: Vec<String> = self.value_sets.iter().map(|v| format!("{:?}", v.name)).collect();
                     return bad(if known.is_empty() {
                         format!("it has no value sets, so {name:?} cannot be chosen")
                     } else {
@@ -179,7 +180,7 @@ impl Macro {
                 }
             },
             None if !self.value_sets.is_empty() => {
-                let known: Vec<&str> = self.value_sets.iter().map(|v| v.name.as_str()).collect();
+                let known: Vec<String> = self.value_sets.iter().map(|v| format!("{:?}", v.name)).collect();
                 return bad(format!("choose a value set: {}", known.join(", ")));
             }
             None => None,
@@ -200,7 +201,7 @@ impl Macro {
         }
         for (k, v) in overrides {
             if !self.placeholders.iter().any(|p| key(&p.name) == key(k)) {
-                return bad(format!("{k} is not a placeholder"));
+                return bad(format!("{k:?} is not a placeholder"));
             }
             values.insert(key(k), v.clone());
         }
@@ -287,7 +288,7 @@ impl Macro {
     /// Rename declared placeholder `old` to `new` (names matched without regard to case): its
     /// declaration, its values in the value sets and its uses in the texts.
     pub fn rename_declared(&mut self, old: &str, new: &str) -> Result<()> {
-        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", self.name)));
         let new = new.trim();
         if new.is_empty() {
             return bad(format!("placeholder {} needs a new name", old.trim()));
@@ -681,7 +682,7 @@ mod tests {
 
         let none = BTreeMap::new();
         let err = err_of(m.apply(None, &none));
-        assert!(err.contains("choose a value set: 0.75 kW, 3 kW"), "{err}");
+        assert!(err.contains("choose a value set: \"0.75 kW\", \"3 kW\""), "{err}");
         assert!(m.apply(Some("5 kW"), &none).is_err());
 
         let small = m.apply(Some("0.75 KW"), &none)?;
@@ -824,7 +825,13 @@ mod tests {
         undeclared.value_sets.iter_mut().for_each(|v| {
             v.values.remove("current");
         });
-        assert!(err_of(undeclared.check()).contains("{{current}} is used"));
+        let err = err_of(undeclared.check());
+        // The name is quoted (escaped), so odd characters in it cannot reach a terminal raw.
+        assert!(
+            err.contains("{{current}} is used") && err.contains(&format!("macro {:?}:", undeclared.name)),
+            "{err}"
+        );
+        assert!(err.contains("macro \""), "{err}");
 
         let mut twice = starter()?;
         twice.placeholders.push(Placeholder {
@@ -881,7 +888,12 @@ mod tests {
         assert!(m.value_sets.iter().all(|v| !v.values.keys().any(|k| key(k) == "kw")));
         m.check()?;
         assert!(err_of(m.rename_declared("power", "Part")).contains("there already"));
-        assert!(err_of(m.rename_declared("volts", "v")).contains("no placeholder volts"));
+        let err = err_of(m.rename_declared("volts", "v"));
+        assert!(
+            err.contains("no placeholder volts") && err.contains(&format!("macro {:?}:", m.name)),
+            "{err}"
+        );
+        assert!(err.contains("macro \""), "{err}");
 
         // A set giving the placeholder under two spellings keeps the value placing used.
         let mut twice = starter()?;
@@ -1274,7 +1286,7 @@ mod edge_tests {
             name: "Big".into(),
             ..Default::default()
         });
-        assert!(err_of(with_sets.apply(Some(" "), &bridge)).contains("choose a value set: Big"));
+        assert!(err_of(with_sets.apply(Some(" "), &bridge)).contains("choose a value set: \"Big\""));
         Ok(())
     }
 

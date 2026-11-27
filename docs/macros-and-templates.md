@@ -102,6 +102,12 @@ description  Relay 230 V AC
 
 The macro was drawn with `-K1`; it was placed as `-K2` because the page already had a `-K1`.
 
+### Pages from a table
+
+A table can drive a macro: `wiringcraft macro generate <macro> --table motors.csv` places one
+copy per row, each row's cells filling the placeholders (a column `set` picks the value set), on
+new pages. See [Pages from a table](cli/library-and-macros.md#pages-from-a-table).
+
 ### EPLAN macros
 
 The macros in an EPLAN parts archive, read by `import parts-edz`, become library symbols
