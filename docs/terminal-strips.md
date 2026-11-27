@@ -103,7 +103,8 @@ The columns, sorting and grouping of the report can be changed with a report lay
 ## Example
 
 Three drawn terminals, a lamp wired to `-X1.1`, and two terminals tagged with just `-X1`, on a
-page `p2` with nothing on it yet. `place` prints each symbol's id (`s1` to `s6` here), and
+page `p2` with nothing on it yet, in a project with no other `-X1` terminals (those would
+change the numbers the two `-X1` terminals get). `place` prints each symbol's id (`s1` to `s6` here), and
 `wire` uses those ids; on a page that already has symbols, use the ids `place` printed:
 
 ```sh
