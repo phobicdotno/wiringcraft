@@ -2833,7 +2833,9 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.leave(leave)));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        // Escape is Cancel, as in the other dialogs: nothing is saved or dropped.
+                        // It is used up here, so the symbol editor does not also drop its shape.
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2843,7 +2845,8 @@ impl App {
                     egui::ScrollArea::vertical()
                         .max_height((screen.height() * 0.6).max(120.0))
                         .show(ui, |ui| ui.label(m.as_str()));
-                    if ui.button("OK").clicked() {
+                    // OK is the only answer: Enter and Escape give it too.
+                    if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape)) {
                         keep = false;
                     }
                 }
@@ -8237,6 +8240,43 @@ mod nudge_tests {
         let sent = app_frame(&mut app, &ctx, Vec::new(), true);
         assert!(!sent.contains(&CancelClose));
         assert!(app.dialog.is_none());
+    }
+
+    /// Escape answers the unsaved-changes question as Cancel: the window stays open, the
+    /// change stays in the project and nothing is written. Enter or Escape closes a message
+    /// as OK (#1493).
+    #[test]
+    fn escape_cancels_the_unsaved_question_and_closes_a_message() {
+        use egui::ViewportCommand::Close;
+        let key = |key| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        let (_tmp, mut app, ctx) = changed_app();
+        app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+            "the person is asked"
+        );
+        // A window just opened is laid out unseen in its first frame.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let mut sent = app_frame(&mut app, &ctx, key(Key::Escape), false);
+        sent.extend(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert!(app.dialog.is_none(), "Escape answers the question");
+        assert!(!sent.contains(&Close), "the window stays open");
+        assert!(app.open.as_ref().unwrap().dirty, "the change is kept, unsaved");
+        assert_eq!(coil_on_disk(&app), Point::new(55.0, 60.0), "nothing is written");
+        for k in [Key::Enter, Key::Escape] {
+            app.dialog = Some(Dialog::Message("Done.".into()));
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, key(k), false);
+            assert!(app.dialog.is_none(), "{k:?} closes the message");
+        }
     }
 
     /// A device tag typed and not entered yet when the window's close button is pressed is
