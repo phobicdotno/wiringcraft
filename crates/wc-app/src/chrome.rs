@@ -15,6 +15,15 @@ pub trait Status {
     fn enabled(&self, a: Action) -> bool;
 }
 
+/// A shortcut hint (an action's `shortcut`) as the keys are on `os`: the Ctrl shortcuts are
+/// matched with the Command key, which on a Mac is Cmd, not Ctrl (#1492).
+pub fn shortcut_hint(os: egui::os::OperatingSystem, shortcut: &str) -> String {
+    match shortcut.strip_prefix("Ctrl+") {
+        Some(rest) if os == egui::os::OperatingSystem::Mac => format!("Cmd+{rest}"),
+        _ => shortcut.to_owned(),
+    }
+}
+
 #[derive(Default)]
 pub struct ChromeState {
     pub ribbon_tab: usize,
@@ -195,7 +204,7 @@ pub fn menu_bar(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<Action>) {
                         Some(a) => {
                             let info = a.info();
                             let button = egui::Button::new(info.label)
-                                .shortcut_text(info.shortcut)
+                                .shortcut_text(shortcut_hint(ui.ctx().os(), info.shortcut))
                                 .selected(status.active(*a));
                             if ui
                                 .add_enabled(status.enabled(*a), button)
@@ -265,7 +274,8 @@ fn icon_button_rect(
     let tip = if info.shortcut.is_empty() {
         format!("{}\n{}", info.label, info.tip)
     } else {
-        format!("{} ({})\n{}", info.label, info.shortcut, info.tip)
+        let keys = shortcut_hint(ui.ctx().os(), info.shortcut);
+        format!("{} ({keys})\n{}", info.label, info.tip)
     };
     // A pointer release counts only over the button where it is now: egui hit-tests against the
     // last frame, where a button with an id (a ribbon button) that has moved since still looks to
@@ -659,6 +669,16 @@ mod tests {
         assert!(w.is_some(), "no window width moves the Undo button");
         let w = w.unwrap_or(1210.0);
         (w, w + 10.0)
+    }
+
+    #[test]
+    fn shortcut_hints_name_cmd_on_a_mac() {
+        use egui::os::OperatingSystem::{Mac, Windows};
+        assert_eq!(shortcut_hint(Mac, "Ctrl+S"), "Cmd+S");
+        assert_eq!(shortcut_hint(Mac, "Ctrl+Shift+N"), "Cmd+Shift+N");
+        assert_eq!(shortcut_hint(Mac, "Del"), "Del");
+        assert_eq!(shortcut_hint(Mac, ""), "");
+        assert_eq!(shortcut_hint(Windows, "Ctrl+S"), "Ctrl+S");
     }
 
     #[test]

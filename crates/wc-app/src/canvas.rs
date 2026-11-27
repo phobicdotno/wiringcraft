@@ -2310,7 +2310,9 @@ fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor) {
     for &a in actions {
         let info = a.info();
         if ui
-            .add(egui::Button::new(info.label).shortcut_text(info.shortcut))
+            .add(
+                egui::Button::new(info.label).shortcut_text(crate::chrome::shortcut_hint(ui.ctx().os(), info.shortcut)),
+            )
             .clicked()
         {
             ed.menu_action = Some(a);
