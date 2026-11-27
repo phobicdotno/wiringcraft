@@ -35,21 +35,12 @@ pub struct Row {
     pub through: Vec<usize>,
 }
 
-const SEP: char = '\u{1f}';
-
 fn parse_log(text: &str) -> Vec<Commit> {
-    text.split('\u{1e}')
-        .filter_map(|rec| {
-            let rec = rec.trim_matches('\n');
-            if rec.is_empty() {
-                return None;
-            }
-            let f: Vec<&str> = rec.split(SEP).collect();
-            if f.len() < 6 {
-                return None;
-            }
+    crate::log_records(text)
+        .into_iter()
+        .map(|[id, parents, refs, subject, author, time]| {
             let mut head = false;
-            let refs = f[2]
+            let refs = refs
                 .split(", ")
                 .filter(|r| !r.is_empty())
                 .filter_map(|r| {
@@ -68,15 +59,19 @@ fn parse_log(text: &str) -> Vec<Commit> {
                     }
                 })
                 .collect();
-            Some(Commit {
-                id: f[0].to_owned(),
-                parents: f[1].split(' ').filter(|p| !p.is_empty()).map(str::to_owned).collect(),
+            Commit {
+                id: id.to_owned(),
+                parents: parents
+                    .split(' ')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
                 refs,
                 head,
-                subject: f[3].to_owned(),
-                author: f[4].to_owned(),
-                time: f[5].trim().parse().unwrap_or(0),
-            })
+                subject: subject.to_owned(),
+                author: author.to_owned(),
+                time: time.trim().parse().unwrap_or(0),
+            }
         })
         .collect()
 }
@@ -158,7 +153,7 @@ pub fn history(git: &Git, limit: usize) -> Result<Vec<Row>> {
         "--all",
         "--topo-order",
         &n,
-        "--format=%H%x1f%P%x1f%D%x1f%s%x1f%an%x1f%at%x1e",
+        "--format=%H%x00%P%x00%D%x00%s%x00%an%x00%at%x00",
     ])?;
     Ok(layout(parse_log(&text)))
 }
@@ -395,7 +390,7 @@ mod tests {
 
     #[test]
     fn parses_git_log_records() {
-        let text = "h1\u{1f}p1 p2\u{1f}HEAD -> main, tag: v1\u{1f}Merge x\u{1f}Ann\u{1f}100\u{1e}\nh2\u{1f}\u{1f}\u{1f}Root\u{1f}Ann\u{1f}50\u{1e}\n";
+        let text = "h1\x00p1 p2\x00HEAD -> main, tag: v1\x00Merge x\x00Ann\x00100\x00\nh2\x00\x00\x00Root\x00Ann\x0050\x00\n";
         let cs = parse_log(text);
         assert_eq!(cs.len(), 2);
         assert!(cs[0].head);

@@ -1043,3 +1043,29 @@ fn in_work_tree_is_false_where_git_finds_no_repository() -> Result<()> {
     assert!(!Git::new(dir).in_work_tree()?);
     Ok(())
 }
+
+#[test]
+fn a_subject_with_git_log_separators_keeps_its_commit() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let mut p = store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    if let Some(page) = p.page_mut("p0001") {
+        page.title = "Cover sheet".into();
+    }
+    store::save(dir, &p)?;
+    let subject = "Rename \u{1e}cover\u{1f} sheet";
+    git.commit(subject)?;
+
+    let rows = history(&git, 50)?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows.first().map(|r| r.commit.subject.as_str()), Some(subject));
+    assert!(rows.first().is_some_and(|r| r.commit.head), "{rows:?}");
+
+    let h = page_history(&git, "p0001", 10)?;
+    let subjects: Vec<&str> = h.iter().map(|v| v.subject.as_str()).collect();
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert_eq!(subjects.first(), Some(&subject));
+    Ok(())
+}
