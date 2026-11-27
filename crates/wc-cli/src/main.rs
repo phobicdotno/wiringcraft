@@ -3519,7 +3519,7 @@ fn run(mut cli: Cli) -> Res<()> {
             // The same for the project's own files (pages, panels, lock, ...): both the save and
             // the rollback would put a plain file where the link was (#614), so refuse before any
             // write.
-            refuse_linked_files(&before, "box-edit")?;
+            refuse_linked_files(dir, &before, "box-edit")?;
             // A run that stops between these writes leaves the journal: the next run puts the
             // files back from it (#653).
             let mut journaled = before.clone();
@@ -3761,7 +3761,11 @@ fn run(mut cli: Cli) -> Res<()> {
                         .map(|(kind, id)| vendored_bytes(dir, *kind, id))
                         .collect::<Res<_>>()?;
                     // A link would become a plain file on the rollback, or be removed (#614).
-                    refuse_linked_files(&vendored, "macro generate")?;
+                    refuse_linked_files(dir, &vendored, "macro generate")?;
+                    // The project's files and the pages folder the new pages go to are checked
+                    // the same way before any copy is taken, so a linked folder there refuses
+                    // before anything is written (#1858). The page id only names that folder.
+                    refuse_linked_files(dir, &snapshot_project(dir, &["new"], &[])?, "macro generate")?;
                     let undo_vendored = |err: String| -> String {
                         let failed = put_files_back(&vendored);
                         if failed.is_empty() {
@@ -3785,7 +3789,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
                     let mut before = snapshot_project(dir, &new_pages, &[]).map_err(undo_vendored)?;
                     // A link would become a plain file on the save and on the rollback (#614).
-                    refuse_linked_files(&before, "macro generate").map_err(undo_vendored)?;
+                    refuse_linked_files(dir, &before, "macro generate").map_err(undo_vendored)?;
                     // The symbol and part copies go back with the project's files, as they were
                     // before this run.
                     // `put_files_back` puts the last entry back first, so the state from before
@@ -6267,16 +6271,33 @@ fn same_file(at: &std::fs::Metadata, file: &std::fs::File) -> std::io::Result<bo
     }
 }
 
-/// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
-/// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
 /// Refuse, before any write, when a project file about to be saved is a link: the save and a
-/// rollback would both put a plain file where the link was (#614).
-fn refuse_linked_files<T>(files: &[(PathBuf, T)], command: &str) -> Result<(), String> {
-    let mut linked: Vec<String> = Vec::new();
+/// rollback would both put a plain file where the link was (#614). A folder between `dir` and
+/// such a file that is a link is refused too: writes there would land outside the project.
+fn refuse_linked_files<T>(dir: &Path, files: &[(PathBuf, T)], command: &str) -> Result<(), String> {
+    let (mut linked, mut folders) = (Vec::new(), std::collections::BTreeSet::new());
+    let mut checked = std::collections::BTreeSet::new();
     for (path, _) in files {
         if is_link(path)? {
             linked.push(escape_field(&path.display().to_string()));
         }
+        // A folder on the way that is a link would take the save and the rollback out of the
+        // project (#1858). The project folder itself may be reached through a link.
+        let mut at = path.parent();
+        while let Some(folder) = at.filter(|f| *f != dir && f.starts_with(dir)) {
+            if checked.insert(folder.to_path_buf()) && is_link(folder)? {
+                folders.insert(folder.to_path_buf());
+            }
+            at = folder.parent();
+        }
+    }
+    if !folders.is_empty() {
+        let shown: Vec<String> = folders.iter().map(|f| escape_field(&f.display().to_string())).collect();
+        return Err(format!(
+            "{} {} a link; {command} does not write through a linked folder (copy its target over the link first)",
+            shown.join(", "),
+            if shown.len() == 1 { "is" } else { "are" }
+        ));
     }
     if linked.is_empty() {
         return Ok(());
@@ -6288,6 +6309,8 @@ fn refuse_linked_files<T>(files: &[(PathBuf, T)], command: &str) -> Result<(), S
     ))
 }
 
+/// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
+/// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
 fn is_link(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(m) => Ok(m.file_type().is_symlink()),
