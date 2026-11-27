@@ -197,8 +197,14 @@ impl Git {
     /// [`Git::run`] with git's output as the bytes it printed. The arguments are OS strings,
     /// so a path read back from git as bytes ([`os_path`]) is handed to it byte for byte.
     fn run_bytes<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Vec<u8>> {
+        self.run_bytes_env(args, &[])
+    }
+
+    /// [`Git::run_bytes`] with these extra variables set for git.
+    fn run_bytes_env<S: AsRef<OsStr>>(&self, args: &[S], envs: &[(&str, &str)]) -> Result<Vec<u8>> {
         let out = Command::new("git")
             .args(args)
+            .envs(envs.iter().copied())
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env(PARENT_PROJECT_ENV, self.full_dir())
@@ -276,6 +282,34 @@ impl Git {
 
     pub fn is_repo(&self) -> bool {
         self.dir.join(".git").exists()
+    }
+
+    /// Whether git can keep versions here: the project folder is in a work tree, its own
+    /// repository's or that of a larger one it sits in. `false` only when git ran and found
+    /// none; a folder that is not there, git that cannot be started, or any other refusal of
+    /// git's is an error with its reason.
+    pub fn in_work_tree(&self) -> Result<bool> {
+        // Checked first: git started in a missing folder fails like git that is not installed.
+        std::fs::metadata(&self.dir).map_err(|source| Error::Io {
+            path: self.dir.display().to_string(),
+            source,
+        })?;
+        // Git's own words, untranslated, so its "not a git repository" is recognised. A `.git`
+        // file pointing nowhere is no repository either: older git says "not a git
+        // repository" for it, newer git "gitfile does not point to a valid repository".
+        match self.run_bytes_env(
+            &["rev-parse", "--is-inside-work-tree"],
+            &[("LC_ALL", "C"), ("LANGUAGE", "C")],
+        ) {
+            Ok(out) => Ok(String::from_utf8_lossy(&out).trim() == "true"),
+            Err(Error::Git { message, .. })
+                if message.contains("not a git repository")
+                    || message.contains("gitfile does not point to a valid repository") =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Make the project folder a repository (no-op when it is one) and record a first version.
