@@ -2840,6 +2840,30 @@ fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
 }
 
 #[test]
+fn a_very_long_heading_is_cut_quickly_and_keeps_its_counter() {
+    let title = "Cable list for the north basin pump station ".repeat(2_300);
+    let title = format!("{}\u{e9}", &title[..99_999]);
+    assert_eq!(title.chars().count(), 100_000);
+    let counter = " (2 / 3)";
+    let heading = layout::fit_heading(&title, counter, 180.0);
+    assert!(heading.ends_with(&format!("...{counter}")), "{heading:?}");
+    assert!(writer::text_width_mm(&heading, 4.0) <= 180.0, "{heading:?}");
+    // The cut is the longest start that fits: one more character would not.
+    let Some(kept) = heading.strip_suffix(&format!("...{counter}")) else {
+        unreachable!("the heading ends with the counter")
+    };
+    let Some(next) = title[kept.len()..].chars().next() else {
+        unreachable!("the title was cut")
+    };
+    let longer = format!("{kept}{next}...{counter}");
+    assert!(writer::text_width_mm(&longer, 4.0) > 180.0, "{longer:?}");
+    // A short heading is left as it is.
+    assert_eq!(layout::fit_heading("Cables", counter, 180.0), "Cables (2 / 3)");
+    // No room at all for the title leaves only "..." before the counter.
+    assert_eq!(layout::fit_heading(&title, counter, 1.0), format!("...{counter}"));
+}
+
+#[test]
 fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
     let mut project = Project::new("x");
     let mut page = Page::new("p1", "1", "Cabinet");
@@ -3197,5 +3221,71 @@ fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
     assert_eq!(
         report.warnings,
         vec!["page 1: the PDF cannot print Ω Ж а р in its text; they show as ?".to_string()]
+    );
+}
+
+#[test]
+fn a_long_report_or_plc_card_heading_is_cut_to_the_frame_and_keeps_its_counter() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let long = "Device list for the north basin pumping station, the second pump hall and its \
+                cabinets, with every spare and every terminal named on the drawings, listed \
+                again for the south basin, its pump hall, its cabinets and every spare there";
+    let table = wc_report::Table {
+        title: long.into(),
+        columns: vec!["Tag".into()],
+        ..Default::default()
+    };
+    let card = wc_report::PlcCardSheet {
+        card: long.into(),
+        ..Default::default()
+    };
+    let page = Page::new("r", "R1", "Report");
+    let (w, _) = page.size.mm();
+    let right = w - layout::MARGIN - 6.0;
+    let headings = |drawn: &writer::Drawn| -> Vec<(f64, String)> {
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { at, height, text, .. } if (*height - 4.0).abs() < 1e-9 => {
+                    Some((at.0 + writer::text_width_mm(text, 4.0), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let report = layout::draw_table_page(&project, &page, 0, 3, &table, &[], (2, 3), "");
+    let card_sheet = layout::draw_card_page(&project, &page, 0, 3, &card, 0, (2, 3), "");
+    for (what, drawn, start) in [
+        ("report", &report, "Device list"),
+        ("card", &card_sheet, "PLC card Device"),
+    ] {
+        let found: Vec<(f64, String)> = headings(drawn)
+            .into_iter()
+            .filter(|(_, t)| t.starts_with(start))
+            .collect();
+        let [(end, text)] = found.as_slice() else {
+            unreachable!("one {what} heading, got {found:?}")
+        };
+        assert!(
+            *end <= right + 1e-6,
+            "{what} heading {text:?} ends at {end} mm, past {right} mm"
+        );
+        assert!(
+            text.ends_with("... (2 / 3)"),
+            "{what} heading {text:?} is cut and keeps its counter"
+        );
+    }
+    // A short title is drawn whole.
+    let short = wc_report::Table {
+        title: "Devices".into(),
+        ..table
+    };
+    let drawn = layout::draw_table_page(&project, &page, 0, 1, &short, &[], (1, 1), "");
+    assert!(
+        headings(&drawn).iter().any(|(_, t)| t == "Devices"),
+        "{:?}",
+        headings(&drawn)
     );
 }

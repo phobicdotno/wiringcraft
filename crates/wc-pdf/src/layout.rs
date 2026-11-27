@@ -1075,11 +1075,31 @@ pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
     if text_width_mm(s, height) <= width {
         return s.to_owned();
     }
-    let mut out: String = s.to_owned();
-    while !out.is_empty() && text_width_mm(&format!("{out}..."), height) > width {
-        out.pop();
+    // The longest start of `s` that still fits with "..." after it. A longer start is never
+    // narrower, so the cut point is found by halving: a few measures, not one per character.
+    let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).skip(1).collect();
+    let fits = |end: usize| {
+        s.get(..end)
+            .is_some_and(|start| text_width_mm(&format!("{start}..."), height) <= width)
+    };
+    let (mut lo, mut hi) = (0, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if ends.get(mid - 1).is_some_and(|&end| fits(end)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
     }
-    format!("{out}...")
+    let end = lo.checked_sub(1).and_then(|i| ends.get(i)).map_or(0, |&e| e);
+    format!("{}...", s.get(..end).unwrap_or_default())
+}
+
+/// A sheet heading drawn 4 mm high, at most `width` mm wide: `title` cut short with "..." when
+/// it is too long, followed by `counter` (such as " (2 / 3)"), which is always kept whole.
+pub(crate) fn fit_heading(title: &str, counter: &str, width: f64) -> String {
+    let room = width - text_width_mm(counter, 4.0);
+    format!("{}{counter}", fit_at(title, room, 4.0))
 }
 
 /// One line of a report page's table: a row of the table, by its index, or the heading of a
@@ -1156,12 +1176,12 @@ pub fn draw_table_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let mut y = MARGIN + HEADER + 10.0;
-    let heading = if part.1 > 1 {
-        format!("{} ({} / {})", table.title, part.0, part.1)
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
     } else {
-        table.title.clone()
+        String::new()
     };
-    pen.text((x0, y), 4.0, 0, &heading);
+    pen.text((x0, y), 4.0, 0, &fit_heading(&table.title, &counter, x1 - x0));
     y += 4.0;
     if !table.header.is_empty() {
         // The title-block values the layout asks for, as on the page's title block.
@@ -1368,10 +1388,12 @@ pub fn draw_card_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let top = MARGIN + HEADER + 10.0;
-    let mut heading = format!("PLC card {}", card.card);
-    if part.1 > 1 {
-        heading.push_str(&format!(" ({} / {})", part.0, part.1));
-    }
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
+    } else {
+        String::new()
+    };
+    let heading = fit_heading(&format!("PLC card {}", card.card), &counter, x1 - x0);
     pen.text((x0, top), 4.0, 0, &heading);
     let mut about = vec![];
     if !card.rack.is_empty() {
