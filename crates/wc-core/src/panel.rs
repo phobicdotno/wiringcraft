@@ -569,7 +569,9 @@ pub fn arrange(
                     .items
                     .iter()
                     .filter_map(|d| d.device_bounds())
-                    .filter(|(min, max)| min.y <= at.y && max.y >= at.y && max.x > at.x)
+                    // Only devices over this rail's own length: one on another rail further
+                    // along the same row does not use up this one.
+                    .filter(|(min, max)| min.y <= at.y && max.y >= at.y && max.x > at.x && min.x < at.x + length)
                     .map(|(_, max)| max.x + GAP)
                     .fold(at.x, f64::max);
                 Some((*at, *length, used_to))
@@ -1376,5 +1378,50 @@ mod tests {
         assert!(!p.resize_item(1, Point::new(700.0, 300.0)));
         assert!(!p.resize_item(2, Point::new(300.0, 500.0)));
         assert_eq!(p.items, before, "nothing changes");
+    }
+
+    #[test]
+    fn arrange_ignores_devices_on_another_rail_in_the_same_row() {
+        // Two rails side by side on one row; the right one already carries a device.
+        let mut panel = Panel::new("p", "P", 600.0, 300.0);
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(10.0, 150.0),
+            length: 200.0,
+        });
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(300.0, 150.0),
+            length: 200.0,
+        });
+        let (Some(on_right), Some(new)) = (tag("-K1"), tag("-K2")) else {
+            unreachable!()
+        };
+        let Ok(()) = panel.place_device(on_right.clone(), Point::new(300.0, 105.0), (45.0, 90.0), Rotation::R0) else {
+            unreachable!()
+        };
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        let mut part = Part {
+            id: "c".into(),
+            ..Default::default()
+        };
+        part.properties.insert("Width".into(), "45".into());
+        part.properties.insert("Height".into(), "90".into());
+        parts.insert("c".to_string(), part);
+        for t in [&on_right, &new] {
+            project.devices.insert(
+                t.clone(),
+                Device {
+                    part: Some("c".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let done = arrange(&mut panel, &project, &parts, None);
+        assert_eq!(done.placed, vec![new.to_string()]);
+        assert_eq!(
+            panel.device(&new).and_then(PanelItem::device_bounds),
+            Some((Point::new(10.0, 105.0), Point::new(55.0, 195.0))),
+            "the empty left rail takes it from its own left end"
+        );
     }
 }
