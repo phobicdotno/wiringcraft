@@ -3545,7 +3545,8 @@ impl App {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.edit_rules()));
                         }
-                        if ui.button("Close").clicked() {
+                        // Escape closes the list, as it does the other read-only dialogs.
+                        if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });

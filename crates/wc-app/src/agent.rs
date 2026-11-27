@@ -9216,6 +9216,34 @@ mod tests {
     }
 
     #[test]
+    fn escape_closes_the_project_check_list() {
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let frame = |a: &mut App, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| a.dialogs(ctx));
+        };
+        a.show_check();
+        assert!(matches!(a.dialog, Some(Dialog::Check(_))));
+        frame(&mut a, Vec::new());
+        assert!(matches!(a.dialog, Some(Dialog::Check(_))), "stays open without a key");
+        frame(
+            &mut a,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
     fn check_rules_added_changed_and_deleted_in_the_dialog_are_kept_checked_and_undone() {
         use crate::rules_form::{Change, RuleRow, change, rows_of};
         use wc_core::check_rule::CheckRule;
