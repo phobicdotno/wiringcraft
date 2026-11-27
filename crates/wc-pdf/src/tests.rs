@@ -3737,3 +3737,73 @@ fn a_long_panel_name_or_card_rack_is_cut_to_the_frame() {
     );
     assert!(text.ends_with("..."), "{text:?}");
 }
+
+#[test]
+fn a_graphic_that_is_not_a_number_is_left_out_of_every_export() {
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    let mut project = Project::new("x");
+    let mut clean = Page::new("p1", "1", "Mains");
+    clean.graphics.push(Shape::Line {
+        a: Point::new(20.0, 20.0),
+        b: Point::new(60.0, 20.0),
+    });
+    project.pages = vec![clean.clone()];
+    let (clean_pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let svg_of = |project: &Project| {
+        let (pages, _) = page_drawings(project, &BTreeMap::new(), &Options::default());
+        let Some(page) = pages.first() else {
+            unreachable!("the page is drawn")
+        };
+        (svg(page), dxf(page))
+    };
+    let (clean_svg, clean_dxf) = svg_of(&project);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut page = clean.clone();
+        page.graphics.extend([
+            Shape::Line {
+                a: Point::new(bad, 10.0),
+                b: Point::new(50.0, 50.0),
+            },
+            Shape::Rect {
+                min: Point::new(10.0, 10.0),
+                max: Point::new(30.0, bad),
+            },
+            Shape::Circle {
+                center: Point::new(bad, 40.0),
+                radius: 5.0,
+                filled: true,
+            },
+            Shape::Circle {
+                center: Point::new(40.0, 40.0),
+                radius: bad,
+                filled: false,
+            },
+            Shape::Arc {
+                center: Point::new(40.0, 40.0),
+                radius: 5.0,
+                start: bad,
+                end: 90.0,
+            },
+            Shape::Polyline {
+                points: vec![Point::new(1.0, 1.0), Point::new(bad, 2.0), Point::new(3.0, 1.0)],
+                closed: true,
+                filled: true,
+            },
+            Shape::Text {
+                at: Point::new(bad, 30.0),
+                text: "lost".into(),
+                height: 3.0,
+                align: Default::default(),
+                angle: 0.0,
+            },
+        ]);
+        project.pages = vec![page];
+        let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+        // Left out, instead of `NaN` or `inf` in the page, which readers refuse.
+        assert!(
+            pdf == clean_pdf,
+            "{bad}: the PDF differs from the page without the bad shapes"
+        );
+        assert_eq!(svg_of(&project), (clean_svg.clone(), clean_dxf.clone()), "{bad}");
+    }
+}
