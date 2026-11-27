@@ -508,16 +508,28 @@ impl Git {
     /// While a merge is being finished, refuse to commit when a file git still lists as
     /// conflicted holds a conflict marker line (`<<<<<<<` or `>>>>>>>`): committing would stage
     /// it as resolved and record the markers. Nothing is staged, so the merge stays as it was.
-    /// A conflicted file that is gone (resolved by removing it) is fine.
+    /// A conflicted file that is gone (resolved by removing it) is fine, and so is a conflicted
+    /// directory (a submodule), which holds no text; any other file that cannot be read is an
+    /// error naming it. Paths are the worktree's (`--no-relative`), so this also holds for a
+    /// project inside a parent repository.
     fn refuse_unresolved_markers(&self) -> Result<()> {
         if !self.git_path("MERGE_HEAD")?.exists() {
             return Ok(());
         }
-        let out = self.run_bytes(&["diff", "--name-only", "--diff-filter=U", "-z"])?;
+        let root = self.dir.join(self.run(&["rev-parse", "--show-toplevel"])?.trim());
+        let out = self.run_bytes(&["diff", "--no-relative", "--name-only", "--diff-filter=U", "-z"])?;
         let mut left = Vec::new();
         for path in out.split(|&b| b == 0).filter(|p| !p.is_empty()) {
-            let Ok(bytes) = std::fs::read(self.dir.join(os_path(path))) else {
-                continue;
+            let file = root.join(os_path(path));
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound || file.is_dir() => continue,
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: file.display().to_string(),
+                        source,
+                    });
+                }
             };
             let marked = bytes
                 .split(|&b| b == b'\n')

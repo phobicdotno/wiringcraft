@@ -335,6 +335,60 @@ fn a_merge_conflict_left_with_markers_is_not_committed() -> Result<()> {
     Ok(())
 }
 
+/// A merge left with `notes.txt` conflicted in the repository `git` works in, whose files are
+/// under `dir`. Returns the head before the merge.
+fn conflicted_merge(git: &Git, dir: &std::path::Path) -> Result<Option<String>> {
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(|e| wc_core::Error::io("notes", e));
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    let before = git.head();
+    assert!(matches!(git.merge("other")?, MergeOutcome::Conflicts(_)));
+    Ok(before)
+}
+
+#[test]
+fn markers_are_found_in_a_project_inside_a_parent_repository() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    Git::new(tmp.path()).init()?;
+    let dir = tmp.path().join("project");
+    std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("project", e))?;
+    let git = Git::new(&dir);
+    let before = conflicted_merge(&git, &dir)?;
+    // git names the file project/notes.txt; it is read there, not at project/project/notes.txt.
+    let result = git.commit("Merge other");
+    let err = result.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("conflict markers") && err.contains("notes.txt"), "{err}");
+    assert_eq!(git.head(), before);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_conflicted_file_that_cannot_be_read_is_an_error_naming_it() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let before = conflicted_merge(&git, dir)?;
+    // A link to itself cannot be read (even by root), and is not a removed file.
+    let notes = dir.join("notes.txt");
+    std::fs::remove_file(&notes).map_err(|e| wc_core::Error::io("notes", e))?;
+    std::os::unix::fs::symlink("notes.txt", &notes).map_err(|e| wc_core::Error::io("link", e))?;
+    let result = git.commit("Merge other");
+    assert!(
+        matches!(&result, Err(Error::Io { path, .. }) if path.ends_with("notes.txt")),
+        "{result:?}"
+    );
+    assert_eq!(git.head(), before);
+    Ok(())
+}
+
 #[test]
 fn a_merge_while_another_is_unfinished_is_refused() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
