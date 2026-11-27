@@ -118,8 +118,8 @@ pub fn redact_location(location: &str) -> String {
     let Some((scheme, rest)) = location.split_once("://") else {
         return location.to_owned();
     };
-    let (had_userinfo, host_path, secret) = split_url(rest);
-    let userinfo = if had_userinfo { "***@" } else { "" };
+    let (userinfo, host_path, secret) = split_url(rest);
+    let userinfo = if userinfo.is_some() { "***@" } else { "" };
     let tail = match secret.chars().next() {
         Some(mark) => format!("{mark}***"),
         None => String::new(),
@@ -127,35 +127,44 @@ pub fn redact_location(location: &str) -> String {
     format!("{scheme}://{userinfo}{host_path}{tail}")
 }
 
-/// The part of a URL after `scheme://` split into whether it had a user name or password, its
-/// host and path without them, and its query and fragment (from the first `?` or `#`, empty
-/// when there is none).
-fn split_url(rest: &str) -> (bool, &str, &str) {
+/// The part of a URL after `scheme://` split into its user name and password (without the `@`;
+/// `None` when there are none), its host and path, and its query and fragment (from the first
+/// `?` or `#`, empty when there is none).
+fn split_url(rest: &str) -> (Option<&str>, &str, &str) {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let (had_userinfo, host_path) = match authority.rfind('@').and_then(|at| rest.get(at + 1..)) {
-        Some(after) => (true, after),
-        None => (false, rest),
+    let (userinfo, host_path) = match authority.rsplit_once('@') {
+        Some((userinfo, _)) => (Some(userinfo), rest.get(userinfo.len() + 1..).unwrap_or_default()),
+        None => (None, rest),
     };
     let (host_path, secret) = match host_path.find(['?', '#']) {
         Some(at) => host_path.split_at_checked(at).unwrap_or((host_path, "")),
         None => (host_path, ""),
     };
-    (had_userinfo, host_path, secret)
+    (userinfo, host_path, secret)
 }
 
 /// `text` with every form of `location` that shows a secret replaced by [`redact_location`]:
 /// the location as given, and (when it has a query or fragment) the location without its user
-/// name and password and its bare host and path, as git may print it.
+/// name and password and its bare host and path, as git may print it. The user name and
+/// password are then replaced by `***` wherever they are still followed by `@`, as in git's
+/// credential prompts (`https://user@host`), which leave out the path and the password.
 fn redact_text(text: &str, location: &str) -> String {
     let shown = redact_location(location);
     let mut text = text.replace(location, &shown);
     if let Some((scheme, rest)) = location.split_once("://") {
-        let (_, host_path, secret) = split_url(rest);
+        let (userinfo, host_path, secret) = split_url(rest);
         if !secret.is_empty() {
             let bare = format!("{host_path}{secret}");
             text = text
                 .replace(&format!("{scheme}://{bare}"), &shown)
                 .replace(&bare, &shown);
+        }
+        if let Some(userinfo) = userinfo.filter(|u| !u.is_empty() && !u.contains('*')) {
+            // The whole user name and password first, then the user name alone.
+            text = text.replace(&format!("{userinfo}@"), "***@");
+            if let Some((user, _)) = userinfo.split_once(':').filter(|(u, _)| !u.is_empty()) {
+                text = text.replace(&format!("{user}@"), "***@");
+            }
         }
     }
     text

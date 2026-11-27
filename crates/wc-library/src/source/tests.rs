@@ -264,6 +264,19 @@ fn git_error_text_is_redacted_in_every_form_of_the_url() {
     }
 }
 
+#[test]
+fn git_credential_prompts_do_not_show_the_user_name_or_password() {
+    let location = "https://user:pw@host/lib.git";
+    for printed in ["https://user:pw@host", "https://user@host", "user:pw@host"] {
+        let text = redact_text(
+            &format!("fatal: could not read Password for '{printed}': terminal prompts disabled"),
+            location,
+        );
+        assert!(!text.contains("user") && !text.contains("pw"), "{text}");
+        assert!(text.contains("***@host"), "{text}");
+    }
+}
+
 // A file URL with a host needs a Unix path after it.
 #[cfg(unix)]
 #[test]
