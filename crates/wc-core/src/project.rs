@@ -1741,18 +1741,21 @@ fn is_one(n: &u32) -> bool {
 
 impl Device {
     /// Every part of the device with its quantity: the main part (once), then the accessories.
+    /// A blank part id is left out and a quantity of 0 is taken as 1, as the editor does, so a
+    /// hand-edited file cannot put an empty or zero line into the parts list.
     pub fn all_parts(&self) -> Vec<(&str, u32)> {
         self.part
             .as_deref()
             .map(|p| (p, 1))
             .into_iter()
-            .chain(self.accessories.iter().map(|a| (a.part.as_str(), a.qty)))
+            .chain(self.accessories.iter().map(|a| (a.part.as_str(), a.qty.max(1))))
+            .filter(|(p, _)| !p.trim().is_empty())
             .collect()
     }
 
     /// Whether the device uses part `id`, as its main part or as an accessory.
     pub fn uses_part(&self, id: &str) -> bool {
-        self.part.as_deref() == Some(id) || self.accessories.iter().any(|a| a.part == id)
+        self.all_parts().iter().any(|(p, _)| *p == id)
     }
 }
 
@@ -2214,6 +2217,22 @@ mod tests {
         let mut p = Project::new("x");
         p.devices.insert(DeviceTag::parse("-K1")?, d);
         assert_eq!(p.used_parts().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_hand_edited_device_gives_no_blank_or_zero_part_line() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let text =
+            r#"{"part":" ","accessories":[{"part":"acme.block","qty":0},{"part":""},{"part":"acme.marker","qty":2}]}"#;
+        let d: Device = serde_json::from_str(text)?;
+        assert_eq!(d.all_parts(), [("acme.block", 1), ("acme.marker", 2)]);
+        assert!(!d.uses_part("") && !d.uses_part(" ") && d.uses_part("acme.block"));
+        let mut p = Project::new("x");
+        p.devices.insert(DeviceTag::parse("-K1")?, d);
+        assert_eq!(
+            p.used_parts().into_iter().collect::<Vec<_>>(),
+            ["acme.block", "acme.marker"]
+        );
         Ok(())
     }
 

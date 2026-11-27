@@ -222,14 +222,9 @@ pub fn check_with_unreadable(
     }
     for (tag, (count, uses)) in &drawn {
         let Some(device) = p.devices.get(*tag) else { continue };
-        let fitted = device
-            .part
-            .iter()
-            .map(|id| (id.as_str(), 1))
-            .chain(device.accessories.iter().map(|a| (a.part.as_str(), a.qty)));
         let mut has = wc_core::Contacts::default();
         let mut listed = false;
-        for (id, qty) in fitted {
+        for (id, qty) in device.all_parts() {
             if let Some(c) = i.parts.get(id).and_then(|part| part.contacts.as_ref()) {
                 has.add_all(c, qty);
                 listed = true;
