@@ -286,6 +286,12 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     if resp.clicked_by(egui::PointerButton::Primary) {
         ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
     }
+    // A right-click picks the item under the pointer too, before the arrow keys below act on the
+    // pick; a right-click drag still pans the view. Not during a drag: the dragged item stays
+    // the picked one, so Escape and the release still apply to it.
+    if resp.secondary_clicked() && ed.panel_drag.is_none() {
+        ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
+    }
     if let (Some((grab, checkpoint, start)), Some(i), Some(at)) = (ed.panel_drag.clone(), ed.panel_pick, pointer)
         && resp.dragged_by(egui::PointerButton::Primary)
     {
@@ -379,11 +385,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         }
     }
     let p = open.project.panels.get(panel).cloned().unwrap_or(p);
-    // A right-click on a device, rail or duct picks it and offers the toolbar's edits for it, as
-    // on a schematic page; a right-click drag still pans the view.
-    if resp.secondary_clicked() {
-        ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
-    }
+    // The right-click menu: the toolbar's edits for the picked item, as on a schematic page.
     let actions = ed.panel_pick.and_then(|i| p.items.get(i)).map_or(&[][..], menu_actions);
     if !actions.is_empty() {
         resp.context_menu(|ui| {
@@ -1568,5 +1570,61 @@ mod tests {
         assert_eq!(ed.panel_pick, Some(2));
         let ran = h.frame(&mut o, &mut ed, Vec::new());
         assert!(painted(&ran, "Rotate").is_some() && painted(&ran, "Delete").is_some());
+    }
+
+    /// The plate with a rail and a duct and two devices away from both, A (item 2) picked.
+    fn plate_with_two_devices() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        for (tag, x) in [("-A1", 100.0), ("-B1", 300.0)] {
+            o.project.panels[0].items.push(PanelItem::Device {
+                tag: wc_core::DeviceTag::parse(tag).unwrap_or_default(),
+                at: Point::new(x, 180.0),
+                width: 20.0,
+                height: 40.0,
+                rotation: wc_core::geom::Rotation::R0,
+            });
+        }
+        ed.panel_pick = Some(2);
+        (tmp, o, ed)
+    }
+
+    /// A right-click on B and an arrow key in the same frame move B, not A that was picked.
+    #[test]
+    fn an_arrow_key_with_a_right_click_moves_the_device_right_clicked() {
+        let (_tmp, mut o, mut ed) = plate_with_two_devices();
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let b = h.to_screen(&ed, Point::new(310.0, 200.0));
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(b), secondary(b, true)]);
+        h.frame(&mut o, &mut ed, vec![secondary(b, false), key(egui::Key::ArrowRight)]);
+        assert_eq!(ed.panel_pick, Some(3));
+        assert_eq!(device_pos(&o, 2), Point::new(100.0, 180.0), "A stays");
+        assert_eq!(device_pos(&o, 3), Point::new(305.0, 180.0), "B moves");
+    }
+
+    /// A right-click during a left-button drag leaves the dragged device picked, and the drag
+    /// still moves it.
+    #[test]
+    fn a_right_click_during_a_drag_keeps_the_dragged_device_picked() {
+        let (_tmp, mut o, mut ed) = plate_with_two_devices();
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let a = h.to_screen(&ed, Point::new(110.0, 200.0));
+        let b = h.to_screen(&ed, Point::new(310.0, 200.0));
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(a), primary(a, true)]);
+        for k in 1..=3 {
+            h.frame(
+                &mut o,
+                &mut ed,
+                vec![egui::Event::PointerMoved(a + Vec2::new(0.0, 10.0 * k as f32))],
+            );
+        }
+        assert!(ed.panel_drag.is_some(), "the drag is on");
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(b), secondary(b, true)]);
+        h.frame(&mut o, &mut ed, vec![secondary(b, false)]);
+        assert_eq!(ed.panel_pick, Some(2), "A stays picked");
+        h.frame(&mut o, &mut ed, vec![primary(b, false)]);
+        assert_eq!(device_pos(&o, 3), Point::new(300.0, 180.0), "B is not moved");
+        assert_ne!(device_pos(&o, 2), Point::new(100.0, 180.0), "the drag moved A");
     }
 }
