@@ -170,7 +170,8 @@ fn item_at(items: &[PanelItem], at: Point) -> Option<usize> {
 /// corner. Devices have none.
 fn handle(item: &PanelItem) -> Option<Point> {
     match item {
-        PanelItem::Rail { at, length } => Some(Point::new(at.x + length, at.y)),
+        // A rail drawn right to left (a negative length) has its right end at `at`.
+        PanelItem::Rail { at, length } => Some(Point::new(at.x.max(at.x + length), at.y)),
         PanelItem::Duct { .. } => Some(item.bounds().1),
         PanelItem::Device { .. } => None,
     }
@@ -1286,6 +1287,34 @@ mod tests {
         });
         drag_on_plate(&mut o, &mut ed, Point::new(300.0, 100.0), Point::new(120.0, 100.0));
         assert_eq!(o.project.panels[0].items[1].bounds().1.x, 210.0);
+        assert_eq!(o.project.panels[0].items[2].anchor(), Point::new(160.0, 55.0));
+    }
+
+    /// A picked rail drawn right to left has its handle on its real right end, and dragging
+    /// that in stops at the device on it (#1746).
+    #[test]
+    fn a_rail_drawn_right_to_left_resizes_by_its_right_end() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items[1] = PanelItem::Rail {
+            at: Point::new(300.0, 100.0),
+            length: -200.0,
+        };
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(160.0, 55.0),
+            width: 50.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        ed.panel_pick = Some(1);
+        drag_on_plate(&mut o, &mut ed, Point::new(300.0, 100.0), Point::new(120.0, 100.0));
+        assert_eq!(
+            o.project.panels[0].items[1],
+            PanelItem::Rail {
+                at: Point::new(100.0, 100.0),
+                length: 110.0,
+            }
+        );
         assert_eq!(o.project.panels[0].items[2].anchor(), Point::new(160.0, 55.0));
     }
 

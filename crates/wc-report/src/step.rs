@@ -53,24 +53,30 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
     for item in &panel.items {
         match item {
             PanelItem::Rail { at, length } => {
-                rails.push((at.x, at.x + length, at.y));
+                // A rail drawn right to left (negative length) covers the same span.
+                let (x0, x1) = (at.x.min(at.x + length), at.x.max(at.x + length));
+                rails.push((x0, x1, at.y));
                 out.push((
                     (
                         "DIN rail".into(),
-                        [at.x, y(at.y + 17.5), PLATE],
-                        [at.x + length, y(at.y - 17.5), PLATE + RAIL],
+                        [x0, y(at.y + 17.5), PLATE],
+                        [x1, y(at.y - 17.5), PLATE + RAIL],
                     ),
                     false,
                 ));
             }
-            PanelItem::Duct { min, max } => out.push((
-                (
-                    "Wire duct".into(),
-                    [min.x, y(max.y), PLATE],
-                    [max.x, y(min.y), PLATE + DUCT_HEIGHT],
-                ),
-                false,
-            )),
+            PanelItem::Duct { .. } => {
+                // Corners may be written either way round; draw the rectangle they span.
+                let (min, max) = item.bounds();
+                out.push((
+                    (
+                        "Wire duct".into(),
+                        [min.x, y(max.y), PLATE],
+                        [max.x, y(min.y), PLATE + DUCT_HEIGHT],
+                    ),
+                    false,
+                ));
+            }
             PanelItem::Device { .. } => {}
         }
     }
@@ -143,9 +149,11 @@ pub fn panel_step(project: &Project, panel: &Panel, parts: &BTreeMap<String, Par
         "(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{unc})) GLOBAL_UNIT_ASSIGNED_CONTEXT((#{len},#{ang},#{sol})) REPRESENTATION_CONTEXT('',''))"
     ));
     let origin = w.placement([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
+    // The origin first, then the solids; with no solids the list holds the origin alone.
+    let items: Vec<String> = std::iter::once(format!("#{origin}")).chain(refs).collect();
     let rep = w.add(&format!(
-        "ADVANCED_BREP_SHAPE_REPRESENTATION('',(#{origin},{}),#{gctx})",
-        refs.join(",")
+        "ADVANCED_BREP_SHAPE_REPRESENTATION('',({}),#{gctx})",
+        items.join(",")
     ));
     w.add(&format!("SHAPE_DEFINITION_REPRESENTATION(#{pds},#{rep})"));
 
@@ -404,6 +412,41 @@ mod tests {
     }
 
     #[test]
+    fn a_duct_with_swapped_corners_and_a_rail_drawn_right_to_left_are_kept() -> Result<(), wc_core::Error> {
+        let project = Project::new("x");
+        let mut panel = Panel::new("main", "Cabinet", 400.0, 300.0);
+        panel.items.push(PanelItem::Duct {
+            min: Point::new(80.0, 50.0),
+            max: Point::new(40.0, 10.0),
+        });
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(300.0, 150.0),
+            length: -200.0,
+        });
+        panel.items.push(PanelItem::Device {
+            tag: DeviceTag::parse("-K1")?,
+            at: Point::new(150.0, 105.0),
+            width: 20.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-27T12:00:00").text;
+        // Plate, duct, rail and device.
+        assert_eq!(step.matches("MANIFOLD_SOLID_BREP(").count(), 4, "{step}");
+        // The duct spans 40..80 x 10..50 on the plate (y up: 250..290).
+        assert!(step.contains("CARTESIAN_POINT('',(40.,250.,2.))"), "duct corner");
+        assert!(step.contains("CARTESIAN_POINT('',(80.,290.,62.))"), "duct corner");
+        // The rail spans 100..300, and the device sits on it (z 9.5).
+        assert!(step.contains("CARTESIAN_POINT('',(100.,132.5,2.))"), "rail corner");
+        assert!(step.contains("CARTESIAN_POINT('',(300.,167.5,9.5))"), "rail corner");
+        assert!(
+            step.contains("CARTESIAN_POINT('',(150.,105.,9.5))"),
+            "device on the rail"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn every_edge_is_used_once_each_way() {
         // In a closed box each edge appears in two faces, once forwards and once backwards.
         let mut w = Writer::default();
@@ -422,5 +465,156 @@ mod tests {
         }
         assert_eq!(uses.len(), 12);
         assert!(uses.values().all(|u| *u == (1, 1)), "{uses:?}");
+    }
+
+    #[test]
+    fn step_text_escapes_backslashes_quotes_and_bmp_characters() {
+        assert_eq!(step_text(""), "''");
+        assert_eq!(step_text("a\\b'c"), "'a\\\\b''c'");
+        // A BMP character outside printable ASCII is `\X2\` hex.
+        assert_eq!(step_text("\u{C5}"), "'\\X2\\00C5\\X0\\'");
+    }
+
+    #[test]
+    fn reals_keep_their_decimal_point() {
+        assert_eq!(real(45.0), "45.");
+        assert_eq!(real(9.5), "9.5");
+        assert_eq!(real(-17.5), "-17.5");
+        assert_eq!(real(0.0), "0.");
+        assert_eq!(real(1.0 / 3.0), "0.333333");
+        // Below the printed precision it rounds to zero, still with its point.
+        assert_eq!(real(1e-9), "0.");
+    }
+
+    #[test]
+    fn rails_and_ducts_stand_on_the_plate() {
+        let project = Project::new("x");
+        let mut panel = Panel::new("main", "Cabinet", 400.0, 300.0);
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(10.0, 100.0),
+            length: 200.0,
+        });
+        panel.items.push(PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(40.0, 300.0),
+        });
+        let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-27T07:00:00").text;
+        assert!(step.contains("MANIFOLD_SOLID_BREP('DIN rail',"), "{step}");
+        assert!(step.contains("MANIFOLD_SOLID_BREP('Wire duct',"), "{step}");
+        // The rail is 35 high about its centre line (page y 100, model y 200) and 7.5 deep.
+        assert!(step.contains("CARTESIAN_POINT('',(10.,182.5,2.))"), "{step}");
+        assert!(step.contains("CARTESIAN_POINT('',(210.,217.5,9.5))"), "{step}");
+        // The duct is 60 deep on top of the plate.
+        assert!(step.contains("CARTESIAN_POINT('',(40.,300.,62.))"), "{step}");
+        assert_eq!(step.matches("MANIFOLD_SOLID_BREP(").count(), 3);
+        assert!(
+            panel_step(&project, &panel, &BTreeMap::new(), "t")
+                .default_depth
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_a_device_over_the_rail_sits_on_it() -> Result<(), wc_core::Error> {
+        let project = Project::new("x");
+        let mut panel = Panel::new("main", "Cabinet", 400.0, 300.0);
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(10.0, 100.0),
+            length: 100.0,
+        });
+        let device = |tag: &str, x: f64, y: f64| -> Result<PanelItem, wc_core::Error> {
+            Ok(PanelItem::Device {
+                tag: DeviceTag::parse(tag)?,
+                at: Point::new(x, y),
+                width: 20.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            })
+        };
+        // Middle on the rail's line and over its length.
+        panel.items.push(device("-K1", 50.0, 70.0)?);
+        // Middle on the line but past the rail's right end.
+        panel.items.push(device("-K2", 200.0, 70.0)?);
+        // Over the rail but its middle 1.5 below the line.
+        panel.items.push(device("-K3", 80.0, 71.5)?);
+        let step = panel_step(&project, &panel, &BTreeMap::new(), "t").text;
+        assert!(step.contains("CARTESIAN_POINT('',(50.,170.,9.5))"), "{step}");
+        assert!(step.contains("CARTESIAN_POINT('',(70.,230.,84.5))"), "{step}");
+        assert!(step.contains("CARTESIAN_POINT('',(200.,170.,2.))"), "{step}");
+        assert!(step.contains("CARTESIAN_POINT('',(220.,230.,77.))"), "{step}");
+        assert!(step.contains("CARTESIAN_POINT('',(80.,168.5,2.))"), "{step}");
+        assert!(!step.contains("CARTESIAN_POINT('',(80.,168.5,9.5))"), "{step}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_depth_is_guessed_when_the_part_is_missing_or_says_nothing() -> Result<(), wc_core::Error> {
+        let mut project = Project::new("x");
+        let mut parts: BTreeMap<String, Part> = BTreeMap::new();
+        let mut deep = Part::default();
+        deep.properties.insert("Tiefe".into(), "120".into());
+        parts.insert("deep".into(), deep);
+        parts.insert("plain".into(), Part::default());
+        let mut panel = Panel::new("main", "Cabinet", 400.0, 300.0);
+        for (i, (tag, part)) in [
+            ("-A1", Some("deep")),
+            ("-A2", Some("plain")),
+            ("-A3", Some("gone")),
+            ("-A4", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tag = DeviceTag::parse(tag)?;
+            project.devices.insert(
+                tag.clone(),
+                Device {
+                    part: part.map(Into::into),
+                    ..Default::default()
+                },
+            );
+            panel.items.push(PanelItem::Device {
+                tag,
+                at: Point::new(10.0 + 50.0 * i as f64, 10.0),
+                width: 20.0,
+                height: 20.0,
+                rotation: wc_core::geom::Rotation::R0,
+            });
+        }
+        let done = panel_step(&project, &panel, &parts, "t");
+        assert_eq!(done.default_depth, ["-A2", "-A3", "-A4"]);
+        // A1 takes its part's `Tiefe`: 120 deep on the plate.
+        assert!(
+            done.text.contains("CARTESIAN_POINT('',(30.,290.,122.))"),
+            "{}",
+            done.text
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_header_names_the_panel_and_the_stamp() {
+        let project = Project::new("x");
+        let panel = Panel::new("o'id", "Cabinet", 100.0, 100.0);
+        let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-27T07:00:00Z").text;
+        assert!(step.contains("FILE_NAME('o''id','2026-11-27T07:00:00Z',"), "{step}");
+        assert!(step.contains("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));"));
+    }
+
+    #[test]
+    fn a_panel_with_no_solids_has_no_dangling_comma() {
+        let project = Project::new("x");
+        for panel in [
+            Panel::new("main", "Empty", 0.0, 0.0),
+            Panel::new("main", "Broken", f64::NAN, 300.0),
+        ] {
+            let step = panel_step(&project, &panel, &BTreeMap::new(), "t").text;
+            assert_eq!(step.matches("MANIFOLD_SOLID_BREP(").count(), 0, "{step}");
+            // The shape representation lists the origin alone, without a dangling comma
+            // (syntax only: an origin-only representation still breaks the schema's WR2).
+            assert!(!step.contains(",)"), "{step}");
+            assert!(!step.contains("NaN"), "{step}");
+            assert!(step.ends_with("END-ISO-10303-21;\n"));
+        }
     }
 }

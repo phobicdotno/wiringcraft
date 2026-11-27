@@ -55,7 +55,12 @@ the list after the configurator has filled in the articles, and writes them onto
 devices and jumpers:
 
 - The header must have the `Index` and `Article` columns; `Type`, `Strip`, `Terminal`,
-  `Connects`, `Manufacturer` and `Quantity` are read when present. The leading `'` the export puts on some
+  `Connects`, `Manufacturer` and `Quantity` are read when present. Case, spaces and punctuation
+  in the header do not matter, and some other names are taken too (`Order number`,
+  `Artikelnummer` or `Bestellnummer` for Article, `Hersteller`, `Menge`). The file may be
+  separated by semicolons, tabs or commas, in UTF-8 or Latin-1. The separator is the one that
+  shows most often in the header line, counting text in quotes too, so a comma-separated header
+  whose quoted text holds more semicolons than the line has commas is not read. The leading `'` the export puts on some
   cells is dropped. Rows without an article are passed over.
 - Each article is looked up by part id (as the export writes a part without a copy) or by order
   number (ignoring case), among the project's own parts first (parts made for the project, not
