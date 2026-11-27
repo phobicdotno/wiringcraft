@@ -2677,7 +2677,8 @@ pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
     }
 }
 
-fn on_paper(open: &Open, page: usize, at: Point) -> bool {
+/// Whether `at` (page mm) is on the sheet of page `page`.
+pub(crate) fn on_paper(open: &Open, page: usize, at: Point) -> bool {
     open.project.pages.get(page).is_some_and(|p| {
         let (w, h) = p.size.mm();
         at.x >= 0.0 && at.y >= 0.0 && at.x <= w && at.y <= h

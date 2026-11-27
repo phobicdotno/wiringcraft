@@ -11836,6 +11836,62 @@ mod tests {
     }
 
     #[test]
+    fn paste_with_the_pointer_beside_the_sheet_keeps_the_copy_on_the_page() {
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "line", "a": {"x": 30, "y": 30}, "b": {"x": 40, "y": 30}}}),
+        )
+        .unwrap();
+        a.ed.page = 1;
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Copy);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Hover over the canvas at `pos`, as the window does before Ctrl+V.
+        let hover = |a: &mut App, pos: egui::Pos2, t: f64| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                time: Some(t),
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            };
+            let (open, ed) = (a.open.as_mut().unwrap(), &mut a.ed);
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| crate::canvas::show(ui, open, ed, false, 1.0, true));
+            });
+        };
+        hover(&mut a, egui::pos2(500.0, 400.0), 0.5);
+        // The sheet panned right and down, so the canvas's top-left corner is on the desk.
+        a.ed.view.zoom = 3.0;
+        a.ed.view.offset = egui::vec2(300.0, 300.0);
+        a.ed.view.fit = false;
+        hover(&mut a, egui::pos2(40.0, 40.0), 1.0);
+        let off = a.ed.cursor.unwrap();
+        assert!(off.x < 0.0 && off.y < 0.0, "the pointer is beside the sheet: {off:?}");
+        a.run(Action::Paste);
+        let Some(Shape::Line { a: from, .. }) = page2(&a).graphics.get(1) else {
+            unreachable!("a line is pasted: {:?}", page2(&a).graphics);
+        };
+        assert_eq!(
+            *from,
+            Point::new(40.0, 40.0),
+            "a little below the original, on the sheet"
+        );
+
+        // With the pointer on the sheet the copy lands at the pointer.
+        hover(&mut a, egui::pos2(480.0, 450.0), 1.5);
+        let on = a.ed.cursor.unwrap();
+        assert!(on.x > 0.0 && on.y > 0.0, "the pointer is on the sheet: {on:?}");
+        a.run(Action::Paste);
+        let Some(Shape::Line { a: from, .. }) = page2(&a).graphics.get(2) else {
+            unreachable!("a second line is pasted: {:?}", page2(&a).graphics);
+        };
+        assert_eq!(*from, on);
+    }
+
+    #[test]
     fn the_text_and_comment_dialogs_add_nothing_to_a_layer_hidden_while_they_were_open() {
         use crate::layers::Layer;
         let (_tmp, mut a) = app(vec![]);
