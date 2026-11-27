@@ -612,6 +612,16 @@ mod tests {
         assert!(crate::placement::used_tags(&p).contains(&tag("-W1")));
         let free = crate::placement::free_tag_like(&crate::placement::used_tags(&p), &tag("-W1"));
         assert_eq!(free, Some(tag("-W2")), "a new cable does not take over -W1's cores");
+
+        // A core-only cable with a placeholder's tag is not used as a placeholder either.
+        p.pages[0].wires[0].cable = Some(crate::project::CableCore {
+            cable: tag("-WCFIND0"),
+            core: "1".into(),
+        });
+        let hits = find(&p, "-F1", opts);
+        assert_eq!(replace(&mut p, &hits, "-F1", "-F2", opts), Ok(1));
+        let core = p.pages[0].wires[0].cable.as_ref().map(|c| c.cable.clone());
+        assert_eq!(core, Some(tag("-WCFIND0")), "the core keeps its cable");
     }
 
     #[test]
