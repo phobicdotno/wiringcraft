@@ -66,8 +66,9 @@ In the page file the wire stores it as:
 ## The cable list
 
 `report cables` prints one block per cable: tag, type, description, then one row per wire that
-names a core of it, with the page and the two ends of that wire. A core drawn as two wires (two
-wires naming `-W1:1`) has two rows, so count cores, not rows.
+names the cable, with the page and the two ends of that wire. A wire that names the cable but no
+core has an empty Core cell. A core drawn as two wires (two wires naming `-W1:1`) has two rows,
+so count cores, not rows.
 
 ```
 $ wiringcraft report cables
