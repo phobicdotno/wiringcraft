@@ -6171,11 +6171,16 @@ impl eframe::App for App {
         } else {
             let mut start = None;
             let mut recent = None;
+            let mut forget = None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(t.backdrop))
                 .show(ctx, |ui| {
-                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent);
+                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent, &mut forget);
                 });
+            if let Some(d) = forget {
+                self.prefs.forget(&d);
+                self.prefs.save();
+            }
             if let Some(d) = recent {
                 let mut prefs = std::mem::take(&mut self.prefs);
                 self.open_dir(&d, &mut prefs);
@@ -6879,14 +6884,27 @@ fn read_only_banner(ui: &egui::Ui, t: &theme::Theme, name: &str) {
     p.galley(rect.min + Vec2::new(12.0, 6.0), galley, t.text);
 }
 
+/// Why a recent project folder cannot be opened, or `None` when it is a folder. A folder that
+/// cannot be read keeps the reason, so it is not taken for a missing one.
+fn recent_problem(d: &Path) -> Option<String> {
+    match std::fs::metadata(d) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some("not a folder".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("folder not found".into()),
+        Err(e) => Some(format!("cannot be read: {e}")),
+    }
+}
+
 /// The start screen shown when no project is open: a card with the two ways in and the
-/// recently opened projects.
+/// recently opened projects. A recent folder that is gone is shown muted, and any entry can be
+/// taken out of the list from its right-click menu (`forget`).
 fn welcome(
     ui: &mut egui::Ui,
     t: &theme::Theme,
     recent: &[PathBuf],
     start: &mut Option<Action>,
     open_recent: &mut Option<PathBuf>,
+    forget: &mut Option<PathBuf>,
 ) {
     let width = 440.0;
     ui.add_space((ui.available_height() * 0.18).max(24.0));
@@ -6926,17 +6944,33 @@ fn welcome(
                 if !recent.is_empty() {
                     ui.add_space(18.0);
                     panels::section(ui, "Recent projects", None);
-                    for d in recent.iter().take(6) {
-                        let name = d
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| d.display().to_string());
-                        let r = panels::row(ui, false, panels::Lead::Dot(t.accent), RichText::new(name), false)
-                            .on_hover_text(d.display().to_string());
-                        if r.clicked() {
-                            *open_recent = Some(d.clone());
+                    // Every entry stays reachable in a short window.
+                    egui::ScrollArea::vertical().id_salt("recent").show(ui, |ui| {
+                        for d in recent {
+                            let name = d
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| d.display().to_string());
+                            let (dot, text, hover) = match recent_problem(d) {
+                                None => (t.accent, RichText::new(name), d.display().to_string()),
+                                Some(why) => (
+                                    t.muted,
+                                    RichText::new(name).color(t.muted),
+                                    format!("{} ({why})", d.display()),
+                                ),
+                            };
+                            let r = panels::row(ui, false, panels::Lead::Dot(dot), text, false).on_hover_text(hover);
+                            if r.clicked() {
+                                *open_recent = Some(d.clone());
+                            }
+                            r.context_menu(|ui| {
+                                if ui.button("Remove from recent projects").clicked() {
+                                    *forget = Some(d.clone());
+                                    ui.close_menu();
+                                }
+                            });
                         }
-                    }
+                    });
                 }
             });
     });
@@ -7258,6 +7292,20 @@ mod renderer_tests {
 #[allow(clippy::unwrap_used)]
 mod library_tests {
     use super::*;
+
+    /// A recent folder that is there is fine; a missing one and a file each say why.
+    #[test]
+    fn a_recent_project_says_why_it_cannot_be_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(recent_problem(tmp.path()), None);
+        assert_eq!(
+            recent_problem(&tmp.path().join("gone")).as_deref(),
+            Some("folder not found")
+        );
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(recent_problem(&file).as_deref(), Some("not a folder"));
+    }
 
     #[test]
     fn wires_on_pins_a_new_symbol_version_drops_are_listed() {
