@@ -38,7 +38,12 @@ pub struct ProjectMeta {
     #[serde(default, rename = "location", skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
     /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
-    #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "jumper",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "merged_jumpers"
+    )]
     pub jumpers: Vec<Jumper>,
     /// Terminal strips arranged in the terminal strip editor: their terminal order and spare
     /// terminals. A strip that is not listed keeps the usual order (by terminal number).
@@ -200,6 +205,7 @@ pub fn relative_file_is_safe(f: &str) -> bool {
 
 /// Terminals of one strip bridged together by a jumper: they form one potential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredJumper")]
 pub struct Jumper {
     /// The strip, e.g. `-X1`.
     pub strip: DeviceTag,
@@ -228,6 +234,46 @@ pub struct StripLayout {
     /// later is that drawn terminal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spares: Vec<String>,
+}
+
+/// A [`Jumper`] as written in the file, before it is checked.
+#[derive(Deserialize)]
+struct StoredJumper {
+    strip: DeviceTag,
+    terminals: Vec<String>,
+    #[serde(default)]
+    part: Option<String>,
+}
+
+impl TryFrom<StoredJumper> for Jumper {
+    type Error = String;
+
+    /// Refuses a jumper naming a number that cannot be a terminal of its strip (a hand edit or
+    /// another tool), so it never becomes a device tag the project cannot read back.
+    fn try_from(s: StoredJumper) -> Result<Self, String> {
+        for t in &s.terminals {
+            check_terminal_number(&s.strip, t)?;
+        }
+        Ok(Jumper {
+            strip: s.strip,
+            terminals: s.terminals,
+            part: s.part,
+        })
+    }
+}
+
+/// Read the `[[jumper]]` list as [`ProjectMeta::add_jumper`] keeps it: jumpers of one strip
+/// that share a terminal are one jumper (the first part in file order counts), and a jumper of
+/// fewer than two different terminals joins nothing, so it is left out rather than counting
+/// its part and showing as a jumper in the terminal plan and the configurator export.
+fn merged_jumpers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Jumper>, D::Error> {
+    let list = Vec::<Jumper>::deserialize(d)?;
+    let mut meta = ProjectMeta::new("");
+    for j in list {
+        // Refused only for fewer than two terminals: the numbers were checked above.
+        let _ = meta.add_jumper_with(&j.strip, &j.terminals, j.part);
+    }
+    Ok(meta.jumpers)
 }
 
 /// Read the `[[strip]]` layouts, refusing two for the same strip: which one counts would
@@ -2539,6 +2585,23 @@ mod tests {
         let old: ProjectMeta =
             toml::from_str("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = [\"1\", \"2\"]\n")?;
         assert_eq!(old.jumpers[0].part, None);
+        // Hand-edited jumpers read as add_jumper keeps them: a two-level number is refused,
+        // a jumper that joins nothing is left out, two sharing a terminal are one.
+        let read = |jumpers: &str| toml::from_str::<ProjectMeta>(&format!("name = \"t\"\n{jumpers}"));
+        let jumper = |strip: &str, t: &str| format!("[[jumper]]\nstrip = \"{strip}\"\nterminals = [{t}]\n");
+        let err = read(&jumper("-X1", "\"1\", \"2.3\"")).err().map(|e| e.to_string());
+        assert!(err.as_deref().is_some_and(|e| e.contains("one tag level")), "{err:?}");
+        assert!(read(&jumper("-X1", "\"1\", \"1\""))?.jumpers.is_empty());
+        let shared = read(&format!(
+            "{}part = \"acme.bridge\"\n{}{}",
+            jumper("-X1", "\"3\", \"4\""),
+            jumper("-X1", "\"1\", \"3\""),
+            jumper("-X2", "\"1\", \"3\"")
+        ))?;
+        assert_eq!(shared.jumpers.len(), 2, "{:?}", shared.jumpers);
+        assert_eq!(shared.jumpers[0].terminals, s(&["1", "3", "4"]));
+        assert_eq!(shared.jumpers[0].part.as_deref(), Some("acme.bridge"));
+        assert_eq!(shared.jumpers[1].strip, DeviceTag::parse("-X2")?);
         // Extended by another jumper: the part stays.
         m.add_jumper(&x1, &s(&["2", "3"]))?;
         assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-402"));
