@@ -228,7 +228,8 @@ fn num(e: &BytesStart, name: &str) -> f64 {
 /// Path data to polylines. Curves and elliptical arcs are flattened into short straight segments.
 /// The arguments of an arc command: groups of seven, whose fourth and fifth (the large-arc and
 /// sweep flags) are one `0` or `1` each and may run into the next argument without a separator
-/// (`0110 20` is the flags 0 and 1 and the end x 10). Reading stops at the first argument that is
+/// (`0110 20` is the flags 0 and 1 and the end x 10); arguments are parted by white space and at
+/// most one comma. Reading stops at the first argument that is
 /// not well formed, or at an arc with no arguments or a group cut short, as SVG stops drawing a
 /// path at an error: the arguments read before it come back with the reason.
 fn arc_numbers(s: &str) -> (Vec<f64>, Option<String>) {
@@ -244,8 +245,15 @@ fn arc_numbers(s: &str) -> (Vec<f64>, Option<String>) {
     let mut out = Vec::new();
     let mut i = 0;
     loop {
-        while at(i).is_some_and(|c| c.is_ascii_whitespace() || c == b',') {
+        // Between arguments: white space with at most one comma.
+        let mut commas = 0;
+        while let Some(c) = at(i).filter(|c| c.is_ascii_whitespace() || *c == b',') {
+            commas += usize::from(c == b',');
             i += 1;
+        }
+        if commas > 1 {
+            let n = out.len() + 1;
+            return (out, Some(format!("arc argument {n} comes after more than one comma")));
         }
         let Some(first) = at(i) else { break };
         if matches!(out.len() % 7, 3 | 4) {
@@ -274,13 +282,14 @@ fn arc_numbers(s: &str) -> (Vec<f64>, Option<String>) {
             return (out, Some(format!("arc argument {n} is not a number")));
         }
         if matches!(at(i), Some(b'e' | b'E')) {
-            let mark = i;
             i += 1;
             if matches!(at(i), Some(b'+' | b'-')) {
                 i += 1;
             }
+            // An `e` or sign without digits after it is not a number, as `5e` or `5e+`.
             if !digits(&mut i) {
-                i = mark;
+                let n = out.len() + 1;
+                return (out, Some(format!("arc argument {n} is not a number")));
             }
         }
         match s.get(start..i).and_then(|t| t.parse::<f64>().ok()) {
@@ -327,7 +336,10 @@ fn path(d: &str, m: &M) -> (Vec<(Vec<Point>, bool)>, Option<String>) {
     let mut stopped: Option<String> = None;
     let stop_at = |n: usize, cmd: char, why: String| format!("stopped at command {n} ({cmd}): {why}");
     for c in d.chars() {
-        if c.is_ascii_alphabetic() && c != 'e' && c != 'E' {
+        // In an arc, a letter that is no command stays with the arguments, so that the arc
+        // reports the argument it spoils.
+        let in_arc = cmd.eq_ignore_ascii_case(&'A') && !"MmZzLlHhVvCcSsQqTtAa".contains(c);
+        if c.is_ascii_alphabetic() && c != 'e' && c != 'E' && !in_arc {
             if cmd != ' ' {
                 let (v, error) = args(cmd, &buf);
                 cmds.push((cmd, v));
@@ -519,14 +531,18 @@ struct Arc {
 }
 
 impl Arc {
-    /// The points after the start, the last one the end point. Radii too small to reach the end
-    /// point are scaled up; a zero radius, or values that are not finite, give a straight line
-    /// (SVG 1.1, appendix F.6).
+    /// The points after the start, the last one the end point; none when the end point is the
+    /// start. Radii too small to reach the end point are scaled up; a zero radius, or values that
+    /// are not finite, give a straight line (SVG 1.1, appendix F.6).
     fn points(&self) -> Vec<(f64, f64)> {
         let ((x1, y1), (x2, y2)) = (self.from, self.to);
         let line = vec![(x2, y2)];
         let (mut rx, mut ry) = (self.radii.0.abs(), self.radii.1.abs());
-        if (x1 == x2 && y1 == y2) || rx == 0.0 || ry == 0.0 {
+        // Coinciding end points draw nothing (as if the arc were left out).
+        if x1 == x2 && y1 == y2 {
+            return Vec::new();
+        }
+        if rx == 0.0 || ry == 0.0 {
             return line;
         }
         let (sin, cos) = self.rotation.to_radians().sin_cos();
@@ -832,7 +848,15 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     if !seen_root {
         return Err(Error::Format("not an SVG file".into()));
     }
-    make_symbol(id, name, shapes, pins).map(|s| (s, warnings))
+    let empty = shapes.is_empty() && pins.is_empty();
+    match make_symbol(id, name, shapes, pins) {
+        Ok(s) => Ok((s, warnings)),
+        // Nothing drawn because a path stopped at bad data: say why.
+        Err(Error::Format(m)) if empty && !warnings.is_empty() => {
+            Err(Error::Format(format!("{m}: {}", warnings.join("; "))))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Mirrors the previous control point `prev` through the current point `cur`, the implied
@@ -1605,6 +1629,53 @@ mod tests {
     }
 
     #[test]
+    fn malformed_arc_arguments_name_the_argument() {
+        let why = |d: &str| path(d, &M::ID).1;
+        // An exponent without digits spoils its own argument, not the next one.
+        assert_eq!(
+            arc_numbers("5e 5 0 0 1 10 0"),
+            (vec![], Some("arc argument 1 is not a number".to_owned()))
+        );
+        assert_eq!(
+            arc_numbers("5 5e+ 0 0 1 10 0"),
+            (vec![5.0], Some("arc argument 2 is not a number".to_owned()))
+        );
+        assert_eq!(
+            arc_numbers("5 5 0 0 1 2e+0 0"),
+            (vec![5.0, 5.0, 0.0, 0.0, 1.0, 2.0, 0.0], None)
+        );
+        // A letter that is no command is a bad argument of the arc.
+        assert_eq!(
+            why("M 0 0 A 5 5 0 0 1 10x 0 L 20 0").as_deref(),
+            Some("stopped at command 2 (A): arc argument 7 is not a number")
+        );
+        assert_eq!(why("M 0 0 A 5 5 0 0 1 10 0 L 20 0"), None);
+        // One comma between arguments, not two; compact flags still read.
+        assert_eq!(
+            arc_numbers("5,,5 0 0 1 10 0"),
+            (
+                vec![5.0],
+                Some("arc argument 2 comes after more than one comma".to_owned())
+            )
+        );
+        assert_eq!(
+            arc_numbers("5 , 5 0 0110 20"),
+            (vec![5.0, 5.0, 0.0, 0.0, 1.0, 10.0, 20.0], None)
+        );
+        // An arc back to its start draws nothing.
+        assert_eq!(one_line("M 0 0 L 10 0 A 5 5 0 0 1 10 0").len(), 2);
+        // A drawing left empty by a stopped path says why.
+        let Err(err) = symbol("<svg><path d=\"M 0 0 A 5 5 0 0 1 10\"/></svg>", "x", "x") else {
+            unreachable!("an empty drawing is an error");
+        };
+        assert_eq!(
+            err.to_string(),
+            "the drawing is empty: path 1 is drawn only in part: stopped at command 2 (A): an arc is cut \
+             short after argument 6 (an arc takes 7)"
+        );
+    }
+
+    #[test]
     fn hostile_arcs_do_not_panic() {
         for d in [
             "M 0 0 A 0 0 0 0 1 10 0",
@@ -1631,6 +1702,8 @@ mod tests {
             "M 9e307 0 C -1e308 0 -1e308 0 9e307 0 S 0 0 0 0",
             "M 0 9e307 Q 0 -1e308 0 9e307 T 0 0",
             "M 0 9e307 C 0 -1e308 0 -1e308 0 9e307 S 0 0 0 0",
+            "M 0 0 Q -1e308 0 5e307 0 T 5e307 0",
+            "M 0 0 C 0 0 -1e308 0 5e307 0 S 5e307 0 5e307 0",
         ] {
             let pts = one_line(d);
             assert!(!pts.is_empty(), "{d}");
