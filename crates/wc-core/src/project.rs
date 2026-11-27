@@ -2082,6 +2082,15 @@ impl Project {
                 j.strip = to.clone();
             }
         }
+        // A strip's rail order and spares go with it, unless `to` has a layout of its own: two
+        // layouts for one strip would not load.
+        if !self.meta.strips.iter().any(|l| &l.strip == to) {
+            for l in &mut self.meta.strips {
+                if &l.strip == from {
+                    l.strip = to.clone();
+                }
+            }
+        }
         for net in &mut self.meta.networks {
             net.rename_device(from, to);
         }

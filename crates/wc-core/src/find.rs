@@ -365,6 +365,7 @@ pub fn replace_renaming(
         .keys()
         .cloned()
         .chain(p.tag_index().into_keys())
+        .chain(p.meta.strips.iter().map(|l| l.strip.clone()))
         .filter(|t| !renames.contains_key(t))
         .collect();
     if let Some(to) = renames.values().find(|to| taken.contains(to)) {
@@ -378,6 +379,7 @@ pub fn replace_renaming(
         .keys()
         .cloned()
         .chain(p.tag_index().into_keys())
+        .chain(p.meta.strips.iter().map(|l| l.strip.clone()))
         .chain(renames.values().cloned())
         .collect();
     let mut next = 0usize;
@@ -621,6 +623,39 @@ mod tests {
                 .iter()
                 .all(|h| matches!(h.target, FindTarget::Symbol { .. }))
         );
+    }
+
+    #[test]
+    fn a_renamed_strip_keeps_its_rail_order_and_spares() {
+        let mut p = sample();
+        p.pages[1].symbols.push(PlacedSymbol {
+            id: "t1".into(),
+            symbol: "wc.terminal".into(),
+            at: Point::new(40.0, 20.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag("-X1")),
+        });
+        let layout = |strip: &str| crate::project::StripLayout {
+            strip: tag(strip),
+            order: vec!["2".into(), "1".into()],
+            spares: vec!["S1".into()],
+        };
+        p.meta.strips.push(layout("-X1"));
+        let opts = FindOptions { match_case: true };
+        let hits = find(&p, "X1", opts);
+        assert_eq!(replace(&mut p, &hits, "X1", "X2", opts), Ok(1));
+        assert_eq!(p.meta.strips, [layout("-X2")], "the layout follows the strip");
+
+        // A tag that only a layout uses (a strip of spares) is taken.
+        p.meta.strips.push(layout("-X3"));
+        let before = p.clone();
+        let hits = find(&p, "X2", opts);
+        assert_eq!(
+            replace(&mut p, &hits, "X2", "X3", opts),
+            Err("-X3 is already used.".into())
+        );
+        assert_eq!(p, before);
     }
 
     #[test]
