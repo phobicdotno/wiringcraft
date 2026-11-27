@@ -323,6 +323,8 @@ fn rgb(ink: &Stroke) -> String {
     format!("#{:02x}{:02x}{:02x}", c(ink.rgb.0), c(ink.rgb.1), c(ink.rgb.2))
 }
 
+/// `s` escaped for SVG text and attributes. Control characters and U+FFFE and U+FFFF, which
+/// XML does not allow (a viewer refuses the whole file), are left out.
 fn xml(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -331,7 +333,7 @@ fn xml(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            c if c.is_control() => {}
+            c if c.is_control() || matches!(c, '\u{FFFE}' | '\u{FFFF}') => {}
             c => out.push(c),
         }
     }
