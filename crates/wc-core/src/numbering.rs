@@ -86,18 +86,22 @@ pub fn number_wires_keeping(
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();
-    // Every number on a kept page stays there, also a second one on the same connection.
+    // Every number on a kept page stays there: a second one on the same connection, and one on
+    // a wire that touches no pin, too.
     let mut reserved: BTreeSet<String> = BTreeSet::new();
     for (pi, page) in project.pages.iter().enumerate() {
         for w in &page.wires {
+            // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
+            let number = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if let Some(num) = number
+                && kept(page)
+            {
+                reserved.insert(num.to_string());
+            }
             let Some(&n) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
                 continue;
             };
-            // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
-            if let Some(num) = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                if kept(page) {
-                    reserved.insert(num.to_string());
-                }
+            if let Some(num) = number {
                 // With `overwrite` only the numbers on kept pages count as existing.
                 if !overwrite || kept(page) {
                     existing.entry(n).or_insert_with(|| num.to_string());
@@ -310,6 +314,11 @@ mod tests {
         p.pages[0].wires[1].number = Some("1".into());
         number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
         assert_eq!(numbers(&p), [Some("2"), Some("2"), Some("3"), None, Some("4")]);
+        // A numbered wire that touches no pin keeps its number from the others too.
+        let mut p = project();
+        p.pages[0].wires[3].number = Some("1".into());
+        number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("4"), Some("4"), Some("2"), Some("1"), Some("3")]);
     }
 
     #[test]
