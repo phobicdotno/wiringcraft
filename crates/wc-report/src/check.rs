@@ -309,8 +309,9 @@ pub fn check_with_unreadable(
         }
     }
 
-    // Open pins: a pin no wire reaches.
-    for page in &p.pages {
+    // Open pins: a pin no wire reaches. An overview page (line diagram) shows devices again
+    // without wiring every pin, so its symbols do not count.
+    for page in p.pages.iter().filter(|pg| !pg.overview) {
         let wired: BTreeSet<(&str, &str)> = page
             .wires
             .iter()
