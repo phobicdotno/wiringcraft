@@ -203,3 +203,75 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod parse_edge_tests {
+    use super::*;
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_before_parsing() -> Result<()> {
+        assert_eq!(DeviceTag::parse("  =A+C1-K1\t\n")?.to_string(), "=A+C1-K1");
+        let Err(e) = DeviceTag::parse("   ") else {
+            unreachable!("blank tag should fail");
+        };
+        assert_eq!(e.to_string(), "invalid device tag \"\": empty");
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_without_a_product_aspect_is_rejected() {
+        for bad in ["=A", "+C1", "=A.B+C1"] {
+            let Err(e) = DeviceTag::parse(bad) else {
+                unreachable!("{bad} should fail");
+            };
+            assert_eq!(
+                e.to_string(),
+                format!("invalid device tag {bad:?}: needs a product aspect such as -K1")
+            );
+        }
+    }
+
+    #[test]
+    fn aspects_given_out_of_order_display_in_canonical_order() -> Result<()> {
+        let t = DeviceTag::parse("-K1+C1=A")?;
+        assert_eq!(t, DeviceTag::parse("=A+C1-K1")?);
+        assert_eq!(t.to_string(), "=A+C1-K1");
+        Ok(())
+    }
+
+    #[test]
+    fn underscores_and_non_ascii_letters_are_allowed_in_levels() -> Result<()> {
+        let t = DeviceTag::parse("=PUMP_1+SKAP_Ø-Ø1")?;
+        assert_eq!(t.function, vec!["PUMP_1"]);
+        assert_eq!(t.location, vec!["SKAP_Ø"]);
+        assert_eq!(t.letter_code(), "Ø");
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_matches_parse() -> Result<()> {
+        let t: DeviceTag = "=A.B+C1-X1.3".parse()?;
+        assert_eq!(t, DeviceTag::parse("=A.B+C1-X1.3")?);
+        assert!("-K 1".parse::<DeviceTag>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn serde_round_trips_as_a_plain_string_and_rejects_bad_tags() {
+        let Ok(t) = DeviceTag::parse("=PUMPS.P1+CAB1-K3") else {
+            unreachable!("valid tag");
+        };
+        let Ok(json) = serde_json::to_string(&t) else {
+            unreachable!("serializes");
+        };
+        assert_eq!(json, "\"=PUMPS.P1+CAB1-K3\"");
+        let Ok(back) = serde_json::from_str::<DeviceTag>(&json) else {
+            unreachable!("deserializes");
+        };
+        assert_eq!(back, t);
+        let Err(e) = serde_json::from_str::<DeviceTag>("\"-K1-K2\"") else {
+            unreachable!("bad tag should fail to deserialize");
+        };
+        assert!(e.to_string().contains("the product aspect (-) is given twice"), "{e}");
+    }
+}
