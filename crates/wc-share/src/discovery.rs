@@ -87,10 +87,20 @@ impl Beacon {
     }
 }
 
+/// A name from a beacon as a browser lists it: any device on the network can send one, so a
+/// control character (a line break, a tab, an escape) becomes a space and the ends are
+/// trimmed, keeping each session to one tidy row of the Join dialog.
+fn listable(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    s.trim().to_owned()
+}
+
 /// A session a browser has heard of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
+    /// The announced project name, with control characters turned into spaces.
     pub project: String,
+    /// The announced host name, with control characters turned into spaces.
     pub host: String,
     /// Where to connect to join: the sender's IP address with the announced port.
     pub addr: SocketAddr,
@@ -231,8 +241,8 @@ impl Browser {
                     if let Some(b) = Beacon::decode(&buf[..n.min(buf.len())]) {
                         let addr = SocketAddr::new(from.ip(), b.port);
                         let s = Session {
-                            project: b.project,
-                            host: b.host,
+                            project: listable(&b.project),
+                            host: listable(&b.host),
                             addr,
                             protocol: b.protocol,
                         };
@@ -281,5 +291,204 @@ impl Browser {
     fn forget_silent(&mut self, now: Instant) {
         let keep = self.forget_after;
         self.heard.retain(|_, (_, at)| now.duration_since(*at) <= keep);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn beacon(project: &str, host: &str, port: u16) -> Beacon {
+        Beacon {
+            project: project.into(),
+            host: host.into(),
+            port,
+            protocol: crate::PROTOCOL_VERSION,
+        }
+    }
+
+    fn browser() -> Result<Browser> {
+        Browser::bind(
+            "127.0.0.1:0".parse().map_err(io::Error::other)?,
+            Duration::from_secs(60),
+        )
+    }
+
+    /// Hand `datagrams` to the browser, each from its sender, then report "would block".
+    fn feed(b: &mut Browser, datagrams: Vec<(Vec<u8>, SocketAddr)>) -> Result<usize> {
+        let mut it = datagrams.into_iter();
+        b.receive(|buf| {
+            let Some((bytes, from)) = it.next() else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            Ok((bytes.len(), from))
+        })
+    }
+
+    #[test]
+    fn a_beacon_survives_encode_and_decode() {
+        let b = Beacon {
+            protocol: 7,
+            ..beacon("Pump \"station\" \u{e6}\u{f8}\u{e5}\n", "Ola\t", 65535)
+        };
+        assert_eq!(Beacon::decode(&b.encode()), Some(b));
+    }
+
+    #[test]
+    fn a_beacon_without_magic_with_port_0_or_cut_short_is_not_read() {
+        let good = beacon("P", "Ola", 7001).encode();
+        assert!(Beacon::decode(&good).is_some());
+        assert_eq!(
+            Beacon::decode(&beacon("P", "Ola", 0).encode()),
+            None,
+            "port 0 cannot be joined"
+        );
+        assert_eq!(
+            Beacon::decode(br#"{"project":"P","host":"Ola","port":7001}"#),
+            None,
+            "no magic"
+        );
+        assert_eq!(
+            Beacon::decode(br#"{"magic":"WiringCraft-Session","project":"P","host":"Ola","port":7001}"#),
+            None,
+            "magic is compared exactly"
+        );
+        assert_eq!(Beacon::decode(&good[..good.len() - 1]), None, "truncated JSON");
+        assert_eq!(Beacon::decode(b""), None);
+        assert_eq!(
+            Beacon::decode(br#"{"magic":"wiringcraft-session","project":"P","host":"Ola","port":70000}"#),
+            None,
+            "a port out of range"
+        );
+        assert_eq!(
+            Beacon::decode(br#"{"magic":"wiringcraft-session","project":"P","port":7001}"#),
+            None,
+            "a missing host"
+        );
+    }
+
+    #[test]
+    fn a_beacon_from_a_newer_build_with_more_fields_is_still_read() {
+        let wire =
+            br#"{"magic":"wiringcraft-session","project":"P","host":"Ola","port":7001,"protocol":3,"colour":"blue"}"#;
+        assert_eq!(
+            Beacon::decode(wire),
+            Some(Beacon {
+                protocol: 3,
+                ..beacon("P", "Ola", 7001)
+            })
+        );
+    }
+
+    #[test]
+    fn a_datagram_longer_than_a_beacon_is_cut_and_ignored() -> TestResult {
+        let mut b = browser()?;
+        let from: SocketAddr = "192.168.1.50:5000".parse()?;
+        // Valid JSON as a whole, but only its first MAX_BEACON bytes are read.
+        let long = beacon(&"P".repeat(MAX_BEACON), "Ola", 7001).encode();
+        assert!(long.len() > MAX_BEACON);
+        assert_eq!(feed(&mut b, vec![(long, from)])?, 1);
+        assert!(b.poll()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn one_sender_on_two_ports_is_two_sessions_and_a_repeat_replaces_one() -> TestResult {
+        let mut b = browser()?;
+        let from: SocketAddr = "192.168.1.50:5000".parse()?;
+        let other: SocketAddr = "192.168.1.51:6000".parse()?;
+        feed(
+            &mut b,
+            vec![
+                (beacon("Mill", "Kari", 7001).encode(), from),
+                (beacon("Mill", "Kari", 7002).encode(), from),
+                (beacon("Mill", "Kari", 7001).encode(), other),
+                // The same address again, renamed: it replaces the first, not a new entry.
+                (beacon("Mill 2", "Kari", 7001).encode(), from),
+            ],
+        )?;
+        let list = b.poll()?;
+        let seen: Vec<_> = list.iter().map(|s| (s.project.as_str(), s.addr.to_string())).collect();
+        assert_eq!(
+            seen,
+            [
+                ("Mill", "192.168.1.50:7002".to_string()),
+                ("Mill", "192.168.1.51:7001".to_string()),
+                ("Mill 2", "192.168.1.50:7001".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_are_sorted_by_project_then_host() -> TestResult {
+        let mut b = browser()?;
+        let from = |last: u8| SocketAddr::from(([10, 0, 0, last], 5000));
+        feed(
+            &mut b,
+            vec![
+                (beacon("B", "Zed", 7001).encode(), from(1)),
+                (beacon("A", "Ola", 7001).encode(), from(2)),
+                (beacon("B", "Ada", 7001).encode(), from(3)),
+            ],
+        )?;
+        let order: Vec<_> = b.poll()?.into_iter().map(|s| (s.project, s.host)).collect();
+        assert_eq!(
+            order,
+            [
+                ("A".into(), "Ola".into()),
+                ("B".into(), "Ada".into()),
+                ("B".into(), "Zed".into())
+            ] as [(String, String); 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_is_kept_until_silent_for_longer_than_the_timeout() -> TestResult {
+        let forget = Duration::from_secs(60);
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, forget)?;
+        feed(
+            &mut b,
+            vec![(beacon("P", "Ola", 7001).encode(), "10.0.0.1:5000".parse()?)],
+        )?;
+        b.age(forget / 2);
+        assert_eq!(b.poll()?.len(), 1, "half the timeout: still listed");
+        b.age(forget);
+        assert!(b.poll()?.is_empty(), "past the timeout: forgotten");
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_and_reset_receives_are_skipped_and_other_errors_returned() -> TestResult {
+        let mut b = browser()?;
+        let from: SocketAddr = "10.0.0.1:5000".parse()?;
+        let wire = beacon("P", "Ola", 7001).encode();
+        let mut step = 0;
+        let read = b.receive(|buf| {
+            step += 1;
+            match step {
+                1 => Err(io::ErrorKind::Interrupted.into()),
+                2 => Err(io::ErrorKind::ConnectionReset.into()),
+                3 => {
+                    buf[..wire.len()].copy_from_slice(&wire);
+                    Ok((wire.len(), from))
+                }
+                _ => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        })?;
+        assert_eq!(read, 1, "only the datagram counts");
+        assert_eq!(b.poll()?.len(), 1, "the beacon after the errors is read");
+
+        let err = b.receive(|_| Err(io::ErrorKind::PermissionDenied.into()));
+        assert!(
+            matches!(err, Err(crate::Error::Io(ref e)) if e.kind() == io::ErrorKind::PermissionDenied),
+            "{err:?}"
+        );
+        Ok(())
     }
 }
