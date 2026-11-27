@@ -4924,7 +4924,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             let prefix = prefix.unwrap_or_else(|| kicad_prefix(&file.to_string_lossy()));
             // An old library keeps its descriptions beside it, in a `.dcm` file of the same name.
             let docs = kicad_docs(&file, &text);
-            import_kicad(&text, docs.as_deref(), &lib, &prefix, scale, &category)?;
+            import_kicad(&text, docs, &lib, &prefix, scale, &category)?;
         }
         ImportCmd::SymbolQet {
             files,
@@ -6715,24 +6715,36 @@ fn import_wago_bytes(dir: &Path, bytes: &[u8]) -> Res<WagoImported> {
 
 /// The text of the `.dcm` file beside an old KiCad library `file` (the same name), which holds
 /// its symbols' descriptions; None for a new `.kicad_sym` library or when there is no such file.
-/// One that cannot be read is a warning: the symbols are imported without descriptions.
-fn kicad_docs(file: &Path, text: &str) -> Option<String> {
+/// One that cannot be read is an error here, and a warning to the import (see [`import_kicad`]).
+fn kicad_docs(file: &Path, text: &str) -> Option<Res<String>> {
     if !wc_import::kicad_legacy::is_legacy(text) {
         return None;
     }
     let dcm = file.with_extension("dcm");
-    if !dcm.is_file() {
-        return None;
-    }
-    read_text(&dcm)
-        .map_err(|why| eprintln!("warning: descriptions not read: {why}"))
-        .ok()
+    dcm.is_file().then(|| read_text(&dcm))
 }
 
 /// Import every symbol (one per unit) of a KiCad library text into `lib`, printing each.
-fn import_kicad(text: &str, docs: Option<&str>, lib: &Path, prefix: &str, scale: f64, category: &str) -> Res<usize> {
+/// `docs` is the library's `.dcm` text; one that could not be read is a warning, and the
+/// symbols are imported without descriptions.
+fn import_kicad(
+    text: &str,
+    docs: Option<Res<String>>,
+    lib: &Path,
+    prefix: &str,
+    scale: f64,
+    category: &str,
+) -> Res<usize> {
     let mut n = 0;
     logged(|log| {
+        let docs = match docs {
+            Some(Err(why)) => {
+                log.err(format!("warning: descriptions not read: {why}"));
+                None
+            }
+            docs => docs.and_then(Result::ok),
+        };
+        let docs = docs.as_deref();
         n = write_kicad(
             read_kicad_described(text, docs, prefix, scale, log)?,
             lib,

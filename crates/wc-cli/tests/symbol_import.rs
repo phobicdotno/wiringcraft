@@ -465,5 +465,16 @@ fn symbol_kicad_imports_an_old_library_whose_dcm_file_cannot_be_read() -> TestRe
         "{err}"
     );
     assert_eq!(symbol(&tmp.path().join("lib"), "kicad.lamps.lamp")?.description, "");
+    // A closed stderr (its reader gone) drops the warning; the symbols are still imported.
+    let (reader, writer) = std::io::pipe()?;
+    drop(reader);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .current_dir(tmp.path())
+        .args(["import", "symbol-kicad", "lamps.lib", "--lib", "closed"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(writer)
+        .output()?;
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(tmp.path().join("closed/symbols/kicad.lamps.lamp.json").is_file());
     Ok(())
 }
