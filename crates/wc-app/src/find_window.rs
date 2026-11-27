@@ -23,6 +23,9 @@ pub struct FindState {
     searched: Option<(String, bool)>,
     searched_in: Option<Project>,
     pub message: String,
+    /// Put the keyboard in the Find field on the next frame: set when Ctrl+F is pressed
+    /// while the window is already open, so the shortcut brings you back to typing.
+    pub focus: bool,
 }
 
 /// What the window asks the app to do.
@@ -96,13 +99,18 @@ impl FindState {
                 egui::Grid::new("find-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Find");
                     let field = ui.add(egui::TextEdit::singleline(&mut self.query).desired_width(280.0));
-                    if self.searched.is_none() {
+                    if self.searched.is_none() || std::mem::take(&mut self.focus) {
                         field.request_focus();
                     }
                     ui.end_row();
                     ui.label("Replace with");
-                    ui.add(egui::TextEdit::singleline(&mut self.with).desired_width(280.0));
+                    let with = ui.add(egui::TextEdit::singleline(&mut self.with).desired_width(280.0));
                     ui.end_row();
+                    // Escape in either field closes the window, as Cancel does in a dialog. The
+                    // field had the keyboard, so the canvas did not take the Escape as well.
+                    if (field.lost_focus() || with.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        out = FindOutcome::Close;
+                    }
                 });
                 ui.checkbox(&mut self.match_case, "Match case");
                 self.refresh(project);
@@ -278,6 +286,60 @@ mod tests {
         q.pages[0].graphics.clear();
         f.refresh(&q);
         assert!(f.hits.is_empty());
+    }
+
+    fn frame(ctx: &egui::Context, f: &mut FindState, p: &Project, events: Vec<egui::Event>) -> FindOutcome {
+        let mut out = FindOutcome::None;
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| out = f.show(ctx, p));
+        out
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn escape_in_the_find_field_closes_the_window() {
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState::default();
+        assert_eq!(frame(&ctx, &mut f, &p, vec![]), FindOutcome::None);
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![egui::Event::Text("pump".into())]),
+            FindOutcome::None
+        );
+        assert_eq!(f.query, "pump", "the Find field has the keyboard when the window opens");
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![key(egui::Key::Escape)]),
+            FindOutcome::Close
+        );
+    }
+
+    #[test]
+    fn ctrl_f_again_puts_the_keyboard_back_in_the_find_field() {
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState::default();
+        frame(&ctx, &mut f, &p, vec![]);
+        ctx.memory_mut(|m| m.stop_text_input());
+        frame(&ctx, &mut f, &p, vec![]);
+        frame(&ctx, &mut f, &p, vec![egui::Event::Text("x".into())]);
+        assert_eq!(f.query, "", "nothing has the keyboard");
+        f.focus = true;
+        frame(&ctx, &mut f, &p, vec![]);
+        frame(&ctx, &mut f, &p, vec![egui::Event::Text("pump".into())]);
+        assert_eq!(f.query, "pump");
+        assert!(!f.focus, "asked once");
     }
 
     #[test]

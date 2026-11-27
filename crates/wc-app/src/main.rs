@@ -1624,7 +1624,8 @@ impl App {
             }
             Action::Find => {
                 if self.open.is_some() {
-                    self.find.get_or_insert_with(Default::default);
+                    // Already open: Ctrl+F puts the keyboard back in its Find field.
+                    self.find.get_or_insert_with(Default::default).focus = true;
                 }
                 return;
             }
