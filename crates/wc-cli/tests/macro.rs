@@ -664,6 +664,48 @@ fn a_generation_whose_save_fails_leaves_the_project_as_it_was() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn a_generation_whose_save_fails_takes_back_a_new_black_box_symbol_copy() -> TestResult {
+    // A `box.*` symbol copy is also in the save's own snapshot (the save removes unused ones):
+    // after a failed save it must end as it was before the run, absent.
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    let boxed = std::fs::read_to_string(coil)?.replace("\"wc.coil\"", "\"box.p9.s1\"");
+    std::fs::write(lib.join("symbols/box.p9.s1.json"), boxed)?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER.replace("wc.coil", "box.p9.s1"))?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, format!("set\n{}", "3 kW\n".repeat(30)))?;
+    let args = [
+        "macro",
+        "generate",
+        "starter",
+        "--table",
+        table.to_str().ok_or("path")?,
+        "--size",
+        "100x110",
+    ];
+    let blocker = dir.join("pages/p0003.page.json.tmp");
+    std::fs::create_dir_all(&blocker)?;
+    assert!(wiringcraft(&dir, &args).is_err(), "the save failed");
+    assert!(
+        !dir.join("vendor/symbols/box.p9.s1.json").exists(),
+        "the black box symbol copy taken for the run is taken back"
+    );
+    assert!(!dir.join("pages/p0002.page.json").exists());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn a_generation_refuses_project_files_that_are_links() -> TestResult {
