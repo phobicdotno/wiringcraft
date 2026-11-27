@@ -537,6 +537,68 @@ fn a_commit_of_some_paths_leaves_every_other_change() -> Result<()> {
     Ok(())
 }
 
+/// The names in a commit, byte for byte (`git ls-tree -r -z --name-only`).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn names_in(dir: &std::path::Path, commit: &str) -> Result<Vec<Vec<u8>>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["ls-tree", "-r", "-z", "--name-only", commit])
+        .output()
+        .map_err(|e| wc_core::Error::io("git", e))?;
+    let mut names: Vec<Vec<u8>> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|n| !n.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+// macOS file systems refuse names that are not UTF-8.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn names_that_are_not_utf8_are_recorded_as_they_are() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |name: &[u8]| -> Result<()> {
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| wc_core::Error::io(parent, e))?;
+        }
+        std::fs::write(&path, name).map_err(|e| wc_core::Error::io(&path, e).into())
+    };
+    // Two names that read alike when read lossily (both `a\u{fffd}.txt`).
+    write(b"a\xff.txt")?;
+    write(b"a\xfe.txt")?;
+    let head = git
+        .commit("Two odd names")?
+        .ok_or_else(|| wc_core::Error::Invalid("no commit".into()))?;
+    let names = names_in(dir, &head)?;
+    assert!(names.contains(&b"a\xff.txt".to_vec()), "{names:?}");
+    assert!(names.contains(&b"a\xfe.txt".to_vec()), "{names:?}");
+
+    // Only some paths: the names git lists under them go back to it byte for byte.
+    write(b"pages/p\xff.json")?;
+    write(b"pages/p\xfe.json")?;
+    write(b"other.txt")?;
+    let head = git
+        .commit_paths_as("Pages", "Guest <guest@example.com>", &["pages"])?
+        .ok_or_else(|| wc_core::Error::Invalid("no commit".into()))?;
+    let names = names_in(dir, &head)?;
+    assert!(names.contains(&b"pages/p\xff.json".to_vec()), "{names:?}");
+    assert!(names.contains(&b"pages/p\xfe.json".to_vec()), "{names:?}");
+    assert!(!names.contains(&b"other.txt".to_vec()), "{names:?}");
+    // Nothing under the paths is left to record.
+    let left = git.run(&["status", "--porcelain"])?;
+    assert_eq!(left.trim(), "?? other.txt");
+    Ok(())
+}
+
 fn git_out(dir: &std::path::Path, args: &[&str]) -> Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")

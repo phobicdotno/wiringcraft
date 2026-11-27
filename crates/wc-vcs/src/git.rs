@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,6 +43,21 @@ pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
     at.with_file_name(name)
 }
 
+/// A path from git's `-z` output as the OS string it names, to hand back to git: its bytes
+/// as they are on Unix, where a file name may hold any bytes. Elsewhere names are Unicode and
+/// git prints them as UTF-8, so they are read as text.
+fn os_path(bytes: &[u8]) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(bytes.to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 /// A path from git's `-z` output as text: as it is when it is UTF-8. A name that is not (a
 /// Unix file name may hold any bytes) comes back in git's own quoted form, `"`, the name with
 /// `"` and `\` escaped and each byte that is not UTF-8 as a `\` and three octal digits, then
@@ -49,7 +65,7 @@ pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
 /// where reading them lossily would give both the same text. The quoted form names no file:
 /// such an entry can be listed, not opened. A UTF-8 name made of exactly that quoted text (a file
 /// literally named `"a\377.txt"` beside `a\xff.txt`) reads the same; telling those two apart
-/// needs the paths kept as bytes (#1223).
+/// needs the paths kept as bytes, as [`os_path`] keeps the ones handed back to git (#1223).
 pub(crate) fn path_text(bytes: &[u8]) -> String {
     use std::fmt::Write;
     // A UTF-8 name is always its own text, so it can be opened and handed back to git.
@@ -178,8 +194,9 @@ impl Git {
             .collect())
     }
 
-    /// [`Git::run`] with git's output as the bytes it printed.
-    fn run_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
+    /// [`Git::run`] with git's output as the bytes it printed. The arguments are OS strings,
+    /// so a path read back from git as bytes ([`os_path`]) is handed to it byte for byte.
+    fn run_bytes<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Vec<u8>> {
         let out = Command::new("git")
             .args(args)
             .current_dir(&self.dir)
@@ -199,7 +216,11 @@ impl Git {
                 message = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             }
             Err(Error::Git {
-                args: args.join(" "),
+                args: args
+                    .iter()
+                    .map(|a| a.as_ref().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 message,
             })
         }
@@ -328,20 +349,22 @@ impl Git {
             "--",
         ];
         args.extend(paths);
-        let out = self.run(&args)?;
+        // Bytes, not text: these paths go back to git, so a name that is not UTF-8 must stay
+        // the name it is (#1223).
+        let out = self.run_bytes(&args)?;
         let mut changed = Changed::default();
-        for entry in out.split('\0') {
+        for entry in out.split(|&b| b == 0) {
             let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else {
                 continue;
             };
             if path.is_empty() {
                 continue;
             }
-            changed.commit.push(path.to_owned());
+            changed.commit.push(os_path(path));
             // A removal staged already (`git rm`) is in neither the index nor the folder, so
             // `git add` would not find it; the commit takes it as it is staged.
-            if code != "D " {
-                changed.add.push(path.to_owned());
+            if code != b"D " {
+                changed.add.push(os_path(path));
             }
         }
         changed.commit.sort();
@@ -369,9 +392,12 @@ impl Git {
             }
             Some(changed) => {
                 if !changed.add.is_empty() {
-                    let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
-                    add.extend(changed.add.iter().map(String::as_str));
-                    self.run(&add)?;
+                    let mut add: Vec<&OsStr> = ["--literal-pathspecs", "add", "-A", "--"]
+                        .into_iter()
+                        .map(OsStr::new)
+                        .collect();
+                    add.extend(changed.add.iter().map(OsString::as_os_str));
+                    self.run_bytes(&add)?;
                 }
             }
         }
@@ -382,21 +408,24 @@ impl Git {
             None => None,
             Some(changed) => {
                 let head = self.head();
-                let mut diff = vec![
+                let mut diff: Vec<&OsStr> = [
                     "--literal-pathspecs",
                     "diff",
                     "--cached",
                     "--name-only",
                     "--no-renames",
                     "-z",
-                ];
+                ]
+                .into_iter()
+                .map(OsStr::new)
+                .collect();
                 if let Some(h) = &head {
-                    diff.push(h);
+                    diff.push(OsStr::new(h));
                 }
-                diff.push("--");
-                diff.extend(changed.commit.iter().map(String::as_str));
-                let out = self.run(&diff)?;
-                let paths: Vec<String> = out.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect();
+                diff.push(OsStr::new("--"));
+                diff.extend(changed.commit.iter().map(OsString::as_os_str));
+                let out = self.run_bytes(&diff)?;
+                let paths: Vec<OsString> = out.split(|&b| b == 0).filter(|p| !p.is_empty()).map(os_path).collect();
                 if paths.is_empty() {
                     return Ok(None);
                 }
@@ -404,25 +433,25 @@ impl Git {
             }
         };
         let author_arg = author.map(|a| format!("--author={a}"));
-        let mut args: Vec<&str> = Vec::new();
+        let mut args: Vec<&OsStr> = Vec::new();
         // Commit as the configured user; fall back to a neutral identity so a fresh machine works.
         if self.run(&["config", "user.email"]).is_err() {
-            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
+            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"].map(OsStr::new));
         }
         if only.is_some() {
-            args.push("--literal-pathspecs");
+            args.push(OsStr::new("--literal-pathspecs"));
         }
-        args.extend(["commit", "-q", "--allow-empty", "-m", message]);
+        args.extend(["commit", "-q", "--allow-empty", "-m", message].map(OsStr::new));
         if let Some(a) = &author_arg {
-            args.push(a);
+            args.push(OsStr::new(a));
         }
         // Only these paths' changes, whatever else is staged.
         if let Some(paths) = &selected {
-            args.push("--only");
-            args.push("--");
-            args.extend(paths.iter().map(String::as_str));
+            args.push(OsStr::new("--only"));
+            args.push(OsStr::new("--"));
+            args.extend(paths.iter().map(OsString::as_os_str));
         }
-        if let Err(e) = self.run(&args) {
+        if let Err(e) = self.run_bytes(&args) {
             let undo = match &index_before {
                 Ok(tree) => self.run(&["read-tree", tree]).err(),
                 Err(snapshot) => Some(Error::Git {
@@ -643,6 +672,6 @@ fn no_such_version(commit: &str) -> Error {
 /// `git add` can take (all but removals staged already).
 #[derive(Debug, Default)]
 struct Changed {
-    commit: Vec<String>,
-    add: Vec<String>,
+    commit: Vec<OsString>,
+    add: Vec<OsString>,
 }
