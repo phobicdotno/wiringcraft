@@ -446,11 +446,30 @@ pub fn follow_terminals_in(
     before: &TerminalNumbers,
     role: impl Fn(&str) -> Option<SymbolRole>,
 ) -> bool {
+    let was = project.meta.clone();
+    let moves = follow_terminals_carrying(project, before, &TerminalNumbers::new(), role);
+    project.meta != was || !moves.is_empty()
+}
+
+/// [`follow_terminals_in`], where `carried` says where terminals that are not drawn went (a
+/// key of `before` to its new strip and number), and returning the layouts taken to another
+/// strip, as (old strip, new strip).
+pub fn follow_terminals_carrying(
+    project: &mut Project,
+    before: &TerminalNumbers,
+    carried: &TerminalNumbers,
+    role: impl Fn(&str) -> Option<SymbolRole>,
+) -> Vec<(DeviceTag, DeviceTag)> {
     if !project.meta.follows_terminals() {
-        return false;
+        return Vec::new();
     }
     let was = project.meta.clone();
-    let mut after = numbers_after(project, before, &role);
+    let after_of = |project: &Project| {
+        let mut after = numbers_after(project, before, &role);
+        after.extend(carried.iter().map(|(k, v)| (k.clone(), v.clone())));
+        after
+    };
+    let mut after = after_of(project);
     // A spare can only go with its strip to a tag no other device is drawn with there, nor has
     // device data of its own: it would take over that device (its part, its panel place), as
     // Project::add_spare refuses, and leave its own data behind. Judged by what is drawn with
@@ -488,7 +507,7 @@ pub fn follow_terminals_in(
             }
         }
         project.meta.follow_terminals(&jb, &ja);
-        let again = numbers_after(project, before, &role);
+        let again = after_of(project);
         if again == after || pass == 1 {
             break;
         }
@@ -508,7 +527,7 @@ pub fn follow_terminals_in(
             }
         }
     }
-    project.meta != was || !moves.is_empty()
+    moves
 }
 
 /// The [`terminal_numbers`] of `project` after a change, for following it from `before`: a
