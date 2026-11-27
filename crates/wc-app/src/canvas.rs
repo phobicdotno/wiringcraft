@@ -2866,6 +2866,8 @@ fn wire_tool(
 }
 
 fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, mut via: Vec<Point>, end: Endpoint) {
+    // The draft as drawn, given back if this end is refused so its start and bends are kept.
+    let draft = via.clone();
     // Keep it orthogonal: add an elbow before the end if the last leg is diagonal.
     let last = via.last().copied().or_else(|| open.end_pos(page, &start));
     if let (Some(l), Some(e)) = (last, open.end_pos(page, &end))
@@ -2891,6 +2893,7 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
     let same_spot = matches!((open.end_pos(page, &start), open.end_pos(page, &end)), (Some(a), Some(b)) if a == b);
     if start == end || same_spot {
         ed.message = "A wire needs two different ends.".into();
+        ed.wire = Some((start, draft));
         return;
     }
     open.add_wire(ed.page, start, end, via);
@@ -5858,9 +5861,12 @@ mod tests {
         };
         let at = o.end_pos(&o.project.pages[page], &pin).unwrap();
         let free = Endpoint::Point { at };
+        let bend = vec![Point::new(at.x, at.y + 20.0)];
         for (start, end) in [(free.clone(), pin.clone()), (pin, free)] {
             let p = o.project.pages[page].clone();
-            finish_wire(&mut o, &mut ed, &p, start, Vec::new(), end);
+            finish_wire(&mut o, &mut ed, &p, start.clone(), bend.clone(), end);
+            // The draft is kept, so another end can still be picked.
+            assert_eq!(ed.wire.take(), Some((start, bend.clone())));
             assert!(
                 o.project.pages[page].wires.is_empty(),
                 "{:?}",
