@@ -126,9 +126,19 @@ pub fn records(text: &str, delim: char) -> Rows {
 }
 
 /// The separator a CSV text uses, guessed from its first line that is not blank: the header
-/// [`records`] reads, also when blank lines come before it.
+/// [`records`] reads, also when blank lines come before it. As in [`records`], a line ends at a
+/// `\n` or a lone `\r`, but not inside quotes.
 fn guess_delimiter(text: &str) -> char {
-    let header = text.split(['\r', '\n']).find(|l| !l.trim().is_empty()).unwrap_or("");
+    let mut quoted = false;
+    let header = text
+        .split(|c| {
+            if c == '"' {
+                quoted = !quoted;
+            }
+            !quoted && (c == '\r' || c == '\n')
+        })
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
     [';', '\t', ',', '|']
         .into_iter()
         .max_by_key(|d| header.matches(*d).count())
@@ -586,6 +596,12 @@ mod tests {
         let given = Rows::from(vec![vec!["Order number".to_owned()], vec![String::new()]]);
         assert_eq!(parts_from_rows(&given)?.1, ["row 2: no order number, skipped"]);
         Ok(())
+    }
+
+    #[test]
+    fn a_line_break_inside_a_quoted_header_does_not_end_it() {
+        assert_eq!(guess_delimiter("\"Order\rnumber\";Description\r\nA1;example\r\n"), ';');
+        assert_eq!(guess_delimiter("\"Order\nnumber\";Description\nA1;example\n"), ';');
     }
 
     #[test]
