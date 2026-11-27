@@ -265,6 +265,8 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Open elements, to know where a `<name>` text or a dynamic text's `<info_name>` belongs.
     let mut path: Vec<String> = Vec::new();
     let mut name_lang: Option<String> = None;
+    // Set once a name's text could not be read, so that is said only once.
+    let mut name_unreadable = false;
     // The open name's text, kept whole (text around a comment, CDATA) and trimmed at `</name>`.
     let mut name_text = String::new();
     // The element's `<elementInformation>` texts named `description` and `label`, and which one is open.
@@ -370,12 +372,18 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
             Event::CData(t) if name_lang.is_some() => name_text.push_str(&String::from_utf8_lossy(&t)),
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                if let Some(lang) = &name_lang {
+                if name_lang.is_some() {
                     match t.unescape() {
                         Ok(v) => name_text.push_str(&v),
-                        Err(e) => warnings.push(format!(
-                            "the element's name ({lang}) has text that cannot be read ({e}); it is left out"
-                        )),
+                        // Said once per file, without the language the file gives: a file of many
+                        // bad names (or one long language) cannot fill memory with warnings.
+                        Err(e) if !name_unreadable => {
+                            name_unreadable = true;
+                            warnings.push(format!(
+                                "an element name has text that cannot be read ({e}); it is left out"
+                            ));
+                        }
+                        Err(_) => {}
                     }
                 } else if path.last().map(String::as_str) == Some("info_name")
                     && v == "label"
@@ -1229,7 +1237,15 @@ mod tests {
         )?;
         assert_eq!(imp.qet_name, "NO");
         assert!(
-            warnings.iter().any(|w| w.contains("name (en)") && w.contains("bogus")),
+            warnings.iter().any(|w| w.contains("name") && w.contains("bogus")),
+            "{warnings:?}"
+        );
+        // Many unreadable parts of a name are said once.
+        let many = format!(r#"<name lang="en">{}</name>"#, "&bogus;<!-- x -->".repeat(50));
+        let (_, warnings) = element(&el(&many), "q.k", DEFAULT_SCALE)?;
+        assert_eq!(
+            warnings.iter().filter(|w| w.contains("bogus")).count(),
+            1,
             "{warnings:?}"
         );
         Ok(())
