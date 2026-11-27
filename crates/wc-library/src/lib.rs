@@ -741,13 +741,26 @@ pub fn update_items_then(
 /// `<source>/proposed/<kind>/<id>.json` so a librarian (or a git pull request) can review it
 /// before it replaces the real item.
 pub fn propose(project_dir: &Path, lib: &Library, source: &str, kind: ItemKind, id: &str) -> Result<PathBuf> {
+    // Source names are unique ignoring case (`lib add` refuses a second `Company` next to
+    // `company`), so a name that differs only in case still names one source.
     let src = lib
         .sources
         .iter()
         .find(|s| s.name == source)
+        .or_else(|| lib.sources.iter().find(|s| s.name.eq_ignore_ascii_case(source)))
         .ok_or_else(|| Error::Source {
             name: source.into(),
-            message: "no such source in this project".into(),
+            message: match lib.sources.len() {
+                0 => "no such source in this project; it has no library sources".into(),
+                _ => format!(
+                    "no such source in this project; its sources are {}",
+                    lib.sources
+                        .iter()
+                        .map(|s| format!("{:?}", s.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
         })?;
     let content = match kind {
         ItemKind::Symbol => store::to_json(&store::read_vendored_symbol(project_dir, id)?)?,
