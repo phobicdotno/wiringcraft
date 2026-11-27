@@ -1044,9 +1044,13 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
                 Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
                 Endpoint::Point { at } => format!("junction {:.1},{:.1}", at.x, at.y),
             };
+            // A blank name is no potential, as connectivity has it: the net's name shows.
             let potential = w
                 .potential
-                .clone()
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
                 .or_else(|| net_of.get(&(pi, wi)).and_then(|n| names.get(*n)).cloned());
             t.push_linked(
                 vec![

@@ -385,6 +385,25 @@ fn wire_list_names_the_potential_of_a_wire_between_two_junctions() {
 }
 
 #[test]
+fn wire_list_shows_the_net_name_past_a_blank_potential() {
+    let (mut p, s, parts) = fixture();
+    // Spaces around a name are no part of it, and a blank name is no potential: w8 is in the
+    // 24V net through the coil's pin A1, as w1 is.
+    p.pages[0].wires[0].potential = Some(" 24V ".into());
+    let at = Endpoint::Point {
+        at: Point::new(50.0, 0.0),
+    };
+    p.pages[0].wires.push(wire("w8", pin("s1", "A1"), at, None, Some("  ")));
+    let t = wire_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][2], "24V");
+    assert_eq!(t.rows[4][2], "24V");
+}
+
+#[test]
 fn wire_list_shows_section_colour_and_type() {
     let (mut p, s, parts) = fixture();
     let w = p
