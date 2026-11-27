@@ -2678,12 +2678,18 @@ impl App {
                         .id_salt("macro-edit-scroll")
                         .max_height(ui.ctx().screen_rect().height() * 0.6)
                         .show(ui, |ui| macro_form::show(ui, form));
+                    // What keeps the form from being a macro is shown as it is typed, and Save
+                    // waits for it, as OK does in the rules and report layout dialogs.
+                    let bad = form.to_macro().err();
                     if let Some(e) = error {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
                     }
+                    if let Some(why) = bad.as_ref().filter(|b| error.as_ref() != Some(*b)) {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, why.as_str());
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
+                        if ui.add_enabled(bad.is_none(), egui::Button::new("Save")).clicked() {
                             // Saved through the project, so the save is one undo step.
                             let form = form.clone();
                             then = Some(Box::new(move |app: &mut App| {
