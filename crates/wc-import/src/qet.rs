@@ -265,6 +265,8 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Open elements, to know where a `<name>` text or a dynamic text's `<info_name>` belongs.
     let mut path: Vec<String> = Vec::new();
     let mut name_lang: Option<String> = None;
+    // The open name's text, kept whole (text around a comment, CDATA) and trimmed at `</name>`.
+    let mut name_text = String::new();
     // The element's `<elementInformation>` texts named `description` and `label`, and which one is open.
     let mut description = String::new();
     let mut label = String::new();
@@ -333,7 +335,15 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                 if let Some(tag) = path.pop() {
                     match tag.as_str() {
                         "description" => in_description = false,
-                        "name" => name_lang = None,
+                        "name" => {
+                            if let Some(lang) = name_lang.take() {
+                                let v = name_text.trim();
+                                if !v.is_empty() {
+                                    names.push((lang, v.to_owned()));
+                                }
+                            }
+                            name_text.clear();
+                        }
                         "elementInformation" => in_info = None,
                         "dynamic_text" => dynamic_at = None,
                         _ => {}
@@ -357,12 +367,11 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                 Some("label") => label.push_str(&String::from_utf8_lossy(&t)),
                 _ => description.push_str(&String::from_utf8_lossy(&t)),
             },
+            Event::CData(t) if name_lang.is_some() => name_text.push_str(&String::from_utf8_lossy(&t)),
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                if let Some(lang) = &name_lang {
-                    if !v.is_empty() {
-                        names.push((lang.clone(), v));
-                    }
+                if name_lang.is_some() {
+                    name_text.push_str(&t.unescape().unwrap_or_default());
                 } else if path.last().map(String::as_str) == Some("info_name")
                     && v == "label"
                     && let Some(at) = dynamic_at
@@ -1188,6 +1197,25 @@ mod tests {
         let (imp, _) = element(el, "qet.lamp", 1.0)?;
         assert_eq!(imp.qet_name, "lamp");
         assert_eq!(imp.symbol.tag_at, Point::new(-15.0, -5.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_in_cdata_or_around_a_comment_comes_in_whole() -> Result<()> {
+        let el = |name: &str| {
+            format!(
+                r#"<definition type="element"><names><name lang="fr">Contact</name>{name}</names>
+<description><line x1="0" y1="0" x2="10" y2="0"/></description></definition>"#
+            )
+        };
+        for name in [
+            r#"<name lang="en"><![CDATA[NO contact]]></name>"#,
+            r#"<name lang="en"> NO <!-- old -->contact </name>"#,
+            r#"<name lang="en">NO <![CDATA[contact]]></name>"#,
+        ] {
+            let (imp, _) = element(&el(name), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.qet_name, "NO contact", "{name}");
+        }
         Ok(())
     }
 
