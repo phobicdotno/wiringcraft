@@ -17,6 +17,24 @@ pub fn value_keys(project: &wc_core::Project) -> Vec<String> {
     keys
 }
 
+/// Carry the boxes' open or closed headers along when the boxes move: `ids` are the headers
+/// by box index and `op` does to their open flags what is done to the boxes, so the box that
+/// was drawn earlier or the ones after a removed box keep their header open, not the box that
+/// takes their place in the list.
+fn carry_open(ctx: &egui::Context, ids: &[egui::Id], op: impl FnOnce(&mut Vec<bool>)) {
+    use egui::collapsing_header::CollapsingState;
+    let mut open: Vec<bool> = ids
+        .iter()
+        .map(|&id| CollapsingState::load(ctx, id).is_some_and(|s| s.is_open()))
+        .collect();
+    op(&mut open);
+    for (k, &id) in ids.iter().enumerate() {
+        let mut s = CollapsingState::load_with_default_open(ctx, id, false);
+        s.set_open(open.get(k).copied().unwrap_or(false));
+        s.store(ctx);
+    }
+}
+
 fn edge(ui: &mut egui::Ui, mm: &mut f64, from: &mut Side, salt: impl std::hash::Hash) -> bool {
     let mut changed = ui
         .add(egui::DragValue::new(mm).range(0.0..=600.0).speed(0.5).suffix(" mm"))
@@ -129,6 +147,8 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
     let mut remove = None;
     let mut raise = None;
     egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+        // The id each header keeps its open state under, as the header itself reports it.
+        let mut header_ids = Vec::with_capacity(draft.boxes.len());
         for (i, b) in draft.boxes.iter_mut().enumerate() {
             let heading = if !b.label.is_empty() {
                 b.label.clone()
@@ -137,7 +157,7 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
             } else {
                 "(no label)".to_owned()
             };
-            egui::CollapsingHeader::new(heading).id_salt(("box", i)).show(ui, |ui| {
+            let header = egui::CollapsingHeader::new(heading).id_salt(("box", i)).show(ui, |ui| {
                 egui::Grid::new(("box-grid", i))
                     .num_columns(2)
                     .spacing([8.0, 4.0])
@@ -193,6 +213,16 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
                     }
                 });
             });
+            header_ids.push(header.header_response.id);
+        }
+        if remove.is_some() || raise.is_some() {
+            carry_open(ui.ctx(), &header_ids, |open| {
+                if let Some(i) = remove {
+                    open.remove(i);
+                } else if let Some(i) = raise {
+                    open.swap(i - 1, i);
+                }
+            });
         }
     });
     if let Some(i) = remove {
@@ -221,4 +251,84 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(ctx: &egui::Context, ids: &[egui::Id]) -> Vec<bool> {
+        ids.iter()
+            .map(|&id| egui::collapsing_header::CollapsingState::load(ctx, id).is_some_and(|s| s.is_open()))
+            .collect()
+    }
+
+    fn standard() -> Vec<String> {
+        template::SPECIAL_VALUES
+            .iter()
+            .chain(wc_core::project::TITLE_FIELDS)
+            .map(|(k, _)| (*k).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn an_open_box_stays_open_when_it_moves_or_one_before_it_is_removed() {
+        let ctx = egui::Context::default();
+        let ids: Vec<egui::Id> = (0..3).map(|i| egui::Id::new(("box", i))).collect();
+        // Only the last box is open.
+        carry_open(&ctx, &ids, |o| o[2] = true);
+        assert_eq!(open(&ctx, &ids), [false, false, true]);
+        // "Draw earlier" on it: it is box 2 now, still open, and the one it passed is closed.
+        carry_open(&ctx, &ids, |o| o.swap(1, 2));
+        assert_eq!(open(&ctx, &ids), [false, true, false]);
+        // Removing the first box moves it to box 1, still open; the freed last slot is closed.
+        carry_open(&ctx, &ids, |o| {
+            o.remove(0);
+        });
+        assert_eq!(open(&ctx, &ids), [true, false, false]);
+    }
+
+    #[test]
+    fn a_new_project_offers_the_special_values_then_the_title_fields_in_order() {
+        let keys = value_keys(&wc_core::Project::new("x"));
+        assert_eq!(keys, standard());
+        assert_eq!(keys.first().map(String::as_str), Some(template::PROJECT_NAME));
+    }
+
+    #[test]
+    fn the_projects_own_fields_come_after_the_standard_ones_in_name_order() {
+        let mut p = wc_core::Project::new("x");
+        p.meta.title_block.insert("zone".into(), "B".into());
+        p.meta.title_block.insert("approved_by".into(), "Ann".into());
+        let keys = value_keys(&p);
+        let mut want = standard();
+        want.extend(["approved_by".to_owned(), "zone".to_owned()]);
+        assert_eq!(keys, want);
+    }
+
+    #[test]
+    fn a_field_the_project_fills_that_is_already_standard_is_listed_once() {
+        let mut p = wc_core::Project::new("x");
+        p.meta.title_block.insert("customer".into(), "Acme".into());
+        p.meta.title_block.insert(template::PAGE_TITLE.into(), "odd".into());
+        let keys = value_keys(&p);
+        assert_eq!(keys, standard());
+        assert_eq!(keys.iter().filter(|k| *k == "customer").count(), 1);
+        assert_eq!(keys.iter().filter(|k| *k == template::PAGE_TITLE).count(), 1);
+    }
+
+    #[test]
+    fn every_key_is_unique() {
+        let mut p = wc_core::Project::new("x");
+        for k in standard() {
+            p.meta.title_block.insert(k, "v".into());
+        }
+        p.meta.title_block.insert("extra".into(), "v".into());
+        let keys = value_keys(&p);
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len());
+        assert_eq!(keys.last().map(String::as_str), Some("extra"));
+    }
 }

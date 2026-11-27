@@ -171,8 +171,10 @@ enum Dialog {
     },
     /// The recorded versions of one page, newest first.
     PageHistory(String, Vec<wc_vcs::PageVersion>),
-    Commit(String),
-    NewBranch(String),
+    /// The version message, and whether its field has had the keyboard yet.
+    Commit(String, bool),
+    /// The branch name, and whether its field has had the keyboard yet.
+    NewBranch(String, bool),
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
@@ -341,6 +343,9 @@ struct App {
     show_layers: bool,
     /// The project check that runs after each edit (Check while drawing).
     live: live_check::LiveCheck,
+    /// The open Project check list was opened from the live-check count in the status bar:
+    /// it shows the live check's latest findings, not those of when it was opened.
+    check_follows_live: bool,
     /// A base project being fetched from a git URL for a new project, off the window thread.
     fetch: Option<BaseFetch>,
     /// File > Import running on a worker thread ([`App::poll_import`]).
@@ -350,6 +355,9 @@ struct App {
     after_typed: Vec<Action>,
     /// A window close the person asked for, while it waits for a typed value or is let through.
     closing: Closing,
+    /// The window title last sent: it is sent again only when it changes, as the window would
+    /// otherwise be retitled on every frame.
+    title: String,
 }
 
 /// File > Import running on a worker thread, and what to do with the project when it ends.
@@ -426,6 +434,17 @@ const IMPORT_VIEW_CONTROLS: &[Action] = &[
     Action::ToggleTheme,
     Action::Layers,
 ];
+
+/// Whether an import window view control ([`IMPORT_VIEW_CONTROLS`]) shows as on: the same
+/// state its toolbar button and menu item show, so the grid and dark theme read as on there too.
+fn import_view_control_on(a: Action, prefs: &Prefs, show_layers: bool) -> bool {
+    match a {
+        Action::ToggleGrid => prefs.show_grid,
+        Action::ToggleTheme => prefs.theme == theme::Mode::Dark,
+        Action::Layers => show_layers,
+        _ => false,
+    }
+}
 
 /// Make a new project's folder a repository with its first version.
 fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
@@ -551,6 +570,8 @@ impl chrome::Status for StatusView<'_> {
                 Action::Undo => return se.can_undo(),
                 Action::Redo => return se.can_redo(),
                 Action::Delete => return se.selected.is_some(),
+                // Refused while the editor is open (`carry_out`): not offered either (#1345).
+                a if held_by_symbol_editor(a) => return false,
                 _ => {}
             }
         }
@@ -845,13 +866,15 @@ impl App {
             find: None,
             pending: None,
             pending_for: None,
-            show_layers: false,
+            show_layers: prefs.show_layers,
             strip_editor: None,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -1370,8 +1393,12 @@ impl App {
                 ui.weak("View:");
                 for a in IMPORT_VIEW_CONTROLS {
                     let info = a.info();
-                    let on = *a == Action::Layers && self.show_layers;
-                    if ui.selectable_label(on, info.label).on_hover_text(info.tip).clicked() {
+                    let on = import_view_control_on(*a, &self.prefs, self.show_layers);
+                    if ui
+                        .selectable_label(on, info.label)
+                        .on_hover_text(chrome::tip_hint(ui.ctx().os(), info.tip))
+                        .clicked()
+                    {
                         actions.push(*a);
                     }
                 }
@@ -1529,6 +1556,10 @@ impl App {
             return;
         }
         let earlier = self.pending.take();
+        if a == Action::Check {
+            // Check project shows a check run now, which the live check must not replace.
+            self.check_follows_live = false;
+        }
         self.carry_out(a);
         // The turn for the symbol on the pointer belongs to the place tool: an action that
         // leaves it sets the turn back, also before the canvas is next drawn.
@@ -1625,7 +1656,11 @@ impl App {
             }
             Action::Find => {
                 if self.open.is_some() {
-                    self.find.get_or_insert_with(Default::default);
+                    match self.find.as_mut() {
+                        // Already open: Ctrl+F again takes you back to its Find field.
+                        Some(find) => find.focus_query = true,
+                        None => self.find = Some(Default::default()),
+                    }
                 }
                 return;
             }
@@ -1680,7 +1715,7 @@ impl App {
                 self.prefs.show_grid = !self.prefs.show_grid;
                 self.prefs.save();
             }
-            Action::Layers => self.show_layers = !self.show_layers,
+            Action::Layers => self.set_layers_open(!self.show_layers),
             Action::ToggleAutoWire => {
                 self.prefs.auto_wire = !self.prefs.auto_wire;
                 self.prefs.save();
@@ -1819,8 +1854,8 @@ impl App {
             Action::Save => match open.save() {
                 Ok(n) => {
                     self.ed.message = match &refused {
-                        Some(r) => format!("Saved ({n} files changed). {r}"),
-                        None => format!("Saved ({n} files changed)."),
+                        Some(r) => format!("{} {r}", state::saved_message(n)),
+                        None => state::saved_message(n),
                     }
                 }
                 // A file changed outside that Save would write over asks first (#662).
@@ -2231,11 +2266,7 @@ impl App {
             Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
             Action::Check => {
                 let found = run_check(open);
-                let errors = found
-                    .iter()
-                    .filter(|f| f.severity == wc_report::Severity::Error)
-                    .count();
-                self.ed.message = format!("Project check: {errors} errors, {} findings in all.", found.len());
+                self.ed.message = live_check::check_message(&found);
                 self.dialog = Some(Dialog::Check(found));
             }
             Action::NewSymbol | Action::EditSymbol => {
@@ -2305,8 +2336,8 @@ impl App {
                     Err(e) => self.dialog = Some(Dialog::Message(format!("The library could not be opened:\n{e}"))),
                 }
             }
-            Action::Commit => self.dialog = Some(Dialog::Commit(String::new())),
-            Action::NewBranch => self.dialog = Some(Dialog::NewBranch(String::new())),
+            Action::Commit => self.dialog = Some(Dialog::Commit(String::new(), false)),
+            Action::NewBranch => self.dialog = Some(Dialog::NewBranch(String::new(), false)),
             Action::History => match wc_vcs::subway::history(&wc_vcs::Git::new(&open.dir), 200) {
                 Ok(rows) => self.dialog = Some(Dialog::History(rows)),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("No history yet:\n{e}"))),
@@ -2427,7 +2458,7 @@ impl App {
         // An open dialog takes the keyboard: a shortcut would change the project under it (the
         // cover form's Cancel takes back only what the form changed).
         let dialog_open = self.dialog.is_some();
-        let mut out = ctrl_shortcuts(ctx, dialog_open);
+        let mut out = ctrl_shortcuts(ctx, dialog_open, text_field_focused(ctx));
         if dialog_open {
             return out;
         }
@@ -2515,8 +2546,8 @@ impl App {
             Dialog::Translations(_) => "Translations",
             Dialog::PdfLanguage { .. } => "Export PDF",
             Dialog::Rules { .. } => "Check rules",
-            Dialog::Commit(_) => "Record a version",
-            Dialog::NewBranch(_) => "New branch",
+            Dialog::Commit(..) => "Record a version",
+            Dialog::NewBranch(..) => "New branch",
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
@@ -2539,6 +2570,10 @@ impl App {
             Dialog::Reports(_) | Dialog::ReportLayout { .. } | Dialog::Check(_) | Dialog::Translations(_)
         );
         let screen = ctx.screen_rect();
+        // The symbol editor (its window shows after this one) owns an Escape that drops its
+        // half-drawn shape or cancels its drag: one press does one thing.
+        let editor_escape = self.symbol_editor.as_ref().is_some_and(|e| e.wants_escape(ctx));
+        let escape = !editor_escape && escape_cancels(ctx);
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
@@ -2570,28 +2605,33 @@ impl App {
                         clip.wires.len(),
                         clip.graphics.len()
                     ));
-                    egui::Grid::new("macro")
+                    let enter = egui::Grid::new("macro")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
                             ui.label("Name");
-                            ui.add(
+                            let n = ui.add(
                                 egui::TextEdit::singleline(name)
                                     .hint_text("Motor starter DOL")
                                     .desired_width(320.0),
                             );
                             ui.end_row();
                             ui.label("Description");
-                            ui.add(egui::TextEdit::singleline(description).desired_width(320.0));
+                            let d = ui.add(egui::TextEdit::singleline(description).desired_width(320.0));
                             ui.end_row();
-                        });
+                            (n.lost_focus() || d.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter))
+                        })
+                        .inner;
                     if let Some(e) = error {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
                     }
                     ui.horizontal(|ui| {
-                        if ui
+                        if (ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+                            .on_disabled_hover_text("Give the macro a name first.")
                             .clicked()
+                            || enter)
+                            && !name.trim().is_empty()
                             && let Some(open) = &mut self.open
                         {
                             match open.save_macro(clip, name, description) {
@@ -2602,7 +2642,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2678,12 +2718,18 @@ impl App {
                         .id_salt("macro-edit-scroll")
                         .max_height(ui.ctx().screen_rect().height() * 0.6)
                         .show(ui, |ui| macro_form::show(ui, form));
+                    // What keeps the form from being a macro is shown as it is typed, and Save
+                    // waits for it, as OK does in the rules and report layout dialogs.
+                    let bad = form.to_macro().err();
                     if let Some(e) = error {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
                     }
+                    if let Some(why) = bad.as_ref().filter(|b| error.as_ref() != Some(*b)) {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, why.as_str());
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
+                        if ui.add_enabled(bad.is_none(), egui::Button::new("Save")).clicked() {
                             // Saved through the project, so the save is one undo step.
                             let form = form.clone();
                             then = Some(Box::new(move |app: &mut App| {
@@ -2707,7 +2753,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             then = Some(Box::new(|app: &mut App| {
                                 if let Some(open) = &app.open {
                                     app.dialog = Some(Dialog::Macros(open.macros()));
@@ -2738,7 +2784,14 @@ impl App {
                         };
                         ui.add(egui::Label::new(RichText::new(shown).monospace().small()).wrap());
                     });
-                    ui.checkbox(include, "Include this log in my report");
+                    // An empty log has nothing to include: the box is greyed out and shown
+                    // unticked, so it does not claim a log goes with the report.
+                    let (enabled, mut ticked) = include_log_box(log, *include);
+                    ui.add_enabled(enabled, egui::Checkbox::new(&mut ticked, "Include this log in my report"))
+                        .on_disabled_hover_text("The log is empty.");
+                    if enabled {
+                        *include = ticked;
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Open the report form").clicked() {
                             let (request, copy) = report_request(log, *include);
@@ -2750,7 +2803,7 @@ impl App {
                             }
                             self.open_url
                                 .push(feedback::form_url(feedback::Kind::Problem, &request));
-                            applog::info(if *include {
+                            applog::info(if *include && !log.is_empty() {
                                 "report form opened with the log"
                             } else {
                                 "report form opened without the log"
@@ -2762,7 +2815,8 @@ impl App {
                         {
                             self.open_url.push(format!("file://{}", dir.display()));
                         }
-                        if ui.button("Cancel").clicked() {
+                        // Escape is Cancel, as in the other dialogs: no form opens.
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2826,7 +2880,9 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.leave(leave)));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        // Escape is Cancel, as in the other dialogs: nothing is saved or dropped.
+                        // It is used up here, so the symbol editor does not also drop its shape.
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2836,7 +2892,8 @@ impl App {
                     egui::ScrollArea::vertical()
                         .max_height((screen.height() * 0.6).max(120.0))
                         .show(ui, |ui| ui.label(m.as_str()));
-                    if ui.button("OK").clicked() {
+                    // OK is the only answer: Enter and Escape give it too.
+                    if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape)) {
                         keep = false;
                     }
                 }
@@ -2845,6 +2902,7 @@ impl App {
                     let r = ui
                         .horizontal(|ui| {
                             let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(340.0));
+                            focus_on_open(ui, &r);
                             if ui.button("Browse…").clicked() {
                                 match pick_folder_for("Open project", path) {
                                     Picked::Path(d) => *error = path.pick(d).err(),
@@ -2877,7 +2935,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2885,6 +2943,7 @@ impl App {
                 Dialog::SaveAsPath(path, error) => {
                     ui.label("Folder for the copy (new, or empty):");
                     let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(380.0));
+                    focus_on_open(ui, &r);
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
                     }
@@ -2908,7 +2967,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2980,7 +3039,7 @@ impl App {
                              (not its comments or history), recorded as a git repository. {name} and {date} in \
                              its title block and page titles become this project's name and today's date."
                         })
-                        .color(t.faint),
+                        .color(t.muted),
                     );
                     ui.horizontal(|ui| {
                         if let Ok(d) = target
@@ -2993,7 +3052,7 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.start_new_project(&d, &n, b.as_deref())));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -3019,7 +3078,7 @@ impl App {
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                         }
                     });
@@ -3049,7 +3108,7 @@ impl App {
                     });
                     ui.label(
                         RichText::new("Texts without a translation are printed as drawn and listed as warnings.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                            .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -3078,7 +3137,11 @@ impl App {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                        if ui
+                            .add_enabled(bad.is_none(), egui::Button::new("OK"))
+                            .on_disabled_hover_text(bad.as_deref().unwrap_or_default())
+                            .clicked()
+                        {
                             let (rows, loaded, dir) = (rows.clone(), loaded.clone(), dir.clone());
                             then = Some(Box::new(move |app: &mut App| {
                                 if let Err(e) = app.apply_rules(&rows, &loaded, &dir) {
@@ -3087,7 +3150,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.show_check()));
                         }
@@ -3116,7 +3179,7 @@ impl App {
                         });
                     ui.label(
                         RichText::new("These fields fill the title block on every page.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                            .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.add_space(8.0);
                     ui.label(RichText::new("Locations").strong());
@@ -3263,7 +3326,7 @@ impl App {
                             let current = o.project.meta.logo.as_ref().map(|l| l.file.clone());
                             ui.label(
                                 RichText::new(current.as_deref().unwrap_or("none"))
-                                    .color(theme::Theme::of(ui.ctx()).faint),
+                                    .color(theme::Theme::of(ui.ctx()).muted),
                             );
                             if ui
                                 .button("Logo...")
@@ -3292,7 +3355,7 @@ impl App {
                              Add free text on the cover with the Text tool. Drag the logo on the \
                              cover to move it, or its bottom-right corner to size it.",
                         )
-                        .color(theme::Theme::of(ui.ctx()).faint),
+                        .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3335,13 +3398,13 @@ impl App {
                             "Every page shows each change at once. The layout is kept in \
                              project.toml; a project on the built-in layout leaves it out.",
                         )
-                        .color(theme::Theme::of(ui.ctx()).faint),
+                        .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_template(*since, before);
                             }
@@ -3392,13 +3455,13 @@ impl App {
                             "The PLC cards report shows each change at once. The racks are kept \
                              in project.toml.",
                         )
-                        .color(t.faint),
+                        .color(t.muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_racks(*since, before);
                             }
@@ -3514,11 +3577,7 @@ impl App {
                                 .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
                                     for f in found.iter() {
-                                        let c = match f.severity {
-                                            wc_report::Severity::Error => t.error,
-                                            wc_report::Severity::Warning => t.selection,
-                                            wc_report::Severity::Note => t.faint,
-                                        };
+                                        let c = severity_colour(&t, f.severity);
                                         ui.label(RichText::new(f.severity.label()).color(c));
                                         let page = f
                                             .page_id
@@ -3547,6 +3606,7 @@ impl App {
                             && let Some(o) = self.open.as_ref()
                         {
                             *found = run_check(o);
+                            self.check_follows_live = false;
                         }
                         if ui
                             .button("Rules…")
@@ -3624,7 +3684,7 @@ impl App {
                             }
                             ui.label(
                                 RichText::new(format!("{} rows", table.rows.len()))
-                                    .color(theme::Theme::of(ui.ctx()).faint),
+                                    .color(theme::Theme::of(ui.ctx()).muted),
                             );
                         });
                     } else {
@@ -3662,7 +3722,11 @@ impl App {
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                            if ui
+                                .add_enabled(bad.is_none(), egui::Button::new("OK"))
+                                .on_disabled_hover_text(bad.as_deref().unwrap_or_default())
+                                .clicked()
+                            {
                                 let (form, dir) = (form.as_ref().clone(), dir.clone());
                                 then = Some(Box::new(move |app: &mut App| {
                                     if let Err(e) = app.apply_report_layout(&form, &dir) {
@@ -3674,7 +3738,7 @@ impl App {
                             if ui.button("Built-in layout").on_hover_text("Clear the form to the report's own columns").clicked() {
                                 **form = form.cleared();
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button("Cancel").clicked() || escape {
                                 let k = form.kind;
                                 then = Some(Box::new(move |app: &mut App| app.dialog = Some(Dialog::Reports(k))));
                                 keep = false;
@@ -3708,7 +3772,7 @@ impl App {
                 }
                 Dialog::Comment(at, text, focused) => {
                     ui.label(
-                        RichText::new(format!("As {}", state::author_name())).color(theme::Theme::of(ui.ctx()).faint),
+                        RichText::new(format!("As {}", state::author_name())).color(theme::Theme::of(ui.ctx()).muted),
                     );
                     let r = ui.add(egui::TextEdit::multiline(text).desired_width(360.0).desired_rows(4));
                     if !*focused {
@@ -3718,6 +3782,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(!text.trim().is_empty(), egui::Button::new("Add comment"))
+                            .on_disabled_hover_text("Type the comment first.")
                             .clicked()
                         {
                             self.add_comment_at(*at, text);
@@ -3799,7 +3864,7 @@ impl App {
                     if versions.is_empty() {
                         ui.label(format!("Page {page} has no recorded versions yet."));
                         ui.label(
-                            RichText::new("Record a version (Versions menu) to start its history.").color(t.faint),
+                            RichText::new("Record a version (Versions menu) to start its history.").color(t.muted),
                         );
                     }
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
@@ -3808,7 +3873,7 @@ impl App {
                                 ui.label(
                                     RichText::new(&v.commit[..v.commit.len().min(8)])
                                         .monospace()
-                                        .color(t.faint),
+                                        .color(t.muted),
                                 );
                                 ui.label(RichText::new(&v.subject).strong());
                             });
@@ -3824,7 +3889,7 @@ impl App {
                                 ui.label(
                                     RichText::new("   no changes to symbols or wires")
                                         .small()
-                                        .color(t.faint),
+                                        .color(t.muted),
                                 );
                             }
                             ui.add_space(6.0);
@@ -3977,19 +4042,28 @@ impl App {
                         }
                     });
                 }
-                Dialog::Commit(msg) => {
+                Dialog::Commit(msg, focused) => {
                     ui.label("What changed?");
-                    ui.add(egui::TextEdit::multiline(msg).desired_rows(3).desired_width(380.0));
+                    let r = ui.add(egui::TextEdit::multiline(msg).desired_rows(3).desired_width(380.0));
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
                     ui.horizontal(|ui| {
-                        if ui
+                        // Enter starts a new line in the message; Ctrl+Enter records it.
+                        let enter = r.has_focus() && ui.input(|i| pressed_with(i, Key::Enter, |m| m.command_only()));
+                        if (ui
                             .add_enabled(!msg.trim().is_empty(), egui::Button::new("Commit"))
+                            .on_disabled_hover_text("Describe what changed first.")
                             .clicked()
+                            || enter)
+                            && !msg.trim().is_empty()
                         {
                             let m = msg.trim().to_owned();
                             then = Some(Box::new(move |app: &mut App| app.commit(&m)));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -4292,19 +4366,31 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewBranch(name) => {
+                Dialog::NewBranch(name, focused) => {
                     ui.label("Branch name (for example customer-changes):");
-                    ui.text_edit_singleline(name);
+                    let r = ui.text_edit_singleline(name);
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
                     ui.horizontal(|ui| {
-                        if ui
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if (ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Create and switch"))
+                            .on_disabled_hover_text("Name the branch first.")
                             .clicked()
+                            || enter)
+                            && !name.trim().is_empty()
                         {
                             let n = name.trim().to_owned();
                             then = Some(Box::new(move |app: &mut App| app.branch(&n)));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        else if enter {
+                            // Enter on a blank name took the keyboard from the field: give it back.
+                            r.request_focus();
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -4323,15 +4409,7 @@ impl App {
                             .num_columns(3)
                             .show(ui, |ui| {
                                 for it in items.iter() {
-                                    let (c, s) = match it.state {
-                                        wc_library::State::UpToDate => {
-                                            (egui::Color32::from_rgb(0x2e, 0x8b, 0x57), "up to date")
-                                        }
-                                        wc_library::State::Changed => (t.selection, "newer in library"),
-                                        wc_library::State::NotLocked => (t.wire, "not pinned"),
-                                        wc_library::State::GoneFromLibrary => (t.error, "gone from library"),
-                                        wc_library::State::WrongId => (t.error, "library file has another id"),
-                                    };
+                                    let (c, s) = library_state_look(&t, it.state);
                                     chrome::dot(ui, c);
                                     ui.label(RichText::new(&it.id).monospace());
                                     if it.state == wc_library::State::WrongId {
@@ -4432,6 +4510,7 @@ impl App {
     /// Show the project check, run now.
     fn show_check(&mut self) {
         if let Some(o) = self.open.as_ref() {
+            self.check_follows_live = false;
             self.dialog = Some(Dialog::Check(run_check(o)));
         }
     }
@@ -5063,11 +5142,12 @@ fn window_icon() -> egui::IconData {
         })
 }
 
-/// The main window: size, title and icon.
-fn main_viewport() -> egui::ViewportBuilder {
+/// The main window: size (as it was last closed), title and icon.
+fn main_viewport(window: &prefs::Window) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_inner_size([1400.0, 860.0])
-        .with_min_inner_size([900.0, 560.0])
+        .with_inner_size(window.open_size())
+        .with_min_inner_size(prefs::Window::MIN)
+        .with_maximized(window.maximized)
         .with_title("WiringCraft")
         .with_icon(window_icon())
 }
@@ -5176,6 +5256,79 @@ fn find_library(exe_dir: Option<&Path>, source: &Path) -> Option<PathBuf> {
         .and_then(|d| d.canonicalize().ok())
 }
 
+/// The text colour for a Check finding. Interface tokens only: the sheet colours are tuned
+/// for the white paper and fade on the dark window.
+fn severity_colour(t: &theme::Theme, severity: wc_report::Severity) -> egui::Color32 {
+    match severity {
+        wc_report::Severity::Error => t.error,
+        wc_report::Severity::Warning => t.warning,
+        wc_report::Severity::Note => t.muted,
+    }
+}
+
+/// The dot colour and words for a pinned library item in the Library status dialog.
+fn library_state_look(t: &theme::Theme, state: wc_library::State) -> (egui::Color32, &'static str) {
+    match state {
+        wc_library::State::UpToDate => (t.success, "up to date"),
+        wc_library::State::Changed => (t.warning, "newer in library"),
+        wc_library::State::NotLocked => (t.accent, "not pinned"),
+        wc_library::State::GoneFromLibrary => (t.error, "gone from library"),
+        wc_library::State::WrongId => (t.error, "library file has another id"),
+    }
+}
+
+#[cfg(test)]
+mod status_colour_tests {
+    use super::{library_state_look, severity_colour, theme};
+
+    fn luminance(c: eframe::egui::Color32) -> f32 {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast(a: eframe::egui::Color32, b: eframe::egui::Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn status_colours_stay_readable_on_the_window_in_both_modes() {
+        use wc_library::State;
+        use wc_report::Severity;
+        for dark in [false, true] {
+            let t = theme::Theme::new(dark);
+            let states = [
+                State::UpToDate,
+                State::Changed,
+                State::NotLocked,
+                State::GoneFromLibrary,
+                State::WrongId,
+            ];
+            for s in states {
+                let (c, _) = library_state_look(&t, s);
+                assert!(contrast(c, t.surface) >= 3.0, "{s:?} dot in dark={dark}");
+            }
+            for s in [Severity::Error, Severity::Warning, Severity::Note] {
+                let c = severity_colour(&t, s);
+                assert!(contrast(c, t.surface) >= 3.0, "{s:?} text in dark={dark}");
+            }
+            // The interface tokens, not the sheet colours they replaced.
+            assert_eq!(severity_colour(&t, Severity::Warning), t.warning);
+            assert_eq!(severity_colour(&t, Severity::Note), t.muted);
+            assert_eq!(library_state_look(&t, State::UpToDate).0, t.success);
+            assert_eq!(library_state_look(&t, State::NotLocked).0, t.accent);
+            assert_eq!(library_state_look(&t, State::Changed).0, t.warning);
+        }
+    }
+}
+
 /// The version history drawn as a subway map: one coloured line per branch lane.
 fn subway(ui: &mut egui::Ui, rows: &[wc_vcs::subway::Row]) {
     const LINES: [egui::Color32; 6] = [
@@ -5276,7 +5429,7 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
         .auto_shrink([false, true])
         .show(ui, |ui| {
             if t.rows.is_empty() {
-                ui.label(RichText::new("Nothing to list yet.").color(theme.faint));
+                ui.label(RichText::new("Nothing to list yet.").color(theme.muted));
                 return;
             }
             egui::Grid::new(("report", t.title.as_str()))
@@ -5322,6 +5475,19 @@ fn arrow_steps(i: &egui::InputState, step: f64) -> Vec<wc_core::geom::Point> {
         .collect()
 }
 
+/// Puts the cursor in `field` in the first frame a dialog shows it, as a person opening the
+/// dialog expects to type straight away. Remembered per field: a field seen in the previous
+/// frame keeps whatever focus the person gave it; one not seen then is a dialog just opened.
+fn focus_on_open(ui: &egui::Ui, field: &egui::Response) {
+    let key = field.id.with("seen in pass");
+    let pass = ui.ctx().cumulative_pass_nr();
+    let seen: Option<u64> = ui.data(|d| d.get_temp(key));
+    if seen.is_none_or(|s| s + 1 < pass) {
+        field.request_focus();
+    }
+    ui.data_mut(|d| d.insert_temp(key, pass));
+}
+
 /// A project's title-block fields as form rows: the standard fields first (empty when not
 /// set), then any others the project has.
 /// Whether `a` saves the open project: what was typed in a field and not entered yet is
@@ -5357,8 +5523,10 @@ fn enter_typed_value(ctx: &egui::Context) {
     }
 }
 
-/// The Ctrl shortcuts pressed this frame, none while a dialog is open.
-fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
+/// The Ctrl shortcuts pressed this frame, none while a dialog is open. While a text field has
+/// the keyboard (`typing`), Ctrl+A, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y are left to the field: they
+/// select its text and undo or redo the typing, not select the page or undo the schematic.
+fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool, typing: bool) -> Vec<Action> {
     let mut out = Vec::new();
     if dialog_open {
         return out;
@@ -5380,6 +5548,9 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::J, Action::Assistant),
             (Key::D, Action::Duplicate),
         ] {
+            if typing && is_text_edit_key(k) {
+                continue;
+            }
             // With Shift first: Ctrl+Shift+N is a new project, Ctrl+Shift+Z redoes (a plain Ctrl
             // shortcut would also take them, as it lets Shift through).
             let shifted = match k {
@@ -5400,6 +5571,19 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
     out
 }
 
+/// Whether a text field has the keyboard. `wants_keyboard_input` is not enough: it is true for
+/// any focused widget, such as a button reached with Tab, and that must not take Ctrl+A or undo
+/// from the app. Only a text field keeps an edit state under its id.
+fn text_field_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused())
+        .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+}
+
+/// The Ctrl keys a text field handles itself: select all, undo and redo.
+fn is_text_edit_key(k: Key) -> bool {
+    matches!(k, Key::A | Key::Z | Key::Y)
+}
+
 /// Whether `key` was pressed this frame with modifiers that `ok` accepts. It looks at the
 /// modifiers held at the press itself: the frame's modifiers can differ, as when Ctrl is let go
 /// before the frame runs, and Ctrl+R must not then rotate.
@@ -5407,6 +5591,27 @@ fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool)
     i.events
         .iter()
         .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && ok(modifiers)))
+}
+
+/// Whether Escape, pressed this frame, cancels the open form dialog (rules, translations, macro
+/// placeholders, page template, PLC racks, report layout). An Escape that closes a drop-down
+/// list open since last frame only closes that list, so the form and its edits stay. A key
+/// repeat of a held Escape does not count: holding it to close a list would cancel the form.
+fn escape_cancels(ctx: &egui::Context) -> bool {
+    let pressed = ctx.input(|i| {
+        i.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::Escape,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                }
+            )
+        })
+    });
+    pressed && !ctx.memory(|m| m.any_popup_open())
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -5863,7 +6068,23 @@ fn export_drawings_logged(open: &Open, dir: &Path) -> (String, String) {
     }
 }
 
+/// Note the main window from one frame's viewport. Its size is kept in points at GUI zoom 1,
+/// the unit the window opens with, so a window closed while zoomed in opens at the same size.
+/// A minimized window reports no usable size and changes nothing.
+fn remember_window(window: &mut prefs::Window, v: &egui::ViewportInfo, zoom: f32) {
+    if v.minimized == Some(true) {
+        return;
+    }
+    let size = v.inner_rect.map(|r| [r.width() * zoom, r.height() * zoom]);
+    window.remember(size, v.maximized);
+}
+
 impl eframe::App for App {
+    /// The window's size and maximized state are kept for the next start.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        prefs::Prefs::save_window(self.prefs.window);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // A close that waited a frame for a typed value: the field gives up the keyboard, so
         // the panels enter its value before the close asks about unsaved changes.
@@ -5876,6 +6097,8 @@ impl eframe::App for App {
         }
         self.hold_close_while_importing(ctx);
         self.ask_before_closing(ctx);
+        let zoom = ctx.zoom_factor();
+        ctx.input(|i| remember_window(&mut self.prefs.window, i.viewport(), zoom));
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -5982,7 +6205,7 @@ impl eframe::App for App {
                     )
                 });
                 if panels::status_bar(ui, self.open.as_ref(), &self.ed, live) {
-                    self.dialog = Some(Dialog::Check(self.ed.live.clone()));
+                    self.show_live_check_list();
                 }
             });
         self.assistant_panel(ctx);
@@ -6035,11 +6258,16 @@ impl eframe::App for App {
         } else {
             let mut start = None;
             let mut recent = None;
+            let mut forget = None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(t.backdrop))
                 .show(ctx, |ui| {
-                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent);
+                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent, &mut forget);
                 });
+            if let Some(d) = forget {
+                self.prefs.forget(&d);
+                self.prefs.save();
+            }
             if let Some(d) = recent {
                 let mut prefs = std::mem::take(&mut self.prefs);
                 self.open_dir(&d, &mut prefs);
@@ -6132,7 +6360,10 @@ impl eframe::App for App {
             ),
             None => "WiringCraft".into(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
     }
 }
 
@@ -6143,6 +6374,8 @@ impl App {
         let Some(o) = self.open.as_ref().filter(|_| self.prefs.live_check) else {
             self.live.clear();
             self.ed.live.clear();
+            // The list keeps the findings it shows once there is no live check to follow.
+            self.check_follows_live = false;
             return;
         };
         // A keystroke, a click or a drag may edit (even one that does not report itself in the
@@ -6172,6 +6405,27 @@ impl App {
         }
         if let Some(after) = poll.again {
             ctx.request_repaint_after(after);
+        }
+        self.follow_live_check();
+    }
+
+    /// Show the Project check list from the live-check count: it follows the live check's
+    /// findings while it is open, so it does not go stale as the check finds more.
+    fn show_live_check_list(&mut self) {
+        self.dialog = Some(Dialog::Check(self.ed.live.clone()));
+        self.check_follows_live = true;
+    }
+
+    /// Bring the check list opened from the live-check count up to the latest live findings;
+    /// any other dialog (or none) ends the following.
+    fn follow_live_check(&mut self) {
+        match &mut self.dialog {
+            Some(Dialog::Check(found)) if self.check_follows_live => {
+                if *found != self.ed.live {
+                    found.clone_from(&self.ed.live);
+                }
+            }
+            _ => self.check_follows_live = false,
         }
     }
 
@@ -6329,7 +6583,16 @@ impl App {
         if changed {
             self.layers_changed();
         }
+        self.set_layers_open(open);
+    }
+
+    /// Open or close the Layers window, and keep that in the preferences for the next start.
+    fn set_layers_open(&mut self, open: bool) {
         self.show_layers = open;
+        if self.prefs.show_layers != open {
+            self.prefs.show_layers = open;
+            self.prefs.save();
+        }
     }
 
     /// The layer list changed: save it and apply it to the editor at once, so a command run
@@ -6398,7 +6661,7 @@ impl App {
         };
         let hits = find.chosen_hits();
         find.message = match open.replace_found(&hits, &find.query, &find.with, find.options()) {
-            Ok(n) => find_window::replaced_note(n, &hits),
+            Ok(n) => find.replaced_note(n, &hits),
             Err(e) => e,
         };
         // The items replaced may no longer match; what is selected may be gone.
@@ -6708,14 +6971,27 @@ fn read_only_banner(ui: &egui::Ui, t: &theme::Theme, name: &str) {
     p.galley(rect.min + Vec2::new(12.0, 6.0), galley, t.text);
 }
 
+/// Why a recent project folder cannot be opened, or `None` when it is a folder. A folder that
+/// cannot be read keeps the reason, so it is not taken for a missing one.
+fn recent_problem(d: &Path) -> Option<String> {
+    match std::fs::metadata(d) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some("not a folder".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("folder not found".into()),
+        Err(e) => Some(format!("cannot be read: {e}")),
+    }
+}
+
 /// The start screen shown when no project is open: a card with the two ways in and the
-/// recently opened projects.
+/// recently opened projects. A recent folder that is gone is shown muted, and any entry can be
+/// taken out of the list from its right-click menu (`forget`).
 fn welcome(
     ui: &mut egui::Ui,
     t: &theme::Theme,
     recent: &[PathBuf],
     start: &mut Option<Action>,
     open_recent: &mut Option<PathBuf>,
+    forget: &mut Option<PathBuf>,
 ) {
     let width = 440.0;
     ui.add_space((ui.available_height() * 0.18).max(24.0));
@@ -6755,17 +7031,33 @@ fn welcome(
                 if !recent.is_empty() {
                     ui.add_space(18.0);
                     panels::section(ui, "Recent projects", None);
-                    for d in recent.iter().take(6) {
-                        let name = d
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| d.display().to_string());
-                        let r = panels::row(ui, false, panels::Lead::Dot(t.accent), RichText::new(name), false)
-                            .on_hover_text(d.display().to_string());
-                        if r.clicked() {
-                            *open_recent = Some(d.clone());
+                    // Every entry stays reachable in a short window.
+                    egui::ScrollArea::vertical().id_salt("recent").show(ui, |ui| {
+                        for d in recent {
+                            let name = d
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| d.display().to_string());
+                            let (dot, text, hover) = match recent_problem(d) {
+                                None => (t.accent, RichText::new(name), d.display().to_string()),
+                                Some(why) => (
+                                    t.muted,
+                                    RichText::new(name).color(t.muted),
+                                    format!("{} ({why})", d.display()),
+                                ),
+                            };
+                            let r = panels::row(ui, false, panels::Lead::Dot(dot), text, false).on_hover_text(hover);
+                            if r.clicked() {
+                                *open_recent = Some(d.clone());
+                            }
+                            r.context_menu(|ui| {
+                                if ui.button("Remove from recent projects").clicked() {
+                                    *forget = Some(d.clone());
+                                    ui.close_menu();
+                                }
+                            });
                         }
-                    }
+                    });
                 }
             });
     });
@@ -6775,6 +7067,13 @@ fn welcome(
 const REPORT_LOG_BYTES: usize = 60_000;
 /// How much of the log's end goes into the report form itself (the link has a size limit).
 const REPORT_FORM_BYTES: usize = 1_500;
+
+/// The "Include this log" box: whether it can be used and whether it shows ticked. An empty log
+/// has nothing to include, so the box is greyed out and unticked whatever was chosen.
+fn include_log_box(log: &str, include: bool) -> (bool, bool) {
+    let enabled = !log.is_empty();
+    (enabled, enabled && include)
+}
 
 /// The report form's fields and the text for the clipboard: the log goes in only when the person
 /// chose to include it and there is one.
@@ -6869,7 +7168,7 @@ fn main() -> eframe::Result {
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let wanted = std::env::var(RENDERER_VAR).ok();
     let options = eframe::NativeOptions {
-        viewport: main_viewport(),
+        viewport: main_viewport(&Prefs::load().window),
         renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
@@ -6965,7 +7264,7 @@ mod renderer_tests {
                 ..Default::default()
             };
             let mut got = Vec::new();
-            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open));
+            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open, false));
             got
         };
         assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
@@ -7028,27 +7327,90 @@ mod renderer_tests {
     #[test]
     fn ctrl_shift_z_redoes_and_ctrl_z_undoes() {
         let ctx = egui::Context::default();
-        let press = |modifiers: Modifiers, key: Key| {
-            let raw = egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
-                ..Default::default()
-            };
-            let mut got = Vec::new();
-            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, false));
-            got
-        };
+        let press = |modifiers: Modifiers, key: Key| press_ctrl(&ctx, modifiers, key, false);
         let shift = Modifiers::COMMAND | Modifiers::SHIFT;
         assert_eq!(press(shift, Key::Z), [Action::Redo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Z), [Action::Undo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Y), [Action::Redo]);
         assert_eq!(press(shift, Key::N), [Action::NewProject]);
+    }
+
+    /// In a text field Ctrl+A, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y are the field's (select its
+    /// text, undo or redo the typing); the other Ctrl shortcuts still work.
+    #[test]
+    fn a_text_field_keeps_its_select_all_undo_and_redo_keys() {
+        let ctx = egui::Context::default();
+        let typing = |modifiers: Modifiers, key: Key| press_ctrl(&ctx, modifiers, key, true);
+        let shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        for (m, k) in [
+            (Modifiers::COMMAND, Key::A),
+            (Modifiers::COMMAND, Key::Z),
+            (shift, Key::Z),
+            (Modifiers::COMMAND, Key::Y),
+        ] {
+            assert!(typing(m, k).is_empty(), "{m:?} {k:?} is left to the text field");
+        }
+        assert_eq!(typing(Modifiers::COMMAND, Key::S), [Action::Save]);
+        assert_eq!(typing(shift, Key::S), [Action::SaveAs]);
+        assert_eq!(typing(Modifiers::COMMAND, Key::F), [Action::Find]);
+        // Out of a text field they are the app's again.
+        assert_eq!(press_ctrl(&ctx, Modifiers::COMMAND, Key::A, false), [Action::SelectAll]);
+    }
+
+    /// A focused button is not a text field: Ctrl+A and undo stay the app's. A focused text
+    /// field is one.
+    #[test]
+    fn only_a_focused_text_field_counts_as_typing() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let frame = |ctx: &egui::Context, text: &mut String| {
+            let mut button = egui::Id::NULL;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    button = ui.add(egui::Button::new("Close")).id;
+                    ui.add(egui::TextEdit::singleline(text).id(egui::Id::new("field")));
+                });
+            });
+            button
+        };
+        let field = egui::Id::new("field");
+        let button = frame(&ctx, &mut text);
+        ctx.memory_mut(|m| m.request_focus(button));
+        frame(&ctx, &mut text);
+        assert!(ctx.wants_keyboard_input(), "the button has the focus");
+        assert!(!text_field_focused(&ctx), "a button is not a text field");
+        let ctrl_a = press_ctrl(&ctx, Modifiers::COMMAND, Key::A, text_field_focused(&ctx));
+        assert_eq!(ctrl_a, [Action::SelectAll]);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame(&ctx, &mut text);
+        assert!(text_field_focused(&ctx), "the text field has the keyboard");
+    }
+
+    /// The Ctrl shortcuts of one key press, with or without a text field having the keyboard.
+    fn press_ctrl(ctx: &egui::Context, modifiers: Modifiers, key: Key, typing: bool) -> Vec<Action> {
+        let raw = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, false, typing));
+        got
+    }
+
+    /// An empty log greys out "Include this log" and shows it unticked; a log leaves the choice.
+    #[test]
+    fn the_include_log_box_is_off_for_an_empty_log() {
+        assert_eq!(include_log_box("", true), (false, false));
+        assert_eq!(include_log_box("", false), (false, false));
+        assert_eq!(include_log_box("started", true), (true, true));
+        assert_eq!(include_log_box("started", false), (true, false));
     }
 
     #[test]
@@ -7071,6 +7433,20 @@ mod renderer_tests {
 #[allow(clippy::unwrap_used)]
 mod library_tests {
     use super::*;
+
+    /// A recent folder that is there is fine; a missing one and a file each say why.
+    #[test]
+    fn a_recent_project_says_why_it_cannot_be_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(recent_problem(tmp.path()), None);
+        assert_eq!(
+            recent_problem(&tmp.path().join("gone")).as_deref(),
+            Some("folder not found")
+        );
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(recent_problem(&file).as_deref(), Some("not a folder"));
+    }
 
     #[test]
     fn wires_on_pins_a_new_symbol_version_drops_are_listed() {
@@ -7148,6 +7524,8 @@ mod library_tests {
 
 #[cfg(test)]
 mod icon_tests {
+    use eframe::egui;
+
     #[test]
     fn the_window_icon_is_built_in() {
         let icon = super::window_icon();
@@ -7157,8 +7535,75 @@ mod icon_tests {
 
     #[test]
     fn the_main_window_carries_the_icon() {
-        let icon = super::main_viewport().icon;
+        let icon = super::main_viewport(&Default::default()).icon;
         assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
+    }
+
+    #[test]
+    fn the_main_window_opens_at_the_kept_size_and_state() {
+        let window = super::prefs::Window {
+            size: Some([1200.0, 700.0]),
+            maximized: true,
+        };
+        let v = super::main_viewport(&window);
+        assert_eq!(v.inner_size, Some(egui::vec2(1200.0, 700.0)));
+        assert_eq!(v.maximized, Some(true));
+    }
+
+    #[test]
+    fn the_window_size_is_kept_without_the_gui_zoom() {
+        let mut window = super::prefs::Window::default();
+        let mut v = egui::ViewportInfo {
+            inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        // At GUI zoom 1.2 a 1440 x 960 window measures 1200 x 800 points.
+        super::remember_window(&mut window, &v, 1.2);
+        let kept = window.size;
+        assert!(
+            matches!(kept, Some([w, h]) if (w - 1440.0).abs() < 0.01 && (h - 960.0).abs() < 0.01),
+            "{kept:?}"
+        );
+        // A minimized window changes nothing, not even the maximized state.
+        v.minimized = Some(true);
+        v.maximized = Some(true);
+        v.inner_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.0, 0.0)));
+        super::remember_window(&mut window, &v, 1.0);
+        assert!(!window.maximized);
+        assert_eq!(window.size, kept);
+    }
+}
+
+#[cfg(test)]
+mod theme_mode_tests {
+    use super::theme;
+    use eframe::egui;
+
+    /// One frame with the OS reporting `system` as its mode.
+    fn frame_with_system(ctx: &egui::Context, system: egui::Theme) {
+        let raw = egui::RawInput {
+            system_theme: Some(system),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |_| {});
+    }
+
+    #[test]
+    fn the_chosen_mode_stays_when_the_system_mode_changes() {
+        for (mode, dark, other) in [
+            (theme::Mode::Light, false, egui::Theme::Dark),
+            (theme::Mode::Dark, true, egui::Theme::Light),
+        ] {
+            let ctx = egui::Context::default();
+            frame_with_system(&ctx, if dark { egui::Theme::Dark } else { egui::Theme::Light });
+            theme::apply(&ctx, mode);
+            frame_with_system(&ctx, other);
+            let v = ctx.style().visuals.clone();
+            assert_eq!(v.dark_mode, dark, "{mode:?}");
+            assert_eq!(v.panel_fill, theme::Theme::new(dark).panel, "{mode:?}");
+            assert_eq!(theme::Theme::of(&ctx).panel, theme::Theme::new(dark).panel);
+        }
     }
 }
 
@@ -7741,6 +8186,60 @@ mod marking_tests {
 }
 
 #[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> bool {
+        let mut esc = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| esc = escape_cancels(ctx),
+        );
+        esc
+    }
+
+    fn escape() -> egui::Event {
+        key(false)
+    }
+
+    fn release() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    pub(super) fn key(repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn escape_cancels_a_form_dialog_unless_it_closes_an_open_drop_down() {
+        let ctx = egui::Context::default();
+        assert!(!frame(&ctx, vec![]));
+        assert!(frame(&ctx, vec![escape()]));
+        // Escape held down: its repeats do not cancel the form.
+        assert!(!frame(&ctx, vec![key(true)]));
+        // Let go of Escape so the popup case below is a fresh press, not a repeat.
+        assert!(!frame(&ctx, vec![release()]));
+        ctx.memory_mut(|m| m.open_popup(egui::Id::new("combo")));
+        assert!(!frame(&ctx, vec![escape()]));
+    }
+}
+
+#[cfg(test)]
 mod page_size_tests {
     use super::*;
 
@@ -7816,12 +8315,50 @@ mod nudge_tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         (tmp, app, egui::Context::default())
+    }
+
+    /// The menu and toolbars do not offer what the symbol editor holds back: the commands it
+    /// refuses show disabled while it is open, and enabled again once it is closed (#1345).
+    #[test]
+    fn commands_held_by_the_symbol_editor_show_disabled() {
+        use chrome::Status;
+        let (_tmp, mut app, _) = app(Point::new(80.0, 60.0), false);
+        app.clipboard = app.open.as_ref().unwrap().copy(app.ed.page, &app.ed.selection);
+        let held = [
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::Duplicate,
+            Action::Rotate,
+            Action::Mirror,
+            Action::SelectAll,
+        ];
+        let se = symbol_editor::SymbolEditor::new(Vec::new());
+        for editor in [None, Some(&se)] {
+            let status = StatusView {
+                open: app.open.as_ref(),
+                ed: &app.ed,
+                prefs: &app.prefs,
+                clipboard: &app.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+                symbol_editor: editor,
+            };
+            for a in held {
+                assert!(held_by_symbol_editor(a));
+                assert_eq!(status.enabled(a), editor.is_none(), "{a:?}");
+            }
+        }
     }
 
     /// One frame with `key` pressed; `focus_text` gives a text field the keyboard first.
@@ -8158,6 +8695,244 @@ mod nudge_tests {
         sent
     }
 
+    /// While an import runs, its window's Grid and Dark mode controls read as on when the grid
+    /// is shown and the theme is dark, as the toolbar and menu show them.
+    #[test]
+    fn the_import_window_shows_the_grid_and_dark_mode_as_they_are() {
+        let tab = egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for (grid, dark) in [(true, true), (false, false), (true, false), (false, true)] {
+            let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            app.prefs.show_grid = grid;
+            app.prefs.theme = if dark { theme::Mode::Dark } else { theme::Mode::Light };
+            theme::apply(&ctx, app.prefs.theme);
+            let (job, _running) = imports::Job::running("plan.edz", tmp.path());
+            app.importing = Some(Importing {
+                job,
+                kind: imports::Kind::Eplan,
+                file: tmp.path().join("plan.edz"),
+                lib: None,
+                target: None,
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            // Tab through the window's controls and read whether each shows as on.
+            let mut seen: std::collections::BTreeMap<String, bool> = Default::default();
+            for _ in 0..200 {
+                let out = app_frame_output(&mut app, &ctx, vec![tab.clone()], false);
+                for e in &out.platform_output.events {
+                    if let egui::output::OutputEvent::FocusGained(w) = e
+                        && let (Some(label), Some(on)) = (&w.label, w.selected)
+                    {
+                        seen.insert(label.clone(), on);
+                    }
+                }
+                if seen.contains_key("Grid") && seen.contains_key("Dark mode") {
+                    break;
+                }
+            }
+            assert!(app.importing.is_some(), "the import still runs");
+            assert_eq!(seen.get("Grid"), Some(&grid), "grid {grid}, dark {dark}: {seen:?}");
+            assert_eq!(seen.get("Dark mode"), Some(&dark), "grid {grid}, dark {dark}: {seen:?}");
+        }
+    }
+
+    /// Escape cancels the Open project, Save as, New project and Save as macro dialogs, as it
+    /// does the other small dialogs.
+    #[test]
+    fn escape_cancels_the_path_and_macro_dialogs() {
+        let dialogs: [fn() -> Dialog; 4] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+            || Dialog::NewProject {
+                location: prefs::FolderField::typed(""),
+                name: String::new(),
+                base: String::new(),
+                error: None,
+            },
+            || Dialog::SaveMacro {
+                clip: Default::default(),
+                name: "M".into(),
+                description: String::new(),
+                error: None,
+            },
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            assert!(app.dialog.is_some());
+            let escape = egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            app_frame(&mut app, &ctx, vec![escape], false);
+            assert!(app.dialog.is_none(), "Escape cancels");
+        }
+    }
+
+    /// Escape that cancels one of those dialogs is used up there: a shape half drawn in the
+    /// symbol editor behind it is kept.
+    #[test]
+    fn escape_on_a_path_or_macro_dialog_keeps_a_half_drawn_symbol_shape() {
+        let dialogs: [fn() -> Dialog; 4] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+            || Dialog::NewProject {
+                location: prefs::FolderField::typed(""),
+                name: String::new(),
+                base: String::new(),
+                error: None,
+            },
+            || Dialog::SaveMacro {
+                clip: Default::default(),
+                name: "M".into(),
+                description: String::new(),
+                error: None,
+            },
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+            ed.set_tool(symbol_editor::Tool::Line);
+            ed.click(Point::new(0.0, 0.0));
+            ed.owner = app.open.as_ref().map(|o| o.dir.clone());
+            assert!(ed.drawing_shape());
+            app.symbol_editor = Some(ed);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            ctx.memory_mut(|m| m.stop_text_input());
+            let escape = egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            app_frame(&mut app, &ctx, vec![escape], false);
+            assert!(app.dialog.is_none(), "Escape cancels");
+            assert!(
+                app.symbol_editor
+                    .as_ref()
+                    .is_some_and(symbol_editor::SymbolEditor::drawing_shape),
+                "the half drawn shape is kept"
+            );
+        }
+    }
+
+    /// Enter in either field of Save as macro saves the macro when it has a name, and does
+    /// nothing while the name is blank.
+    #[test]
+    fn enter_in_a_macro_field_saves_only_a_named_macro() {
+        let key = |key: Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        // Tab to the next widget and say what took the focus: its kind and its text.
+        let tab = |app: &mut App, ctx: &egui::Context| {
+            let out = app_frame_output(app, ctx, vec![key(Key::Tab)], false);
+            out.platform_output.events.iter().find_map(|e| match e {
+                egui::output::OutputEvent::FocusGained(w) => Some((w.typ, w.current_text_value.clone())),
+                _ => None,
+            })
+        };
+        for (name, in_description) in [("Starter", false), ("Starter", true), ("  ", false), ("  ", true)] {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            // The selected coil is what the macro holds.
+            let clip = app.open.as_ref().unwrap().copy(app.ed.page, &app.ed.selection);
+            assert!(!clip.is_empty());
+            app.dialog = Some(Dialog::SaveMacro {
+                clip,
+                name: name.into(),
+                description: String::new(),
+                error: None,
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            // Tab past the menus to the Name field, and on to Description if asked.
+            let mut tabs = 0;
+            while tab(&mut app, &ctx) != Some((egui::WidgetType::TextEdit, Some(name.to_owned()))) {
+                tabs += 1;
+                assert!(tabs < 200, "no Name field to tab to");
+            }
+            if in_description {
+                assert_eq!(
+                    tab(&mut app, &ctx),
+                    Some((egui::WidgetType::TextEdit, Some(String::new()))),
+                    "Description follows Name"
+                );
+            }
+            // A frame with the field focused, so Enter makes it lose the focus.
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, vec![key(Key::Enter)], false);
+            let saved = app.ed.message.starts_with("Saved macro");
+            if name.trim().is_empty() {
+                assert!(app.dialog.is_some(), "a blank name is not saved ({in_description})");
+                assert!(!saved, "{}", app.ed.message);
+            } else {
+                assert!(app.dialog.is_none(), "Enter saves ({in_description})");
+                assert!(saved, "{}", app.ed.message);
+            }
+        }
+    }
+
+    fn key(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// The version and branch dialogs give their field the keyboard when they open, so typing
+    /// goes straight in; Enter (Ctrl+Enter in the multi-line message) does nothing while the
+    /// field is blank, and Escape cancels them.
+    #[test]
+    fn version_and_branch_dialogs_take_typing_at_once_and_close_on_escape() {
+        for commit in [true, false] {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            app.dialog = Some(if commit {
+                Dialog::Commit(String::new(), false)
+            } else {
+                Dialog::NewBranch(String::new(), false)
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            let confirm = key(Key::Enter, if commit { Modifiers::COMMAND } else { Modifiers::NONE });
+            app_frame(&mut app, &ctx, vec![confirm], false);
+            assert!(app.dialog.is_some(), "commit {commit}: nothing to confirm yet");
+            app_frame(&mut app, &ctx, vec![egui::Event::Text("fix".into())], false);
+            match &app.dialog {
+                Some(Dialog::Commit(text, _) | Dialog::NewBranch(text, _)) => {
+                    assert_eq!(text, "fix", "commit {commit}: typed into the field")
+                }
+                _ => unreachable!("commit {commit}: the dialog stays open"),
+            }
+            app_frame(&mut app, &ctx, vec![key(Key::Escape, Modifiers::NONE)], false);
+            assert!(app.dialog.is_none(), "commit {commit}: Escape cancels");
+        }
+    }
+
     /// An app with its coil moved one step: the project has unsaved changes.
     fn changed_app() -> (tempfile::TempDir, App, egui::Context) {
         let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
@@ -8172,6 +8947,27 @@ mod nudge_tests {
     fn coil_on_disk(app: &App) -> Point {
         let saved = wc_core::store::load(&app.open.as_ref().unwrap().dir).unwrap();
         saved.pages[app.ed.page].symbols[1].at
+    }
+
+    /// Escape closes Help, Report a problem as Cancel does: no form is opened (#1632).
+    #[test]
+    fn escape_cancels_the_report_a_problem_dialog() {
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app.carry_out(Action::ReportProblem);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(matches!(app.dialog, Some(Dialog::Report { .. })), "the dialog is open");
+        let escape = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        app_frame(&mut app, &ctx, vec![escape], false);
+        assert!(app.dialog.is_none(), "Escape cancels");
+        assert!(app.copied_text.is_none(), "no log is copied for a form");
     }
 
     /// Closing the window with unsaved changes asks first: Cancel keeps the window and the
@@ -8214,6 +9010,83 @@ mod nudge_tests {
         let sent = app_frame(&mut app, &ctx, Vec::new(), true);
         assert!(!sent.contains(&CancelClose));
         assert!(app.dialog.is_none());
+    }
+
+    /// The window title is sent once when it changes, not on every frame (#1544).
+    #[test]
+    fn the_window_title_is_sent_only_when_it_changes() {
+        let titles = |sent: Vec<egui::ViewportCommand>| {
+            sent.into_iter()
+                .filter_map(|c| match c {
+                    egui::ViewportCommand::Title(t) => Some(t),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        app.open.as_mut().unwrap().save().unwrap();
+        let name = app.open.as_ref().unwrap().project.meta.name.clone();
+        let first = titles(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert_eq!(
+            first,
+            vec![format!("{name} – WiringCraft")],
+            "the first frame titles the window"
+        );
+        let again = titles(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert!(again.is_empty(), "nothing changed: not sent again, got {again:?}");
+        // A real edit (the selected coil nudged left) makes the project unsaved.
+        let mut dirty = titles(app_frame(
+            &mut app,
+            &ctx,
+            vec![key(Key::ArrowLeft, Modifiers::NONE)],
+            false,
+        ));
+        assert!(app.open.as_ref().unwrap().dirty, "the nudge is not saved yet");
+        dirty.extend(titles(app_frame(&mut app, &ctx, Vec::new(), false)));
+        assert_eq!(
+            dirty,
+            vec![format!("• {name} – WiringCraft")],
+            "the unsaved marker shows"
+        );
+        assert!(titles(app_frame(&mut app, &ctx, Vec::new(), false)).is_empty());
+    }
+
+    /// Escape answers the unsaved-changes question as Cancel: the window stays open, the
+    /// change stays in the project and nothing is written. Enter or Escape closes a message
+    /// as OK (#1493).
+    #[test]
+    fn escape_cancels_the_unsaved_question_and_closes_a_message() {
+        use egui::ViewportCommand::Close;
+        let key = |key| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        let (_tmp, mut app, ctx) = changed_app();
+        app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+            "the person is asked"
+        );
+        // A window just opened is laid out unseen in its first frame.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let mut sent = app_frame(&mut app, &ctx, key(Key::Escape), false);
+        sent.extend(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert!(app.dialog.is_none(), "Escape answers the question");
+        assert!(!sent.contains(&Close), "the window stays open");
+        assert!(app.open.as_ref().unwrap().dirty, "the change is kept, unsaved");
+        assert_eq!(coil_on_disk(&app), Point::new(55.0, 60.0), "nothing is written");
+        for k in [Key::Enter, Key::Escape] {
+            app.dialog = Some(Dialog::Message("Done.".into()));
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, key(k), false);
+            assert!(app.dialog.is_none(), "{k:?} closes the message");
+        }
     }
 
     /// A device tag typed and not entered yet when the window's close button is pressed is
@@ -9378,6 +10251,35 @@ mod nudge_tests {
             "the second moves"
         );
     }
+
+    /// What the open path dialog's field holds; None when no path dialog is open.
+    fn typed_path(app: &App) -> Option<&str> {
+        match &app.dialog {
+            Some(Dialog::OpenPath(p, _) | Dialog::SaveAsPath(p, _)) => Some(&p.text),
+            _ => None,
+        }
+    }
+
+    /// Open project and Save as take typing at once: the path field has the cursor.
+    #[test]
+    fn the_path_dialogs_open_with_the_cursor_in_the_path_field() {
+        let dialogs: [fn() -> Dialog; 2] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, vec![egui::Event::Text("x".into())], false);
+            assert_eq!(typed_path(&app), Some("x"));
+            // Focus taken away stays away: the field asks for it only when the dialog opens.
+            ctx.memory_mut(|m| m.stop_text_input());
+            app_frame(&mut app, &ctx, vec![egui::Event::Text("y".into())], false);
+            assert_eq!(typed_path(&app), Some("x"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9553,10 +10455,12 @@ mod menu_action_tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         (tmp, app, id)
     }
@@ -9569,6 +10473,50 @@ mod menu_action_tests {
             .find(|s| s.id == id)
             .unwrap()
             .rotation
+    }
+
+    /// Runs one frame of the dialogs with these events.
+    fn dialog_frame(a: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| a.dialogs(ctx),
+        );
+    }
+
+    #[test]
+    fn escape_cancels_the_racks_form_once_and_is_the_symbol_editors_while_it_draws() {
+        let (_tmp, mut a, _) = app();
+        let ctx = egui::Context::default();
+        a.ed.menu_action = Some(Action::PlcRacks);
+        a.run_menu_action();
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // The symbol editor drawing a shape takes the Escape: the form stays.
+        let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(symbol_editor::Tool::Line);
+        ed.click(wc_core::Point::new(0.0, 0.0));
+        assert!(ed.drawing_shape());
+        a.symbol_editor = Some(ed);
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Escape still held: its key repeat does not cancel the form either.
+        a.symbol_editor = None;
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(true)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Released and pressed again, with nothing half drawn, Escape cancels the form.
+        let release = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        dialog_frame(&mut a, &ctx, vec![release]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(a.dialog.is_none());
     }
 
     #[test]
@@ -9763,5 +10711,48 @@ mod import_folder_tests {
         assert_eq!(got.kind, "folder");
         assert_eq!(got.name, "vendor-2");
         assert_eq!(Path::new(&got.location), other.as_path());
+    }
+}
+
+#[cfg(test)]
+mod import_view_control_tests {
+    use super::*;
+
+    /// The import window's view controls read as on exactly when their toolbar buttons and menu
+    /// items do: a shown grid and the dark theme too, not only an open layer list.
+    #[test]
+    fn the_import_window_view_controls_show_the_state_the_menu_shows() {
+        let ed = Editor::default();
+        let clipboard = edit::Clipboard::default();
+        for (grid, dark, layers) in [
+            (false, false, false),
+            (true, true, true),
+            (true, false, false),
+            (false, true, true),
+        ] {
+            let prefs = Prefs {
+                show_grid: grid,
+                theme: if dark { theme::Mode::Dark } else { theme::Mode::Light },
+                ..Prefs::default()
+            };
+            let status = StatusView {
+                open: None,
+                ed: &ed,
+                prefs: &prefs,
+                clipboard: &clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: layers,
+                symbol_editor: None,
+            };
+            for a in IMPORT_VIEW_CONTROLS {
+                assert_eq!(
+                    import_view_control_on(*a, &prefs, layers),
+                    chrome::Status::active(&status, *a),
+                    "{a:?} with grid {grid}, dark {dark}, layers {layers}"
+                );
+            }
+        }
     }
 }

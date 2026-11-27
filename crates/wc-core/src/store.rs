@@ -2,15 +2,32 @@
 //!
 //! ```text
 //! my-project/
-//!   project.toml            name, title block, library sources
-//!   devices.json            device tag -> part and properties
+//!   project.toml            name, format version, title block, library sources and settings
+//!   devices.json            device tag -> part, description and properties
 //!   library.lock            exact version of every library item in use
 //!   pages/<id>.page.json    one file per page
-//!   vendor/symbols/<id>.json  copies of the library items in use
-//!   vendor/parts/<id>.json
 //!   panels/<id>.panel.json  cabinet panel layouts
 //!   comments/<page id>.comments.json  review comments on a page
+//!   vendor/symbols/<id>.json  copies of the library symbols in use
+//!   vendor/parts/<id>.json    copies of the library parts in use
+//!   macros/<id>.json        the project's own macros ([`crate::macros`])
+//!   translations.toml       translation dictionary ([`crate::translate`])
+//!   pictures/               the logo and other pictures ([`crate::Logo::DIR`])
+//!   underlays/              pictures drawn under a page ([`crate::Underlay::DIR`])
 //! ```
+//!
+//! `project.toml` holds `name`, `format_version`, `[title_block]` and the `[[library]]`
+//! sources, then one table or key per kind of project setting: `[[location]]`, `[[jumper]]`,
+//! `[[strip]]`, `[logo]`, `[template]`, `[[revision]]`, `[[report]]`, `[[rule]]`, `rules_off`,
+//! `[[rack]]` and `[[network]]` (see [`ProjectMeta`]). A setting that would be empty, or a
+//! `[template]` that is the built-in one, is left out.
+//!
+//! This module reads and writes `project.toml`, `devices.json`, `library.lock`, pages, panels,
+//! comments and `vendor/`. Macros and the translation dictionary are read and written by their
+//! own modules, with the same write helpers. Only `project.toml` is needed: a missing
+//! `devices.json` or `library.lock` reads as empty, and a missing folder as one with nothing in
+//! it. [`docs/project-format.md`](https://github.com/phobicdotno/wiringcraft/blob/main/docs/project-format.md)
+//! in the repository is the full reference for the format.
 //!
 //! Every file is written deterministically (sorted keys, fixed indentation, trailing newline),
 //! atomically (temporary file, then rename) and only when its content changed, so version
@@ -338,6 +355,9 @@ fn folder_synced(dir: &Path, outcome: std::io::Result<()>) -> Result<()> {
 /// new name never points at bytes a power loss can drop, and the folder is synced after it
 /// (Unix; elsewhere the rename is what the system keeps). A failed sync of the bytes fails the
 /// write and leaves the file as it was. A folder that cannot be synced does not fail it.
+///
+/// A file that is replaced keeps its permissions (Unix; a link at `path` is replaced, not followed, and passes none on); a new file
+/// gets the default ones.
 pub fn replace_whole(path: &Path, bytes: &[u8]) -> Result<()> {
     rename_staged(path, bytes)?;
     synced(Ok(()), &Folders::from([folder_of(path)]))
@@ -355,7 +375,8 @@ fn rename_staged(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = fs::remove_file(&tmp);
         }
     };
-    if let Err(e) = write_staging(&tmp, bytes) {
+    let keep = kept_permissions(path).map_err(|e| Error::io(path, e))?;
+    if let Err(e) = write_staging(&tmp, bytes, keep) {
         drop_tmp();
         return Err(Error::io(&tmp, e));
     }
@@ -366,23 +387,60 @@ fn rename_staged(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The permissions the file staged for `path` is given, so a file that is replaced keeps its own
+/// (one only its owner may read stays that way) instead of getting the default ones: the
+/// permission bits of the regular file at `path`. `None` when there is no file there (a new file
+/// gets the default), and when `path` is a link or anything else that is not a regular file: the
+/// rename replaces a link itself, it is not followed, so the file it points at has no say here.
+///
+/// Unix only. Elsewhere there is nothing to keep: the one flag there is, read-only on Windows,
+/// makes the rename over the file fail, so a file that can be replaced does not have it.
+#[cfg(unix)]
+fn kept_permissions(path: &Path) -> std::io::Result<Option<fs::Permissions>> {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(fs::Permissions::from_mode(meta.permissions().mode() & 0o777))),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn kept_permissions(_path: &Path) -> std::io::Result<Option<fs::Permissions>> {
+    Ok(None)
+}
+
 /// Write `content` to a staging file at `tmp` that this call creates itself, and sync it, so the
 /// bytes are on disk before the file gets its real name.
+///
+/// With `keep` the staging file gets those permissions before it is synced. Until then it is one
+/// only its owner may read or write (Unix), so the bytes are at no time open to more readers
+/// than the file they replace.
 ///
 /// The file is opened with `create_new`, which never follows a link: a symbolic link left at
 /// `tmp` by something else in the project folder is removed (the link, not its target), and a
 /// link that shows up again before the file is created makes the write fail instead of writing
 /// through it. A regular file left by an earlier failed write is replaced the same way. Anything
 /// else in the way, such as a folder, is not ours to remove and fails the write.
-fn write_staging(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
+fn write_staging(tmp: &Path, content: &[u8], keep: Option<fs::Permissions>) -> std::io::Result<()> {
     use std::io::Write;
     if let Ok(meta) = fs::symlink_metadata(tmp)
         && (meta.is_symlink() || meta.is_file())
     {
         fs::remove_file(tmp)?;
     }
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if keep.is_some() {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    }
+    let mut file = options.open(tmp)?;
     file.write_all(content)?;
+    if let Some(permissions) = keep {
+        file.set_permissions(permissions)?;
+    }
     sync_file(&file, tmp)
 }
 
@@ -1477,6 +1535,101 @@ mod staging_tests {
         assert!(write_if_changed(&path, "{}\n").unwrap());
         assert!(!target.exists());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_replaced_by_a_save_keeps_its_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Project::new("Demo");
+        p.pages.push(Page::new("p0001", "1", "First"));
+        save(dir.path(), &p).unwrap();
+        let project = dir.path().join(PROJECT_FILE);
+        let page = dir.path().join(PAGES_DIR).join(format!("p0001{PAGE_SUFFIX}"));
+        set_mode(&project, 0o600);
+        set_mode(&page, 0o640);
+
+        p.meta.name = "Renamed".into();
+        for page in &mut p.pages {
+            page.title = "Changed".into();
+        }
+        let written = save(dir.path(), &p).unwrap();
+        assert!(written.contains(&project) && written.contains(&page), "{written:?}");
+        assert_eq!(mode_of(&project), 0o600);
+        assert_eq!(mode_of(&page), 0o640);
+
+        // A file open to more than the default stays so too.
+        let wide = dir.path().join("notes.bin");
+        fs::write(&wide, "old").unwrap();
+        set_mode(&wide, 0o666);
+        replace_whole(&wide, b"new").unwrap();
+        assert_eq!(mode_of(&wide), 0o666);
+        assert_eq!(fs::read(&wide).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_gets_the_default_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        // Next to a file only its owner may read: its mode is not what a new file gets.
+        let private = dir.path().join("private.txt");
+        fs::write(&private, "mine").unwrap();
+        set_mode(&private, 0o600);
+        let default = dir.path().join("default.txt");
+        fs::write(&default, "made the plain way").unwrap();
+
+        let written = dir.path().join("devices.json");
+        assert!(write_if_changed(&written, "{}\n").unwrap());
+        let whole = dir.path().join("notes.bin");
+        replace_whole(&whole, b"new").unwrap();
+        assert_eq!(mode_of(&written), mode_of(&default));
+        assert_eq!(mode_of(&whole), mode_of(&default));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_bytes_put_back_over_a_file_keep_its_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devices.json");
+        fs::write(&path, "old\n").unwrap();
+        set_mode(&path, 0o600);
+        let before = fs::read(&path).unwrap();
+
+        assert!(write_if_changed(&path, "new\n").unwrap());
+        replace_whole(&path, &before).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_is_replaced_does_not_pass_on_the_permissions_of_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.txt");
+        fs::write(&target, "keep me").unwrap();
+        set_mode(&target, 0o600);
+        let default = dir.path().join("default.txt");
+        fs::write(&default, "made the plain way").unwrap();
+        let path = dir.path().join("devices.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        replace_whole(&path, b"new").unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(mode_of(&path), mode_of(&default));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert_eq!(mode_of(&target), 0o600);
     }
 
     /// Every file under `dir`, named from it, in order.

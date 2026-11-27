@@ -172,10 +172,11 @@ enum Cmd {
         /// Do not make it a git repository.
         #[arg(long)]
         no_git: bool,
-        /// Start from a base project: a project folder or a git repository URL. Its pages,
-        /// settings, title block, library sources and pictures are copied (not its review
-        /// comments or history); `{name}` and `{date}` in its title block and page titles
-        /// become the new project's name and today's date.
+        /// Start from a base project: a project folder or a git repository URL. Everything in
+        /// it is copied except its review comments, its history and symbolic links: pages,
+        /// settings, title block, library sources, pictures, macros (`macros/`), device data
+        /// (`devices.json`) and the vendored library items (`vendor/`). `{name}` and `{date}` in its title block and
+        /// page titles become the new project's name and today's date.
         #[arg(long, value_name = "FOLDER_OR_URL")]
         template: Option<String>,
     },
@@ -400,7 +401,8 @@ enum Cmd {
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
     /// drawn like the PDF (frame, title block, symbols, wires, cross-references), and one per
-    /// panel layout (plate, rails, ducts, devices).
+    /// panel layout (plate, rails, ducts, devices). With `--page`, only those pages are written
+    /// and no panel layouts.
     Drawing {
         /// Output folder; files are named `<page number>.<format>`, and `panel-<name>.<format>`
         /// for panel layouts.
@@ -408,7 +410,8 @@ enum Cmd {
         /// `svg` or `dxf`.
         #[arg(long, default_value = "svg")]
         format: String,
-        /// Page ids to export (default: all).
+        /// Page ids to export (default: all pages and all panel layouts). With it, only these
+        /// pages are written, without the panel layouts.
         #[arg(long = "page")]
         pages: Vec<String>,
         /// Date for the title block where the page and project set none; free text, printed as
@@ -480,8 +483,9 @@ enum Cmd {
     },
     /// Find text in free texts, device tags, wire numbers, potentials and device descriptions
     /// on every page; one hit per line: page, kind, value. With --replace, replace it in every
-    /// hit (a device tag renames the device everywhere it appears). Status lines go to stderr,
-    /// so stdout holds only hits.
+    /// hit (a device tag renames the device everywhere it appears). A hit the replace does not
+    /// change, such as the tag `-K15` for `-K1`, gets a fourth field `not changed: another tag`,
+    /// and the status line counts them. Status lines go to stderr, so stdout holds only hits.
     Find {
         /// The text to find; upper and lower case are alike unless --match-case. A device tag
         /// such as `-K1` is taken as the text, though it starts with `-`.
@@ -574,7 +578,8 @@ struct MarkingArgs {
 enum CommentCmd {
     /// Pin a comment on a page. Prints its id.
     Add {
-        /// The page's id.
+        /// The page's id or number. An id wins: when one page's number is another page's id,
+        /// the page with that id is taken, so give the id of the page you mean.
         page: String,
         /// The comment.
         text: String,
@@ -612,7 +617,8 @@ enum CommentCmd {
     },
     /// List the comments, of one page or all; open ones only unless --all.
     List {
-        /// Only this page's comments (page id).
+        /// Only this page's comments: the page's id or number. An id wins when one page's
+        /// number is another page's id.
         page: Option<String>,
         /// Resolved comments too.
         #[arg(long)]
@@ -1270,7 +1276,8 @@ enum PageCmd {
 
 #[derive(Subcommand)]
 enum LibCmd {
-    /// Add a source. Earlier sources win over later ones.
+    /// Add a source after the existing ones. Earlier sources win over later ones, so the new
+    /// one loses to them; to change the order, move the `[[library]]` tables in `project.toml`.
     Add {
         /// The source's name, used in item listings.
         name: String,
@@ -1558,9 +1565,11 @@ enum ImportCmd {
     /// the project already vendors is replaced by the new version (an earlier import's box by
     /// the drawn block) when its copy is still the one the project pins; a copy changed in the
     /// project is refused, not replaced. To take the new version into such a project, import
-    /// with --lib into a library folder, add that folder as a source (`lib add`) ahead of any
-    /// source with the same id, and run `lib update <id>`. Into a library folder with --lib,
-    /// else vendored into the project.
+    /// with --lib into a library folder, add that folder as a source (`lib add`) and run
+    /// `lib update <id>`. `lib add` puts the new source last and earlier sources win: when
+    /// another source has the same id, first move the new source's `[[library]]` table above
+    /// that source's in `project.toml`. Into a library folder with --lib, else vendored into
+    /// the project.
     SweLibrary {
         /// The `.tewzip` archive.
         path: PathBuf,
@@ -1646,13 +1655,15 @@ enum VcsCmd {
 }
 
 fn parse_point(s: &str) -> Result<Point, String> {
-    let (x, y) = s.split_once(',').ok_or("expected x,y")?;
-    let x: f64 = x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?;
-    let y: f64 = y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?;
+    let (x, y) = s
+        .split_once(',')
+        .ok_or("expected two numbers in mm with a comma between, e.g. 10,20")?;
+    let x: f64 = x.trim().parse().map_err(|_| "the first value is not a number")?;
+    let y: f64 = y.trim().parse().map_err(|_| "the second value is not a number")?;
     if x.is_finite() && y.is_finite() {
         Ok(Point::new(x, y))
     } else {
-        Err("coordinates must be finite".into())
+        Err("coordinates must be plain numbers, not inf or NaN".into())
     }
 }
 
@@ -2339,6 +2350,16 @@ fn turn_library_rule(
 /// The `find` output: one hit per line, the page number (`-` for a device not drawn), the
 /// kind and the value, separated by tabs.
 fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
+    find_lines_noted(p, hits, |_| None)
+}
+
+/// [`find_lines`] for a replace: a hit that `alone` names a reason for gets a fourth field,
+/// `not changed: <reason>`.
+fn find_lines_noted(
+    p: &Project,
+    hits: &[wc_core::find::Hit],
+    alone: impl Fn(&wc_core::find::Hit) -> Option<wc_core::find::LeftAlone>,
+) -> String {
     hits.iter()
         .map(|h| {
             let page = h
@@ -2346,14 +2367,30 @@ fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
                 .page()
                 .and_then(|id| p.page(id))
                 .map_or_else(|| "-".to_owned(), |pg| pg.number.clone());
+            let note = alone(h).map_or_else(String::new, |why| format!("\tnot changed: {}", why.reason()));
             format!(
-                "{}\t{}\t{}\n",
+                "{}\t{}\t{}{note}\n",
                 escape_field(&page),
                 h.kind.label(),
                 escape_field(&h.value)
             )
         })
         .collect()
+}
+
+/// The status line of `find --replace`: how many values changed, and how many hits were left
+/// alone for which reason.
+fn replaced_line(n: usize, alone: &[wc_core::find::LeftAlone]) -> String {
+    let mut by_reason: std::collections::BTreeMap<wc_core::find::LeftAlone, usize> = std::collections::BTreeMap::new();
+    for why in alone {
+        *by_reason.entry(*why).or_default() += 1;
+    }
+    let mut line = format!("replaced {n} value(s)");
+    for (i, (why, count)) in by_reason.iter().enumerate() {
+        line.push_str(if i == 0 { "; left alone: " } else { ", " });
+        line.push_str(&format!("{count} hit(s) {}", why.reason()));
+    }
+    line
 }
 
 /// The `location list` output: one location per line, `+path`, then a tab and the description
@@ -2627,7 +2664,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.panels.iter().any(|x| x.id == id) {
-                        return Err(format!("panel {id:?} exists"));
+                        return Err(format!("panel {id:?} exists; pick another id"));
                     }
                     check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
@@ -2868,7 +2905,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.page(&id).is_some() {
-                        return Err(format!("page {id:?} exists"));
+                        return Err(format!("page {id:?} exists; pick another id"));
                     }
                     let number = p.free_page_number(&number, None).map_err(e)?;
                     let mut page = Page::new(id, number, title);
@@ -2885,8 +2922,8 @@ fn run(mut cli: Cli) -> Res<()> {
                     for pg in &p.pages {
                         println!(
                             "{:<10} {:<6} {} ({} symbols, {} wires){}",
-                            pg.id,
-                            pg.number,
+                            escape_field(&pg.id),
+                            escape_field(&pg.number),
                             escape_field(&pg.title),
                             pg.symbols.len(),
                             pg.wires.len(),
@@ -2904,7 +2941,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let i = page_index(&p, &id)?;
                     // Same rule as the app: a project keeps at least one page.
                     if p.pages.len() <= 1 {
-                        return Err("A project needs at least one page.".into());
+                        return Err("a project needs at least one page".into());
                     }
                     p.pages.remove(i);
                 }
@@ -3451,22 +3488,60 @@ fn run(mut cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
-                    // A pinned symbol keeps its pinned version: a missing copy is put back from
-                    // a library that still has that version, never from a newer one. A symbol
-                    // without a pin is taken from the library and pinned, also when a copy is
-                    // left from an earlier attempt that failed before it was pinned.
+                    // A pinned symbol or part keeps its pinned version: a missing copy is put
+                    // back from a library that still has that version, never from a newer one.
+                    // One without a pin is taken from the library and pinned, also when a copy
+                    // is left from an earlier attempt that failed before it was pinned. The
+                    // parts are those the macro's devices and their accessories name, as
+                    // `device --part` takes them; a part no library has is left as it is.
                     let symbols: std::collections::BTreeSet<&str> =
                         m.symbols.iter().map(|s| s.symbol.as_str()).collect();
-                    // The library is opened only when a symbol needs it, so a macro whose
-                    // symbols all have their pinned copies works without it.
+                    let parts: std::collections::BTreeSet<&str> = m
+                        .devices
+                        .values()
+                        .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+                        .map(|id| id.trim())
+                        .filter(|id| !id.is_empty())
+                        .collect();
+                    let items = symbols
+                        .into_iter()
+                        .map(|id| (ItemKind::Symbol, id))
+                        .chain(parts.into_iter().map(|id| (ItemKind::Part, id)));
+                    // The library is opened only when an item needs it, so a macro whose
+                    // symbols and parts all have their pinned copies works without it.
                     let mut lib: Option<wc_library::Library> = None;
-                    for id in symbols {
-                        let pin = p.lock.symbols.get(id).cloned();
+                    for (kind, id) in items {
+                        let what = match kind {
+                            ItemKind::Symbol => "symbol",
+                            ItemKind::Part => "part",
+                        };
+                        let pin = match kind {
+                            ItemKind::Symbol => p.lock.symbols.get(id),
+                            ItemKind::Part => p.lock.parts.get(id),
+                        }
+                        .cloned();
                         if pin.is_some() {
-                            let vendored = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                            let vendored = store::vendor_path(dir, kind, id).map_err(e)?;
                             if vendored.exists() {
                                 // A copy that cannot be read is reported now, not after saving.
-                                store::read_vendored_symbol(dir, id).map_err(e)?;
+                                match kind {
+                                    ItemKind::Symbol => store::read_vendored_symbol(dir, id).map(drop),
+                                    ItemKind::Part => store::read_vendored_part(dir, id).map(drop),
+                                }
+                                .map_err(e)?;
+                                continue;
+                            }
+                        }
+                        // A part no library has stays a name on the device, as before: `check`
+                        // reports it, and value sets may name parts kept elsewhere.
+                        if pin.is_none() && kind == ItemKind::Part {
+                            if lib.is_none() {
+                                match wc_library::Library::open(dir, &p) {
+                                    Ok(opened) => lib = Some(opened),
+                                    Err(_) => continue,
+                                }
+                            }
+                            if lib.as_ref().is_none_or(|lib| lib.locate(kind, id).is_none()) {
                                 continue;
                             }
                         }
@@ -3476,24 +3551,41 @@ fn run(mut cli: Cli) -> Res<()> {
                         };
                         match pin {
                             Some(pin) => {
-                                let fits = |s: &wc_core::Symbol| {
-                                    if s.id != id {
-                                        Err(format!("its file holds {}", s.id))
-                                    } else if s.hash() != pin.hash {
+                                let fits = |found: &str, hash: String| {
+                                    if found != id {
+                                        Err(format!("its file holds {found}"))
+                                    } else if hash != pin.hash {
                                         Err("another version".to_owned())
                                     } else {
                                         Ok(())
                                     }
                                 };
-                                let s = lib.find_version(ItemKind::Symbol, id, &pin.source, fits).map_err(|why| {
+                                let missing = |why: String| {
                                     format!(
-                                        "symbol {id}: its copy in the project is missing and no library has the version the project pins ({why})"
+                                        "{what} {id}: its copy in the project is missing and no library has the version the project pins ({why})"
                                     )
-                                })?;
-                                store::write_vendored_symbol(dir, &s).map_err(e)?;
+                                };
+                                match kind {
+                                    ItemKind::Symbol => {
+                                        let s = lib
+                                            .find_version(kind, id, &pin.source, |s: &wc_core::Symbol| {
+                                                fits(&s.id, s.hash())
+                                            })
+                                            .map_err(missing)?;
+                                        store::write_vendored_symbol(dir, &s).map_err(e)?;
+                                    }
+                                    ItemKind::Part => {
+                                        let part = lib
+                                            .find_version(kind, id, &pin.source, |part: &wc_core::Part| {
+                                                fits(&part.id, part.hash())
+                                            })
+                                            .map_err(missing)?;
+                                        store::write_vendored_part(dir, &part).map_err(e)?;
+                                    }
+                                }
                             }
                             None => {
-                                wc_library::take(dir, &mut p, lib, ItemKind::Symbol, id).map_err(e)?;
+                                wc_library::take(dir, &mut p, lib, kind, id).map_err(e)?;
                             }
                         }
                     }
@@ -4041,17 +4133,19 @@ fn run(mut cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
-            // Panel layouts follow the pages, one file each, as their PDF sheets.
+            // Panel layouts follow the pages, one file each, as their PDF sheets. Picking pages
+            // with --page leaves them out: only the named pages are written.
+            let panels = if pages.is_empty() { p.panels.clone() } else { Vec::new() };
             let options = wc_pdf::Options {
                 pages,
                 date,
-                panels: p.panels.clone(),
                 // A part that cannot be read is named in a warning; the others still export.
-                footprints: if p.panels.is_empty() {
+                footprints: if panels.is_empty() {
                     Default::default()
                 } else {
                     wc_pdf::footprints(vendored_parts_warning_unreadable(dir, &p).values())
                 },
+                panels,
                 ..Default::default()
             };
             // Only SVG shows pictures; a DXF export neither reads nor checks them.
@@ -4088,7 +4182,7 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::NumberWires { rule, overwrite } => {
             let rule = wc_core::numbering::Rule::parse(&rule)
-                .ok_or_else(|| format!("unknown rule {rule:?} (sequential, page-column, potential)"))?;
+                .ok_or_else(|| format!("unknown rule {rule:?}: use sequential, page-column or potential"))?;
             let mut p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
             let done = wc_core::numbering::number_wires(
@@ -4118,15 +4212,20 @@ fn run(mut cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             let opts = wc_core::find::FindOptions { match_case };
             let hits = wc_core::find::find(&p, &query, opts);
-            print!("{}", find_lines(&p, &hits));
             if let Some(with) = replace {
+                let alone = |h: &wc_core::find::Hit| wc_core::find::left_alone(h, &query, &with, opts);
+                print!("{}", find_lines_noted(&p, &hits, alone));
+                let left: Vec<wc_core::find::LeftAlone> = hits.iter().filter_map(alone).collect();
                 let n = wc_core::find::replace(&mut p, &hits, &query, &with, opts)?;
                 if n > 0 {
                     save(dir, &p)?;
                 }
-                eprintln!("replaced {n} value(s)");
-            } else if hits.is_empty() {
-                eprintln!("nothing found");
+                eprintln!("{}", replaced_line(n, &left));
+            } else {
+                print!("{}", find_lines(&p, &hits));
+                if hits.is_empty() {
+                    eprintln!("nothing found");
+                }
             }
         }
         Cmd::Check { all } => {
@@ -4145,7 +4244,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     .page_id
                     .as_deref()
                     .and_then(|id| p.page(id))
-                    .map(|pg| format!("page {}: ", pg.number))
+                    .map(|pg| format!("page {}: ", escape_field(&pg.number)))
                     .unwrap_or_default();
                 println!("{:<7} {page}{}", f.severity.label(), escape_field(&f.message));
             }
@@ -4154,14 +4253,26 @@ fn run(mut cli: Cli) -> Res<()> {
                 count(wc_report::Severity::Warning),
                 count(wc_report::Severity::Note),
             );
-            println!("{errors} errors, {warnings} warnings, {notes} notes");
+            let counted = |n: usize, one: &str| {
+                if n == 1 {
+                    format!("1 {one}")
+                } else {
+                    format!("{n} {one}s")
+                }
+            };
+            println!(
+                "{}, {}, {}",
+                counted(errors, "error"),
+                counted(warnings, "warning"),
+                counted(notes, "note")
+            );
             if errors > 0 {
-                return Err(format!("the project check found {errors} errors"));
+                return Err(format!("the project check found {}", counted(errors, "error")));
             }
         }
         Cmd::Report { kind, format, out, sep } => {
             if !matches!(sep, ',' | ';') {
-                return Err(format!("unknown separator {sep:?} (, or ;)"));
+                return Err(format!("unknown separator {sep:?}: use , or ;"));
             }
             if sep != ',' && format != "csv" {
                 return Err("--sep is for --format csv".into());
@@ -4384,10 +4495,10 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
         } => {
             store::check_id(&name).map_err(e)?;
             if p.meta.libraries.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
-                return Err(format!("source {name:?} exists"));
+                return Err(format!("source {name:?} exists; pick another name"));
             }
             if kind != "folder" && kind != "git" {
-                return Err("kind must be folder or git".into());
+                return Err(format!("unknown source kind {kind:?}: use folder or git"));
             }
             p.meta.libraries.push(LibrarySource {
                 name,
@@ -6039,7 +6150,7 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
         } else {
             vec![wc_report::Kind::parse(n).ok_or_else(|| {
                 format!(
-                    "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, all)"
+                    "unknown report {n:?}: use contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks or all"
                 )
             })?]
         };
@@ -6175,7 +6286,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
     let kinds = wc_report::parse_kinds(&args.kinds)?;
     let lines = wc_report::parse_lines(&args.lines)?;
     let language = wc_report::Language::parse(&args.lang)
-        .ok_or_else(|| format!("unknown language {:?} (en, de, nb)", args.lang))?;
+        .ok_or_else(|| format!("unknown language {:?}: use en, de or nb", args.lang))?;
     let p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     let mut warnings: Vec<String> = missing
@@ -8403,6 +8514,61 @@ mod tests {
         assert_eq!(p.pages[0].symbols[0].tag.as_ref(), Some(&k2));
         assert!(p.devices.contains_key(&k2));
         assert!(cli(&dir, &["find", "K2", "--replace", "?"]).is_err(), "not a tag");
+    }
+
+    /// With --replace a tag hit the replace does not change says so in the list, and the status
+    /// line counts it.
+    #[test]
+    fn find_replace_says_which_hits_it_left_alone_and_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        for (id, t) in [("s1", "-K1"), ("s2", "-K15")] {
+            let tag = wc_core::DeviceTag::parse(t).unwrap();
+            p.pages[0].symbols.push(wc_core::PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.coil".into(),
+                at: wc_core::Point::new(10.0, 10.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag.clone()),
+            });
+            p.devices.insert(tag, wc_core::Device::default());
+        }
+        save(&dir, &p).unwrap();
+        let opts = wc_core::find::FindOptions::default();
+        let hits = wc_core::find::find(&p, "-K1", opts);
+        let alone = |h: &wc_core::find::Hit| wc_core::find::left_alone(h, "-K1", "-K2", opts);
+        let number = p.pages[0].number.clone();
+        assert_eq!(
+            find_lines_noted(&p, &hits, alone),
+            format!("{number}\tDevice tag\t-K1\n{number}\tDevice tag\t-K15\tnot changed: another tag\n")
+        );
+        // A plain search lists both, without a note.
+        assert_eq!(
+            find_lines(&p, &hits),
+            format!("{number}\tDevice tag\t-K1\n{number}\tDevice tag\t-K15\n")
+        );
+        let left: Vec<_> = hits.iter().filter_map(alone).collect();
+        assert_eq!(
+            replaced_line(1, &left),
+            "replaced 1 value(s); left alone: 1 hit(s) another tag"
+        );
+        assert_eq!(replaced_line(2, &[]), "replaced 2 value(s)");
+        use wc_core::find::LeftAlone::{AnotherTag, SameValue};
+        assert_eq!(
+            replaced_line(0, &[SameValue, AnotherTag, AnotherTag]),
+            "replaced 0 value(s); left alone: 2 hit(s) another tag, 1 hit(s) already so"
+        );
+        cli(&dir, &["find", "-K1", "--replace", "-K2"]).unwrap();
+        let p = load(&dir).unwrap();
+        let tags: Vec<String> = p.pages[0]
+            .symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(tags, ["-K2", "-K15"]);
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub fn pin_position(placed: &PlacedSymbol, symbol: &Symbol, pin: &str) -> Option
 #[derive(Debug, Clone)]
 pub struct Appearance {
     pub page_id: String,
+    /// The page's position in the project's page order.
+    pub page_index: usize,
     pub page_number: String,
     pub column: usize,
     /// The reference row, 1 for `A`.
@@ -43,10 +45,17 @@ pub struct Appearance {
 }
 
 impl Appearance {
+    /// Where it sits in reading order: page, then column, then row.
+    pub fn position(&self) -> (usize, usize, usize) {
+        (self.page_index, self.column, self.row)
+    }
+
+    /// `page/column.row`, such as `3/2.B`. Blanks around a stored page number are left out, as
+    /// wire numbering leaves them out.
     pub fn location(&self) -> String {
         format!(
             "{}/{}.{}",
-            self.page_number,
+            self.page_number.trim(),
             self.column,
             wc_core::project::row_letter(self.row)
         )
@@ -105,8 +114,8 @@ pub fn tag_lines(placed: &PlacedSymbol, symbol: &Symbol, tag: &DeviceTag) -> (Al
     (align, lines)
 }
 
-/// Cross-reference texts for a page: a coil lists its contacts with their pins and locations,
-/// a contact points back to its coil, an interruption point lists where the wire continues.
+/// Cross-reference texts for a page: a coil (or a breaker with aux contacts) lists its contacts
+/// with their pins and locations, a contact points back to it, an interruption point lists where the wire continues.
 /// Problems (a contact without a coil, an interruption point without a partner) go to `warnings`.
 pub fn xref_marks(
     page: &Page,
@@ -129,12 +138,23 @@ pub fn xref_marks(
         let right = placed.iter().map(|g| g.bounds().1.x).fold(s.at.x, f64::max);
         let (tag_align, tag_at) = tag_lines(s, sym, tag);
         match sym.role {
-            SymbolRole::Main => {
+            // A breaker or MPCB lists its aux contacts as a coil does, unless a coil of its
+            // tag lists them already (#1467).
+            SymbolRole::Main | SymbolRole::Standalone
+                if sym.role == SymbolRole::Main || !xref.mains.contains_key(tag) =>
+            {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
+                    // Only named pins are listed; a contact without any shows its location alone.
+                    let pins: Vec<&str> = a.pins.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+                    let text = if pins.is_empty() {
+                        a.location()
+                    } else {
+                        format!("{} {}", pins.join("-"), a.location())
+                    };
                     out.push(XrefMark {
                         at: Point::new(s.at.x + 5.0, below + 3.5 + line_h * i as f64),
                         align: Align::Left,
-                        text: format!("{} {}", a.pins.join("-"), a.location()),
+                        text,
                         target_page_id: a.page_id.clone(),
                     });
                 }
@@ -157,7 +177,7 @@ pub fn xref_marks(
                 // A point on a schematic page continues only on schematic pages; one on an
                 // overview page may have its partner anywhere (as the project check counts).
                 let repeats = xref.overview_links.get(tag).filter(|_| page.overview);
-                let others: Vec<&Appearance> = xref
+                let mut others: Vec<&Appearance> = xref
                     .links
                     .get(tag)
                     .into_iter()
@@ -165,6 +185,7 @@ pub fn xref_marks(
                     .flatten()
                     .filter(|a| !(a.page_id == page.id && a.item == s.id))
                     .collect();
+                others.sort_by_key(|a| a.position());
                 match others.first() {
                     Some(first) => out.push(XrefMark {
                         at: Point::new(right + 1.5, s.at.y + 0.7 + (below - s.at.y) / 2.0),
@@ -184,13 +205,14 @@ pub fn xref_marks(
 impl CrossRefs {
     pub fn build(project: &Project, symbols: &BTreeMap<String, Symbol>) -> Self {
         let mut x = CrossRefs::default();
-        for page in &project.pages {
+        for (page_index, page) in project.pages.iter().enumerate() {
             for s in &page.symbols {
                 let (Some(tag), Some(sym)) = (&s.tag, symbols.get(&s.symbol)) else {
                     continue;
                 };
                 let a = Appearance {
                     page_id: page.id.clone(),
+                    page_index,
                     page_number: page.number.clone(),
                     column: project.column_of(page, s.at.x),
                     row: page.size.row_of(s.at.y),
@@ -211,6 +233,16 @@ impl CrossRefs {
                 }
             }
         }
+        // Every list reads in page order, then by column and row within a page, not in the
+        // order the symbols were placed (#1331).
+        for list in x
+            .auxes
+            .values_mut()
+            .chain(x.links.values_mut())
+            .chain(x.overview_links.values_mut())
+        {
+            list.sort_by_key(Appearance::position);
+        }
         // A contact points to its coil's first drawing: the detailed one on a schematic page,
         // not a repeat on an overview page (line diagram) that may come first in page order.
         let overview: BTreeSet<&str> = project
@@ -220,6 +252,10 @@ impl CrossRefs {
             .map(|p| p.id.as_str())
             .collect();
         for list in x.mains.values_mut() {
+            list.sort_by_key(|a| (overview.contains(a.page_id.as_str()), a.position()));
+        }
+        // The same for a breaker: its contacts point to its schematic drawing (#1467).
+        for list in x.standalones.values_mut() {
             list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
         }
         x

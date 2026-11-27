@@ -15,6 +15,25 @@ pub trait Status {
     fn enabled(&self, a: Action) -> bool;
 }
 
+/// A shortcut hint (an action's `shortcut`) as the keys are on `os`: the Ctrl shortcuts are
+/// matched with the Command key, which on a Mac is Cmd, not Ctrl (#1492).
+pub fn shortcut_hint(os: egui::os::OperatingSystem, shortcut: &str) -> String {
+    match shortcut.strip_prefix("Ctrl+") {
+        Some(rest) if os == egui::os::OperatingSystem::Mac => format!("Cmd+{rest}"),
+        _ => shortcut.to_owned(),
+    }
+}
+
+/// An action's `tip` as the keys are on `os`: a Ctrl shortcut named in the text (Redo's
+/// Ctrl+Shift+Z) is Cmd on a Mac, as in [`shortcut_hint`].
+pub fn tip_hint(os: egui::os::OperatingSystem, tip: &str) -> String {
+    if os == egui::os::OperatingSystem::Mac {
+        tip.replace("Ctrl+", "Cmd+")
+    } else {
+        tip.to_owned()
+    }
+}
+
 #[derive(Default)]
 pub struct ChromeState {
     pub ribbon_tab: usize,
@@ -205,11 +224,11 @@ pub fn menu_bar(ui: &mut egui::Ui, status: &dyn Status, out: &mut Vec<Action>) {
                         Some(a) => {
                             let info = a.info();
                             let button = egui::Button::new(info.label)
-                                .shortcut_text(info.shortcut)
+                                .shortcut_text(shortcut_hint(ui.ctx().os(), info.shortcut))
                                 .selected(status.active(*a));
                             if ui
                                 .add_enabled(status.enabled(*a), button)
-                                .on_hover_text(info.tip)
+                                .on_hover_text(tip_hint(ui.ctx().os(), info.tip))
                                 .clicked()
                             {
                                 out.push(*a);
@@ -273,9 +292,10 @@ fn icon_button_rect(
     };
     icons::paint(p, rect.shrink(size * 0.2), info.icon, c, accent);
     let tip = if info.shortcut.is_empty() {
-        format!("{}\n{}", info.label, info.tip)
+        format!("{}\n{}", info.label, tip_hint(ui.ctx().os(), info.tip))
     } else {
-        format!("{} ({})\n{}", info.label, info.shortcut, info.tip)
+        let keys = shortcut_hint(ui.ctx().os(), info.shortcut);
+        format!("{} ({keys})\n{}", info.label, tip_hint(ui.ctx().os(), info.tip))
     };
     // A pointer release counts only over the button where it is now: egui hit-tests against the
     // last frame, where a button with an id (a ribbon button) that has moved since still looks to
@@ -381,7 +401,9 @@ fn ribbon_rects(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status,
             } else {
                 text
             };
-            let r = ui.add(egui::Label::new(text).sense(Sense::click()));
+            // Not selectable: a tab is a button, so no text cursor on hover and a drag over
+            // it does not select its word.
+            let r = ui.add(egui::Label::new(text).selectable(false).sense(Sense::click()));
             if on {
                 ui.painter().line_segment(
                     [
@@ -422,6 +444,21 @@ const RIBBON_BUTTON: f32 = 66.0;
 /// The room a divider takes between two ribbon groups.
 const RIBBON_DIVIDER: f32 = 9.0;
 
+/// The most lines a ribbon button's label wraps to.
+const RIBBON_LABEL_ROWS: usize = 3;
+
+/// A ribbon button's label, centred under its icon and wrapped onto up to
+/// [`RIBBON_LABEL_ROWS`] lines rather than cut to one: cut to the button's width, labels that
+/// start alike ("Move page up" and "Move page down", the three "Parts from ..." imports) all
+/// read the same.
+fn ribbon_label(text: &str, color: Color32) -> egui::text::LayoutJob {
+    let mut job =
+        egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(11.0), color, RIBBON_BUTTON);
+    job.wrap.max_rows = RIBBON_LABEL_ROWS;
+    job.halign = egui::Align::Center;
+    job
+}
+
 /// Lay out one ribbon tab's groups; returns the rectangles of its buttons. Groups go side by
 /// side and start a new row when the next one would not fit, so every button stays on screen in
 /// a narrow window; a group wider than the window wraps its own buttons. Each button's id comes
@@ -455,7 +492,8 @@ fn ribbon_groups(
     }
     let mut rects = Vec::new();
     for row in rows {
-        ui.horizontal(|ui| {
+        // Top-aligned, so the icons line up when one label wraps to more lines than the rest.
+        ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             for (k, &(gname, actions)) in row.into_iter().enumerate() {
                 if k > 0 {
@@ -469,7 +507,7 @@ fn ribbon_groups(
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for line in actions.chunks(per_row) {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_top(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 for a in line {
                                     let r = ui.push_id((gname, *a), |ui| {
@@ -495,12 +533,7 @@ fn ribbon_groups(
                                                 } else {
                                                     t.muted.gamma_multiply(0.6)
                                                 };
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(a.info().label).size(11.0).color(c),
-                                                    )
-                                                    .wrap_mode(egui::TextWrapMode::Truncate),
-                                                );
+                                                ui.add(egui::Label::new(ribbon_label(a.info().label, c)).wrap());
                                                 icon
                                             },
                                         )
@@ -564,6 +597,19 @@ mod tests {
         }
         fn enabled(&self, _: Action) -> bool {
             true
+        }
+    }
+
+    /// A button's tooltip is its label, its shortcut and its tip: a tip that only says the label
+    /// again tells nothing (Redo, Zoom in and Zoom out did).
+    #[test]
+    fn no_tooltip_repeats_the_label() {
+        for a in Action::ALL {
+            let info = a.info();
+            assert!(
+                !info.tip.trim().eq_ignore_ascii_case(info.label.trim()),
+                "{a:?}: the tip only repeats the label"
+            );
         }
     }
 
@@ -669,6 +715,28 @@ mod tests {
         assert!(w.is_some(), "no window width moves the Undo button");
         let w = w.unwrap_or(1210.0);
         (w, w + 10.0)
+    }
+
+    #[test]
+    fn shortcut_hints_name_cmd_on_a_mac() {
+        use egui::os::OperatingSystem::{Mac, Windows};
+        assert_eq!(shortcut_hint(Mac, "Ctrl+S"), "Cmd+S");
+        assert_eq!(shortcut_hint(Mac, "Ctrl+Shift+N"), "Cmd+Shift+N");
+        assert_eq!(shortcut_hint(Mac, "Del"), "Del");
+        assert_eq!(shortcut_hint(Mac, ""), "");
+        assert_eq!(shortcut_hint(Windows, "Ctrl+S"), "Ctrl+S");
+    }
+
+    #[test]
+    fn the_redo_tip_names_cmd_shift_z_on_a_mac() {
+        use egui::os::OperatingSystem::{Mac, Nix, Windows};
+        let tip = Action::Redo.info().tip;
+        assert_eq!(
+            tip_hint(Mac, tip),
+            "Redo the last change you undid (Cmd+Shift+Z works too)"
+        );
+        assert_eq!(tip_hint(Windows, tip), tip);
+        assert_eq!(tip_hint(Nix, tip), tip);
     }
 
     #[test]
@@ -907,6 +975,74 @@ mod tests {
     }
 
     #[test]
+    fn a_ribbon_tab_shows_no_text_cursor_and_opens_on_click() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let mut state = ChromeState { ribbon_tab: 1 };
+        let mut out = Vec::new();
+        // Just inside the first tab's word: 8 points of panel margin and 4 of space before it.
+        let at = egui::pos2(16.0, 12.0);
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let frame = |state: &mut ChromeState, out: &mut Vec<Action>, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1210.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::TopBottomPanel::top("menus")
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 4)))
+                    .show(ctx, |ui| {
+                        ribbon_rects(ui, state, &AllOn, out);
+                    });
+            })
+            .platform_output
+            .cursor_icon
+        };
+        frame(&mut state, &mut out, vec![egui::Event::PointerMoved(at)]);
+        let cursor = frame(&mut state, &mut out, vec![egui::Event::PointerMoved(at)]);
+        assert_ne!(cursor, egui::CursorIcon::Text, "a ribbon tab reads as text to select");
+        frame(&mut state, &mut out, vec![press(true)]);
+        frame(&mut state, &mut out, vec![press(false)]);
+        assert_eq!(state.ribbon_tab, 0, "the point is not on the first tab");
+    }
+
+    #[test]
+    fn every_ribbon_label_is_shown_whole() {
+        // A label cut short can read the same as its neighbour's ("Move page..." for both Move
+        // page up and Move page down), so each wraps under its button and shows every word.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            for (tab, groups) in RIBBON {
+                for a in groups.iter().flat_map(|(_, a)| a.iter()) {
+                    let label = a.info().label;
+                    let galley = ctx.fonts(|f| f.layout_job(ribbon_label(label, Color32::WHITE)));
+                    let shown: String = galley
+                        .rows
+                        .iter()
+                        .flat_map(|r| r.glyphs.iter().map(|g| g.chr))
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    let whole: String = label.chars().filter(|c| !c.is_whitespace()).collect();
+                    assert_eq!(shown, whole, "{tab}: {label:?} is cut short");
+                    assert!(
+                        galley.size().x <= RIBBON_BUTTON + 0.5,
+                        "{tab}: {label:?} is wider than its button"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn a_remembered_ribbon_tab_opens_again_and_one_out_of_range_opens_the_first() {
         assert_eq!(ChromeState::with_ribbon_tab(1).ribbon_tab, 1);
         assert_eq!(
@@ -971,5 +1107,17 @@ mod tests {
             wide.iter().all(|r| (r.center().y - wide[1].center().y).abs() < 1.0),
             "one row"
         );
+    }
+
+    #[test]
+    fn no_two_classic_toolbar_buttons_share_an_icon() {
+        // The classic toolbar shows icons without labels: each must say which command it is.
+        let mut buttons: Vec<Action> = TOOLBAR.iter().flat_map(|g| g.iter().copied()).collect();
+        buttons.extend([Action::ToggleChrome, Action::ToggleTheme]);
+        for (i, a) in buttons.iter().enumerate() {
+            for b in &buttons[i + 1..] {
+                assert_ne!(a.info().icon, b.info().icon, "{a:?} and {b:?} look the same");
+            }
+        }
     }
 }

@@ -4,7 +4,7 @@ A panel layout is a cabinet mounting plate with its DIN rails, wire ducts and th
 outlines on it. `wiringcraft panel` makes and edits layouts. Each one is stored as
 `panels/<id>.panel.json` in the project folder. Layouts print after the schematic pages in the
 PDF (`wiringcraft pdf`), `wiringcraft drawing` writes one SVG or DXF file per layout
-(`panel-<name>.svg` or `.dxf`), and `wiringcraft check` warns about devices that overlap, stick out of the
+(`panel-<name>.svg` or `.dxf`; not when pages are picked with `--page`), and `wiringcraft check` warns about devices that overlap, stick out of the
 plate or are no longer in the project.
 
 All sizes and positions are in mm. `x,y` is measured from the plate's top-left corner, with y

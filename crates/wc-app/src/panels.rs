@@ -316,7 +316,8 @@ pub enum Lead<'a> {
     Dot(egui::Color32),
 }
 
-/// A full-width list row with hover and selection states. Returns the click response.
+/// A full-width list row with hover and selection states. Returns the click response. Text
+/// given a colour keeps it (a muted entry stays muted); other text takes the row's colour.
 pub fn row(ui: &mut egui::Ui, selected: bool, lead: Lead, text: RichText, mono: bool) -> egui::Response {
     let t = Theme::of(ui.ctx());
     let w = ui.available_width();
@@ -355,7 +356,7 @@ pub fn row(ui: &mut egui::Ui, selected: bool, lead: Lead, text: RichText, mono: 
     }
     let color = if selected { t.text } else { t.text.gamma_multiply(0.92) };
     let text = if mono { text.monospace() } else { text };
-    let galley = egui::WidgetText::from(text.color(color)).into_galley(
+    let galley = egui::WidgetText::from(text).into_galley(
         ui,
         Some(egui::TextWrapMode::Truncate),
         r.right() - x - 6.0,
@@ -1082,7 +1083,7 @@ fn black_box_form(
             box_size_field(ui, &mut form.height);
             ui.end_row();
         });
-    ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.faint));
+    ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.muted));
     let mut remove = None;
     egui::Grid::new("box-pins")
         .num_columns(4)
@@ -1168,9 +1169,9 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
         // a page someone else holds.
         if let Some(p) = open.project.pages.get(ed.page) {
             ui.label(format!("Page {} · {}", p.number, p.title));
-            ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
+            ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.muted));
         }
-        ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
+        ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.muted));
         page_comments(ui, open, ed, &t);
         return;
     }
@@ -1222,23 +1223,23 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 .num_columns(2)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| spec_rows(ui, open, page_idx, &wires, ps));
-            ui.label(RichText::new("A value typed here is set on all of them.").color(t.faint));
+            ui.label(RichText::new("A value typed here is set on all of them.").color(t.muted));
         } else {
             ui.label(format!("{n} items selected"));
         }
         if symbols.len() == n {
             jumper_controls(ui, open, page_idx, &symbols);
         }
-        ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.faint));
+        ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.muted));
         return;
     }
     match ed.one().cloned() {
         None => {
             if let Some(p) = open.project.pages.get(page_idx) {
                 ui.label(format!("Page {} · {}", p.number, p.title));
-                ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
+                ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.muted));
             }
-            ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
+            ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.muted));
             page_comments(ui, open, ed, t);
         }
         Some(Selection::Symbol(id)) => {
@@ -1369,11 +1370,11 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 open.set_cloud_revision(page_idx, i, &chosen);
             }
             if let Some(r) = open.project.cloud_revision(&cloud.revision) {
-                ui.label(RichText::new(format!("{} {}", r.date, r.text)).color(t.faint));
+                ui.label(RichText::new(format!("{} {}", r.date, r.text)).color(t.muted));
             } else {
                 ui.colored_label(t.warning, format!("No revision {} in the project.", cloud.revision));
             }
-            ui.label(RichText::new("Drag to move it; Delete takes it off.").color(t.faint));
+            ui.label(RichText::new("Drag to move it; Delete takes it off.").color(t.muted));
         }
         Some(Selection::RevisionTable) => {
             ui.strong("Revision table");
@@ -1383,7 +1384,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                     "Drag to move it; Delete takes it off the page. Revisions are listed in File → Project \
                      properties.",
                 )
-                .color(t.faint),
+                .color(t.muted),
             );
         }
         Some(Selection::Graphic(i)) => {
@@ -1721,7 +1722,7 @@ fn accessories_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, 
     if current.is_empty() {
         ui.label(
             RichText::new("None. Add parts that come with the main part.")
-                .color(t.faint)
+                .color(t.muted)
                 .small(),
         );
     }
@@ -1813,7 +1814,7 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
             if !v.is_empty() {
                 let mut job = egui::text::LayoutJob::default();
                 let font = egui::TextStyle::Body.resolve(ui.style());
-                job.append(&format!("{k}  "), 0.0, egui::TextFormat::simple(font.clone(), t.faint));
+                job.append(&format!("{k}  "), 0.0, egui::TextFormat::simple(font.clone(), t.muted));
                 job.append(v, 0.0, egui::TextFormat::simple(font, ui.visuals().text_color()));
                 ui.add(egui::Label::new(job).wrap());
             }
@@ -1856,7 +1857,7 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
         });
     ui.label(
         RichText::new("Shared by every symbol with this tag. Clear a value to remove it.")
-            .color(t.faint)
+            .color(t.muted)
             .small(),
     );
 }
@@ -1877,11 +1878,11 @@ fn page_comments(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, t: &Theme) {
     for c in list {
         let first: String = c.text.lines().next().unwrap_or_default().chars().take(40).collect();
         let text = RichText::new(format!("{}  {first}", c.id));
-        let text = if c.resolved { text.color(t.faint) } else { text };
+        let text = if c.resolved { text.color(t.muted) } else { text };
         if row(
             ui,
             false,
-            Lead::Dot(if c.resolved { t.faint } else { t.accent }),
+            Lead::Dot(if c.resolved { t.muted } else { t.accent }),
             text,
             false,
         )
@@ -1905,7 +1906,7 @@ fn comment_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &
         ui.label(RichText::new(format!("Comment {}", c.id)).strong());
         badge(ui, if c.resolved { "Resolved" } else { "Open" }, t);
     });
-    ui.label(RichText::new(format!("Page {number}")).color(t.faint).small());
+    ui.label(RichText::new(format!("Page {number}")).color(t.muted).small());
     ui.add_space(6.0);
     let entry = |ui: &mut egui::Ui, author: &str, time: i64, text: &str| {
         ui.label(
@@ -2022,7 +2023,8 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
         sep(ui);
         ui.label(RichText::new(format!("{:.0} %", ed.view.zoom / 3.78 * 100.0)).color(t.muted));
         sep(ui);
-        ui.label(RichText::new(&ed.message).color(t.muted));
+        // The right-hand texts are drawn first so the message gets only the space between,
+        // cut short with "…" (the whole text on hover) rather than running under them.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(o) = open {
                 if let Some((mut text, pending, failed)) = live {
@@ -2047,7 +2049,12 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
                     }
                 }
                 if !o.branch.is_empty() {
-                    ui.label(RichText::new(&o.branch).monospace().color(t.text));
+                    // A long branch name is cut short, so the status message keeps room of its own.
+                    ui.scope(|ui| {
+                        ui.set_max_width(160.0);
+                        ui.add(egui::Label::new(RichText::new(&o.branch).monospace().color(t.text)).truncate())
+                            .on_hover_text(&o.branch);
+                    });
                     let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                     crate::icons::paint(ui.painter(), r, crate::icons::Icon::Branch, t.muted, t.accent);
                 }
@@ -2063,6 +2070,9 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
                     ui.painter().circle_filled(r.center(), 3.5, t.success);
                 }
             }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(&ed.message).color(t.muted)).truncate());
+            });
         });
     });
     show_check
@@ -2363,7 +2373,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
         }
         ui.add_space(6.0);
     } else {
-        ui.label(RichText::new("Click a device on the plate to see it; drag it to move it.").color(t.faint));
+        ui.label(RichText::new("Click a device on the plate to see it; drag it to move it.").color(t.muted));
         ui.add_space(6.0);
     }
     // Devices with a part that could go on the plate but are not on it.
@@ -2384,7 +2394,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
     // Set when a Place button is pressed, applied once the panel is no longer borrowed (#928).
     let mut place: Option<wc_core::DeviceTag> = None;
     if missing.is_empty() {
-        ui.label(RichText::new("Every device with a part is on the plate.").color(t.faint));
+        ui.label(RichText::new("Every device with a part is on the plate.").color(t.muted));
     } else {
         ui.label(RichText::new(format!("Not on the plate yet ({})", missing.len())).color(t.muted));
         for (tag, m) in missing {
@@ -2399,7 +2409,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
                 ui.label(RichText::new(m).monospace());
             });
         }
-        ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+        ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.muted));
     }
     if let Some(tag) = place {
         match open.place_panel_device(pi, &tag) {
@@ -2438,6 +2448,64 @@ fn drawing_rows(g: &Shape) -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
 
+    /// A long status message is cut short to the room left by the right-hand texts, so the
+    /// status bar stays inside a narrow window instead of running under them (#1478).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_long_status_message_stays_inside_the_status_bar() {
+        let (_tmp, o) = crate::state::tests::project();
+        let mut ed = Editor::default();
+        ed.message = format!("Opened {}", "/a/very/long/folder/name".repeat(20));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let mut used = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let room = ui.max_rect();
+                let r = ui.scope(|ui| status_bar(ui, Some(&o), &ed, None)).response.rect;
+                used = Some((r, room));
+            });
+        });
+        let (r, max) = used.unwrap();
+        assert!(r.right() <= max.right() + 0.5, "{r:?} runs past {max:?}");
+        assert!(r.height() < 24.0, "the bar stays one line high: {r:?}");
+    }
+
+    /// A long branch name is cut short too: the bar stays inside the window and the message
+    /// keeps room to the left of it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_long_branch_name_leaves_room_for_the_status_message() {
+        let (_tmp, mut o) = crate::state::tests::project();
+        o.branch = "customer-changes-".repeat(40);
+        let mut ed = Editor::default();
+        ed.message = "Saved".into();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let mut used = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let room = ui.max_rect();
+                let r = ui.scope(|ui| status_bar(ui, Some(&o), &ed, None)).response.rect;
+                used = Some((r, room));
+            });
+        });
+        let (r, max) = used.unwrap();
+        assert!(
+            r.left() >= max.left() - 0.5 && r.right() <= max.right() + 0.5,
+            "{r:?} runs past {max:?}"
+        );
+        assert!(r.height() < 24.0, "the bar stays one line high: {r:?}");
+    }
+
     /// A device picked in the Devices list while a panel layout is shown is shown on its page:
     /// the panel view closes (#1203).
     #[test]
@@ -2454,6 +2522,32 @@ mod tests {
         show_device(&mut ed, 1, "s2");
         assert_eq!((ed.page, ed.panel), (1, None));
         assert_eq!(ed.selection, vec![Selection::Symbol("s2".into())]);
+    }
+
+    /// The colour of the text a `row` paints for `text`: the section colour of its galley.
+    fn row_text_color(text: RichText) -> Option<egui::Color32> {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row(ui, false, Lead::Dot(egui::Color32::GRAY), text.clone(), false);
+            });
+        });
+        out.shapes.into_iter().find_map(|clipped| match clipped.shape {
+            egui::Shape::Text(t) if t.galley.text() == "entry" => t.galley.job.sections.first().map(|s| s.format.color),
+            _ => None,
+        })
+    }
+
+    /// Text given a colour keeps it in a row, so a recent project that is gone stays muted
+    /// (#1329); text without one does not take that colour.
+    #[test]
+    fn a_row_keeps_the_colour_its_text_was_given() {
+        let red = egui::Color32::from_rgb(200, 10, 10);
+        assert_eq!(row_text_color(RichText::new("entry").color(red)), Some(red));
+        let plain = row_text_color(RichText::new("entry"));
+        assert!(plain.is_some(), "the row draws its text");
+        assert_ne!(plain, Some(red));
     }
 
     /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.

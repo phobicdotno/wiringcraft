@@ -11,6 +11,70 @@ use wc_core::{DeviceTag, Footprint, Part, Point, Shape};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// The file names in `dir`, sorted.
+fn files(dir: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// `--page` writes the named pages only: no panel layout files (#1796).
+#[test]
+fn picking_pages_leaves_the_panel_layouts_out() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .output()
+    };
+    let made = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .output()?;
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    let added = run(&["page", "add", "p2", "--number", "2"])?;
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let mut project = store::load(&dir)?;
+    project.panels.push(Panel::new("main", "Main", 600.0, 800.0));
+    project.panels.push(Panel::new("door", "Door", 600.0, 800.0));
+    store::save(&dir, &project)?;
+
+    for ext in ["svg", "dxf"] {
+        let picked = tmp.path().join(format!("picked-{ext}"));
+        let out = run(&[
+            "drawing",
+            picked.to_str().ok_or("path")?,
+            "--format",
+            ext,
+            "--page",
+            "p2",
+        ])?;
+        assert!(out.status.success(), "{ext}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(files(&picked)?, [format!("2.{ext}")], "{ext}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("wrote 1 {ext} file(s)")),
+            "{ext}"
+        );
+
+        // Without --page every page and every panel layout is written.
+        let all = tmp.path().join(format!("all-{ext}"));
+        let out = run(&["drawing", all.to_str().ok_or("path")?, "--format", ext])?;
+        assert!(out.status.success(), "{ext}: {}", String::from_utf8_lossy(&out.stderr));
+        let written = files(&all)?;
+        for name in ["2", "panel-Main", "panel-Door"] {
+            assert!(written.contains(&format!("{name}.{ext}")), "{ext}: {written:?}");
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn an_unreadable_part_is_warned_about_and_the_readable_footprint_is_still_drawn() -> TestResult {
     let tmp = tempfile::tempdir()?;

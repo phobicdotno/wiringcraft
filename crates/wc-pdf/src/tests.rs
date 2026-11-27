@@ -157,6 +157,36 @@ fn turned_text_gets_a_text_matrix() {
 }
 
 #[test]
+fn text_without_a_positive_height_is_left_out() {
+    for height in [0.0, -3.0] {
+        let mut pen = crate::writer::Pen::new(297.0);
+        pen.text((100.0, 100.0), height, 0, "flat");
+        pen.text_at_angle((100.0, 100.0), height, 1, 90.0, "turned");
+        assert!(!pen.ops.contains("Tj"), "{height}: {}", pen.ops);
+        assert!(pen.prims.is_empty(), "{height}: {:?}", pen.prims);
+    }
+    // A hand-edited page text with a negative height is not printed upside down.
+    let mut project = Project::new("Heights");
+    let mut p1 = Page::new("p1", "1", "Notes");
+    p1.graphics.push(Shape::Text {
+        at: Point::new(120.0, 80.0),
+        text: "upside down".into(),
+        height: -3.0,
+        align: Default::default(),
+        angle: 0.0,
+    });
+    project.pages = vec![p1];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let hex = crate::writer::pdf_text("upside down");
+    assert!(!String::from_utf8_lossy(&pdf).contains(&hex));
+    let (pages, _) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    let Some(page) = pages.first() else {
+        unreachable!("one page drawn");
+    };
+    assert!(!svg(page).contains("upside down"));
+}
+
+#[test]
 fn pages_export_as_svg_and_dxf() {
     let mut project = Project::new("Pump & <station>");
     let mut p1 = Page::new("p1", "1", "Control");
@@ -1664,6 +1694,31 @@ fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
 }
 
 #[test]
+fn coils_of_one_tag_on_one_page_are_listed_by_column_not_by_drawing_order() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut page = Page::new("p1", "1", "Control");
+    // Drawn right to left: the coil at column 7 first, then the one at column 2.
+    page.symbols.push(place("s1", "coil", 260.0, "-K1"));
+    page.symbols.push(place("s2", "coil", 80.0, "-K1"));
+    project.pages = vec![page];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let tag = DeviceTag::parse("-K1").ok();
+    let mains = tag
+        .as_ref()
+        .and_then(|t| x.mains.get(t))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let found: Vec<(&str, String)> = mains.iter().map(|a| (a.item.as_str(), a.location())).collect();
+    assert_eq!(
+        found,
+        [("s2", "1/2.B".to_owned()), ("s1", "1/7.B".to_owned())],
+        "the coil at column 2 first"
+    );
+}
+
+#[test]
 fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
@@ -1729,6 +1784,65 @@ fn a_breaker_contact_points_to_its_breaker_and_a_coil_still_wins() {
 }
 
 #[test]
+fn a_breaker_lists_its_contacts_unless_a_coil_of_its_tag_does() {
+    // A breaker or MPCB lists its aux contacts under its symbol as a coil does (#1467).
+    let mut symbols = BTreeMap::new();
+    symbols.insert("mpcb".to_owned(), sym("mpcb", SymbolRole::Standalone, ["1", "2"]));
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut power = Page::new("p1", "1", "Power");
+    power.symbols.push(place("s1", "mpcb", 50.0, "-Q1"));
+    power.symbols.push(place("s2", "mpcb", 150.0, "-K1"));
+    let mut control = Page::new("p2", "2", "Control");
+    control.symbols.push(place("s3", "no", 50.0, "-Q1"));
+    control.symbols.push(place("s4", "coil", 100.0, "-K1"));
+    control.symbols.push(place("s5", "no", 150.0, "-K1"));
+    project.pages = vec![power, control];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let listed: Vec<(&str, &str)> = marks
+        .iter()
+        .map(|m| (m.text.as_str(), m.target_page_id.as_str()))
+        .collect();
+    // -Q1 lists its contact; -K1's contact is listed under its coil, not again here.
+    assert_eq!(listed, [("13-14 2/2.B", "p2")], "{marks:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_breaker_contact_points_to_the_schematic_breaker_not_its_overview_copy() {
+    // An overview page (line diagram) before the schematic repeats the breaker (#1467).
+    let mut symbols = BTreeMap::new();
+    symbols.insert("mpcb".to_owned(), sym("mpcb", SymbolRole::Standalone, ["1", "2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p0", "0", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s0", "mpcb", 50.0, "-Q1"));
+    let mut power = Page::new("p1", "1", "Power");
+    power.symbols.push(place("s1", "mpcb", 50.0, "-Q1"));
+    power.symbols.push(place("s2", "no", 150.0, "-Q1"));
+    project.pages = vec![overview, power];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let back: Vec<&str> = marks
+        .iter()
+        .filter(|m| m.text.starts_with('>'))
+        .map(|m| m.target_page_id.as_str())
+        .collect();
+    assert_eq!(back, ["p1"], "{marks:?}");
+}
+
+#[test]
 fn an_interruption_point_does_not_point_to_its_copy_on_an_overview_page() {
     let mut symbols = BTreeMap::new();
     symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
@@ -1763,6 +1877,59 @@ fn an_interruption_point_does_not_point_to_its_copy_on_an_overview_page() {
 }
 
 #[test]
+fn a_coil_lists_its_contacts_by_column_not_by_drawing_order() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    symbols.insert("nc".to_owned(), sym("nc", SymbolRole::Auxiliary, ["21", "22"]));
+    symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut first = Page::new("p1", "1", "Control");
+    first.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    first.symbols.push(place("s2", "arrow", 50.0, "-L1"));
+    let mut second = Page::new("p2", "2", "Control");
+    // Drawn right to left: the contact at column 7 first, then the one at column 2.
+    second.symbols.push(place("s3", "no", 260.0, "-K1"));
+    second.symbols.push(place("s4", "nc", 80.0, "-K1"));
+    second.symbols.push(place("s5", "arrow", 260.0, "-L1"));
+    second.symbols.push(place("s6", "arrow", 80.0, "-L1"));
+    project.pages = vec![first, second];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let texts: Vec<&str> = marks.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["21-22 2/2.B", "13-14 2/7.B", "2/2.B 2/7.B"], "{marks:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn an_overview_interruption_point_lists_its_partners_in_page_order() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Line diagram");
+    p1.overview = true;
+    p1.symbols.push(place("s1", "arrow", 50.0, "-L1"));
+    let mut p2 = Page::new("p2", "2", "Power");
+    p2.symbols.push(place("s2", "arrow", 50.0, "-L1"));
+    let mut p3 = Page::new("p3", "3", "Line diagram");
+    p3.overview = true;
+    p3.symbols.push(place("s3", "arrow", 50.0, "-L1"));
+    project.pages = vec![p1, p2, p3];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(last) = project.pages.get(2) else {
+        unreachable!("three pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(last, &symbols, &x, &mut warnings);
+    assert_eq!(marks.first().map(|m| m.text.as_str()), Some("1/2.B 2/2.B"), "{marks:?}");
+    assert_eq!(marks.first().map(|m| m.target_page_id.as_str()), Some("p1"));
+}
+
+#[test]
 fn cross_references_give_page_column_and_row() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
@@ -1775,6 +1942,35 @@ fn cross_references_give_page_column_and_row() {
     let tag = DeviceTag::parse("-K1").ok();
     let first = tag.as_ref().and_then(|t| x.mains.get(t)).and_then(|m| m.first());
     assert_eq!(first.map(|a| a.location()).as_deref(), Some("12/3.B"));
+}
+
+#[test]
+fn cross_references_leave_out_page_number_blanks_and_unnamed_pins() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", " "]));
+    let mut bare = sym("bare", SymbolRole::Auxiliary, ["", ""]);
+    bare.pins.clear();
+    symbols.insert("bare".to_owned(), bare);
+    let mut project = wc_core::Project::new("x");
+    // A hand-edited page number with blanks around it.
+    let mut control = Page::new("p1", " 3 ", "Control");
+    control.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    control.symbols.push(place("s2", "no", 100.0, "-K1"));
+    control.symbols.push(place("s3", "bare", 150.0, "-K1"));
+    project.pages = vec![control];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("one page")
+    };
+    let mut warnings = Vec::new();
+    let mut texts: Vec<String> = layout::xref_marks(page, &symbols, &x, &mut warnings)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["13 3/3.B", "3/4.B", "> 3/2.B", "> 3/2.B"]);
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 #[test]
@@ -3411,6 +3607,44 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
 }
 
 #[test]
+fn a_project_without_a_name_leaves_the_reader_title_bar_to_the_file_name() {
+    // A blank or all-space name would show as an empty title bar (#1628): the PDF then has no
+    // /Title and does not ask the reader to show it, so the file name shows instead.
+    for name in ["", "   "] {
+        let mut project = Project::new(name);
+        project.pages.push(Page::new("p1", "1", "Main"));
+        let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+        let text = String::from_utf8_lossy(&pdf);
+        let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
+            unreachable!("no catalog in {text}");
+        };
+        assert!(!catalog.contains("DisplayDocTitle"), "{name:?}: {catalog}");
+        let Some(info) = text.split("endobj").find(|o| o.contains("/Producer")) else {
+            unreachable!("no info dictionary in {text}");
+        };
+        assert!(!info.contains("/Title"), "{name:?}: {info}");
+        // The page's bookmark keeps its title.
+        assert!(text.contains(&format!("/Title {}", writer::pdf_text("1 Main"))));
+    }
+}
+
+#[test]
+fn a_padded_project_name_is_trimmed_in_the_reader_title() {
+    let mut project = Project::new("  Pump station  ");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(info) = text.split("endobj").find(|o| o.contains("/Producer")) else {
+        unreachable!("no info dictionary in {text}");
+    };
+    assert!(
+        info.contains(&format!("/Title {} /Producer", writer::pdf_text("Pump station"))),
+        "{info}"
+    );
+    assert!(!info.contains(&writer::pdf_text("  Pump station  ")), "{info}");
+}
+
+#[test]
 fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
     // One page, so there is a sheet to print (#833).
     let mut project = Project::new("Pump station");
@@ -4072,5 +4306,30 @@ fn an_underlay_corner_that_is_not_a_number_leaves_the_underlay_out() {
         };
         assert!(!svg(drawing).contains("<image"), "{bad}: no underlay in the SVG");
         assert_eq!(report.warnings.len(), 1, "{bad}: {:?}", report.warnings);
+    }
+}
+
+#[test]
+fn a_cross_reference_at_a_position_that_is_not_a_number_has_no_link() {
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    // `1e308` is finite in mm but overflows to `inf` once turned into points.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e308] {
+        let mut project = Project::new("x");
+        let mut p1 = Page::new("p1", "1", "A");
+        p1.symbols.push(place("s1", "coil", 50.0, "-K1"));
+        let mut p2 = Page::new("p2", "2", "B");
+        let mut contact = place("s1", "no", 50.0, "-K1");
+        contact.at = Point::new(bad, 60.0);
+        p2.symbols.push(contact);
+        project.pages = vec![p1, p2];
+        let mut symbols = BTreeMap::new();
+        symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+        symbols.insert("no".to_string(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+        let (pdf, _) = export(&project, &symbols, &Options::default());
+        let text = String::from_utf8_lossy(&pdf);
+        // The contact's link back to its coil is left out, instead of a `NaN` rectangle that
+        // readers refuse; the coil's link to the contact stays.
+        assert!(!text.contains("NaN") && !text.contains("inf"), "{bad}: {text}");
+        assert_eq!(text.matches("/Subtype /Link").count(), 1, "{bad}");
     }
 }

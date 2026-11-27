@@ -454,6 +454,9 @@ fn shapes(
         }
         polyline(pts, closed, false)
     };
+    // Set after an invisible INSERT: the attributes that follow it in the list belong to it and
+    // are left out with it, as on a page.
+    let mut in_invisible_insert = false;
     for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
@@ -462,8 +465,20 @@ fn shapes(
             return;
         }
         *budget -= 1;
+        // Charged to the budget like any other entity, so a repeated block cannot walk them free.
+        if e.kind == "ATTRIB" && in_invisible_insert {
+            continue;
+        }
+        in_invisible_insert = e.kind == "INSERT" && e.f(60) as i64 == 1;
         let layer = e.layer();
         if skip_layer(&layer) {
+            continue;
+        }
+        // Code 60 = 1: the entity is invisible, so it is not drawn (an INSERT draws nothing of
+        // its block), except on the layers `hidden_text` names (a symbol's pin layers, where it
+        // still marks or names a pin; an INSERT there is left out like anywhere else). A POINT
+        // is never drawn and marks a pin on any layer, so it is kept whether shown or not.
+        if e.f(60) as i64 == 1 && e.kind != "POINT" && (e.kind == "INSERT" || !hidden_text(&layer)) {
             continue;
         }
         // An extrusion pointing down (left by mirroring in AutoCAD) mirrors the entity's own
@@ -2497,6 +2512,9 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
     let mut tag_warnings = Vec::new();
+    // Per symbol: how many were placed at an angle that is not a right angle, the first such
+    // angle as the file gives it, and how many at an angle out of range (placed unturned).
+    let mut odd_angles: BTreeMap<String, (usize, Option<f64>, usize)> = BTreeMap::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -2512,6 +2530,12 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         while j < d.entities.len() && d.entities[j].kind == "ATTRIB" {
             attribs.push(&d.entities[j]);
             j += 1;
+        }
+        // An invisible INSERT (code 60 = 1) places no symbol and draws nothing, nor do the
+        // attributes that come with it.
+        if e.kind == "INSERT" && e.f(60) as i64 == 1 {
+            i = j;
+            continue;
         }
         let symbol = (e.kind == "INSERT")
             .then(|| e.get(2).and_then(|n| known.get(&normalise_block_name(n))))
@@ -2537,10 +2561,18 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                             })
                             .ok()
                     });
-                // Taken to a turn first: a huge angle (a damaged file) would saturate the cast
-                // and overflow when negated.
-                let turn = e.f(50).round().rem_euclid(360.0);
-                let rotation = Rotation::from_degrees(-(turn as i64)).unwrap_or_default();
+                // A symbol only turns in right angles: any other angle is taken to the nearest
+                // one and said, so a symbol turned 45 degrees in the file is not placed
+                // unturned without a word. Past a turn of a billion degrees (a damaged file) the
+                // angle has no meaning left: it is placed unturned, and said as out of range.
+                // Taken to a quarter turn before the cast, which a huge angle would saturate.
+                let angle = e.f(50);
+                let in_range = angle.abs() < 1e9;
+                let turn = if in_range { angle.rem_euclid(360.0) } else { 0.0 };
+                let quarter = (turn / 90.0).round();
+                // A DWG angle comes in radians: a right angle can be off by a rounding error.
+                let odd = !in_range || (turn - quarter * 90.0).abs() > 1e-6;
+                let rotation = Rotation::from_degrees(-(quarter as i64) * 90).unwrap_or_default();
                 // An array places one symbol per copy. The copies share the attributes, so
                 // only the first keeps the device tag: the rest would repeat it.
                 let cells = ArrayCells::of(e);
@@ -2561,6 +2593,15 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                         break;
                     }
                     budget -= 1;
+                    if odd {
+                        let entry = odd_angles.entry((*id).clone()).or_default();
+                        if in_range {
+                            entry.0 += 1;
+                            entry.1.get_or_insert(angle);
+                        } else {
+                            entry.2 += 1;
+                        }
+                    }
                     let (x, y) = cells.at(cell, (ix, iy));
                     out.symbols.push(PlacedSymbol {
                         id: String::new(),
@@ -2579,6 +2620,23 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
             }
         }
         i = j;
+    }
+    for (id, (count, first, out_of_range)) in odd_angles {
+        let mut said = Vec::new();
+        if let Some(first) = first {
+            let what = if count == 1 {
+                "1 placed".to_owned()
+            } else {
+                format!("{count} placed, the first")
+            };
+            said.push(format!(
+                "{what} at {first} degrees, turned to the nearest right angle (symbols only turn in right angles)"
+            ));
+        }
+        if out_of_range > 0 {
+            said.push(format!("{out_of_range} placed at an angle out of range, left unturned"));
+        }
+        tag_warnings.push(format!("{id}: {}", said.join("; ")));
     }
     shapes(
         d,
@@ -3102,6 +3160,202 @@ mod tests {
             assert_eq!(p.symbols.len(), 1, "{angle}");
             assert_eq!(p.symbols[0].rotation, want, "{angle}");
         }
+        Ok(())
+    }
+
+    /// A symbol turned by an angle that is not a right angle is placed at the nearest one, and
+    /// the import says so, naming the symbol and the angle (#1793).
+    #[test]
+    fn a_symbol_at_an_odd_angle_is_turned_to_a_right_angle_and_said() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string(), "wc.lamp".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n45\n\
+                    0\nINSERT\n2\nWC.COIL\n10\n9\n20\n0\n50\n100\n\
+                    0\nINSERT\n2\nWC.LAMP\n10\n0\n20\n9\n50\n90\n";
+        let p = page(&dxf(ents, ""), 1.0, &known)?;
+        let rotations: Vec<Rotation> = p.symbols.iter().map(|s| s.rotation).collect();
+        // 45 rounds up to a quarter turn, 100 down to one; DXF angles run the other way round.
+        assert_eq!(rotations, [Rotation::R270, Rotation::R270, Rotation::R270]);
+        let odd: Vec<&String> = p
+            .warnings
+            .iter()
+            .filter(|w| w.contains("nearest right angle"))
+            .collect();
+        assert_eq!(odd.len(), 1, "{:?}", p.warnings);
+        assert!(
+            odd.iter()
+                .any(|w| w.starts_with("wc.coil: 2 placed, the first at 45 degrees")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// The angle is rounded once, to the nearest quarter turn: 44.6 is nearer 0 than 90, and
+    /// 89.6 is near but not at a right angle, so it is said. The warning gives the angle as the
+    /// file does.
+    #[test]
+    fn a_fractional_angle_takes_the_nearest_quarter_turn_and_is_said() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        for (angle, want) in [
+            ("44.6", Rotation::R0),
+            ("45.4", Rotation::R270),
+            ("89.6", Rotation::R270),
+            ("-100", Rotation::R90),
+        ] {
+            let ents = format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+            let p = page(&dxf(&ents, ""), 1.0, &known)?;
+            assert_eq!(p.symbols.first().map(|s| s.rotation), Some(want), "{angle}");
+            let said = format!("wc.coil: 1 placed at {angle} degrees, turned to the nearest right angle");
+            assert!(
+                p.warnings.iter().any(|w| w.starts_with(&said)),
+                "{angle}: {:?}",
+                p.warnings
+            );
+        }
+        Ok(())
+    }
+
+    /// An angle out of range is said as left unturned, apart from the rounded ones, whichever
+    /// comes first.
+    #[test]
+    fn an_angle_out_of_range_is_said_as_left_unturned() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let at = |angle: &str| format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+        let said = |ents: &str| -> Result<Vec<String>> {
+            let p = page(&dxf(ents, ""), 1.0, &known)?;
+            Ok(p.warnings.into_iter().filter(|w| w.starts_with("wc.coil:")).collect())
+        };
+        assert_eq!(
+            said(&at("1e9"))?,
+            ["wc.coil: 1 placed at an angle out of range, left unturned"]
+        );
+        let both = "wc.coil: 1 placed at 45 degrees, turned to the nearest right angle (symbols only turn in \
+                    right angles); 1 placed at an angle out of range, left unturned";
+        assert_eq!(said(&format!("{}{}", at("45"), at("1e9")))?, [both]);
+        assert_eq!(said(&format!("{}{}", at("1e9"), at("45")))?, [both]);
+        Ok(())
+    }
+
+    /// An array counts each copy it places.
+    #[test]
+    fn an_array_at_an_odd_angle_counts_its_copies() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n45\n70\n3\n71\n2\n44\n10\n45\n10\n";
+        let p = page(&dxf(ents, ""), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 6);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.starts_with("wc.coil: 6 placed, the first at 45 degrees")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// Right angles are placed as they are, without a warning.
+    #[test]
+    fn a_symbol_at_a_right_angle_is_not_warned_about() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        for angle in ["0", "90", "180", "270", "-90", "450"] {
+            let ents = format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+            let p = page(&dxf(&ents, ""), 1.0, &known)?;
+            assert!(
+                p.warnings.iter().all(|w| !w.contains("nearest right angle")),
+                "{angle}: {:?}",
+                p.warnings
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invisible_entities_are_not_drawn() -> Result<()> {
+        // A visible and an invisible (60 = 1) line, and a visible and an invisible insert of a
+        // block with one line: only the visible ones are drawn, and nothing is said.
+        let blocks = "0\nBLOCK\n2\nBOX\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n7\n0\nENDBLK\n";
+        let ents = "0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n\
+                    0\nLINE\n60\n1\n10\n0\n20\n0\n11\n9\n21\n0\n\
+                    0\nINSERT\n2\nBOX\n10\n20\n20\n0\n\
+                    0\nINSERT\n2\nBOX\n60\n1\n10\n40\n20\n0\n";
+        let (shapes, skipped) = drawn(ents, blocks)?;
+        let lines: Vec<(Point, Point)> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Line { a, b } => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (Point::new(0.0, 0.0), Point::new(5.0, 0.0)),
+                (Point::new(20.0, 0.0), Point::new(20.0, -7.0))
+            ],
+            "{shapes:?}"
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        // On a symbol's pin layer an invisible point still marks a pin.
+        let sym = symbol(
+            &dxf(
+                "0\nPOINT\n8\nPIN\n60\n1\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n",
+                "",
+            ),
+            "s",
+            "S",
+        )?;
+        assert_eq!(sym.pins.len(), 1);
+        // So does an invisible point on any other layer: a POINT marks a pin wherever it is.
+        let sym = symbol(
+            &dxf(
+                "0\nPOINT\n8\n0\n60\n1\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n",
+                "",
+            ),
+            "s",
+            "S",
+        )?;
+        assert_eq!(sym.pins.len(), 1);
+        // An invisible INSERT on a pin layer is left out with its whole block: neither the
+        // line nor the pin inside it is kept.
+        let blocks = "0\nBLOCK\n2\nPINBOX\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n0\n21\n7\n\
+                      0\nPOINT\n8\nPIN\n10\n0\n20\n7\n0\nENDBLK\n";
+        let ents = "0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n\
+                    0\nINSERT\n8\nPIN\n2\nPINBOX\n60\n1\n10\n20\n20\n0\n";
+        let sym = symbol(&dxf(ents, blocks), "s", "S")?;
+        assert_eq!(sym.pins.len(), 0);
+        let lines = sym.graphics.iter().filter(|s| matches!(s, Shape::Line { .. })).count();
+        assert_eq!(lines, 1, "{:?}", sym.graphics);
+        // On a page an invisible INSERT of a known symbol places nothing, and its attributes
+        // are not drawn; the visible one is placed as before.
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n60\n1\n10\n0\n20\n0\n66\n1\n\
+                    0\nATTRIB\n2\nTAG\n1\n-K1\n10\n0\n20\n5\n\
+                    0\nATTRIB\n2\nNOTE\n1\nHidden\n10\n0\n20\n9\n\
+                    0\nINSERT\n2\nWC.COIL\n10\n50\n20\n0\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K2\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 1, "{:?}", p.symbols);
+        assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K2"));
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        // Inside a visible block, an invisible INSERT's attributes are left out with it, while
+        // a visible INSERT's attribute is still drawn.
+        let blocks = "0\nBLOCK\n2\nINNER\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nOUTER\n\
+                      0\nINSERT\n2\nINNER\n60\n1\n10\n0\n20\n0\n66\n1\n\
+                      0\nATTRIB\n2\nNOTE\n1\nHidden\n10\n0\n20\n5\n70\n0\n\
+                      0\nINSERT\n2\nINNER\n10\n0\n20\n20\n66\n1\n\
+                      0\nATTRIB\n2\nNOTE\n1\nShown\n10\n0\n20\n25\n70\n0\n\
+                      0\nENDBLK\n";
+        let (shapes, skipped) = drawn("0\nINSERT\n2\nOUTER\n10\n0\n20\n0\n", blocks)?;
+        let texts: Vec<&str> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Shown"], "{shapes:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
         Ok(())
     }
 
@@ -4324,6 +4578,32 @@ mod tests {
         assert_eq!(shapes.len(), 2);
         assert_eq!(skipped.get(OVER_LIMIT), Some(&3), "{skipped:?}");
         assert_eq!(budget, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn attributes_of_an_invisible_insert_use_the_budget() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nIN\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let attribs = "0\nATTRIB\n2\nA\n1\nx\n0\nATTRIB\n2\nB\n1\ny\n0\nATTRIB\n2\nC\n1\nz\n";
+        let hidden = format!("0\nINSERT\n2\nIN\n10\n0\n20\n0\n60\n1\n66\n1\n{attribs}");
+        // The INSERT and two of its attributes take the budget of 3; the third attribute and
+        // the two lines after it are counted as over the limit, and nothing is drawn.
+        let line = "0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
+        let d = parse(&dxf(&format!("{hidden}{line}{line}"), blocks))?;
+        let (mut skipped, mut budget) = (BTreeMap::new(), 3);
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert!(shapes.is_empty(), "{shapes:?}");
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&3), "{skipped:?}");
+        assert_eq!(budget, 0);
+        // A block holding such an INSERT, placed as a 4 x 5 array: each copy walks the
+        // attributes again and pays for them, so the budget runs out instead of being walked free.
+        let rep = format!("0\nBLOCK\n2\nREP\n{hidden}0\nENDBLK\n");
+        let arr = "0\nINSERT\n2\nREP\n10\n0\n20\n0\n70\n4\n71\n5\n44\n1\n45\n1\n";
+        let d = parse(&dxf(arr, &format!("{blocks}{rep}")))?;
+        let (mut skipped, mut budget) = (BTreeMap::new(), 50);
+        draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert_eq!(budget, 0, "20 copies of 4 entities need more than 50");
+        assert!(skipped.get(OVER_LIMIT).is_some_and(|n| *n > 0), "{skipped:?}");
         Ok(())
     }
 

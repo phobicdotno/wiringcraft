@@ -25,6 +25,7 @@ pub struct Theme {
     /// Hairlines between areas.
     pub border: Color32,
     pub text: Color32,
+    /// Secondary interface text: hints, counts, dates. Use this, not `faint`, off the sheet.
     pub muted: Color32,
     pub accent: Color32,
     /// Accent tint behind selected rows and pressed tools.
@@ -41,6 +42,7 @@ pub struct Theme {
     pub grid: Color32,
     pub grid_major: Color32,
     pub ink: Color32,
+    /// Secondary marks on the white sheet. Too dark for text on the dark window.
     pub faint: Color32,
     pub wire: Color32,
     pub wire_label: Color32,
@@ -169,6 +171,10 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// Apply the WiringCraft style for `mode` to the whole app.
 pub fn apply(ctx: &egui::Context, mode: Mode) {
     let dark = mode == Mode::Dark;
+    // Pin egui to the chosen mode. Left on "follow the system", egui keeps a
+    // second, unstyled style for the other OS mode and swaps to it as soon as
+    // the OS changes between dark and light, throwing away all of the below.
+    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
     let t = Theme::new(dark);
     let mut v = if dark {
         egui::Visuals::dark()
@@ -263,4 +269,37 @@ pub fn apply(ctx: &egui::Context, mode: Mode) {
         sp.scroll.floating = true;
         s.interaction.selectable_labels = false;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn luminance(c: Color32) -> f32 {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn interface_text_reads_on_panels_in_both_modes() {
+        for dark in [false, true] {
+            let t = Theme::new(dark);
+            for bg in [t.panel, t.surface] {
+                assert!(contrast(t.text, bg) >= 4.5, "text, dark={dark}");
+                assert!(contrast(t.muted, bg) >= 4.5, "muted, dark={dark}");
+            }
+        }
+    }
 }
