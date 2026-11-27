@@ -17,6 +17,8 @@ pub enum Chrome {
 #[serde(default)]
 pub struct Prefs {
     pub chrome: Chrome,
+    /// The ribbon tab that was open last, so the ribbon opens on it again.
+    pub ribbon_tab: usize,
     /// Light or dark interface.
     pub theme: crate::theme::Mode,
     pub show_grid: bool,
@@ -86,6 +88,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             chrome: Chrome::Classic,
+            ribbon_tab: 0,
             theme: crate::theme::Mode::Light,
             show_grid: true,
             auto_wire: true,
@@ -374,6 +377,18 @@ mod tests {
             }
         );
         assert_eq!(toml::from_str::<Prefs>("").unwrap().window, Window::default());
+    }
+
+    #[test]
+    fn the_open_ribbon_tab_is_kept_and_older_files_open_on_the_first() {
+        let p = Prefs {
+            ribbon_tab: 2,
+            ..Prefs::default()
+        };
+        let back: Prefs = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back.ribbon_tab, 2);
+        let old: Prefs = toml::from_str("chrome = \"ribbon\"\n").unwrap();
+        assert_eq!(old.ribbon_tab, 0);
     }
 
     #[test]
