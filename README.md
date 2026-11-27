@@ -171,6 +171,19 @@ gives the details.
 - [docs/pdf-output.md](docs/pdf-output.md): what the exported PDF contains
 - [docs/check-reference.md](docs/check-reference.md): every finding the project check can report
 - [docs/eplan-import.md](docs/eplan-import.md): what the EPLAN import reads and what it leaves out
+- [docs/glossary.md](docs/glossary.md): the terms WiringCraft uses
+- [docs/device-tags.md](docs/device-tags.md): device tags, functions and locations
+- [docs/wires-and-potentials.md](docs/wires-and-potentials.md): wires, potentials and how connections are worked out
+- [docs/cross-references.md](docs/cross-references.md): how cross-references work
+- [docs/symbols.md](docs/symbols.md): symbols and the project's library copies
+- [docs/black-boxes.md](docs/black-boxes.md): black boxes
+- [docs/terminal-strips.md](docs/terminal-strips.md): terminal strips, levels and jumpers
+- [docs/cables.md](docs/cables.md): cables, cable types and cores
+- [docs/plc.md](docs/plc.md): PLC addresses, racks, cards and exports
+- [docs/reports.md](docs/reports.md): every report and its columns
+- [docs/revisions.md](docs/revisions.md): drawing revisions, clouds and the revision table
+- [docs/versions.md](docs/versions.md): how versions, branches and merges work
+- [docs/translations.md](docs/translations.md): multilingual project texts
 - [docs/app-shortcuts.md](docs/app-shortcuts.md): every key and mouse gesture in the desktop app
 - [docs/preferences.md](docs/preferences.md): the app preferences file
 - [docs/troubleshooting.md](docs/troubleshooting.md): common problems and what to do
