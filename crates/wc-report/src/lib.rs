@@ -965,9 +965,23 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             ));
         }
     }
-    // Cables listed before their cores are drawn; `-X1.W1` is a terminal, not a cable.
+    // Cables listed before their cores are drawn, told from terminals named like a cable
+    // (`-X1.W1`) as the marking list does: a terminal on the rail is no cable. A tag drawn on a
+    // schematic page with a symbol of known role is a cable when that role is not a terminal
+    // (`-A1.WD3`); one not drawn so is a terminal when it has a terminal level.
+    let (_, on_rail) = marking::terminal_tags(i);
+    let drawn_with_role: BTreeSet<&DeviceTag> = i
+        .project
+        .pages
+        .iter()
+        .filter(|pg| !pg.overview)
+        .flat_map(|pg| &pg.symbols)
+        .filter(|s| i.symbols.contains_key(&s.symbol))
+        .filter_map(|s| s.tag.as_ref())
+        .collect();
     for tag in i.project.devices.keys() {
-        if tag.product.len() == 1 && marking::is_cable_tag(tag) {
+        let terminal = on_rail.contains(tag) || (!drawn_with_role.contains(tag) && counts_as_terminal(None, Some(tag)));
+        if !terminal && marking::is_cable_tag(tag) {
             cores.entry(tag.clone()).or_default();
         }
     }
