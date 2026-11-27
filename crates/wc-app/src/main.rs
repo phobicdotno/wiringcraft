@@ -2729,10 +2729,12 @@ impl App {
                     });
                     // An empty log has nothing to include: the box is greyed out and shown
                     // unticked, so it does not claim a log goes with the report.
-                    let mut nothing = false;
-                    let tick = if log.is_empty() { &mut nothing } else { &mut *include };
-                    ui.add_enabled(!log.is_empty(), egui::Checkbox::new(tick, "Include this log in my report"))
+                    let (enabled, mut ticked) = include_log_box(log, *include);
+                    ui.add_enabled(enabled, egui::Checkbox::new(&mut ticked, "Include this log in my report"))
                         .on_disabled_hover_text("The log is empty.");
+                    if enabled {
+                        *include = ticked;
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Open the report form").clicked() {
                             let (request, copy) = report_request(log, *include);
@@ -6752,6 +6754,13 @@ const REPORT_LOG_BYTES: usize = 60_000;
 /// How much of the log's end goes into the report form itself (the link has a size limit).
 const REPORT_FORM_BYTES: usize = 1_500;
 
+/// The "Include this log" box: whether it can be used and whether it shows ticked. An empty log
+/// has nothing to include, so the box is greyed out and unticked whatever was chosen.
+fn include_log_box(log: &str, include: bool) -> (bool, bool) {
+    let enabled = !log.is_empty();
+    (enabled, enabled && include)
+}
+
 /// The report form's fields and the text for the clipboard: the log goes in only when the person
 /// chose to include it and there is one.
 fn report_request(log: &str, include: bool) -> (feedback::Request, Option<String>) {
@@ -7025,6 +7034,15 @@ mod renderer_tests {
         assert_eq!(press(Modifiers::COMMAND, Key::Z), [Action::Undo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Y), [Action::Redo]);
         assert_eq!(press(shift, Key::N), [Action::NewProject]);
+    }
+
+    /// An empty log greys out "Include this log" and shows it unticked; a log leaves the choice.
+    #[test]
+    fn the_include_log_box_is_off_for_an_empty_log() {
+        assert_eq!(include_log_box("", true), (false, false));
+        assert_eq!(include_log_box("", false), (false, false));
+        assert_eq!(include_log_box("started", true), (true, true));
+        assert_eq!(include_log_box("started", false), (true, false));
     }
 
     #[test]
