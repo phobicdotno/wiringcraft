@@ -23,8 +23,9 @@ itself again with wgpu (Direct3D, Metal or Vulkan, with a software fallback) and
 wiringcraft-app: OpenGL could not start (<reason>); starting again with wgpu
 ```
 
-If the second start fails as well, it prints
-`wiringcraft-app: could not start again with wgpu: <reason>`.
+If the app cannot launch that second copy of itself at all, it prints
+`wiringcraft-app: could not start again with wgpu: <reason>`. If the second copy launches but
+wgpu fails in it, that line does not appear: the app stops with the wgpu error instead.
 
 To pick the backend yourself, set `WIRINGCRAFT_RENDERER` before starting the app:
 
