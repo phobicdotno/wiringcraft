@@ -214,7 +214,10 @@ impl Network {
         let mut used: BTreeMap<Port, usize> = BTreeMap::new();
         for (i, l) in self.links.iter().enumerate() {
             let ends = [Port::parse(&l.from), Port::parse(&l.to)];
-            for end in &ends {
+            // A link from a port to itself is one link on that port, and one warning about a
+            // stranger: its second end is not counted again.
+            let looped = matches!(&ends, [Ok(a), Ok(b)] if a == b);
+            for end in ends.iter().take(if looped { 1 } else { 2 }) {
                 match end {
                     Ok(p) => {
                         if !devices.contains(&p.device) {
@@ -231,9 +234,7 @@ impl Network {
                     Err(e) => out.push(format!("network {name}: link {}: {e}", i + 1)),
                 }
             }
-            if let [Ok(a), Ok(b)] = &ends
-                && a == b
-            {
+            if looped && let [Ok(a), _] = &ends {
                 out.push(format!("network {name}: link {} joins {a} to itself", i + 1));
             }
         }
@@ -354,7 +355,28 @@ cable = "-W20"
                 "network PN1: link 3 is on -K99, which is not a node",
                 "network PN1: link 4 joins -K11:P2 to itself",
                 "network PN1: port -A1:X1P1 has 2 links",
-                "network PN1: port -K11:P2 has 3 links",
+                "network PN1: port -K11:P2 has 2 links",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_to_itself_counts_once_on_its_port() -> R {
+        let mut n: Network = toml::from_str(TOML)?;
+        for end in ["-K10:P9", "-K99:P1"] {
+            n.links.push(Link {
+                from: end.into(),
+                to: end.into(),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            n.warnings(),
+            [
+                "network PN1: link 2 joins -K10:P9 to itself",
+                "network PN1: link 3 is on -K99, which is not a node",
+                "network PN1: link 3 joins -K99:P1 to itself",
             ]
         );
         Ok(())
