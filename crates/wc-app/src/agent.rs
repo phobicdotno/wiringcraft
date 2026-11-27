@@ -751,7 +751,8 @@ fn report_kind(text: &str) -> Result<wc_report::Kind, String> {
     })
 }
 
-/// `set_device`'s `accessories`: a list of `{part, qty}`, qty 1 when left out. An entry that is
+/// `set_device`'s `accessories`: a list of `{part, qty}`, qty 1 when left out (a null qty is
+/// refused). An entry that is
 /// not one refuses the whole list, so no accessory is dropped or changed by a mistake.
 fn accessories(list: &Value) -> Result<Vec<wc_core::DevicePart>, String> {
     let shape = "accessories must be a list of {part, qty} (qty a whole number of 1 or more)";
@@ -763,7 +764,7 @@ fn accessories(list: &Value) -> Result<Vec<wc_core::DevicePart>, String> {
                 return Err(format!("{shape}: an entry has no part."));
             }
             let qty = match a.get("qty") {
-                None | Some(Value::Null) => 1,
+                None => 1,
                 Some(q) => q
                     .as_u64()
                     .and_then(|q| u32::try_from(q).ok())
@@ -2899,6 +2900,16 @@ impl App {
     fn tool_set_device(&mut self, v: &Value) -> Result<String, String> {
         let mut t = tag(need_s(v, "tag")?)?;
         let open = need_open(self.open.as_mut())?;
+        // The accessories are checked before any field is applied, so a refused list leaves the
+        // project as it was.
+        let list = v
+            .get("accessories")
+            .filter(|l| !l.is_null())
+            .map(accessories)
+            .transpose()?;
+        if let Some(list) = &list {
+            open.check_parts(list.iter().map(|a| a.part.as_str()))?;
+        }
         let mut done = Vec::new();
         if let Some(to) = s(v, "rename_to") {
             let to = tag(to)?;
@@ -2928,8 +2939,7 @@ impl App {
                 format!("part {p}")
             });
         }
-        if let Some(list) = v.get("accessories").filter(|l| !l.is_null()) {
-            let list = accessories(list)?;
+        if let Some(list) = list {
             let n = list.len();
             open.set_device_accessories(&t, list)?;
             done.push(if n == 0 {
@@ -5441,12 +5451,21 @@ mod tests {
             json!([{"qty": 2}]),
             json!([{"part": "example.ex-tb-2-5", "qty": 0}]),
             json!([{"part": "example.ex-tb-2-5", "qty": "2"}]),
+            json!([{"part": "example.ex-tb-2-5", "qty": null}]),
             json!([{"part": "no.such"}]),
         ] {
             let r = call(&mut a, "set_device", json!({"tag": "-K1", "accessories": bad.clone()}));
             assert!(r.is_err(), "{bad}: {r:?}");
+            // Nor does it let the call's other fields through.
+            let r = call(
+                &mut a,
+                "set_device",
+                json!({"tag": "-K1", "description": "New", "part": "example.ex-tb-2-5", "properties": {"k": "v"}, "accessories": bad.clone()}),
+            );
+            assert!(r.is_err(), "{bad} with other fields: {r:?}");
         }
         assert!(got(&a).is_empty());
+        assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
 
         let said = call(

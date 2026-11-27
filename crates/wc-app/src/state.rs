@@ -1163,6 +1163,15 @@ impl Open {
         Ok(())
     }
 
+    /// Check that every part can be used (taken from the library when needed) without pinning
+    /// any of them, so a change can be refused before anything else of it is applied.
+    pub fn check_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let lock = self.project.lock.clone();
+        let r = ids.into_iter().try_for_each(|id| self.ensure_part(id));
+        self.project.lock = lock;
+        r
+    }
+
     /// Replace a device's accessories (its parts after the main part). New parts are taken from
     /// the library into the project; a quantity of 0 is taken as 1. One undo step.
     pub fn set_device_accessories(&mut self, tag: &DeviceTag, accessories: Vec<DevicePart>) -> Result<(), String> {
