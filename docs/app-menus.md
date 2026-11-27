@@ -138,7 +138,9 @@ the schematic behind it.
 
 Request a function and Something is missing open a GitHub issue form in the browser. Report a
 problem first shows WiringCraft's recent log, which you can choose to include, then opens the
-form. Nothing is sent until you press Submit on GitHub, and what you send goes on the todo list.
+form. The form's fields are filled in through the link the browser opens, so with the log
+included, the end of the log reaches GitHub when the form opens, before you press Submit.
+Nothing is published until you press Submit, and what you send goes on the todo list.
 
 ## Right-click menus
 
