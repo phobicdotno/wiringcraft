@@ -2507,8 +2507,15 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
             if pin.is_some() && (readable || store::vendor_path(dir, ItemKind::Symbol, id).is_ok_and(|f| f.exists())) {
                 continue;
             }
+            // A library that cannot be opened or read for a symbol without a pin stops here:
+            // the loop below would read it again, and could then write a version this check
+            // never saw.
             if lib.is_none() {
-                lib = wc_library::Library::open(dir, p).ok();
+                lib = match (wc_library::Library::open(dir, p), pin) {
+                    (Ok(lib), _) => Some(lib),
+                    (Err(why), None) => return Err(e(why)),
+                    (Err(_), Some(_)) => None,
+                };
             }
             let Some(lib) = &lib else { break };
             let found = match pin {
@@ -2521,7 +2528,7 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
                         }
                     })
                     .ok(),
-                None => lib.symbol(id).ok().map(|(s, _)| s),
+                None => Some(lib.symbol(id).map_err(e)?.0),
             };
             let Some(found) = found else { continue };
             if pin.is_none() {
