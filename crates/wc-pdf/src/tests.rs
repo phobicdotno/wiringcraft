@@ -1670,6 +1670,35 @@ fn cross_references_give_page_column_and_row() {
 }
 
 #[test]
+fn cross_references_leave_out_page_number_blanks_and_unnamed_pins() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", " "]));
+    let mut bare = sym("bare", SymbolRole::Auxiliary, ["", ""]);
+    bare.pins.clear();
+    symbols.insert("bare".to_owned(), bare);
+    let mut project = wc_core::Project::new("x");
+    // A hand-edited page number with blanks around it.
+    let mut control = Page::new("p1", " 3 ", "Control");
+    control.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    control.symbols.push(place("s2", "no", 100.0, "-K1"));
+    control.symbols.push(place("s3", "bare", 150.0, "-K1"));
+    project.pages = vec![control];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("one page")
+    };
+    let mut warnings = Vec::new();
+    let mut texts: Vec<String> = layout::xref_marks(page, &symbols, &x, &mut warnings)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["13 3/3.B", "3/4.B", "> 3/2.B", "> 3/2.B"]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
 fn the_frame_shows_row_letters_on_both_sides() {
     let project = wc_core::Project::new("x");
     let mut page = Page::new("p1", "1", "");
