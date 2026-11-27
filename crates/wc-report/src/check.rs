@@ -271,15 +271,10 @@ pub fn check_with_unreadable(
     }
     for (tag, (count, uses)) in &drawn {
         let Some(device) = p.devices.get(*tag) else { continue };
-        let fitted = device
-            .part
-            .iter()
-            .map(|id| (id.as_str(), 1))
-            .chain(device.accessories.iter().map(|a| (a.part.as_str(), a.qty)));
         let mut has = wc_core::Contacts::default();
         let mut listed = false;
         let mut unknown = false;
-        for (id, qty) in fitted {
+        for (id, qty) in device.all_parts() {
             match i.parts.get(id) {
                 Some(part) => {
                     if let Some(c) = &part.contacts {
@@ -633,7 +628,11 @@ pub fn check_with_unreadable(
         }
     }
     for tag in crate::all_tags(i) {
-        if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
+        if p.devices
+            .get(&tag)
+            .and_then(|d| d.part.as_deref())
+            .is_none_or(|part| part.trim().is_empty())
+        {
             out.push(Finding {
                 severity: Severity::Note,
                 page_id: None,
