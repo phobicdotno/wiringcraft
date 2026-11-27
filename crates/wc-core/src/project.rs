@@ -200,6 +200,7 @@ pub fn relative_file_is_safe(f: &str) -> bool {
 
 /// Terminals of one strip bridged together by a jumper: they form one potential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredJumper")]
 pub struct Jumper {
     /// The strip, e.g. `-X1`.
     pub strip: DeviceTag,
@@ -209,6 +210,43 @@ pub struct Jumper {
     /// list and written in the WAGO configurator export.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+}
+
+/// A [`Jumper`] as read from `project.toml`, before its terminals are checked.
+#[derive(Deserialize)]
+struct StoredJumper {
+    strip: DeviceTag,
+    terminals: Vec<String>,
+    #[serde(default)]
+    part: Option<String>,
+}
+
+impl TryFrom<StoredJumper> for Jumper {
+    type Error = String;
+
+    /// Refuses a jumper naming a number that cannot be a terminal of its strip, or with fewer
+    /// than two different terminals (a hand edit or another tool), as
+    /// [`ProjectMeta::add_jumper`] does.
+    fn try_from(j: StoredJumper) -> Result<Self, String> {
+        let mut distinct: Vec<&String> = Vec::new();
+        for t in &j.terminals {
+            check_terminal_number(&j.strip, t)?;
+            if !distinct.contains(&t) {
+                distinct.push(t);
+            }
+        }
+        if distinct.len() < 2 {
+            return Err(format!(
+                "the jumper on {} needs at least two different terminals of the strip",
+                j.strip
+            ));
+        }
+        Ok(Jumper {
+            strip: j.strip,
+            terminals: j.terminals,
+            part: j.part,
+        })
+    }
 }
 
 /// How a terminal strip is arranged on its rail: the order of its terminals and the spare
@@ -649,8 +687,16 @@ pub fn location_rows(rows: &[(String, String)]) -> Result<Vec<Location>, String>
             description: description.trim().to_owned(),
         });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    sort_locations(&mut out);
     Ok(out)
+}
+
+/// Sort locations in natural order of their paths, as tags are listed: `+CAB2` before `+CAB10`.
+/// Paths alike in natural order (`L01` and `L1`, `+L1` and `L1`) keep a fixed order by their text.
+pub fn sort_locations(locations: &mut [Location]) {
+    // A path stored as typed (`+CAB10`) sorts by its normal form (`CAB10`).
+    let key = |l: &Location| natural_key(&location_path(&l.path).unwrap_or_else(|_| l.path.clone()));
+    locations.sort_by_cached_key(|l| (key(l), l.path.clone()));
 }
 
 /// A location of the project, such as a cabinet or a room.
@@ -693,12 +739,12 @@ impl ProjectMeta {
             Some(l) => {
                 l.path = path;
                 l.description = description;
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
             None => {
                 self.locations.push(Location { path, description });
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
         }
@@ -744,7 +790,7 @@ impl ProjectMeta {
             Some(_) => false,
             None => {
                 self.locations.push(loc);
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 true
             }
         }
@@ -836,6 +882,7 @@ impl ProjectMeta {
     /// Take `terminal` of `strip` out of its jumper; a jumper left with one terminal goes.
     /// Returns whether anything changed.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let terminal = terminal.trim();
         let mut changed = false;
         for j in self.jumpers.iter_mut().filter(|j| &j.strip == strip) {
             let before = j.terminals.len();
@@ -927,6 +974,7 @@ impl ProjectMeta {
     /// Give the jumper that holds `terminal` of `strip` a part, or none. Returns whether that
     /// changed anything; `Err` when the terminal is in no jumper.
     pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<bool, String> {
+        let terminal = terminal.trim();
         let j = self
             .jumpers
             .iter_mut()
@@ -1723,6 +1771,19 @@ pub struct Device {
     pub properties: BTreeMap<String, String>,
 }
 
+impl Device {
+    /// Set the description to `text` without the spaces around it; a blank text clears it.
+    /// Returns whether the description changed.
+    pub fn set_description(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if self.description == text {
+            return false;
+        }
+        text.clone_into(&mut self.description);
+        true
+    }
+}
+
 /// One more part of a device, with how many of it the device needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePart {
@@ -2084,8 +2145,15 @@ impl Project {
         }
         // A strip's rail order and spares go with it, unless `to` has a layout of its own: two
         // layouts for one strip would not load. The layout goes where `to` sorts, and each
-        // spare's device data (its part) goes along, unless the new spare tag has its own.
+        // spare's device data (its part) goes along, unless the new spare tag has its own. A
+        // strip renamed to a tag below itself (`-X1` to `-X1.S1`) keeps its layout: its spares
+        // would follow it there level after level.
+        let below = to.function == from.function
+            && to.location == from.location
+            && to.product.len() > from.product.len()
+            && to.product.starts_with(&from.product);
         if let Some(k) = self.meta.strips.iter().position(|l| &l.strip == from)
+            && !below
             && !self.meta.strips.iter().any(|l| &l.strip == to)
         {
             let mut layout = self.meta.strips.remove(k);
@@ -2234,6 +2302,18 @@ mod tests {
         p.devices.insert(DeviceTag::parse("-K1")?, d);
         assert_eq!(p.used_parts().len(), 3);
         Ok(())
+    }
+
+    #[test]
+    fn a_device_description_is_trimmed_and_a_blank_one_cleared() {
+        let mut d = Device::default();
+        assert!(d.set_description("  Pump motor\t"));
+        assert_eq!(d.description, "Pump motor");
+        assert!(!d.set_description("Pump motor "));
+        assert!(d.set_description("   "));
+        assert_eq!(d.description, "");
+        assert!(!d.set_description(""));
+        assert_eq!(serde_json::to_string(&d).ok().as_deref(), Some("{}"));
     }
 
     #[test]
@@ -2443,8 +2523,8 @@ mod tests {
         assert!(!m.merge_location(loc("+L2", "Other")));
         assert!(m.merge_location(loc("+L5", "")));
         let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
-        assert_eq!(paths, ["+L4", "L1.L3", "L2", "L5"]);
-        assert_eq!(m.locations[0].description, "Deck");
+        assert_eq!(paths, ["L1.L3", "L2", "+L4", "L5"], "+L4 sorts as L4");
+        assert_eq!(m.locations[2].description, "Deck");
         m.locations.retain(|l| l.path != "+L4" && l.path != "L5");
         let text = toml::to_string(&m).unwrap_or_default();
         assert!(text.contains("[[location]]"), "{text}");
@@ -2536,6 +2616,20 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn jumper_edits_trim_the_terminal_number_like_adding_does() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&[" 1 ", "2", "3"]))?;
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert!(m.set_jumper_part(&x1, " 2 ", Some("wago.2002-403"))?);
+        assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-403"));
+        assert!(m.remove_from_jumper(&x1, " 3 "));
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2"]));
         Ok(())
     }
 
@@ -2790,6 +2884,31 @@ mod tests {
     }
 
     #[test]
+    fn locations_are_kept_in_natural_order() -> Result<(), String> {
+        let paths = |l: &[Location]| l.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
+        let want = ["CAB2", "CAB2.R2", "CAB2.R10", "CAB10"];
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.set_location(p, "")?;
+        }
+        assert_eq!(paths(&m.locations), want);
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.merge_location(Location {
+                path: p.into(),
+                description: String::new(),
+            });
+        }
+        assert_eq!(paths(&m.locations), want);
+        let rows: Vec<(String, String)> = ["+CAB10", "CAB2.R10", "CAB2", "+CAB2.R2"]
+            .into_iter()
+            .map(|p| (p.to_owned(), String::new()))
+            .collect();
+        assert_eq!(paths(&location_rows(&rows)?), want);
+        Ok(())
+    }
+
+    #[test]
     fn jumper_terminals_are_one_tag_level_and_keep_a_fixed_order() -> Result<(), String> {
         let x1 = DeviceTag::parse("-X1").map_err(|e| e.to_string())?;
         let mut m = ProjectMeta::new("t");
@@ -2805,6 +2924,24 @@ mod tests {
         assert_eq!(m, once, "the same terminals in another order change nothing");
         assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
         Ok(())
+    }
+
+    #[test]
+    fn a_hand_edited_jumper_is_checked_on_load() {
+        let load = |terminals: &str| {
+            let text = format!("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = {terminals}\n");
+            toml::from_str::<ProjectMeta>(&text).map_err(|e| e.to_string())
+        };
+        for bad in [r#"["1.2", "3"]"#, r#"["", "3"]"#, r#"["a b", "3"]"#] {
+            let err = load(bad).err().unwrap_or_default();
+            assert!(err.contains("cannot be a terminal of -X1"), "{bad}: {err}");
+        }
+        for single in [r#"["3"]"#, r#"["3", "3"]"#, "[]"] {
+            let err = load(single).err().unwrap_or_default();
+            assert!(err.contains("at least two different terminals"), "{single}: {err}");
+        }
+        let ok = load(r#"["3", "4"]"#).map(|m| m.jumpers.len());
+        assert_eq!(ok, Ok(1));
     }
 
     #[test]
