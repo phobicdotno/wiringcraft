@@ -986,3 +986,241 @@ fn same_pin_wires(i: &Inputs<'_>, out: &mut Vec<Finding>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wc_core::check_rule::CheckRule;
+    use wc_core::geom::Rotation;
+    use wc_core::project::PlacedSymbol;
+    use wc_core::symbol::{Pin, PinDir};
+    use wc_core::{Part, Project, Symbol};
+
+    fn lamp() -> Symbol {
+        Symbol {
+            source: String::new(),
+            id: "lamp".into(),
+            name: "lamp".into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: SymbolRole::Standalone,
+            graphics: vec![],
+            pins: vec![Pin {
+                name: "X1".into(),
+                at: Point::new(0.0, 0.0),
+                dir: PinDir::Down,
+            }],
+            tag_at: Point::default(),
+            description: String::new(),
+        }
+    }
+
+    fn place(id: &str, symbol: &str, tag: &str) -> PlacedSymbol {
+        PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(10.0, 10.0),
+            rotation: Rotation::R0,
+            mirror: false,
+            tag: DeviceTag::parse(tag).ok(),
+        }
+    }
+
+    /// One page with lamp -P1 on it.
+    fn project() -> Project {
+        let mut p = Project::new("Test");
+        let mut page = Page::new("p1", "1", "Lamps");
+        page.symbols = vec![place("s1", "lamp", "-P1")];
+        p.pages.push(page);
+        p
+    }
+
+    fn run(p: &Project) -> Vec<Finding> {
+        let symbols: BTreeMap<String, Symbol> = [("lamp".to_owned(), lamp())].into_iter().collect();
+        let parts: BTreeMap<String, Part> = BTreeMap::new();
+        check(&Inputs {
+            project: p,
+            symbols: &symbols,
+            parts: &parts,
+        })
+    }
+
+    fn rule(kind: &str) -> CheckRule {
+        CheckRule {
+            kind: kind.into(),
+            ..CheckRule::default()
+        }
+    }
+
+    #[test]
+    fn cloud_item_and_cloud_index_round_trip_and_reject_other_items() {
+        for n in [0, 1, 7, 1234] {
+            assert_eq!(cloud_index(&cloud_item(n)), Some(n));
+        }
+        for item in [
+            "cloud", "cloud ", "cloud x", "cloud -1", "Cloud 1", "cloud  1", "s1", "",
+        ] {
+            assert_eq!(cloud_index(item), None, "{item:?}");
+        }
+    }
+
+    #[test]
+    fn severities_order_errors_first_and_have_plain_labels() {
+        assert!(Severity::Error < Severity::Warning && Severity::Warning < Severity::Note);
+        assert_eq!(
+            [Severity::Error, Severity::Warning, Severity::Note].map(Severity::label),
+            ["error", "warning", "note"]
+        );
+    }
+
+    #[test]
+    fn rule_severity_and_kind_ignore_case_and_spaces() {
+        let mut p = project();
+        p.meta.rules = vec![CheckRule {
+            severity: Some(" Note ".into()),
+            ..rule(" CABLE ")
+        }];
+        let found = run(&p);
+        let Some(f) = found.iter().find(|f| f.message == "-P1 has no cable (check rule 1)") else {
+            unreachable!("{found:?}")
+        };
+        assert_eq!(f.severity, Severity::Note);
+        assert_eq!((f.page_id.as_deref(), f.item.as_deref()), (Some("p1"), Some("s1")));
+    }
+
+    #[test]
+    fn rule_with_an_unknown_severity_cannot_run() {
+        let mut p = project();
+        p.meta.rules = vec![CheckRule {
+            severity: Some("Fatal".into()),
+            ..rule("cable")
+        }];
+        let found = run(&p);
+        assert!(
+            found.iter().any(|f| f.severity == Severity::Error
+                && f.page_id.is_none()
+                && f.message == "check rule 1 cannot run: severity \"fatal\" is not error, warning or note"),
+            "{found:?}"
+        );
+        assert!(!found.iter().any(|f| f.message.contains("has no cable")), "{found:?}");
+    }
+
+    #[test]
+    fn rule_names_are_trimmed_and_a_blank_name_is_left_out() {
+        let mut p = project();
+        p.meta.rules = vec![
+            CheckRule {
+                name: Some("  lamps  ".into()),
+                ..rule("cable")
+            },
+            CheckRule {
+                name: Some("   ".into()),
+                ..rule("cable")
+            },
+        ];
+        let found: Vec<String> = run(&p).into_iter().map(|f| f.message).collect();
+        assert!(
+            found.iter().any(|m| m == "-P1 has no cable (check rule 1 \"lamps\")"),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|m| m == "-P1 has no cable (check rule 2)"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn max_wires_without_max_and_tag_with_a_blank_pattern_cannot_run() {
+        let mut p = project();
+        p.meta.rules = vec![
+            rule("max-wires"),
+            CheckRule {
+                pattern: Some("  ".into()),
+                ..rule("tag")
+            },
+        ];
+        let found: Vec<String> = run(&p).into_iter().map(|f| f.message).collect();
+        assert!(
+            found
+                .iter()
+                .any(|m| m == "check rule 1 cannot run: a max-wires rule needs max"),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|m| m == "check rule 2 cannot run: a tag rule needs a pattern"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn tag_rule_reports_a_device_drawn_twice_once() {
+        let mut p = project();
+        p.pages[0].symbols.push(place("s2", "lamp", "-P1"));
+        p.meta.rules = vec![CheckRule {
+            pattern: Some("-H#".into()),
+            ..rule("tag")
+        }];
+        let found = run(&p);
+        let hits: Vec<&Finding> = found
+            .iter()
+            .filter(|f| f.message == "-P1 does not match -H# (check rule 1)")
+            .collect();
+        assert_eq!(hits.len(), 1, "{found:?}");
+        assert_eq!(hits[0].item.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn findings_sort_by_severity_then_page_order_not_page_id() {
+        let mut p = project();
+        // A page whose id sorts first but which comes second in the project.
+        let mut second = Page::new("a0", "2", "More");
+        second.symbols = vec![place("s9", "nowhere", "-P9")];
+        p.pages.push(second);
+        p.pages[0].symbols.push(place("s3", "gone", "-P3"));
+        p.meta.rules = vec![rule("")];
+        let found = run(&p);
+        let errors: Vec<(Option<&str>, &str)> = found
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .map(|f| (f.page_id.as_deref(), f.message.as_str()))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                (Some("p1"), "symbol gone is missing from the project's library copy"),
+                (Some("a0"), "symbol nowhere is missing from the project's library copy"),
+                (None, "check rule 1 cannot run: it has no kind (cable, tag, max-wires)"),
+            ]
+        );
+        assert!(found.windows(2).all(|w| w[0].severity <= w[1].severity), "{found:?}");
+    }
+
+    #[test]
+    fn check_table_shows_page_numbers_and_leaves_project_wide_findings_blank() {
+        let mut p = project();
+        p.meta.rules = vec![rule("cable"), rule("")];
+        let symbols: BTreeMap<String, Symbol> = [("lamp".to_owned(), lamp())].into_iter().collect();
+        let parts = BTreeMap::new();
+        let t = check_table(&Inputs {
+            project: &p,
+            symbols: &symbols,
+            parts: &parts,
+        });
+        assert_eq!(t.rows.len(), run(&p).len());
+        let row = |m: &str| t.rows.iter().find(|r| r.get(2).is_some_and(|x| x == m)).cloned();
+        assert_eq!(
+            row("-P1 has no cable (check rule 1)"),
+            Some(vec![
+                "warning".to_owned(),
+                "1".to_owned(),
+                "-P1 has no cable (check rule 1)".to_owned()
+            ])
+        );
+        let Some(broken) = row("check rule 2 cannot run: it has no kind (cable, tag, max-wires)") else {
+            unreachable!("{:?}", t.rows)
+        };
+        assert_eq!((broken[0].as_str(), broken[1].as_str()), ("error", ""));
+    }
+}
