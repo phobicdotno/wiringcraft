@@ -260,8 +260,14 @@ pub fn parse(text: &str) -> Result<AmlImport> {
         }
         let idx = out.devices.len();
         elem_ids.insert(el.id.clone(), idx);
-        let mut names = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         for (id, name) in &el.interfaces {
+            // A repeated name gets a mark, as its pin does, so a link to the second `PE` by its
+            // ID ends on that pin, not on the first `PE`.
+            let mut name = name.clone();
+            while names.contains(&name) {
+                name.push('\'');
+            }
             if !id.is_empty() {
                 iface_index.insert(id.clone(), (idx, name.clone()));
             }
@@ -700,6 +706,41 @@ mod tests {
         let nets = wc_core::connectivity::nets(&project);
         assert_eq!(nets.len(), 2);
         assert!(nets.iter().all(|n| n.pins.len() == 2));
+        Ok(())
+    }
+
+    #[test]
+    fn link_to_a_repeated_connection_point_name_ends_on_its_own_pin() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="M1" ID="e1">
+    <ExternalInterface Name="PE" ID="i1"/>
+    <ExternalInterface Name="PE" ID="i2"/>
+  </InternalElement>
+  <InternalElement Name="X1" ID="e2">
+    <ExternalInterface Name="1" ID="i3"/>
+    <ExternalInterface Name="2" ID="i4"/>
+  </InternalElement>
+  <InternalLink Name="a" RefPartnerSideA="i1" RefPartnerSideB="i3"/>
+  <InternalLink Name="b" RefPartnerSideA="i2" RefPartnerSideB="i4"/>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(imp.links[1].a, (0, "PE'".to_string()));
+        let b = build(&imp, 1);
+        let ends: Vec<(String, String)> = b.pages[0]
+            .wires
+            .iter()
+            .filter_map(|w| match (&w.from, &w.to) {
+                (Endpoint::Pin { pin: a, .. }, Endpoint::Pin { pin: z, .. }) => Some((a.clone(), z.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                ("PE".to_string(), "1".to_string()),
+                ("PE'".to_string(), "2".to_string())
+            ]
+        );
         Ok(())
     }
 
