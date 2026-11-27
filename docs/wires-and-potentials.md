@@ -51,9 +51,9 @@ Some things do not connect:
   dot is drawn there. End both wires at the same point instead (see issue #1655).
 - A free end placed where a pin is drawn is not joined to the pin. Draw the end on the pin
   (`item:pin`).
-- A symbol does not join its own pins. Wires on two different pins of one symbol are one net
-  only when the rules above join them: through shared free ends, the same potential name,
-  interruption points with the same tag, or a jumper.
+- A symbol does not join its own pins. Two of its pins are one net only when the rules above
+  join them: a wire drawn between them, a path of wires through other pins or shared free ends,
+  the same potential name, interruption points with the same tag, or a jumper.
 
 ## Listing the nets
 
