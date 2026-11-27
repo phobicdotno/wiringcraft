@@ -381,46 +381,80 @@ fn up(v: f64) -> f64 {
     (v / GRID - 1e-9).ceil() * GRID
 }
 
-/// Place each of `copies` (macros already [applied](Macro::apply), all drawing the same group,
-/// whose box is `extent`) on new pages of `size` titled `title`, added after the last page:
-/// left to right, then row below row, inside the frame and above the title block, a new page
-/// when one is full. Tags are renumbered as [`crate::macros::place`] does. Nothing changes when
-/// one copy cannot be placed. The symbols and parts must be in the project already.
+/// Where a box round a copy goes in a drawing area: the anchor's offset from the area's corner
+/// (on the grid) and the size the copy then takes.
+struct Fit {
+    dx: f64,
+    dy: f64,
+    w: f64,
+    h: f64,
+}
+
+/// How a copy whose box is `(min, max)` and whose anchor is `anchor` sits in a drawing area of
+/// `area` (width, height), or `None` when it does not fit.
+fn fit((min, max): (Point, Point), anchor: Point, area: (f64, f64)) -> Option<Fit> {
+    // The anchor goes on the grid, which can move the drawing right or down by up to a step.
+    let (dx, dy) = (up(anchor.x - min.x), up(anchor.y - min.y));
+    let w = max.x - min.x + dx - (anchor.x - min.x);
+    let h = max.y - min.y + dy - (anchor.y - min.y);
+    (w <= area.0 && h <= area.1).then_some(Fit { dx, dy, w, h })
+}
+
+/// Place each of `copies` (macros already [applied](Macro::apply), all drawing the same group)
+/// on new pages of `size` titled `title`, added after the last page: left to right, then row
+/// below row, inside the frame and above the title block, a new page when one is full. The
+/// pitch is the box round all copies ([`extent`], symbols through `symbol`); when that box does
+/// not fit the drawing area but each copy's own box does (copies sticking out on different
+/// sides), each copy gets a page of its own. Tags are renumbered as [`crate::macros::place`]
+/// does. Nothing changes when one copy cannot be placed. The symbols and parts must be in the
+/// project already.
 pub fn generate(
     project: &mut Project,
     copies: &[Macro],
-    extent: (Point, Point),
+    symbol: impl Fn(&str) -> Option<Symbol>,
     size: PageSize,
     title: &str,
 ) -> Result<Generated> {
     let Some(first) = copies.first() else {
         return Ok(Generated::default());
     };
-    let (min, max) = extent;
     let (w, h) = size.mm();
     let band = project.meta.template.band_height();
     let (x0, y0) = (FRAME_MARGIN + INSET, FRAME_MARGIN + INSET);
     let (x1, y1) = (w - FRAME_MARGIN - INSET, h - FRAME_MARGIN - band - INSET);
-    // The anchor goes on the grid, which can move the drawing right or down by up to a step.
-    let (dx, dy) = (up(first.anchor.x - min.x), up(first.anchor.y - min.y));
-    let slack_x = dx - (first.anchor.x - min.x);
-    let slack_y = dy - (first.anchor.y - min.y);
-    let (gw, gh) = (max.x - min.x + slack_x, max.y - min.y + slack_y);
-    if gw > x1 - x0 || gh > y1 - y0 {
-        return Err(Error::Invalid(format!(
-            "macro {:?} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
+    let area = (x1 - x0, y1 - y0);
+    let too_large = |(min, max): (Point, Point), which: String| {
+        Error::Invalid(format!(
+            "macro {:?}{which} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
             first.name,
             max.x - min.x,
             max.y - min.y,
-            (x1 - x0).max(0.0),
-            (y1 - y0).max(0.0),
+            area.0.max(0.0),
+            area.1.max(0.0),
             size.label()
-        )));
-    }
-    let (step_x, step_y) = (up(gw + GAP), up(gh + GAP));
-    let across = 1 + ((x1 - x0 - gw) / step_x).floor() as usize;
-    let down = 1 + ((y1 - y0 - gh) / step_y).floor() as usize;
-    let per_page = across.saturating_mul(down).max(1);
+        ))
+    };
+    let shared = extent(copies, &symbol);
+    // Where each copy's anchor goes from its slot's corner, and how many slots a page has.
+    let (offsets, across, per_page) = match fit(shared, first.anchor, area) {
+        Some(f) => {
+            let (step_x, step_y) = (up(f.w + GAP), up(f.h + GAP));
+            let across = 1 + ((area.0 - f.w) / step_x).floor() as usize;
+            let down = 1 + ((area.1 - f.h) / step_y).floor() as usize;
+            let offsets = vec![(f.dx, f.dy, step_x, step_y); copies.len()];
+            (offsets, across, across.saturating_mul(down).max(1))
+        }
+        None if copies.len() == 1 => return Err(too_large(shared, String::new())),
+        None => {
+            let mut offsets = Vec::with_capacity(copies.len());
+            for (i, m) in copies.iter().enumerate() {
+                let own = extent(std::slice::from_ref(m), &symbol);
+                let f = fit(own, m.anchor, area).ok_or_else(|| too_large(own, format!(" (copy {})", i + 1)))?;
+                offsets.push((f.dx, f.dy, 0.0, 0.0));
+            }
+            (offsets, 1, 1)
+        }
+    };
 
     let mut work = project.clone();
     // After the last page in page order (see `Project::sort_pages`): its first number, one up.
@@ -441,7 +475,7 @@ pub fn generate(
     let mut id_cursor = 0u64;
     let mut out = Generated::default();
     let mut page_id = String::new();
-    for (i, m) in copies.iter().enumerate() {
+    for (i, (m, &(dx, dy, step_x, step_y))) in copies.iter().zip(&offsets).enumerate() {
         let slot = i % per_page;
         if slot == 0 {
             id_cursor += 1;
@@ -653,7 +687,7 @@ mod tests {
         // The coil drawn as an unknown symbol: 8 mm round (20, 30), with the wire up to y 10.
         let ext = extent(&copies, |_| None);
         assert_eq!(ext, (Point::new(16.0, 10.0), Point::new(24.0, 34.0)));
-        let generated = generate(&mut project, &copies, ext, PageSize::A4, "Motors")?;
+        let generated = generate(&mut project, &copies, |_| None, PageSize::A4, "Motors")?;
         assert_eq!(generated.copies, 60);
         assert_eq!(generated.pages, ["p0002", "p0003"]);
         assert_eq!(generated.pages.first().map(String::as_str), Some("p0002"));
@@ -699,8 +733,7 @@ mod tests {
         let mut project = Project::new("x");
         // A later copy's longer label sets the pitch for all of them.
         let copies = [short.clone(), long, short];
-        let ext = extent(&copies, |_| None);
-        generate(&mut project, &copies, ext, PageSize::A3, "Fans")?;
+        generate(&mut project, &copies, |_| None, PageSize::A3, "Fans")?;
         // Every label stays inside the frame.
         let (fx0, fx1) = (FRAME_MARGIN, PageSize::A3.mm().0 - FRAME_MARGIN);
         for page in &project.pages {
@@ -739,7 +772,7 @@ mod tests {
         let err = err_of(generate(
             &mut Project::new("x"),
             std::slice::from_ref(&one),
-            ext,
+            |_| Some(def.clone()),
             PageSize::A4,
             "Wide",
         ));
@@ -764,7 +797,7 @@ mod tests {
         // Copies placed with it keep their texts apart.
         let copies = [one.clone(), one.clone(), one];
         let mut project = Project::new("x");
-        generate(&mut project, &copies, ext, PageSize::A3, "Stops")?;
+        generate(&mut project, &copies, |_| Some(def.clone()), PageSize::A3, "Stops")?;
         let mut xs: Vec<f64> = project
             .pages
             .iter()
@@ -842,7 +875,7 @@ mod tests {
         assert!(min.x <= lmin.x && min.y <= lmin.y && max.x >= lmax.x && max.y >= lmax.y);
         // Copies placed with it keep their labels apart.
         let mut project = Project::new("x");
-        generate(&mut project, &[c.clone(), c], (min, max), PageSize::A3, "Dims")?;
+        generate(&mut project, &[c.clone(), c], |_| None, PageSize::A3, "Dims")?;
         let mut boxes = Vec::new();
         for g in project.pages.iter().flat_map(|p| &p.graphics) {
             for part in g.dimension_parts().unwrap_or_default() {
@@ -1023,7 +1056,6 @@ mod tests {
     #[test]
     fn new_pages_come_after_every_page_with_free_ids() -> Result<()> {
         let one = starter()?.apply(Some("small"), &BTreeMap::new())?;
-        let ext = extent(std::slice::from_ref(&one), |_| None);
         for (numbers, want) in [
             (&["1", "12.3", "4"][..], "13"),
             (&["A7", "3"], "A8"),
@@ -1037,7 +1069,7 @@ mod tests {
                 // Ids differing only in case from the next free one are skipped.
                 project.pages.push(Page::new(format!("P{:04}", i + 1), *n, "Old"));
             }
-            let done = generate(&mut project, std::slice::from_ref(&one), ext, PageSize::A3, "New")?;
+            let done = generate(&mut project, std::slice::from_ref(&one), |_| None, PageSize::A3, "New")?;
             let id = format!("p{:04}", numbers.len() + 1);
             assert_eq!(done.pages, std::slice::from_ref(&id));
             assert_eq!(project.page(&id).map(|p| p.number.as_str()), Some(want));
@@ -1049,20 +1081,83 @@ mod tests {
         }
         let mut project = Project::new("x");
         project.pages.push(Page::new("p0001", u64::MAX.to_string(), "Last"));
-        let err = err_of(generate(&mut project, &[one], ext, PageSize::A3, "New"));
+        let err = err_of(generate(&mut project, &[one], |_| None, PageSize::A3, "New"));
         assert!(err.contains("no page number is left"), "{err}");
         Ok(())
     }
 
     #[test]
     fn a_macro_larger_than_the_page_changes_nothing() -> Result<()> {
-        let m = starter()?.apply(Some("big"), &BTreeMap::new())?;
+        let mut m = starter()?.apply(Some("big"), &BTreeMap::new())?;
+        m.graphics.push(Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(500.0, 50.0),
+        });
         let mut project = Project::new("x");
         let before = project.clone();
-        let huge = (Point::new(0.0, 0.0), Point::new(500.0, 50.0));
-        let err = err_of(generate(&mut project, &[m], huge, PageSize::A4, "Motors"));
+        let err = err_of(generate(&mut project, &[m.clone()], |_| None, PageSize::A4, "Motors"));
         assert!(err.contains("does not fit") && err.contains("A4 landscape"), "{err}");
+        assert!(!err.contains("copy"), "{err}");
+        // With more copies, the one too large is named.
+        let small = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let err = err_of(generate(&mut project, &[small, m], |_| None, PageSize::A4, "Motors"));
+        assert!(err.contains("does not fit") && err.contains("(copy 2)"), "{err}");
         assert_eq!(project, before);
+        Ok(())
+    }
+
+    #[test]
+    fn copies_that_stick_out_on_different_sides_get_a_page_each() -> Result<()> {
+        let m = starter()?;
+        // A long text left of the coil on one copy and right of it on the other: each copy fits
+        // an A4 page, the box round both does not.
+        let words = "Main extract fan for the north wing, second floor, behind the stairs";
+        let width = crate::font::text_width_mm(words, 5.0);
+        let labelled = |align: Align| -> Result<Macro> {
+            let mut c = m.apply(Some("small"), &BTreeMap::new())?;
+            c.graphics.push(Shape::Text {
+                at: Point::new(20.0, 40.0),
+                text: words.into(),
+                height: 5.0,
+                align,
+                angle: 0.0,
+            });
+            Ok(c)
+        };
+        let (left, right) = (labelled(Align::Right)?, labelled(Align::Left)?);
+        let (w, h) = PageSize::A4.mm();
+        let mut project = Project::new("x");
+        let band = project.meta.template.band_height();
+        let area = w - 2.0 * (FRAME_MARGIN + INSET);
+        assert!(width < area && 2.0 * width > area, "{width} {area}");
+        let copies = [left, right];
+        let done = generate(&mut project, &copies, |_| None, PageSize::A4, "Fans")?;
+        assert_eq!((done.copies, done.pages.len()), (2, 2));
+        // Every text stays inside the frame and above the title block.
+        for page in &project.pages {
+            assert_eq!(page.symbols.len(), 1, "one copy per page");
+            for g in &page.graphics {
+                let mut pts = Vec::new();
+                drawn_points(g, &mut pts);
+                assert!(
+                    pts.iter().all(|p| p.x >= FRAME_MARGIN
+                        && p.x <= w - FRAME_MARGIN
+                        && p.y >= FRAME_MARGIN
+                        && p.y <= h - FRAME_MARGIN - band),
+                    "{g:?}"
+                );
+            }
+        }
+        // Copies that share a page when the box round them fits still do.
+        let mut project = Project::new("x");
+        let done = generate(
+            &mut project,
+            &[copies[1].clone(), copies[1].clone()],
+            |_| None,
+            PageSize::A3,
+            "Fans",
+        )?;
+        assert_eq!((done.copies, done.pages.len()), (2, 1));
         Ok(())
     }
 }

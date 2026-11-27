@@ -4275,10 +4275,9 @@ impl Open {
         // A symbol loaded here can renumber terminals already placed (a strip-only tag): that
         // is settled in the live project before the copy is made, so the copy keeps it.
         self.follow_terminals();
-        let extent = generate::extent(&copies, |id| self.symbols.get(id).cloned());
         let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
         let mut project = self.project.clone();
-        match generate::generate(&mut project, &copies, extent, size, &m.name) {
+        match generate::generate(&mut project, &copies, |id| self.symbols.get(id).cloned(), size, &m.name) {
             Ok(done) => {
                 // The undo step is the project as it was, taken as it is (nothing followed in
                 // it); the change in progress is then measured from the settled project.
