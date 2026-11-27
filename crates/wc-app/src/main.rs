@@ -2528,6 +2528,7 @@ impl App {
             Dialog::Reports(_) | Dialog::ReportLayout { .. } | Dialog::Check(_) | Dialog::Translations(_)
         );
         let screen = ctx.screen_rect();
+        let escape = escape_cancels(ctx);
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
@@ -2696,7 +2697,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             then = Some(Box::new(|app: &mut App| {
                                 if let Some(open) = &app.open {
                                     app.dialog = Some(Dialog::Macros(open.macros()));
@@ -3008,7 +3009,7 @@ impl App {
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                         }
                     });
@@ -3076,7 +3077,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.show_check()));
                         }
@@ -3330,7 +3331,7 @@ impl App {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_template(*since, before);
                             }
@@ -3387,7 +3388,7 @@ impl App {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_racks(*since, before);
                             }
@@ -3662,7 +3663,7 @@ impl App {
                             if ui.button("Built-in layout").on_hover_text("Clear the form to the report's own columns").clicked() {
                                 **form = form.cleared();
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button("Cancel").clicked() || escape {
                                 let k = form.kind;
                                 then = Some(Box::new(move |app: &mut App| app.dialog = Some(Dialog::Reports(k))));
                                 keep = false;
@@ -5395,6 +5396,13 @@ fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool)
     i.events
         .iter()
         .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && ok(modifiers)))
+}
+
+/// Whether Escape, pressed this frame, cancels the open form dialog (rules, translations, macro
+/// placeholders, page template, PLC racks, report layout). An Escape that closes a drop-down
+/// list open since last frame only closes that list, so the form and its edits stay.
+fn escape_cancels(ctx: &egui::Context) -> bool {
+    ctx.input(|i| pressed_with(i, Key::Escape, |_| true)) && !ctx.memory(|m| m.any_popup_open())
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -7708,6 +7716,42 @@ mod marking_tests {
         let msg = export_wago_marking(&o, &options);
         assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
         assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> bool {
+        let mut esc = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| esc = escape_cancels(ctx),
+        );
+        esc
+    }
+
+    fn escape() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn escape_cancels_a_form_dialog_unless_it_closes_an_open_drop_down() {
+        let ctx = egui::Context::default();
+        assert!(!frame(&ctx, vec![]));
+        assert!(frame(&ctx, vec![escape()]));
+        ctx.memory_mut(|m| m.open_popup(egui::Id::new("combo")));
+        assert!(!frame(&ctx, vec![escape()]));
     }
 }
 
