@@ -411,18 +411,27 @@ fn convex(pts: &[Pos2]) -> bool {
     true
 }
 
-/// How many corner tests [`triangulate`] may spend on one outline. Ear clipping costs about the
-/// square of the point count, so a fill of tens of thousands of points (one long SVG path, a
-/// solid DXF hatch) would freeze the editor on its first paint; past this budget the shape is
-/// drawn as its outline instead. About a few tens of milliseconds in a release build, and enough
-/// for fills of a few thousand points.
+/// How many corner tests [`triangulate`] may spend on one outline. Ear tests look only at the
+/// corners in the grid cells under the ear, so ordinary fills of tens of thousands of points
+/// stay far below this; only a pathological outline (every corner piled into a few cells) runs
+/// out, and is then drawn as its outline instead of freezing the editor on its first paint.
 const TRIANGULATE_BUDGET: usize = 20_000_000;
 
 /// Triangles (vertex indexes) covering a simple polygon, by ear clipping. A polygon with a hole
 /// cut in along a bridge (its two sides on top of each other) comes out right too. `None` when
 /// cutting it up would take more than [`TRIANGULATE_BUDGET`] corner tests.
+///
+/// The corners are kept in a ring that is walked round, clipping each ear as it comes (instead
+/// of searching from the start again), and an ear is checked only against the corners that are
+/// not convex (only those can lie inside it) in the grid cells its box covers, so a fill costs
+/// about its point count, not the square of it.
 fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
     let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let n = pts.len();
+    let mut out = Vec::new();
+    if n < 3 {
+        return Some(out);
+    }
     // Summed in f64 (each f32 product is exact there), so the winding does not cancel out.
     let area: f64 = pts
         .iter()
@@ -430,57 +439,111 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
         .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x))
         .sum();
     let turn = if area >= 0.0 { 1.0 } else { -1.0 };
-    let mut idx: Vec<usize> = (0..pts.len()).collect();
-    let mut out = Vec::new();
-    let mut guard = 0;
+    let mut prev: Vec<usize> = (0..n).map(|i| (i + n - 1) % n).collect();
+    let mut next: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
+    let mut alive = vec![true; n];
+
+    // The corners that are not convex, bucketed in a square grid over the outline's box. A
+    // corner only ever turns from reflex to convex as ears are clipped, so the grid is built
+    // once; clipped corners are skipped when looked up.
+    let (mut lo, mut hi) = (pts[0], pts[0]);
+    for q in pts {
+        lo = lo.min(*q);
+        hi = hi.max(*q);
+    }
+    let reflex: Vec<usize> = (0..n)
+        .filter(|&i| cross(pts[prev[i]], pts[i], pts[next[i]]) * turn <= 0.0)
+        .collect();
+    let side = ((reflex.len() as f32).sqrt().ceil() as usize).clamp(1, 1024);
+    let cell_w = ((hi.x - lo.x) / side as f32).max(f32::MIN_POSITIVE);
+    let cell_h = ((hi.y - lo.y) / side as f32).max(f32::MIN_POSITIVE);
+    let cell = |q: Pos2| {
+        let cx = (((q.x - lo.x) / cell_w) as usize).min(side - 1);
+        let cy = (((q.y - lo.y) / cell_h) as usize).min(side - 1);
+        (cx, cy)
+    };
+    let mut grid: Vec<Vec<usize>> = vec![Vec::new(); side * side];
+    for &i in &reflex {
+        let (cx, cy) = cell(pts[i]);
+        grid[cy * side + cx].push(i);
+    }
+
     let mut work = 0usize;
-    while idx.len() > 3 && guard < pts.len().saturating_mul(pts.len()) {
-        guard += 1;
-        let n = idx.len();
-        let mut over = false;
-        let ear = (0..n).find(|&i| {
-            // Every candidate counts at least once, so a run of reflex corners is bounded too.
-            work += 1;
-            if work > TRIANGULATE_BUDGET {
-                over = true;
-                return true;
-            }
-            let (a, b, c) = (pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
-            if cross(a, b, c) * turn <= 0.0 {
-                return false;
-            }
-            work += n;
-            // No other corner strictly inside the triangle.
-            idx.iter().all(|&k| {
-                let q = pts[k];
-                q == a || q == b || q == c || {
-                    let (d1, d2, d3) = (cross(a, b, q) * turn, cross(b, c, q) * turn, cross(c, a, q) * turn);
-                    d1 < 0.0 || d2 < 0.0 || d3 < 0.0
-                }
-            })
-        });
-        if over {
+    let mut left = n;
+    let mut ear = 0usize;
+    // A full walk round the ring without an ear ends at `stop`.
+    let mut stop = ear;
+    while left > 3 {
+        // Every step counts, so a walk that finds no ear is bounded too.
+        work += 1;
+        if work > TRIANGULATE_BUDGET {
             return None;
         }
-        match ear {
-            Some(i) => {
-                out.push([idx[(i + n - 1) % n] as u32, idx[i] as u32, idx[(i + 1) % n] as u32]);
-                idx.remove(i);
-            }
-            // Only flat corners left (a bridge, collinear points): drop one and go on.
-            None => {
-                if let Some(i) =
-                    (0..n).find(|&i| cross(pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]).abs() < 1e-6)
-                {
-                    idx.remove(i);
-                } else {
-                    break;
+        let (ia, ic) = (prev[ear], next[ear]);
+        let (a, b, c) = (pts[ia], pts[ear], pts[ic]);
+        let is_ear = cross(a, b, c) * turn > 0.0 && {
+            // No other corner strictly inside the triangle.
+            let (c0x, c0y) = cell(a.min(b).min(c));
+            let (c1x, c1y) = cell(a.max(b).max(c));
+            let mut clear = true;
+            'cells: for cy in c0y..=c1y {
+                for cx in c0x..=c1x {
+                    for &k in &grid[cy * side + cx] {
+                        work += 1;
+                        if !alive[k] || k == ia || k == ear || k == ic {
+                            continue;
+                        }
+                        let q = pts[k];
+                        if q == a || q == b || q == c {
+                            continue;
+                        }
+                        let (d1, d2, d3) = (cross(a, b, q) * turn, cross(b, c, q) * turn, cross(c, a, q) * turn);
+                        if d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0 {
+                            clear = false;
+                            break 'cells;
+                        }
+                    }
                 }
             }
+            clear
+        };
+        if is_ear {
+            out.push([ia as u32, ear as u32, ic as u32]);
+            next[ia] = ic;
+            prev[ic] = ia;
+            alive[ear] = false;
+            left -= 1;
+            // Go on from the corner after the ear, as earcut does.
+            ear = next[ic];
+            stop = ear;
+            continue;
+        }
+        ear = next[ear];
+        if ear == stop {
+            // Only flat corners left (a bridge, collinear points): drop one and go on.
+            let mut k = ear;
+            let mut flat = None;
+            for _ in 0..left {
+                work += 1;
+                if cross(pts[prev[k]], pts[k], pts[next[k]]).abs() < 1e-6 {
+                    flat = Some(k);
+                    break;
+                }
+                k = next[k];
+            }
+            let Some(k) = flat else { break };
+            let (p, q) = (prev[k], next[k]);
+            next[p] = q;
+            prev[q] = p;
+            alive[k] = false;
+            left -= 1;
+            ear = q;
+            stop = ear;
         }
     }
-    if let [a, b, c] = idx[..] {
-        out.push([a as u32, b as u32, c as u32]);
+    if left == 3 {
+        let b = next[ear];
+        out.push([ear as u32, b as u32, next[b] as u32]);
     }
     Some(out)
 }
@@ -4300,20 +4363,49 @@ mod tests {
         assert_eq!(runs() - start, 2);
     }
 
-    /// A closed zigzag round a circle: every other corner pointing in, so it is not convex.
-    fn star(n: usize) -> Vec<Point> {
+    /// A closed zigzag round a circle of radius 100: every other corner pointing in, to radius
+    /// `inner`, so it is not convex.
+    fn star_to(n: usize, inner: f64) -> Vec<Point> {
         (0..n)
             .map(|i| {
                 let t = std::f64::consts::TAU * i as f64 / n as f64;
-                let r = if i % 2 == 0 { 100.0 } else { 99.0 };
+                let r = if i % 2 == 0 { 100.0 } else { inner };
                 Point::new(r * t.cos(), r * t.sin())
             })
             .collect()
     }
 
+    fn star(n: usize) -> Vec<Point> {
+        star_to(n, 99.0)
+    }
+
+    fn screen(pts: &[Point]) -> Vec<Pos2> {
+        pts.iter().map(|q| Pos2::new(q.x as f32, q.y as f32)).collect()
+    }
+
+    /// The area the triangles cover and the outline's own area (shoelace), both in f64.
+    fn areas(pts: &[Pos2], tris: &[[u32; 3]]) -> (f64, f64) {
+        let at = |i: u32| (f64::from(pts[i as usize].x), f64::from(pts[i as usize].y));
+        let covered = tris
+            .iter()
+            .map(|&[a, b, c]| {
+                let (a, b, c) = (at(a), at(b), at(c));
+                ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs() / 2.0
+            })
+            .sum();
+        let outline = pts
+            .iter()
+            .zip(pts.iter().cycle().skip(1))
+            .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x))
+            .sum::<f64>()
+            .abs()
+            / 2.0;
+        (covered, outline)
+    }
+
     #[test]
     fn a_fill_of_a_few_thousand_points_is_still_cut_into_triangles() {
-        let pts: Vec<Pos2> = star(2_000).iter().map(|q| Pos2::new(q.x as f32, q.y as f32)).collect();
+        let pts = screen(&star(2_000));
         let Some(tris) = triangulate(&pts) else {
             unreachable!("2000 points fit in the budget")
         };
@@ -4321,9 +4413,62 @@ mod tests {
     }
 
     #[test]
-    fn a_fill_of_a_hundred_thousand_points_is_drawn_as_its_outline_without_stalling() {
+    fn a_fill_of_twenty_thousand_points_is_cut_into_triangles_covering_it() {
+        let pts = screen(&star(20_000));
+        let started = std::time::Instant::now();
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("20 000 points fit in the budget")
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(tris.len(), pts.len() - 2);
+        let (covered, outline) = areas(&pts, &tris);
+        assert!((covered - outline).abs() < outline * 1e-4, "{covered} vs {outline}");
+    }
+
+    #[test]
+    fn a_fill_of_a_hundred_thousand_points_is_filled_once_without_stalling() {
         let shape = Shape::Polyline {
             points: star(100_000),
+            closed: true,
+            filled: true,
+        };
+        let ctx = egui::Context::default();
+        let xf = Xf {
+            origin: Pos2::new(200.0, 200.0),
+            zoom: 1.0,
+        };
+        let paint = || {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                let p = ctx.layer_painter(egui::LayerId::background());
+                paint_shape(&p, &xf, &shape, Stroke::new(1.0_f32, Color32::BLACK));
+            });
+            out.shapes
+                .iter()
+                .any(|c| matches!(&c.shape, EShape::Mesh(m) if m.indices.len() == 3 * (100_000 - 2)))
+        };
+        let runs = || TRIANGULATIONS.with(|n| n.get());
+        let start = runs();
+        let started = std::time::Instant::now();
+        assert!(paint(), "the shape is filled");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(paint(), "and filled on the next frame too");
+        assert_eq!(runs() - start, 1, "from the cached triangles");
+    }
+
+    #[test]
+    fn a_fill_too_costly_to_cut_up_is_drawn_as_its_outline_without_stalling() {
+        // Every inward corner piled up next to the centre, under the box of every ear: each
+        // ear test has to look at all of them, so this runs out of budget.
+        let shape = Shape::Polyline {
+            points: star_to(100_000, 0.001),
             closed: true,
             filled: true,
         };
@@ -4345,8 +4490,8 @@ mod tests {
         let start = runs();
         let started = std::time::Instant::now();
         assert!(paint(), "the outline is painted");
-        // Unbounded ear clipping takes minutes here; the budget keeps it to a fraction of that
-        // even in a debug build.
+        // Unbounded, this takes minutes; the budget keeps it to a fraction of that even in a
+        // debug build.
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "{:?}",
@@ -4357,7 +4502,7 @@ mod tests {
         assert_eq!(
             runs() - start,
             1,
-            "a fill too large to cut up is not tried again every frame"
+            "a fill too costly to cut up is not tried again every frame"
         );
     }
 
