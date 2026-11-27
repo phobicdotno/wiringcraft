@@ -318,6 +318,41 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_part_follows_its_device_when_only_the_part_is_drawn() {
+        // The project draws -K1 (page 1) and its part -K1.1.
+        let mut p = project();
+        p.pages[0].symbols.push(symbol("s2", "-K1.1"));
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1.1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        assert_eq!(new_tags, [Some("-K2".to_string()), Some("-K2.1".to_string())]);
+    }
+
+    #[test]
     fn a_free_product_skips_device_data_terminals_and_other_functions() {
         let mut p = project();
         // -K2 has device data but no symbol (its symbol was deleted); -K3 is in another

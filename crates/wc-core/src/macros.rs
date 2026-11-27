@@ -1033,8 +1033,8 @@ mod tests {
         let tag = p.pages[0].symbol(&ids[0]).and_then(|s| s.tag.clone());
         assert_eq!(tag.map(|t| t.to_string()).as_deref(), Some("-X1.2"));
 
-        // When a terminal's number is taken on the new strip, it takes the next free one there,
-        // not one on the project's own strip.
+        // A strip whose terminal is already used (device data for -X2.1) is taken, so the
+        // macro's strip skips it and its terminals keep their numbers on the next free strip.
         let mut p = Project::new("x");
         let mut page = crate::project::Page::new("p1", "1", "Terminals");
         page.symbols.push(sym("s1", "-X1")?);
@@ -1053,10 +1053,10 @@ mod tests {
             .collect();
         assert_eq!(
             tags,
-            ["-X2.3", "-X2.2", "-X2"],
-            "terminal 2 keeps its free number, terminal 1 takes the next free one on the new strip"
+            ["-X3.1", "-X3.2", "-X3"],
+            "-X2 is held by its terminal -X2.1, so the strip moves to -X3"
         );
-        assert_eq!(p.devices[&DeviceTag::parse("-X2.2")?].part.as_deref(), Some("PT 2.5"));
+        assert_eq!(p.devices[&DeviceTag::parse("-X3.2")?].part.as_deref(), Some("PT 2.5"));
         Ok(())
     }
 
