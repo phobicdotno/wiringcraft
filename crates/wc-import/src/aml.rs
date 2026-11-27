@@ -108,6 +108,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     // Attribute nesting: names of open <Attribute> elements and whether we are in <Value>.
     let mut attr_stack: Vec<String> = Vec::new();
     let mut in_value = false;
+    // The text of the open <Value>, in pieces: plain text and CDATA sections.
+    let mut value = String::new();
     let mut raw_links: Vec<(String, String, String)> = Vec::new();
     let mut iface_index: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut elem_ids: BTreeMap<String, usize> = BTreeMap::new();
@@ -175,7 +177,10 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                         }
                     }
                     "Attribute" if !empty => attr_stack.push(attr(e, "Name").unwrap_or_default()),
-                    "Value" if !empty => in_value = true,
+                    "Value" if !empty => {
+                        in_value = true;
+                        value.clear();
+                    }
                     "InternalLink" => raw_links.push((
                         attr(e, "Name").unwrap_or_default(),
                         attr(e, "RefPartnerSideA").unwrap_or_default(),
@@ -185,17 +190,14 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                 }
             }
             Event::Text(t) if in_value => {
-                let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                let interface = attr_stack.iter().any(|a| a == "\u{0}interface");
-                if let (Some(name), Some(top), false) = (attr_stack.last(), stack.last_mut(), interface)
-                    && !v.is_empty()
-                {
-                    // Nested attributes become dotted names.
-                    let full: Vec<&str> = attr_stack.iter().map(String::as_str).collect();
-                    let key = if full.len() > 1 { full.join(".") } else { name.clone() };
-                    top.attributes.insert(key, v);
+                // A value inside an interface is never kept, so a piece of it that cannot be read
+                // does not stop the import; one that is kept must be read whole.
+                if !attr_stack.iter().any(|a| a == "\u{0}interface") {
+                    let t = t.unescape().map_err(|e| Error::Format(format!("AutomationML: {e}")))?;
+                    value.push_str(&t);
                 }
             }
+            Event::CData(t) if in_value => value.push_str(&String::from_utf8_lossy(&t)),
             Event::End(e) => {
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 if in_lib > 0 {
@@ -215,7 +217,19 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                     "ExternalInterface" | "Attribute" => {
                         attr_stack.pop();
                     }
-                    "Value" => in_value = false,
+                    "Value" if in_value => {
+                        in_value = false;
+                        let v = value.trim().to_owned();
+                        let interface = attr_stack.iter().any(|a| a == "\u{0}interface");
+                        if let (Some(name), Some(top), false) = (attr_stack.last(), stack.last_mut(), interface)
+                            && !v.is_empty()
+                        {
+                            // Nested attributes become dotted names.
+                            let full: Vec<&str> = attr_stack.iter().map(String::as_str).collect();
+                            let key = if full.len() > 1 { full.join(".") } else { name.clone() };
+                            top.attributes.insert(key, v);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -993,6 +1007,55 @@ mod tests {
         assert!(imp.links.is_empty(), "{:?}", imp.links);
         assert!(imp.locations.is_empty(), "{:?}", imp.locations);
         assert!(imp.warnings.is_empty(), "{:?}", imp.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn value_in_cdata_or_split_by_a_comment_is_read_whole() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="Manufacturer"><Value>ACME</Value></Attribute>
+    <Attribute Name="OrderNumber"><Value><![CDATA[R-24 <special>]]></Value></Attribute>
+    <Attribute Name="Voltage"><Value>24 V<!-- note --> DC</Value></Attribute>
+    <ExternalInterface Name="A1" ID="i1"/>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        let props = &imp.devices[0].properties;
+        assert_eq!(props.get("OrderNumber").map(String::as_str), Some("R-24 <special>"));
+        assert_eq!(props.get("Voltage").map(String::as_str), Some("24 V DC"));
+        assert_eq!(build(&imp, 1).parts.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn value_with_a_bad_entity_between_cdata_pieces_is_refused_not_cut_short() {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="OrderNumber"><Value><![CDATA[R-]]>&unknown;<![CDATA[24]]></Value></Attribute>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        let res = parse(aml);
+        assert!(
+            matches!(&res, Err(Error::Format(msg)) if msg.starts_with("AutomationML:")),
+            "a broken value must be refused, got {:?}",
+            res.map(|imp| imp.devices.first().map(|d| d.properties.clone()))
+        );
+    }
+
+    #[test]
+    fn a_bad_entity_in_an_interface_value_does_not_stop_the_import() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="Manufacturer"><Value>ACME</Value></Attribute>
+    <ExternalInterface Name="A1" ID="i1"><Attribute Name="Note"><Value>&unknown;</Value></Attribute></ExternalInterface>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(
+            imp.devices[0].properties.get("Manufacturer").map(String::as_str),
+            Some("ACME")
+        );
         Ok(())
     }
 }
