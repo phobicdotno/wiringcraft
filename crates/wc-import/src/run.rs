@@ -826,10 +826,30 @@ pub fn terminal_numbers_with(
     what: &str,
     again: &str,
 ) -> Res<wc_core::project::TerminalNumbers> {
+    terminal_numbers_after(dir, p, incoming, &[], what, again)
+}
+
+/// [`terminal_numbers_with`], for a command that also writes the symbols `replaced` over the
+/// project's readable copies of them (an unpinned copy a macro takes from the library again).
+///
+/// The save that follows reads the copies as they are then, so it cannot tell that a replaced
+/// symbol changed which placed items are terminals: a strip with jumpers or a rail order that
+/// such a symbol renumbers is refused too, before anything is written.
+pub fn terminal_numbers_after(
+    dir: &Path,
+    p: &Project,
+    incoming: &[wc_core::Symbol],
+    replaced: &[wc_core::Symbol],
+    what: &str,
+    again: &str,
+) -> Res<wc_core::project::TerminalNumbers> {
     let (own, _) = store::vendored_symbols(dir, p);
     let mut symbols = own.clone();
     for s in incoming {
         symbols.entry(s.id.clone()).or_insert_with(|| s.clone());
+    }
+    for s in replaced {
+        symbols.insert(s.id.clone(), s.clone());
     }
     let with = wc_core::project::terminal_numbers(p, |id| symbols.get(id).map(|s| s.role));
     let without = wc_core::project::terminal_numbers(p, |id| own.get(id).map(|s| s.role));
@@ -853,6 +873,19 @@ pub fn terminal_numbers_with(
             .map(|s| s.id.as_str())
             .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
             .collect();
+        // Replaced symbols that are a terminal in one version and not in the other.
+        let terminal = |s: &wc_core::Symbol| s.role == wc_core::symbol::SymbolRole::Terminal;
+        let changed: Vec<&str> = replaced
+            .iter()
+            .filter(|s| own.get(&s.id).is_some_and(|old| terminal(old) != terminal(s)))
+            .map(|s| s.id.as_str())
+            .collect();
+        if missing.is_empty() && !changed.is_empty() {
+            return Err(format!(
+                "the jumpers and rail order of {strip} cannot be kept on their terminals: the {what} replaces the project's copy of {} with the library's version, which changes which items are terminals; remove the strip's jumpers and rail order, {again} and add them back",
+                changed.join(", ")
+            ));
+        }
         return Err(format!(
             "the jumpers and rail order of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the {what} brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and {again}",
             missing.join(", ")

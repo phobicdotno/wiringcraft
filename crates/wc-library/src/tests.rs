@@ -450,6 +450,25 @@ fn lock_missing_reports_a_file_that_turns_wrong_after_the_scan_and_pins_the_rest
 }
 
 #[test]
+fn taking_a_version_refuses_a_library_that_holds_another_one_by_now() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    let seen = lib.symbol("other")?.0.hash();
+    // The library file changes after it was looked at: that version is not written or pinned.
+    write_symbol(&f.company, &sym("other", 6.0))?;
+    let r = take_version(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "other", &seen);
+    assert!(r.is_err_and(|e| e.to_string().contains("changed in the library while it was being read")));
+    assert!(!f.project.lock.symbols.contains_key("other"));
+    assert!(wc_core::store::read_vendored_symbol(&f.proj, "other").is_err());
+    // The version that was looked at is taken and pinned.
+    write_symbol(&f.company, &sym("other", 5.0))?;
+    let entry = take_version(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "other", &seen)?;
+    assert_eq!(entry.hash, seen);
+    assert_eq!(wc_core::store::read_vendored_symbol(&f.proj, "other")?.hash(), seen);
+    Ok(())
+}
+
+#[test]
 fn an_update_checks_every_item_before_it_writes_any() -> Result<()> {
     let mut f = fixture()?;
     // Both placed, so both are pinned.
