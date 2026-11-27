@@ -2910,15 +2910,22 @@ impl App {
     fn tool_set_device(&mut self, v: &Value) -> Result<String, String> {
         let mut t = tag(need_s(v, "tag")?)?;
         let open = need_open(self.open.as_mut())?;
-        // The accessories are checked before any field is applied, so a refused list leaves the
-        // project as it was.
+        // The part and the accessories are checked before any field is applied, so a refused
+        // part or list leaves the project as it was (no rename or description either).
         let list = v
             .get("accessories")
             .filter(|l| !l.is_null())
             .map(accessories)
             .transpose()?;
-        if let Some(list) = &list {
-            open.check_parts(list.iter().map(|a| a.part.as_str()))?;
+        let part = s(v, "part").map(str::trim);
+        let current = open.project.devices.get(&t).and_then(|d| d.part.as_deref());
+        // A part the device already has is not taken again, as set_device_part leaves it alone.
+        let new_part = part.filter(|p| !p.is_empty() && Some(*p) != current);
+        if new_part.is_some() || list.is_some() {
+            let ids = new_part
+                .into_iter()
+                .chain(list.iter().flatten().map(|a| a.part.as_str()));
+            open.check_parts(ids)?;
         }
         let mut done = Vec::new();
         if let Some(to) = s(v, "rename_to") {
@@ -2940,8 +2947,7 @@ impl App {
                 done.push("description set".into());
             }
         }
-        if let Some(p) = s(v, "part") {
-            let p = p.trim();
+        if let Some(p) = part {
             open.set_device_part(&t, (!p.is_empty()).then_some(p))?;
             done.push(if p.is_empty() {
                 "part removed".into()
@@ -5520,6 +5526,69 @@ mod tests {
         assert!(got(&a).is_empty());
         assert!(a.open.as_mut().unwrap().undo());
         assert_eq!(got(&a), want);
+    }
+
+    #[test]
+    fn set_device_with_an_unknown_part_keeps_the_rename_and_description_out() {
+        let (_tmp, mut a) = app(vec![]);
+        let k1 = DeviceTag::parse("-K1").unwrap();
+        let k2 = DeviceTag::parse("-K2").unwrap();
+        call(&mut a, "set_device", json!({"tag": "-K1", "description": "Old"})).unwrap();
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        for extra in [json!(null), json!([{"part": "example.ex-tb-2-5"}])] {
+            let r = call(
+                &mut a,
+                "set_device",
+                json!({"tag": "-K1", "rename_to": "-K2", "description": "New", "part": "no.such", "accessories": extra}),
+            );
+            assert!(r.is_err(), "{extra}: {r:?}");
+            let open = a.open.as_ref().unwrap();
+            assert_eq!(
+                open.project.devices.get(&k1).map(|d| d.description.as_str()),
+                Some("Old")
+            );
+            assert!(!open.project.devices.contains_key(&k2), "no rename");
+            assert_eq!(open.undo_mark(), mark, "no undo step");
+            assert!(!open.parts.contains_key("example.ex-tb-2-5"), "no accessory part taken");
+        }
+
+        // The device's own part again is not checked a second time, and a good part goes through.
+        let said = call(&mut a, "set_device", json!({"tag": "-K1", "part": "example.ex-tb-2-5"})).unwrap();
+        assert!(said.contains("part example.ex-tb-2-5"), "{said}");
+        let said = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "rename_to": "-K2", "part": " example.ex-tb-2-5 "}),
+        )
+        .unwrap();
+        assert!(said.contains("renamed to -K2"), "{said}");
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(
+            open.project.devices.get(&k2).and_then(|d| d.part.as_deref()),
+            Some("example.ex-tb-2-5")
+        );
+
+        // A part the device already has is not checked again, even one no library has: the
+        // rename goes through and the part is kept.
+        open.project.devices.entry(k2.clone()).or_default().part = Some("no.such".into());
+        let said = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K2", "rename_to": "-K3", "part": "no.such"}),
+        )
+        .unwrap();
+        assert!(said.contains("renamed to -K3"), "{said}");
+        let k3 = DeviceTag::parse("-K3").unwrap();
+        assert_eq!(
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .devices
+                .get(&k3)
+                .and_then(|d| d.part.as_deref()),
+            Some("no.such")
+        );
     }
 
     #[test]
