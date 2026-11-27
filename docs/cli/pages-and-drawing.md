@@ -11,6 +11,7 @@ The commands change the project's files but do not commit them; use `wiringcraft
 
 ```sh
 wiringcraft new pump --name "Pump station"
+cd pump
 ```
 
 Creates the folder `pump` with a project in it and makes it a git repository with a first
@@ -120,6 +121,7 @@ Every box placing the same symbol changes.
 wiringcraft wire p2 s1:14 s2:A1 --potential 24V
 wiringcraft wire p2 50,20 s1:13 --potential 24V --section "0.75 mm²" --colour BU
 wiringcraft wire p2 s2:A2 90,100 --via 50,100
+wiringcraft wire p2 s3:14 120,40 --potential 24V
 ```
 
 Draws a wire and prints its id (`w1`, ...). Each end is `item:pin` (a symbol's or a box's
@@ -130,18 +132,17 @@ wire's data: `--number`, `--potential`, `--section` (with its unit), `--colour`,
 ## delete
 
 ```sh
-wiringcraft delete p2 s2 w2
+wiringcraft delete p2 s3 w2
 ```
 
 ```
-s2
-w1
+s3
 w2
-w3
+w4
 ```
 
 Deletes symbols and wires by id and prints each deleted id. Wires that end on a pin of a
-deleted symbol go too (here `w1` and `w3`, which ended on `s2`). The device keeps its data. An id that
+deleted symbol go too (here `w4`, which ended on `s3`). The device keeps its data. An id that
 is not on the page is an error, and then nothing is deleted.
 
 ## number-wires
@@ -152,7 +153,7 @@ wiringcraft number-wires --rule sequential --overwrite
 ```
 
 ```
-numbered 3 connection(s); 4 wire(s) changed
+numbered 2 connection(s); 2 wire(s) changed
 ```
 
 Numbers the wires of the whole project. Every wire of one connection gets the same number.
@@ -175,9 +176,9 @@ wiringcraft find -K1 --replace -K2
 ```
 
 ```
+2	Potential	24V
 2	Device tag	-K1
-2	Device tag	-K1
-replaced 2 value(s)
+replaced 1 value(s)
 ```
 
 Finds text in free texts, device tags, wire numbers, potentials and device descriptions on
