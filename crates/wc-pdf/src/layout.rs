@@ -1539,7 +1539,12 @@ pub fn draw_card_page(
     }
     about.push(format!("{} channels", card.channels.len()));
     pen.colour(0.35, 0.35, 0.35);
-    pen.text((x0, top + 6.0), CARD_TEXT, 0, &about.join(", "));
+    pen.text(
+        (x0, top + 6.0),
+        CARD_TEXT,
+        0,
+        &fit_at(&about.join(", "), x1 - x0, CARD_TEXT),
+    );
     pen.colour(0.0, 0.0, 0.0);
     let rows = card_rows_of(card);
     let per = card_rows_per_page(page.size, project.meta.template.band_height());
@@ -1759,15 +1764,13 @@ pub fn draw_panel_page(
         }
     }
     let devices = panel.device_tags().len();
-    pen.text(
-        (ax0, h - MARGIN - band - 5.0),
-        2.5,
-        0,
-        &format!(
-            "{}  ·  plate {} x {} mm  ·  scale 1:{}  ·  {} device(s)",
-            panel.name, panel.width, panel.height, scale, devices
-        ),
+    // A long panel name is cut short so the plate size and scale stay on the sheet.
+    let facts = format!(
+        "  ·  plate {} x {} mm  ·  scale 1:{}  ·  {} device(s)",
+        panel.width, panel.height, scale, devices
     );
+    let name = fit_at(&panel.name, ax1 - ax0 - text_width_mm(&facts, 2.5), 2.5);
+    pen.text((ax0, h - MARGIN - band - 5.0), 2.5, 0, &format!("{name}{facts}"));
     Drawn {
         ops: pen.ops,
         links: Vec::new(),

@@ -3677,3 +3677,58 @@ fn a_mirrored_or_upside_down_symbol_prints_its_tag_away_from_the_drawing() {
     assert_eq!(back.align, wc_core::geom::Align::Left);
     assert_eq!(back.at, Point::new(105.0, 60.0 + 8.0 + 1.2 + 3.0));
 }
+
+#[test]
+fn a_long_panel_name_or_card_rack_is_cut_to_the_frame() {
+    use wc_core::panel::Panel;
+    let project = Project::new("x");
+    let long = "Main distribution cabinet for the north basin pumping station, the second pump \
+                hall and its cabinets, with every spare listed again for the south basin";
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let (w, _) = page.size.mm();
+    let ends = |drawn: &writer::Drawn, height: f64, start: &str| -> Vec<(f64, String)> {
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text {
+                    at, height: h, text, ..
+                } if (*h - height).abs() < 1e-9 && text.starts_with(start) => {
+                    Some((at.0 + writer::text_width_mm(text, height), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let long = long.repeat(3);
+    let panel = Panel::new("main", &long, 600.0, 800.0);
+    let drawn = layout::draw_panel_page(&project, &page, 0, 1, &panel, &BTreeMap::new(), "");
+    let found = ends(&drawn, 2.5, "Main distribution");
+    let [(end, text)] = found.as_slice() else {
+        unreachable!("one panel caption, got {found:?}")
+    };
+    let right = w - layout::MARGIN - 10.0;
+    assert!(
+        *end <= right + 1e-6,
+        "caption {text:?} ends at {end} mm, past {right} mm"
+    );
+    assert!(text.contains("...  ·  plate 600 x 800 mm  ·  scale 1:"), "{text:?}");
+    assert!(text.ends_with("  ·  0 device(s)"), "{text:?}");
+
+    let card = wc_report::PlcCardSheet {
+        card: "DI1".into(),
+        rack: long.clone(),
+        ..Default::default()
+    };
+    let drawn = layout::draw_card_page(&project, &page, 0, 1, &card, 0, (1, 1), "");
+    let found = ends(&drawn, 2.5, "Rack Main");
+    let [(end, text)] = found.as_slice() else {
+        unreachable!("one card line, got {found:?}")
+    };
+    let right = w - layout::MARGIN - 6.0;
+    assert!(
+        *end <= right + 1e-6,
+        "card line {text:?} ends at {end} mm, past {right} mm"
+    );
+    assert!(text.ends_with("..."), "{text:?}");
+}
