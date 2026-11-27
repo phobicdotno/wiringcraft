@@ -1,7 +1,8 @@
 //! Potentials: which pins are electrically connected, across all pages.
 //!
-//! Wires join their two ends; wire ends that meet at the same point join; wires that carry the
-//! same potential name join across pages.
+//! Wires join their two ends; wire ends that meet at the same point join; a free wire end on
+//! another wire's segment (a T) joins that wire; wires that carry the same potential name join
+//! across pages.
 
 use std::collections::BTreeMap;
 
@@ -80,8 +81,52 @@ impl Graph {
             }
             from.push(a);
         }
+        // A free end on another wire's segment (a T, where the drawing puts a junction dot)
+        // joins that wire. Only segments whose both ends are known here count: free ends and
+        // bends, as a pin's place needs its symbol.
+        let paths: Vec<Vec<Point>> = page
+            .wires
+            .iter()
+            .map(|w| {
+                let free = |e: &Endpoint| match e {
+                    Endpoint::Point { at } => Some(*at),
+                    Endpoint::Pin { .. } => None,
+                };
+                free(&w.from)
+                    .into_iter()
+                    .chain(w.via.iter().copied())
+                    .chain(free(&w.to))
+                    .collect()
+            })
+            .collect();
+        for (wi, w) in page.wires.iter().enumerate() {
+            for e in [&w.from, &w.to] {
+                let Endpoint::Point { at: q } = e else { continue };
+                for (oi, path) in paths.iter().enumerate() {
+                    if oi == wi || !path.windows(2).any(|ab| on_segment(*q, ab[0], ab[1])) {
+                        continue;
+                    }
+                    if let (Some(&end), Some(&other)) = (from.get(wi), from.get(oi)) {
+                        // The end is joined to its own wire already, so joining the wires joins it.
+                        self.dsu.union(end, other);
+                    }
+                }
+            }
+        }
         from
     }
+}
+
+/// Whether `p` lies on the segment from `a` to `b` (ends included), within 0.01 mm.
+fn on_segment(p: Point, a: Point, b: Point) -> bool {
+    const EPS: f64 = 0.01;
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 < EPS * EPS {
+        return (p.x - a.x).hypot(p.y - a.y) < EPS;
+    }
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    (a.x + t * dx - p.x).hypot(a.y + t * dy - p.y) < EPS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -516,6 +561,34 @@ mod tests {
             !numbers.contains_key(&("a".to_owned(), "bare".to_owned())),
             "no number left for it"
         );
+    }
+
+    #[test]
+    fn a_free_end_on_another_wire_joins_it() {
+        let at = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let mut p = Project::new("t");
+        let mut a = Page::new("p2", "2", "");
+        // -K1:A2 down to 20,40; a bus from 20,40 to 100,40; -S1:13 ends on the bus at 60,40.
+        a.wires.push(wire("w1", pin("s2", "A2"), at(20.0, 40.0), None));
+        a.wires.push(wire("w2", at(20.0, 40.0), at(100.0, 40.0), None));
+        a.wires.push(wire("w3", pin("s1", "13"), at(60.0, 40.0), None));
+        // A wire from a pin with a bend at 100,80 and a free end at 140,80: -Q1:1 ends on its
+        // bent part, and -Q2:1 on the bend itself.
+        let mut bent = wire("w4", pin("s3", "1"), at(140.0, 80.0), None);
+        bent.via = vec![Point::new(100.0, 60.0), Point::new(100.0, 80.0)];
+        a.wires.push(bent);
+        a.wires.push(wire("w5", pin("s4", "1"), at(120.0, 80.0), None));
+        a.wires.push(wire("w6", pin("s5", "1"), at(100.0, 60.0), None));
+        // A free end beside a wire, not on it, stays apart.
+        a.wires.push(wire("w7", pin("s6", "1"), at(60.0, 40.5), None));
+        p.pages = vec![a];
+        let nets = nets(&p);
+        let mut pins: Vec<Vec<&str>> = nets
+            .iter()
+            .map(|n| n.pins.iter().map(|(_, item, _)| item.as_str()).collect())
+            .collect();
+        pins.sort();
+        assert_eq!(pins, [vec!["s1", "s2"], vec!["s3", "s4", "s5"], vec!["s6"]]);
     }
 
     #[test]
