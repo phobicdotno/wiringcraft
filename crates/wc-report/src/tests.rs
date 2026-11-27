@@ -3041,6 +3041,14 @@ fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
     let found = overflow(&p, &s, &parts);
     assert!(found[0].message.ends_with("(1 NC too many)"), "{found:?}");
 
+    // An accessory missing from the library copy has unknown contacts: no overflow is claimed.
+    p.devices.get_mut(&k1).unwrap().accessories.push(wc_core::DevicePart {
+        part: "acme.gone".into(),
+        qty: 1,
+    });
+    assert!(overflow(&p, &s, &parts).is_empty());
+    p.devices.get_mut(&k1).unwrap().accessories.pop();
+
     // A contact repeated on an overview page does not count.
     p.pages[0].symbols.pop();
     let mut overview = Page::new("p9", "9", "Overview");

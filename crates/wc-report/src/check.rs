@@ -199,6 +199,8 @@ pub fn check_with_unreadable(
 
     // Contact overflow: a device draws more contacts than its parts have. Only devices whose
     // main part or accessories list their contacts are checked; overview pages do not count.
+    // A fitted part missing from the library copy has contacts nobody knows, so its device is
+    // not checked: the missing part has its own warning.
     type Drawn<'p> = (wc_core::Contacts, Vec<(&'p Page, &'p str)>);
     let mut drawn: BTreeMap<&DeviceTag, Drawn> = BTreeMap::new();
     for page in p.pages.iter().filter(|pg| !pg.overview) {
@@ -229,13 +231,19 @@ pub fn check_with_unreadable(
             .chain(device.accessories.iter().map(|a| (a.part.as_str(), a.qty)));
         let mut has = wc_core::Contacts::default();
         let mut listed = false;
+        let mut unknown = false;
         for (id, qty) in fitted {
-            if let Some(c) = i.parts.get(id).and_then(|part| part.contacts.as_ref()) {
-                has.add_all(c, qty);
-                listed = true;
+            match i.parts.get(id) {
+                Some(part) => {
+                    if let Some(c) = &part.contacts {
+                        has.add_all(c, qty);
+                        listed = true;
+                    }
+                }
+                None => unknown = true,
             }
         }
-        if !listed {
+        if !listed || unknown {
             continue;
         }
         if let Some(over) = has.overflow(count) {
