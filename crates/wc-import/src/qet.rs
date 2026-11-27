@@ -398,16 +398,11 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         .unwrap_or_else(|| id.rsplit('.').next().unwrap_or(id).to_owned());
 
     // Unnamed terminals are numbered in order; a repeated name gets a mark and a count
-    // (`x`, `x'`, `x'2`, ...), so names stay short however often one repeats.
+    // (`x`, `x'`, `x'2`, ...), so names stay short however often one repeats. The names the
+    // file gives are taken first, so an unnamed terminal's number never renames a named one.
     let mut used = std::collections::BTreeSet::new();
     let mut repeats: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut out_pins: Vec<Pin> = Vec::new();
-    for (i, (name, at, dir)) in pins.into_iter().enumerate() {
-        let base = if name.trim().is_empty() {
-            (i + 1).to_string()
-        } else {
-            name
-        };
+    let mut unique = |base: String| {
         let mut name = base.clone();
         while !used.insert(name.clone()) {
             let n = repeats.entry(base.clone()).or_insert(0);
@@ -418,6 +413,15 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                 format!("{base}'{n}")
             };
         }
+        name
+    };
+    let named: Vec<Option<String>> = pins
+        .iter()
+        .map(|(name, ..)| (!name.trim().is_empty()).then(|| unique(name.clone())))
+        .collect();
+    let mut out_pins: Vec<Pin> = Vec::new();
+    for (i, ((_, at, dir), name)) in pins.into_iter().zip(named).enumerate() {
+        let name = name.unwrap_or_else(|| unique((i + 1).to_string()));
         out_pins.push(Pin { name, at, dir });
     }
     // The first pin is the origin, as for the other importers.
@@ -1185,6 +1189,21 @@ mod tests {
         );
         let names: Vec<&str> = imp.symbol.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["x", "x'", "x'2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_named_terminal_keeps_its_name_when_an_unnamed_one_comes_first() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<line x1="0" y1="0" x2="0" y2="30"/>
+<terminal x="0" y="0" orientation="n"/>
+<terminal x="0" y="10" orientation="s" name="1"/>
+<terminal x="0" y="20" orientation="s" name="2"/>
+<terminal x="0" y="30" orientation="s"/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.x", 1.0)?;
+        let names: Vec<&str> = imp.symbol.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["1'", "1", "2", "4"]);
         Ok(())
     }
 
