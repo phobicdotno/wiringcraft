@@ -37,7 +37,8 @@ while a text field has the keyboard, so typing an S in a field does not start th
 | M | Mirror the selected symbols left to right, or the symbol being placed |
 | Arrow keys | Move the selection one snap step (2.5 mm by default), one undo step a press |
 
-Arrow keys with Ctrl, Shift or Alt held do not move anything.
+On a schematic page, arrow keys with Ctrl, Shift or Alt held do not move anything. The symbol
+editor does not check these keys: there an arrow moves the selection with or without them.
 
 ## Tools
 
@@ -54,8 +55,9 @@ The other drawing tools (rectangle, circle, arc, polyline, dimension, revision c
 table, black box) have no key; pick them in the toolbar or ribbon.
 
 Esc does one thing at a time: it cancels a drag in progress and puts the items back, else drops
-the black box, shape or wire being drawn, else clears the selection. When there is nothing left
-to drop, it goes back to the Select tool.
+the black box, shape or wire being drawn, else, with the Select tool, clears the selection. When
+there is nothing left to drop, it goes back to the Select tool. So with another tool and nothing
+being drawn, the first Esc switches to Select and keeps the selection, and a second Esc clears it.
 
 ## Pages and view
 
@@ -127,8 +129,8 @@ While the symbol editor is open, the schematic's keys are held back. These work 
 | Keys or gesture | What it does |
 | --- | --- |
 | Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z | Undo, redo in the editor |
-| Del or Backspace | Delete the selected shape |
-| Arrow keys | Move the selected shape one 2.5 mm step |
+| Del or Backspace | Delete the selected shape or pin |
+| Arrow keys | Move the selected shape or pin one 2.5 mm step |
 | Click | Place the tool's next point, or select a shape |
 | Drag (Select tool) | Move a shape; drag a handle of the selected shape to reshape it |
 | Double-click on the last point, or Enter | End a polyline |
@@ -154,5 +156,5 @@ black box tag, and closes the page history.
 | --- | --- |
 | Enter | Send the message |
 | Shift+Enter | New line |
-| Ctrl+V | Paste a picture from the clipboard as a screenshot |
-| Drop a picture on the window | Attach it as a screenshot |
+| Ctrl+V in the message box | Paste a picture from the clipboard as a screenshot (Windows and Linux; on macOS Cmd+V does not do it, use the Paste screenshot button or drop the file) |
+| Drop a picture on the window | Attach it as a screenshot, while the assistant panel is shown and not working on a message (then the drop is refused with a note) |
