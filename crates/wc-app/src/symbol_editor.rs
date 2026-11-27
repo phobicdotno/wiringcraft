@@ -268,7 +268,7 @@ pub fn snap(p: Point) -> Point {
 }
 
 /// The next pin name after `name`: the trailing number goes up by one (`A1` → `A2`, `13` → `14`);
-/// a name without a number stays.
+/// a name without a number stays. Leading zeros keep the number's width (`01` → `02`).
 fn next_name(name: &str) -> String {
     let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
     if digits == 0 {
@@ -276,7 +276,7 @@ fn next_name(name: &str) -> String {
     }
     let (head, num) = name.split_at(name.len() - digits);
     match num.parse::<u64>().ok().and_then(|n| n.checked_add(1)) {
-        Some(n) => format!("{head}{n}"),
+        Some(n) => format!("{head}{n:0digits$}"),
         None => name.to_owned(),
     }
 }
@@ -1449,6 +1449,11 @@ mod tests {
         assert!(e.message.contains("Pin A2 is already there"), "{}", e.message);
         // The last possible number does not overflow.
         assert_eq!(next_name("18446744073709551615"), "18446744073709551615");
+        // Leading zeros keep the number's width (#1305).
+        assert_eq!(next_name("01"), "02");
+        assert_eq!(next_name("X09"), "X10");
+        assert_eq!(next_name("007"), "008");
+        assert_eq!(next_name("99"), "100");
         // No library folder: cannot be saved, and says why.
         assert!(e.problems().iter().any(|p| p.contains("library folder")));
     }
