@@ -194,8 +194,9 @@ pub fn nets(project: &Project) -> Vec<Net> {
 
 /// Like [`nets`], and also joins interruption points. `role(symbol id)` is the role of a placed
 /// symbol's library symbol (`None` when it is not known): every interruption point is connected
-/// to the others with the same device tag, and only terminals (or symbols of unknown role) take
-/// part in jumpers.
+/// to the others with the same device tag (one on an overview page, `Page::overview`, only to
+/// those on overview pages), and only terminals (or symbols of unknown role) take part in
+/// jumpers.
 pub fn nets_linked(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> Vec<Net> {
     wire_nets(project, role).0
 }
@@ -279,7 +280,13 @@ fn linked_graph(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) ->
                 continue;
             }
             // Only interruption points that are wired take part; their pins join under the tag.
-            let link = Node::Link(tag.to_string());
+            // A copy on an overview page links nothing in the schematic (as the project check
+            // counts partners), so overview points join only each other.
+            let link = if page.overview {
+                Node::Link(format!("\u{0}overview\u{0}{tag}"))
+            } else {
+                Node::Link(tag.to_string())
+            };
             let wired: Vec<usize> = wired_pins(page, &s.id).map(|(_, n)| g.id_of(n)).collect();
             for n in wired {
                 let l = g.id_of(link.clone());
@@ -632,5 +639,41 @@ mod tests {
         let linked = nets_linked(&p, |s| (s == "arrow").then_some(SymbolRole::Interruption));
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].pins.len(), 4);
+    }
+
+    #[test]
+    fn an_interruption_point_on_an_overview_joins_no_schematic_net() {
+        use crate::project::PlacedSymbol;
+        use std::collections::BTreeSet;
+        let arrow = |id: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "arrow".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: crate::DeviceTag::parse("-X1").ok(),
+        };
+        let page = |id: &str, from: &str, overview: bool| {
+            let mut pg = Page::new(id, id, "");
+            pg.overview = overview;
+            pg.symbols.push(arrow("s9"));
+            pg.wires.push(wire("w1", pin(from, "1"), pin("s9", "1"), None));
+            pg
+        };
+        let mut p = Project::new("t");
+        p.pages = vec![
+            page("a", "s1", false),
+            page("b", "s2", false),
+            page("o", "s3", true),
+            page("q", "s4", true),
+        ];
+        let linked = nets_linked(&p, |s| (s == "arrow").then_some(SymbolRole::Interruption));
+        let mut found: Vec<BTreeSet<&str>> = linked
+            .iter()
+            .map(|n| n.pins.iter().map(|(pg, _, _)| pg.as_str()).collect())
+            .collect();
+        found.sort();
+        // The schematic points join each other, the overview copies each other, never across.
+        assert_eq!(found, vec![BTreeSet::from(["a", "b"]), BTreeSet::from(["o", "q"])]);
     }
 }
