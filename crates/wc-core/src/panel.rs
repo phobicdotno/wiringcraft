@@ -108,10 +108,19 @@ impl PanelItem {
     }
 
     /// The outline the item covers on the plate, as (top-left, bottom-right): a rail is 35 mm
-    /// tall about its centre line, a duct is its rectangle, a device is turned as it stands.
+    /// tall about its centre line, running left from `at` when its length is negative; a duct
+    /// is its rectangle, a device is turned as it stands.
     pub fn bounds(&self) -> (Point, Point) {
         match self {
-            PanelItem::Rail { at, length } => (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5)),
+            PanelItem::Rail { at, length } => {
+                // A NaN length is kept as it is, so a check on the plate still refuses it.
+                let (left, right) = if *length < 0.0 {
+                    (at.x + length, at.x)
+                } else {
+                    (at.x, at.x + length)
+                };
+                (Point::new(left, at.y - 17.5), Point::new(right, at.y + 17.5))
+            }
             PanelItem::Duct { min, max } => (
                 Point::new(min.x.min(max.x), min.y.min(max.y)),
                 Point::new(min.x.max(max.x), min.y.max(max.y)),
@@ -576,6 +585,14 @@ pub fn arrange(
         .iter()
         .filter_map(|i| match i {
             PanelItem::Rail { at, length } => {
+                // A negative length runs left from `at`: use the rail from its left end, as
+                // `Panel::resize` reads it.
+                let (start, len) = if *length < 0.0 {
+                    (Point::new(at.x + length, at.y), -length)
+                } else {
+                    (*at, *length)
+                };
+                let (at, length) = (&start, &len);
                 let used_to = panel
                     .items
                     .iter()
@@ -1283,6 +1300,25 @@ mod tests {
     }
 
     #[test]
+    fn a_rail_drawn_right_to_left_has_its_outline_from_its_left_end_and_drags_on_the_plate() {
+        let mut rail = PanelItem::Rail {
+            at: Point::new(300.0, 100.0),
+            length: -200.0,
+        };
+        assert_eq!(rail.bounds(), (Point::new(100.0, 82.5), Point::new(300.0, 117.5)));
+        // Dragged far right on a 400 mm plate, its right end stops at the edge.
+        rail.move_on_plate(Point::new(900.0, 100.0), 400.0, 300.0);
+        assert_eq!(rail.bounds(), (Point::new(200.0, 82.5), Point::new(400.0, 117.5)));
+        // A NaN length still makes an outline no plate takes.
+        let nan = PanelItem::Rail {
+            at: Point::new(10.0, 100.0),
+            length: f64::NAN,
+        };
+        let (a, b) = nan.bounds();
+        assert!(!outline_on_plate(400.0, 300.0, a, b));
+    }
+
+    #[test]
     fn a_duct_moves_whole_and_stays_on_the_plate() {
         let mut duct = PanelItem::Duct {
             min: Point::new(0.0, 0.0),
@@ -1453,6 +1489,54 @@ mod tests {
             Some((Point::new(10.0, 105.0), Point::new(55.0, 195.0))),
             "the empty left rail takes it from its own left end"
         );
+    }
+
+    #[test]
+    fn arrange_uses_a_rail_drawn_right_to_left_from_its_left_end() {
+        // A rail drawn from x 250 back to x 50, with one device already on it.
+        let mut panel = Panel::new("p", "P", 300.0, 200.0);
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(250.0, 100.0),
+            length: -200.0,
+        });
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        let mut part = Part {
+            id: "c".into(),
+            ..Default::default()
+        };
+        part.properties.insert("Width".into(), "45".into());
+        part.properties.insert("Height".into(), "90".into());
+        parts.insert("c".to_string(), part);
+        let tags: Vec<DeviceTag> = ["-K1", "-K2", "-K3", "-K4", "-K5"]
+            .iter()
+            .filter_map(|t| tag(t))
+            .collect();
+        for t in &tags {
+            project.devices.insert(
+                t.clone(),
+                Device {
+                    part: Some("c".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let Some(first) = tags.first() else { unreachable!() };
+        panel.items.push(PanelItem::Device {
+            tag: first.clone(),
+            at: Point::new(50.0, 55.0),
+            width: 45.0,
+            height: 90.0,
+            rotation: Rotation::R0,
+        });
+        let done = arrange(&mut panel, &project, &parts, None);
+        // 50..250 holds four 45 mm devices with gaps; the one already there counts.
+        assert_eq!(done.placed.len(), 3, "{done:?}");
+        assert_eq!(done.did_not_fit, vec![tags[4].to_string()]);
+        let Some((min, _)) = panel.device(&tags[1]).and_then(PanelItem::device_bounds) else {
+            unreachable!()
+        };
+        assert_eq!(min, Point::new(95.0 + GAP, 55.0));
     }
 
     #[test]

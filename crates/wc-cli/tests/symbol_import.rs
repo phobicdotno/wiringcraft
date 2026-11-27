@@ -213,6 +213,22 @@ fn symbol_dxf_fails_with_a_message_on_a_missing_or_broken_file() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn symbol_svg_and_dxf_refuse_an_empty_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    std::fs::write(tmp.path().join("coil.svg"), SVG)?;
+    std::fs::write(tmp.path().join("contact.dxf"), dxf())?;
+    for (cmd, file) in [("symbol-svg", "coil.svg"), ("symbol-dxf", "contact.dxf")] {
+        for name in ["", "   "] {
+            let args = ["import", cmd, file, "--id", "my.x", "--name", name, "--lib", "lib"];
+            let err = run_failing(tmp.path(), &args)?;
+            assert!(err.contains("the symbol name cannot be empty"), "{cmd} {name:?}: {err}");
+        }
+    }
+    assert!(!tmp.path().join("lib").exists());
+    Ok(())
+}
+
 /// A one-unit lamp with a body line and two pins.
 const KICAD: &str = r#"(kicad_symbol_lib (version 20231120) (generator "test")
   (symbol "Lamp" (in_bom yes) (on_board yes)
