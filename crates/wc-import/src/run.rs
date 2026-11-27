@@ -853,8 +853,15 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
         }
         let Some(scan) = &t.scan else { continue };
         let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
-        // Some folders do not tell `PDF-5.png` from `pdf-5.png`.
-        let uses = |pg: &&Page| pg.underlay.as_ref().is_some_and(|u| u.file.eq_ignore_ascii_case(&file));
+        // Some folders do not tell `PDF-5.png` from `pdf-5.png`, and `underlays/./pdf-5.png` or
+        // `underlays\pdf-5.png` in a project file names the same picture.
+        let parts = |f: &str| -> Vec<String> {
+            f.split(['/', '\\'])
+                .filter(|s| !s.is_empty() && *s != ".")
+                .map(str::to_ascii_lowercase)
+                .collect()
+        };
+        let uses = |pg: &&Page| pg.underlay.as_ref().is_some_and(|u| parts(&u.file) == parts(&file));
         if let Some(pg) = p.pages.iter().find(uses) {
             return Err(format!(
                 "the scanned sheet of page {} would replace {file}, the picture under page {}; pick another --first-page",
@@ -2301,6 +2308,22 @@ mod tests {
             "{r:?}"
         );
         assert_eq!(files(&dir), before);
+
+        // The same picture under another spelling of its path.
+        let mut dotted = Page::new("y", "61", "Mine");
+        dotted.underlay = Some(wc_core::Underlay {
+            file: format!("{}/./PDF-5.png", wc_core::Underlay::DIR),
+            min: wc_core::Point::new(0.0, 0.0),
+            max: wc_core::Point::new(210.0, 297.0),
+        });
+        let other = project("spelling", vec![dotted]);
+        let before_other = files(&other);
+        let r = pdf(&other, &file, 5, &mut Log::default());
+        assert!(
+            matches!(&r, Err(why) if why.contains("the picture under page y;")),
+            "{r:?}"
+        );
+        assert_eq!(files(&other), before_other);
 
         // Free numbers go through, each page with its scan.
         assert_eq!(pdf(&dir, &file, 7, &mut Log::default()), Ok(()));
