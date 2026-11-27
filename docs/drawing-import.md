@@ -72,7 +72,9 @@ A block reference whose block name matches the id of a symbol in the project's l
 (ignoring case; a space or `/` counts as `-`) is placed as that symbol, not drawn as lines. Its
 device tag comes from an attribute named `TAG`, `DEVICE`, `BMK` or `REF`. The symbol is copied
 into the project as for any placed symbol. Only right-angle turns are kept: a block turned by
-another angle is placed unturned.
+another angle is placed unturned. A negative X scale places the symbol mirrored; a negative Y
+scale alone does not mirror it, and the scale itself is not kept, so the symbol has its
+library size.
 
 ```
 $ wiringcraft import page-dxf plan.dxf --page p2
