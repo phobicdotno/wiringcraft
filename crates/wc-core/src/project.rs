@@ -2083,11 +2083,21 @@ impl Project {
             }
         }
         // A strip's rail order and spares go with it, unless `to` has a layout of its own: two
-        // layouts for one strip would not load.
-        if !self.meta.strips.iter().any(|l| &l.strip == to) {
-            for l in &mut self.meta.strips {
-                if &l.strip == from {
-                    l.strip = to.clone();
+        // layouts for one strip would not load. The layout goes where `to` sorts, and each
+        // spare's device data (its part) goes along, unless the new spare tag has its own.
+        if let Some(k) = self.meta.strips.iter().position(|l| &l.strip == from)
+            && !self.meta.strips.iter().any(|l| &l.strip == to)
+        {
+            let mut layout = self.meta.strips.remove(k);
+            layout.strip = to.clone();
+            let spares = layout.spares.clone();
+            self.meta.with_layout(to, |l| *l = layout);
+            for spare in spares {
+                let (mut old, mut new) = (from.clone(), to.clone());
+                old.product.push(spare.clone());
+                new.product.push(spare);
+                if !self.devices.contains_key(&new) {
+                    self.rename_device(&old, &new);
                 }
             }
         }

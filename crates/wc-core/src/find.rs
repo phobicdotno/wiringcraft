@@ -371,6 +371,21 @@ pub fn replace_renaming(
     if let Some(to) = renames.values().find(|to| taken.contains(to)) {
         return Err(format!("{to} is already used."));
     }
+    // A renamed strip's spares go with it, so their new tags must be free too.
+    for (from, to) in &renames {
+        for spare in p
+            .meta
+            .strip_layout(from)
+            .map(|l| l.spares.as_slice())
+            .unwrap_or_default()
+        {
+            let mut new = to.clone();
+            new.product.push(spare.clone());
+            if p.devices.contains_key(&new) && !renames.contains_key(&new) {
+                return Err(format!("{new} is already used."));
+            }
+        }
+    }
     // Renamed in two steps through placeholders, so `-K1` -> `-K2` and `-K2` -> `-K3` in one
     // replace do not run into each other. A placeholder is a tag nothing in the project uses
     // and no rename gives.
@@ -654,6 +669,57 @@ mod tests {
         assert_eq!(
             replace(&mut p, &hits, "X2", "X3", opts),
             Err("-X3 is already used.".into())
+        );
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn a_renamed_strip_stays_in_strip_order_and_takes_its_spares_parts() {
+        let mut p = sample();
+        p.pages[1].symbols.push(PlacedSymbol {
+            id: "t1".into(),
+            symbol: "wc.terminal".into(),
+            at: Point::new(40.0, 20.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag("-X1")),
+        });
+        let layout = |strip: &str, order: &str| crate::project::StripLayout {
+            strip: tag(strip),
+            order: vec![order.into()],
+            spares: vec!["S1".into()],
+        };
+        // -WCFIND0 is the first placeholder a rename would pick.
+        p.meta.strips = vec![layout("-WCFIND0", "9"), layout("-X1", "2"), layout("-X2", "3")];
+        p.devices.insert(
+            tag("-X1.S1"),
+            Device {
+                part: Some("WAGO.2002-1201".into()),
+                ..Default::default()
+            },
+        );
+        let opts = FindOptions { match_case: true };
+        let hits: Vec<Hit> = find(&p, "-X1", opts).into_iter().filter(|h| h.value == "-X1").collect();
+        assert_eq!(replace(&mut p, &hits, "X1", "X3", opts), Ok(1));
+        assert_eq!(
+            p.meta.strips,
+            [layout("-WCFIND0", "9"), layout("-X2", "3"), layout("-X3", "2")],
+            "each layout keeps its own tag and contents, in strip order"
+        );
+        assert_eq!(
+            p.devices.get(&tag("-X3.S1")).and_then(|d| d.part.as_deref()),
+            Some("WAGO.2002-1201"),
+            "the spare's part goes with it"
+        );
+        assert!(!p.devices.contains_key(&tag("-X1.S1")));
+
+        // A spare's new tag that another device has is taken.
+        p.devices.insert(tag("-X4.S1"), Device::default());
+        let before = p.clone();
+        let hits: Vec<Hit> = find(&p, "-X3", opts).into_iter().filter(|h| h.value == "-X3").collect();
+        assert_eq!(
+            replace(&mut p, &hits, "X3", "X4", opts),
+            Err("-X4.S1 is already used.".into())
         );
         assert_eq!(p, before);
     }
