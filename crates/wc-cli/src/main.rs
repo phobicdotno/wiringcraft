@@ -2668,6 +2668,23 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
                 continue;
             }
         }
+        // Its copy is written from here on. An id that differs only in case from one the
+        // project pins names the same file on a folder that ignores case (macOS and Windows):
+        // that item's copy would be written over, and two pins left for one file. Only an id
+        // the project does not pin yet is refused: a project that already pins both keeps
+        // getting a missing copy of either back, as before.
+        let pinned = match kind {
+            ItemKind::Symbol => &p.lock.symbols,
+            ItemKind::Part => &p.lock.parts,
+        };
+        let twin = pinned
+            .keys()
+            .find(|other| other.as_str() != id && other.eq_ignore_ascii_case(id));
+        if let Some(other) = twin.filter(|_| pin.is_none()) {
+            return Err(format!(
+                "{what} ids {other:?} and {id:?} differ only in case, so their copies would be one file on macOS and Windows; rename one of them"
+            ));
+        }
         let lib = match &mut lib {
             Some(lib) => &*lib,
             None => &*lib.insert(wc_library::Library::open(dir, p).map_err(e)?),
