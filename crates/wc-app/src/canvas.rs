@@ -72,6 +72,9 @@ pub struct Editor {
     pub wire: Option<(Endpoint, Vec<Point>)>,
     /// The id of the page that wire was started on: on another page it is dropped.
     pub wire_page: Option<String>,
+    /// The bends of that wire before the last click added its own: a double click whose end
+    /// is refused goes back to these, not to the bends its first click added.
+    wire_before_click: Option<Vec<Point>>,
     pub view: View,
     pub cursor: Option<Point>,
     drag: Option<Drag>,
@@ -151,6 +154,7 @@ impl Default for Editor {
             shape_points: Vec::new(),
             shape_page: None,
             wire_page: None,
+            wire_before_click: None,
             finish_shape: false,
             cancel_drag: false,
             last_shape_click: None,
@@ -2834,7 +2838,13 @@ fn wire_tool(
             if via.last() == Some(&cur) {
                 via.pop();
             }
+            let before = ed.wire_before_click.take();
             finish_wire(open, ed, page, start, via, end);
+            // Refused: the draft as it was before the double click, without the elbow its
+            // first click may have added.
+            if let (Some((_, kept)), Some(before)) = (ed.wire.as_mut(), before) {
+                *kept = before;
+            }
         }
         return;
     }
@@ -2850,6 +2860,7 @@ fn wire_tool(
                 if near.is_some() {
                     finish_wire(open, ed, page, start, via, end);
                 } else {
+                    ed.wire_before_click = Some(via.clone());
                     let last = via.last().copied().or_else(|| open.end_pos(page, &start));
                     if let Some(l) = last
                         && l.x != cur.x
@@ -4791,6 +4802,31 @@ mod tests {
         click_at(&ctx, &mut o, &mut ed, end, 4.1);
         assert!(ed.wire.is_none());
         assert_eq!(wires(&o), 1);
+    }
+
+    #[test]
+    fn a_refused_double_click_keeps_the_draft_without_its_elbow() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        let start = egui::pos2(300.0, 300.0);
+        let bend = start + Vec2::new(60.0, 40.0);
+        click_at(&ctx, &mut o, &mut ed, start, 1.0);
+        click_at(&ctx, &mut o, &mut ed, bend, 2.0);
+        let drawn = ed.wire.as_ref().map(|(_, via)| via.clone());
+        assert_eq!(drawn.as_ref().map(Vec::len), Some(1), "{drawn:?}");
+        // A double click back on the start: its first click adds an elbow and the start as
+        // bends, then the end is refused, and the draft is the one drawn before it.
+        click_at(&ctx, &mut o, &mut ed, start, 3.0);
+        click_at(&ctx, &mut o, &mut ed, start, 3.1);
+        assert_eq!(ed.message, "A wire needs two different ends.");
+        assert_eq!(ed.wire.as_ref().map(|(_, via)| via.clone()), drawn);
+        assert!(o.project.pages[0].wires.is_empty());
     }
 
     #[test]
