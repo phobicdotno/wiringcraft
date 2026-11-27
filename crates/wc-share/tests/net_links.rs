@@ -35,17 +35,23 @@ fn reason_after_close(link: &GuestLink) -> Option<CloseReason> {
     None
 }
 
-/// Wait (without sleeping) for the next message on the link.
-fn next_msg(link: &GuestLink) -> Option<HostMsg> {
+/// Wait (without sleeping) for the next message on the link. A link that closes first, or
+/// a wait that runs out, is an error that says which, with the close reason.
+fn next_msg(link: &GuestLink) -> Result<HostMsg, String> {
     let start = Instant::now();
     while start.elapsed() < PATIENCE {
         match link.try_recv() {
-            Ok(Some(msg)) => return Some(msg),
+            Ok(Some(msg)) => return Ok(msg),
             Ok(None) => std::thread::yield_now(),
-            Err(_) => return None,
+            Err(e) => {
+                return Err(format!(
+                    "the link failed before a message came: {e} (close reason: {:?})",
+                    link.close_reason()
+                ));
+            }
         }
     }
-    None
+    Err(format!("no message within {PATIENCE:?}"))
 }
 
 #[test]
@@ -132,7 +138,7 @@ fn a_guest_link_speaks_one_json_line_per_message() -> TestResult {
     let mut writer = raw;
     writer.write_all(b"\n  \r\n")?;
     writer.write_all(encode(&HostMsg::Waiting)?.as_bytes())?;
-    assert_eq!(next_msg(&link), Some(HostMsg::Waiting));
+    assert_eq!(next_msg(&link)?, HostMsg::Waiting);
     assert_eq!(link.close_reason(), None, "still open");
 
     // The host closing in order reads as closed, and as ended.
@@ -155,7 +161,7 @@ fn a_guest_caps_lines_from_the_host() -> TestResult {
     let waiting = encode(&HostMsg::Waiting)?;
     assert!(waiting.len() <= 64, "{waiting:?}");
     raw.write_all(&[b'x'; 256])?;
-    assert_eq!(next_msg(&link), Some(HostMsg::Waiting));
+    assert_eq!(next_msg(&link)?, HostMsg::Waiting);
     let reason = reason_after_close(&link);
     assert_eq!(reason, Some(CloseReason::LineTooLong { max: 64 }));
     assert!(!reason.is_some_and(|r| r.is_orderly()));
