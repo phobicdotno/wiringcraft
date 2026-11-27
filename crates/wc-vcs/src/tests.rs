@@ -269,6 +269,39 @@ fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
     Ok(())
 }
 
+/// A linked worktree of a repository in a folder whose name is not UTF-8 and ends in a space:
+/// `git_path` must name the worktree's real git folder. macOS refuses such file names.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn git_path_in_a_linked_worktree_of_an_odd_folder_is_exact() -> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path().join(std::ffi::OsString::from_vec(b"main\xff ".to_vec()));
+    std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    let git = Git::new(&dir);
+    git.init()?;
+    std::fs::write(dir.join("note.txt"), "one\n").map_err(|e| wc_core::Error::io("write", e))?;
+    git.commit("one")?;
+    let wt = tmp.path().join("wt");
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["worktree", "add", "-q", "-b", "side"])
+        .arg(&wt)
+        .status()
+        .map_err(|e| wc_core::Error::io("git", e))?
+        .success();
+    assert!(ok, "worktree add");
+    let merge_head = Git::new(&wt).git_path("MERGE_HEAD")?;
+    let real = dir.join(".git").join("worktrees").join("wt");
+    assert_eq!(merge_head.parent(), Some(real.as_path()), "{}", merge_head.display());
+    assert!(real.is_dir());
+    // A name ending in a space keeps it.
+    let spaced = Git::new(&wt).git_path("odd ")?;
+    assert_eq!(spaced, real.join("odd "));
+    Ok(())
+}
+
 #[test]
 fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
