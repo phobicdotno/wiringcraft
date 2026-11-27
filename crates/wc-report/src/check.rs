@@ -155,7 +155,15 @@ pub fn check_with_unreadable(
     // may repeat (a relay has several). An overview page (line diagram) shows devices again on
     // purpose, so its symbols do not count here.
     let terminals = wc_core::project::terminal_numbers(p, role);
-    let mut seen: BTreeMap<(DeviceTag, String), Vec<(&Page, &str)>> = BTreeMap::new();
+    // What a tag is drawn as: its coil, a numbered terminal (the tag is the strip with the
+    // number), or a symbol, by id. Kept apart so that no symbol id can pass for the others.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum DrawnAs {
+        Main,
+        NumberedTerminal,
+        Symbol(String),
+    }
+    let mut seen: BTreeMap<(DeviceTag, DrawnAs), Vec<(&Page, &str)>> = BTreeMap::new();
     let mut mains: BTreeSet<DeviceTag> = BTreeSet::new();
     for page in &p.pages {
         for s in &page.symbols {
@@ -166,7 +174,7 @@ pub fn check_with_unreadable(
                     if page.overview {
                         continue;
                     }
-                    seen.entry((tag.clone(), "main".into()))
+                    seen.entry((tag.clone(), DrawnAs::Main))
                         .or_default()
                         .push((page, &s.id));
                 }
@@ -175,16 +183,16 @@ pub fn check_with_unreadable(
                         Some((strip, number)) => {
                             let mut terminal = strip.clone();
                             terminal.product.push(number.clone());
-                            (terminal, "terminal".into())
+                            (terminal, DrawnAs::NumberedTerminal)
                         }
                         // Not numbered (no strip in its tag, or a strip already at the largest
                         // number): by its tag and symbol.
-                        None => (tag.clone(), s.symbol.clone()),
+                        None => (tag.clone(), DrawnAs::Symbol(s.symbol.clone())),
                     };
                     seen.entry(key).or_default().push((page, &s.id));
                 }
                 Some(SymbolRole::Standalone) if !page.overview => {
-                    seen.entry((tag.clone(), s.symbol.clone()))
+                    seen.entry((tag.clone(), DrawnAs::Symbol(s.symbol.clone())))
                         .or_default()
                         .push((page, &s.id));
                 }
