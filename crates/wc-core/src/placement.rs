@@ -160,17 +160,23 @@ pub fn place(
         .collect();
     olds.sort_by_key(|t| t.product.len());
     // A device the group holds only as a part or terminal (`-K2.1` without `-K2`) is taken too,
-    // so another device of the group does not land on it and absorb that part.
+    // so another device of the group does not land on it and absorb that part. A parent under a
+    // device the group holds itself (`-K1.1` of `-K1` and `-K1.1.1`) is not: it moves with `-K1`.
     let own: BTreeSet<&DeviceTag> = olds.iter().copied().collect();
+    let prefix = |t: &DeviceTag, n: usize| {
+        t.product.get(..n).map(|product| DeviceTag {
+            product: product.to_vec(),
+            ..t.clone()
+        })
+    };
     let held: Vec<DeviceTag> = olds
         .iter()
-        .flat_map(|t| {
-            (1..t.product.len()).map(|n| DeviceTag {
-                product: t.product[..n].to_vec(),
-                ..(*t).clone()
-            })
+        .flat_map(|t| (1..t.product.len()).filter_map(move |n| prefix(t, n)))
+        .filter(|parent| {
+            !(1..=parent.product.len())
+                .filter_map(|n| prefix(parent, n))
+                .any(|p| own.contains(&p))
         })
-        .filter(|parent| !own.contains(parent))
         .collect();
     used.extend(held);
     // Two passes: first every tag that keeps its own number (on its own or on its strip's new
@@ -402,6 +408,41 @@ mod tests {
             .collect();
         // -K1 is held by -K1.1 and -K2 by the pasted -K2.1, so -K7 becomes -K3.
         assert_eq!(new_tags, [Some("-K3".to_string()), Some("-K2.1".to_string())]);
+    }
+
+    #[test]
+    fn a_pasted_device_keeps_its_tag_when_the_group_holds_its_nested_part() {
+        // An empty page; the group holds -K1 and -K1.1.1 but not -K1.1.
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("p1", "1", "One"));
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1.1.1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        assert_eq!(new_tags, [Some("-K1".to_string()), Some("-K1.1.1".to_string())]);
     }
 
     #[test]
