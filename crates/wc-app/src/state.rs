@@ -3962,13 +3962,19 @@ impl Open {
     /// keep their wires as they are; their numbers are listed in `skipped`, and a later run
     /// gives their wires the numbers their connections got elsewhere.
     pub fn number_wires(&mut self, rule: wc_core::numbering::Rule) -> WireNumbering {
+        self.renumber_wires(rule, false)
+    }
+
+    /// [`Self::number_wires`], or with `overwrite` give every connection a new number by
+    /// `rule`, replacing the numbers wires already have (the CLI's `number-wires --overwrite`).
+    pub fn renumber_wires(&mut self, rule: wc_core::numbering::Rule, overwrite: bool) -> WireNumbering {
         self.follow_terminals();
         let mut project = self.project.clone();
         let symbols = &self.symbols;
         let done = wc_core::numbering::number_wires(
             &mut project,
             rule,
-            false,
+            overwrite,
             |id| symbols.get(id).map(|s| s.role),
             |page, end| match end {
                 wc_core::Endpoint::Point { at } => Some(*at),

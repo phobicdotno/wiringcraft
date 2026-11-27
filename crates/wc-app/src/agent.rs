@@ -561,8 +561,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "number_wires",
-            "Give every connection without a number one. Existing numbers are kept.",
-            json!({"rule": {"type": "string", "enum": ["page_column", "sequential", "potential"], "description": "page_column (3.4: page and column, default), sequential (1, 2, 3) or potential (the potential's name)."}}),
+            "Give every connection without a number one. Existing numbers are kept, unless overwrite is true: then every connection is numbered again by the rule.",
+            json!({"rule": {"type": "string", "enum": ["page_column", "sequential", "potential"], "description": "page_column (3.4: page and column, default), sequential (1, 2, 3) or potential (the potential's name)."}, "overwrite": {"type": "boolean", "description": "Replace the numbers wires already have (default false: keep them)."}}),
             &[],
         ),
         tool(
@@ -2123,8 +2123,13 @@ impl App {
                         ));
                     }
                 };
+                let overwrite = match v.get("overwrite") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err("`overwrite` must be true or false.".into()),
+                };
                 let open = need_open(self.open.as_mut())?;
-                Ok(open.number_wires(rule).report())
+                Ok(open.renumber_wires(rule, overwrite).report())
             }
             "run_check" => {
                 let open = need_open(self.open.as_mut())?;
@@ -5308,6 +5313,48 @@ mod tests {
         // The CLI's spelling works too.
         call(&mut a, "number_wires", json!({"rule": "page-column"})).unwrap();
         assert_eq!(numbered(&a), 1);
+    }
+
+    #[test]
+    fn number_wires_overwrite_replaces_existing_numbers() {
+        let (_tmp, mut a) = app(vec![]);
+        let place = |a: &mut App, symbol: &str, x: i32| -> String {
+            let placed = call(
+                a,
+                "place_symbol",
+                json!({"symbol": symbol, "x": x, "y": 60, "page": "2"}),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&placed).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (c, k) = (place(&mut a, "wc.coil", 50), place(&mut a, "wc.contact.no", 120));
+        call(
+            &mut a,
+            "add_wire",
+            json!({"page": "2", "from": {"item": c, "pin": "A1"}, "to": {"item": k, "pin": "13"}}),
+        )
+        .unwrap();
+        let number = |a: &App| page2(a).wires[0].number.clone();
+        call(&mut a, "number_wires", json!({"rule": "page_column"})).unwrap();
+        let first = number(&a);
+        assert!(first.as_deref().is_some_and(|n| n.contains('.')), "{first:?}");
+        // Without overwrite the number stays.
+        call(&mut a, "number_wires", json!({"rule": "sequential"})).unwrap();
+        assert_eq!(number(&a), first);
+        // A value that is not true or false is refused and changes nothing.
+        let err = call(
+            &mut a,
+            "number_wires",
+            json!({"rule": "sequential", "overwrite": "yes"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("true or false"), "{err}");
+        assert_eq!(number(&a), first);
+        call(&mut a, "number_wires", json!({"rule": "sequential", "overwrite": true})).unwrap();
+        assert_eq!(number(&a).as_deref(), Some("1"));
     }
 
     fn page2(app: &App) -> &Page {
