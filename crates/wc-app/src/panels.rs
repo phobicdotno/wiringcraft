@@ -512,9 +512,7 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 && let Some((page_id, item)) = uses.first()
                 && let Some(i) = open.project.pages.iter().position(|p| &p.id == page_id)
             {
-                ed.page = i;
-                ed.select_only(Selection::Symbol(item.clone()));
-                ed.view.fit = true;
+                show_device(ed, i, item);
             }
             // A terminal's strip can have its markers exported on their own.
             if let Some(strip) = terminal_strip_of(open, &tag, &uses) {
@@ -588,6 +586,14 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
                 }
             }
         });
+}
+
+/// A click on a device in the Devices list: its page is shown (a panel layout shown closes, as
+/// from the Pages list) with symbol `item` selected.
+fn show_device(ed: &mut Editor, page: usize, item: &str) {
+    ed.show_page(page);
+    ed.select_only(Selection::Symbol(item.to_owned()));
+    ed.view.fit = true;
 }
 
 fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
@@ -2417,6 +2423,24 @@ fn drawing_rows(g: &Shape) -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device picked in the Devices list while a panel layout is shown is shown on its page:
+    /// the panel view closes (#1203).
+    #[test]
+    fn a_device_picked_in_the_list_over_a_panel_shows_its_page() {
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(2);
+        show_device(&mut ed, 1, "s1");
+        assert_eq!(ed.page, 1);
+        assert_eq!(ed.panel, None, "the panel view closes");
+        assert_eq!(ed.panel_pick, None);
+        assert_eq!(ed.selection, vec![Selection::Symbol("s1".into())]);
+        // On the page shown already, only the selection changes.
+        show_device(&mut ed, 1, "s2");
+        assert_eq!((ed.page, ed.panel), (1, None));
+        assert_eq!(ed.selection, vec![Selection::Symbol("s2".into())]);
+    }
 
     /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.
     fn jumper_texts(o: &mut Open, page: usize, ids: &[String]) -> Vec<String> {
