@@ -37,5 +37,27 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The records of `git log --format=...` output in which every one of the `N` fields ends in
+/// NUL (`%x00`). Git never writes NUL inside a field (a commit message cannot hold one), so
+/// text such as a subject cannot break the framing, whatever other characters it holds. The
+/// newline git puts after each record is left off the first field of the next.
+pub(crate) fn log_records<const N: usize>(text: &str) -> Vec<[&str; N]> {
+    let mut parts = text.split('\0');
+    let mut out = Vec::new();
+    loop {
+        let mut record = [""; N];
+        for slot in &mut record {
+            let Some(field) = parts.next() else {
+                return out;
+            };
+            *slot = field;
+        }
+        if let Some(first) = record.first_mut() {
+            *first = first.trim_start_matches('\n');
+        }
+        out.push(record);
+    }
+}
+
 #[cfg(test)]
 mod tests;

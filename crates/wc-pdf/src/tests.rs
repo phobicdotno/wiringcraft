@@ -313,6 +313,49 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
 }
 
 #[test]
+fn a_negative_radius_is_drawn_in_svg_and_dxf_where_the_pdf_draws_it() {
+    // The PDF places the points at centre + r (cos, sin): a negative radius is the same circle
+    // and the arc turned half round. The SVG and DXF get the size and the turned angles (#1688).
+    let mut turned = crate::writer::Pen::new(100.0);
+    turned.arc((50.0, 50.0), -10.0, 180.0, 270.0, false);
+    let mut plain = crate::writer::Pen::new(100.0);
+    plain.arc((50.0, 50.0), 10.0, 0.0, 90.0, false);
+    assert_eq!(turned.ops, plain.ops, "the PDF draws the same arc");
+    turned.circle((20.0, 20.0), -3.0, false);
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: turned.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let s = svg(&page);
+    assert!(s.contains("d=\"M60 50 A10 10 0 0 1 50 60\""), "{s}");
+    assert!(s.contains("<circle cx=\"20\" cy=\"20\" r=\"3\""), "{s}");
+    let d = dxf(&page);
+    assert!(
+        d.contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"),
+        "{d}"
+    );
+    assert!(d.contains("0\nCIRCLE\n8\n0\n62\n7\n10\n20\n20\n80\n40\n3\n"), "{d}");
+    assert!(!d.contains("\n40\n-"), "{d}");
+    // A tiny arc stays tiny: turned before its sweep was taken, it rounded to a full circle.
+    let mut tiny = crate::writer::Pen::new(100.0);
+    tiny.arc((50.0, 50.0), -10.0, 0.0, 1e-14, false);
+    let sweeps: Vec<f64> = tiny
+        .prims
+        .iter()
+        .filter_map(|p| match p {
+            crate::writer::Prim::Arc { start, end, .. } => Some(end - start),
+            _ => None,
+        })
+        .collect();
+    assert!(sweeps.len() == 1 && sweeps[0] < 1.0, "{sweeps:?}");
+}
+
+#[test]
 fn dxf_circles_and_arcs_wider_than_the_default_pen_keep_their_width() {
     // A symbol's circle and arc are drawn 0.3 mm wide; R12 CIRCLE and ARC cannot carry that
     // (#1287). A thin circle stays a CIRCLE.
@@ -3602,21 +3645,19 @@ fn document_properties_show_drawn_by_and_the_description() {
     project
         .meta
         .title_block
-        .insert("drawn_by".into(), "Kari Nordmann".into());
+        .insert("drawn_by".into(), "Сергей Иванов 日本".into());
     project
         .meta
         .title_block
         .insert("description".into(), "Pumpe – Ålesund".into());
     let dict = info(&project);
-    assert!(
-        dict.contains(&format!("/Author {}", writer::pdf_text_string("Kari Nordmann"))),
-        "{dict}"
-    );
-    let Some(at) = dict.find("/Subject ") else {
-        unreachable!("no subject in {dict}");
+    // Both entries decode back to the text as typed, independent of the encoder.
+    let entry = |key: &str| -> Option<String> {
+        let at = dict.find(key)?;
+        decode_text_string(dict[at + key.len()..].split_whitespace().next()?)
     };
-    let subject = dict[at + "/Subject ".len()..].split_whitespace().next().unwrap_or("");
-    assert_eq!(decode_text_string(subject).as_deref(), Some("Pumpe – Ålesund"));
+    assert_eq!(entry("/Author ").as_deref(), Some("Сергей Иванов 日本"), "{dict}");
+    assert_eq!(entry("/Subject ").as_deref(), Some("Pumpe – Ålesund"), "{dict}");
     // The title still comes first, next to the producer.
     assert!(dict.contains(&format!("/Title {} /Producer", writer::pdf_text("Pump station"))));
 

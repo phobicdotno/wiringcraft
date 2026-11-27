@@ -910,6 +910,8 @@ mod tests {
     fn text(s: &str) -> Prim {
         Prim::Text {
             at: (1.0, 2.0),
+            anchor: (1.0, 2.0),
+            align: 0,
             height: 2.5,
             angle: 0.0,
             text: s.into(),
@@ -1091,6 +1093,8 @@ mod tests {
         };
         let turned = Prim::Text {
             at: (3.0, 4.0),
+            anchor: (3.0, 4.0),
+            align: 0,
             height: 2.5,
             angle: -90.0,
             text: "50%%".into(),
