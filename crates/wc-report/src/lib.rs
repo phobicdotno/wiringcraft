@@ -248,14 +248,12 @@ impl Table {
     pub fn to_markdown(&self) -> String {
         // One line of text: line ends (LF, CR or CRLF) become spaces.
         let one_line = |s: &str| s.replace("\r\n", " ").replace(['\r', '\n'], " ");
-        // `<` and `>` are written as entities so a value is never read as HTML.
-        let line = |s: &str| one_line(s).replace('<', "&lt;").replace('>', "&gt;");
-        // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed
-        // (see `markdown_cell`).
+        // Markdown punctuation gets a backslash so the table shows the text as typed (see
+        // `markdown_cell`).
         let cell = |s: &str| markdown_cell(&one_line(s));
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
-            line(&self.title),
+            markdown_heading(&cell(&self.title)),
             self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "),
             "---|".repeat(self.columns.len())
         );
@@ -266,6 +264,20 @@ impl Table {
             ));
         }
         out
+    }
+}
+
+/// Escaped title text for an ATX heading: a run of `#` at its end that a viewer would take as
+/// the heading's closing sequence and drop gets a backslash before its first `#`. That is a run
+/// after a space or tab (`Wires #`) or making up the whole title; a run right after other text
+/// (`Wires#`, a link ending in `/#`, an escaped `\#`) is shown as typed, so it is left alone.
+fn markdown_heading(title: &str) -> String {
+    let text = title.trim_end();
+    let run = text.trim_end_matches('#');
+    let closes = run.is_empty() || run.ends_with([' ', '\t']);
+    match title.get(run.len()..) {
+        Some(hashes) if closes && run.len() < text.len() => format!("{run}\\{hashes}"),
+        _ => title.to_owned(),
     }
 }
 
@@ -310,7 +322,7 @@ fn markdown_cell(s: &str) -> String {
             let mut tail = String::new();
             markdown_text(link.strip_prefix(body).unwrap_or_default(), &mut tail);
             let www = body.strip_prefix("www.");
-            if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') {
+            if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') && !has_delimiter(body) {
                 // A plain link stays as typed, a `\` inside it too.
                 out.push_str(body);
             } else if let Some((scheme, rest)) = body.split_once("://") {
@@ -344,6 +356,19 @@ fn markdown_cell(s: &str) -> String {
         rest = &rest[end + space..];
     }
     out
+}
+
+/// Whether a link word holds a character a viewer reads as markup before it makes the link:
+/// `*`, `~` or `` ` `` anywhere, or a `_` that is not between letters or digits
+/// (`/*draft*/` would show as emphasis inside the link; `a_b` is fine).
+fn has_delimiter(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let word_char = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+    chars.iter().enumerate().any(|(i, &c)| match c {
+        '*' | '~' | '`' => true,
+        '_' => !(i.checked_sub(1).is_some_and(|j| word_char(chars.get(j))) && word_char(chars.get(i + 1))),
+        _ => false,
+    })
 }
 
 /// Escapes the Markdown punctuation in plain cell text (see `markdown_cell`).

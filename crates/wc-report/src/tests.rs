@@ -4728,6 +4728,40 @@ fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
 }
 
 #[test]
+fn markdown_titles_show_markdown_characters_as_typed() {
+    let heading = |title: &str| {
+        Table::new(title, &["Tag"])
+            .to_markdown()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(heading("Spare *draft* [rev](x)"), "## Spare \\*draft\\* \\[rev\\](x)");
+    // A trailing run of `#` is not the heading's closing sequence, so it stays.
+    assert_eq!(heading("Wires #"), "## Wires \\#");
+    assert_eq!(heading("Panel 2 ## "), "## Panel 2 \\## ");
+    assert_eq!(heading("#"), "## \\#");
+    // A run right after other text is not a closing sequence: it is shown as typed.
+    assert_eq!(heading("Wires#"), "## Wires#");
+    assert_eq!(heading("a \\#"), "## a \\\\#");
+    // A link ending in `#` keeps it without a backslash, which a viewer would take into it.
+    assert_eq!(heading("See https://example.com/#"), "## See https://example.com/#");
+    assert_eq!(heading("Parts list"), "## Parts list");
+    // Emphasis inside a link would show before the link is made: the word is written as text.
+    assert_eq!(
+        heading("See https://example.com/*draft*/x"),
+        "## See https\\://example.com/\\*draft\\*/x"
+    );
+    assert_eq!(
+        heading("https://example.com/_draft_/x"),
+        "## https\\://example.com/\\_draft\\_/x"
+    );
+    // A `_` between letters is not emphasis, so that link stays as typed.
+    assert_eq!(heading("https://example.com/a_b"), "## https://example.com/a_b");
+}
+
+#[test]
 fn markdown_cells_with_a_backslash_keep_their_columns() {
     let mut t = Table::new("Paths", &["Path", "Text", "Next"]);
     t.rows.push(vec!["C:\\".into(), "a\\|b".into(), "next".into()]);
