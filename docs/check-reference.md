@@ -5,8 +5,8 @@ check runs in three places:
 
 - `wiringcraft check` prints errors and warnings, and notes too with `--all`. Each line is the
   severity, the page number when the finding is on a page, and the message. It exits with an
-  error when it finds an error, so it can guard a commit or a CI job. See
-  [Versions and review](cli/versions-and-review.md) for how to run it.
+  error when it finds an error, so it can guard a commit or a CI job. `wiringcraft check --help`
+  lists every check it runs.
 - **Check** (Ctrl+E) in the app lists every finding, notes included. Click a finding that is
   on a page to go to it.
 - **Check while drawing** in the app runs the check again shortly after each edit, rings the
@@ -48,7 +48,7 @@ numbers, cable cores or the check rules.
 |---|---|---|---|
 | error | `potentials <A> and <B> are connected to each other` | One connected net carries two potential names (for example L1 and L2): a short. | Find the wire that joins them and delete or reconnect it, or correct a potential name. |
 | warning | `one connection has wire numbers <list>` | Wires of one connection carry different numbers. Wire numbering never does this; typed or imported numbers can. Named on the connection's first wire. | Give every wire of the connection the same number, or run `wiringcraft number-wires`. |
-| warning | `wire number <number> is on <n> connections` | One wire number is used on wires of separate connections. Named on the second connection, as the first may be the right one. | Renumber one of them, or run `wiringcraft number-wires`. |
+| warning | `wire number <number> is on <n> connections` | One wire number is used on wires of separate connections. Named on the second connection, as the first may be the right one. | Renumber one of them by hand. Plain `wiringcraft number-wires` keeps numbers already set, so it leaves this as it is; `wiringcraft number-wires --overwrite` fixes it but renumbers every connection. |
 | warning | `cable core <cable>:<core> is on <n> connections` | Wires on separate connections name the same core of one cable. A core is one conductor. | Give the wires different cores, or fix the connection. |
 | warning | `jumper of <strip>: terminal <t> is drawn nowhere` | A jumper names a terminal number that is not drawn, not a spare terminal of the strip and not on an overview page. | Draw the terminal, mark it as a spare in the terminal strip editor, or take it out of the jumper (`wiringcraft jumper remove`). |
 
@@ -96,7 +96,7 @@ for a house rule ` (<label>)` is still added.
 
 | Kind | Message | Cause | Fix |
 |---|---|---|---|
-| `cable` | `<tag> has no cable (<label>)` | No wire with a cable ends on any of the device's symbols. | Set a cable on the device's wire (`wiringcraft wire ... --cable`), or narrow the rule's `devices` or `role`. |
+| `cable` | `<tag> has no cable (<label>)` | No wire with a cable ends on any of the device's symbols that the rule picks. With `role` set, only symbols of that role count: a cable on another symbol of the same tag does not. | Set a cable on a wire of a picked symbol (`wiringcraft wire ... --cable`), or narrow the rule's `devices` or `role`. |
 | `tag` | `<tag> does not match <pattern> (<label>)` | A picked device's tag does not match the rule's pattern (`*` any run, `?` one character, `#` a number). | Rename the device, or change the pattern. |
 | `max-wires` | `<tag>:<pin> has <n> wires, at most <max> allowed (<label>)` | More wire ends on one pin than the rule allows. Without `role` or `devices` the rule looks at terminals. | Spread the wires over more terminals, or raise `max`. |
 
