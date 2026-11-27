@@ -308,6 +308,54 @@ fn a_library_file_declaring_another_id_is_not_taken() -> std::result::Result<(),
 }
 
 #[test]
+fn an_id_that_differs_only_in_case_from_a_pinned_one_is_not_taken()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "other")?;
+    let vendored = store::vendor_path(&f.proj, ItemKind::Symbol, "other")?;
+    let kept = std::fs::read(&vendored)?;
+    let lock = f.project.lock.clone();
+    // The library then holds it under an id in other case, one file at a time, so this runs
+    // the same on a file system that ignores case.
+    std::fs::remove_file(f.company.join("symbols").join("other.json"))?;
+    write_symbol(&f.company, &sym("OTHER", 42.0))?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    let hash = sym("OTHER", 42.0).hash();
+    for result in [
+        take(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "OTHER"),
+        take_version(&f.proj, &mut f.project, &lib, ItemKind::Symbol, "OTHER", &hash),
+    ] {
+        let err = result.err().ok_or("taken")?;
+        let text = err.to_string();
+        assert!(text.contains("differ only in case"), "{text}");
+        assert!(
+            text.contains("\"other\"") && text.contains("\"OTHER\""),
+            "both ids named: {text}"
+        );
+        assert!(
+            matches!(
+                err,
+                Error::CaseTwin {
+                    kind: ItemKind::Symbol,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+    assert_eq!(f.project.lock, lock, "nothing pinned");
+    assert_eq!(std::fs::read(&vendored)?, kept, "the pinned copy is kept");
+    // On a file system that ignores case this names the pinned copy, checked above.
+    let upper = store::vendor_path(&f.proj, ItemKind::Symbol, "OTHER")?;
+    assert!(
+        !upper.exists() || std::fs::read(&upper)? == kept,
+        "no second copy written"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_library_part_file_declaring_another_id_is_not_taken() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut f = fixture()?;
     let part = |description: &str| Part {
