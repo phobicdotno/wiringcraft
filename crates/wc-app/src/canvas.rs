@@ -2887,7 +2887,9 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
             via.pop();
         }
     }
-    if start == end {
+    // A free end snapped onto a pin is at the pin too: refuse a wire whose ends meet (#1256).
+    let same_spot = matches!((open.end_pos(page, &start), open.end_pos(page, &end)), (Some(a), Some(b)) if a == b);
+    if start == end || same_spot {
         ed.message = "A wire needs two different ends.".into();
         return;
     }
@@ -5841,6 +5843,38 @@ mod tests {
         assert!(ed.drag.is_none());
         assert_eq!(o.project, before);
         assert_eq!(o.undo_steps(), steps);
+    }
+
+    /// A free start snapped onto a pin, finished on that pin, adds no zero-length wire (#1256).
+    #[test]
+    fn a_wire_from_a_point_on_a_pin_to_that_pin_is_refused() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor::default();
+        let page = ed.page;
+        let coil = o.place(page, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let pin = Endpoint::Pin {
+            item: coil,
+            pin: "A1".into(),
+        };
+        let at = o.end_pos(&o.project.pages[page], &pin).unwrap();
+        let free = Endpoint::Point { at };
+        for (start, end) in [(free.clone(), pin.clone()), (pin, free)] {
+            let p = o.project.pages[page].clone();
+            finish_wire(&mut o, &mut ed, &p, start, Vec::new(), end);
+            assert!(
+                o.project.pages[page].wires.is_empty(),
+                "{:?}",
+                o.project.pages[page].wires
+            );
+            assert_eq!(ed.message, "A wire needs two different ends.");
+        }
+        // A free end elsewhere still makes a wire.
+        let p = o.project.pages[page].clone();
+        let elsewhere = Endpoint::Point {
+            at: Point::new(at.x + 10.0, at.y),
+        };
+        finish_wire(&mut o, &mut ed, &p, Endpoint::Point { at }, Vec::new(), elsewhere);
+        assert_eq!(o.project.pages[page].wires.len(), 1);
     }
 
     #[test]
