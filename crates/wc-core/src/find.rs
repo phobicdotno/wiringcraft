@@ -93,11 +93,19 @@ pub struct FindOptions {
 
 /// Whether `needle` occurs in `hay`.
 fn contains(hay: &str, needle: &str, opts: FindOptions) -> bool {
-    !positions(hay, needle, opts).is_empty()
+    !positions(hay, needle, opts, false).is_empty()
 }
 
-/// The char positions in `hay` where `needle` starts, without overlaps, left to right.
-fn positions(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
+/// Whether a match may not start or end between `a` and `b`: both are letters or both are
+/// digits, so they belong to one part of a tag (`K` and `15` in `-K15`).
+fn one_part(a: char, b: char) -> bool {
+    (a.is_alphabetic() && b.is_alphabetic()) || (a.is_numeric() && b.is_numeric())
+}
+
+/// The char positions in `hay` where `needle` starts, without overlaps, left to right. With
+/// `whole_parts` only where it covers whole runs of letters and of digits, so `-K1` is not
+/// found in `-K15`.
+fn positions(hay: &str, needle: &str, opts: FindOptions, whole_parts: bool) -> Vec<usize> {
     let h: Vec<char> = hay.chars().collect();
     let n: Vec<char> = needle.chars().collect();
     let mut out = Vec::new();
@@ -116,7 +124,8 @@ fn positions(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
         let here = h
             .get(i..i + n.len())
             .is_some_and(|w| w.iter().zip(&n).all(|(&a, &b)| same(a, b)));
-        if here {
+        let cut = |at: usize| matches!((at.checked_sub(1).and_then(|b| h.get(b)), h.get(at)), (Some(&a), Some(&b)) if one_part(a, b));
+        if here && !(whole_parts && (cut(i) || cut(i + n.len()))) {
             out.push(i);
             i += n.len();
         } else {
@@ -128,7 +137,18 @@ fn positions(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
 
 /// `hay` with every occurrence of `needle` replaced by `with`.
 pub fn replace_text(hay: &str, needle: &str, with: &str, opts: FindOptions) -> String {
-    let at = positions(hay, needle, opts);
+    replace_at(hay, needle, with, &positions(hay, needle, opts, false))
+}
+
+/// A device tag with `needle` replaced by `with` where it covers whole parts of the tag: runs
+/// of letters and runs of digits are not cut, so `-K1` to `-K2` leaves `-K15` as it is, while
+/// `K` to `Q` makes it `-Q15`.
+pub fn replace_in_tag(tag: &str, needle: &str, with: &str, opts: FindOptions) -> String {
+    replace_at(tag, needle, with, &positions(tag, needle, opts, true))
+}
+
+/// `hay` with the `needle` at each of the char positions `at` replaced by `with`.
+fn replace_at(hay: &str, needle: &str, with: &str, at: &[usize]) -> String {
     if at.is_empty() {
         return hay.to_owned();
     }
@@ -242,7 +262,8 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
 /// changes and the reason comes back. Returns how many values changed.
 ///
 /// A device tag hit renames that device everywhere it appears, once per device, even when
-/// several of its symbols are chosen.
+/// several of its symbols are chosen. In a tag the query counts only where it covers whole
+/// parts ([`replace_in_tag`]): a hit on `-K15` for `-K1` keeps its tag.
 pub fn replace(
     project: &mut Project,
     hits: &[Hit],
@@ -342,7 +363,7 @@ pub fn replace_renaming(
                     return Err(stale());
                 }
                 if let Some(from) = tag {
-                    let text = replace_text(&from.to_string(), query, with, opts);
+                    let text = replace_in_tag(&from.to_string(), query, with, opts);
                     let to = DeviceTag::parse(&text).map_err(|e| format!("{from} would become \"{text}\": {e}"))?;
                     if to != from {
                         renames.insert(from, to);
@@ -552,21 +573,47 @@ mod tests {
     #[test]
     fn tags_can_move_up_one_in_a_single_replace() {
         let mut p = sample();
+        p.devices.insert(tag("-K1.1"), Device::default());
         let opts = FindOptions::default();
-        // -K1 -> -K12 would clash with the existing -K12, unless -K12 moves too: "K1" -> "K12"
-        // makes -K12 into -K122, so both move and nothing clashes.
+        // -K1 -> -K1.1 would clash with the existing -K1.1, unless that moves too: "K1" ->
+        // "K1.1" makes it -K1.1.1, so both move and nothing clashes. -K12 is another device.
         let hits: Vec<Hit> = find(&p, "K1", opts)
             .into_iter()
             .filter(|h| h.kind == FindKind::Tag)
             .collect();
-        assert_eq!(replace(&mut p, &hits, "K1", "K12", opts), Ok(3));
-        assert!(p.devices.contains_key(&tag("-K12")));
+        assert_eq!(replace(&mut p, &hits, "K1", "K1.1", opts), Ok(3));
+        assert!(p.devices.contains_key(&tag("-K1.1")) && p.devices.contains_key(&tag("-K1.1.1")));
         let tags: Vec<String> = p.pages[0]
             .symbols
             .iter()
             .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
             .collect();
-        assert_eq!(tags, ["-K12", "-K122", "-F1"]);
+        assert_eq!(tags, ["-K1.1", "-K12", "-F1"]);
+    }
+
+    #[test]
+    fn a_tag_replace_leaves_longer_tags_alone() {
+        let mut p = sample();
+        let opts = FindOptions::default();
+        // -K12 is listed as a hit for "-K1", but it is another device: only -K1 is renamed.
+        let hits = find(&p, "-K1", opts);
+        assert!(hits.iter().any(|h| h.value == "-K12"));
+        assert_eq!(replace(&mut p, &hits, "-K1", "-K2", opts), Ok(2));
+        let tags: Vec<String> = p.pages[0]
+            .symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(tags, ["-K2", "-K12", "-F1"]);
+        assert_eq!(p.pages[0].wires[0].number.as_deref(), Some("K1-101"), "no tag in it");
+
+        assert_eq!(replace_in_tag("-K15", "K1", "K2", opts), "-K15");
+        assert_eq!(replace_in_tag("-K15", "5", "6", opts), "-K15");
+        assert_eq!(replace_in_tag("-XK1", "K1", "K2", opts), "-XK1", "K is half of XK");
+        assert_eq!(replace_in_tag("-K15", "k", "Q", opts), "-Q15", "a whole letter code");
+        assert_eq!(replace_in_tag("=A1+C1-K1", "1", "2", opts), "=A2+C2-K2");
+        assert_eq!(replace_in_tag("-X1.11", "X1", "X2", opts), "-X2.11");
+        assert_eq!(replace_in_tag("-X1.11", "-X1.11", "-X1.1", opts), "-X1.1");
     }
 
     #[test]
