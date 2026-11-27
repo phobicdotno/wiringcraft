@@ -270,6 +270,15 @@ pub fn plan<'s>(
     if plan.ends.iter().any(|c| matches!(c.end, Endpoint::Point { .. })) {
         let mut after = project.clone();
         plan.apply_ends(&mut after);
+        // The box moves as the edit applies it, so its kept points are checked where they land
+        // (only this copy: the others stay where they are).
+        if let Some(placed) = after
+            .pages
+            .get_mut(edit.page)
+            .and_then(|p| p.symbols.iter_mut().find(|s| s.id == edit.item))
+        {
+            placed.at = placed.at + edit.moved;
+        }
         // Pin places count too: a free end on a segment between two pins joins that wire.
         let before_symbol = |id: &str| if id == old.id { Some(old) } else { symbol(id) };
         let after_symbol = |id: &str| if id == old.id { Some(&plan.symbol) } else { symbol(id) };
@@ -476,6 +485,29 @@ mod tests {
                 .is_some_and(|e| e.contains("wire w1 on page 1") && e.contains("wire w7")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_moved_box_may_not_bring_a_kept_point_onto_a_removed_points_free_end() {
+        let (p, sym) = setup();
+        let pins = [pin("B", BoxSide::Right, 5.0)];
+        let r = BTreeMap::new();
+        let d: BTreeSet<String> = ["A".to_owned()].into();
+        // A comes off and leaves w1's end at (100, 55); standing still, nothing joins.
+        assert!(plan_err(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)).is_ok());
+        // Moved 20 to the left, B (and w2's end on it) lands on that free end: refused.
+        let mut e = edit((20.0, 10.0), &pins, &r, &d);
+        e.moved = Point::new(-20.0, 0.0);
+        let Err(err) = plan_err(&p, &sym, &e) else {
+            unreachable!()
+        };
+        assert!(
+            err.contains("wire w1") && err.contains("wire w2") && err.contains("joined"),
+            "{err}"
+        );
+        // Moved down instead, B lands nowhere near it: allowed.
+        e.moved = Point::new(0.0, 20.0);
+        assert!(plan_err(&p, &sym, &e).is_ok());
     }
 
     fn plan_err(p: &Project, sym: &Symbol, e: &BoxEdit<'_>) -> Result<(), String> {

@@ -54,13 +54,24 @@ pub struct Placed {
 }
 
 /// The first free tag with the same function, location and letter code as `like`, numbered
-/// 1 to 9999, that is not in `used`.
+/// 1 to 9999, that is not in `used` and does not hold a tag in `used`: strip `-X1` is taken
+/// when only its terminal `-X1.3` is drawn, as `-K1` is by its part `-K1.2`.
 pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<DeviceTag> {
     let letter = like.letter_code();
+    // Each used tag's parents: the same tag with fewer product levels.
+    let parents: BTreeSet<DeviceTag> = used
+        .iter()
+        .flat_map(|t| {
+            (1..t.product.len()).map(|n| DeviceTag {
+                product: t.product[..n].to_vec(),
+                ..t.clone()
+            })
+        })
+        .collect();
     (1..10_000).find_map(|n| {
         let mut t = like.clone();
         *t.product.last_mut()? = format!("{letter}{n}");
-        (!used.contains(&t)).then_some(t)
+        (!used.contains(&t) && !parents.contains(&t)).then_some(t)
     })
 }
 
@@ -157,6 +168,26 @@ pub fn place(
         .chain(cables)
         .collect();
     olds.sort_by_key(|t| t.product.len());
+    // A device the group holds only as a part or terminal (`-K2.1` without `-K2`) is taken too,
+    // so another device of the group does not land on it and absorb that part. A parent under a
+    // device the group holds itself (`-K1.1` of `-K1` and `-K1.1.1`) is not: it moves with `-K1`.
+    let own: BTreeSet<&DeviceTag> = olds.iter().copied().collect();
+    let prefix = |t: &DeviceTag, n: usize| {
+        t.product.get(..n).map(|product| DeviceTag {
+            product: product.to_vec(),
+            ..t.clone()
+        })
+    };
+    let held: Vec<DeviceTag> = olds
+        .iter()
+        .flat_map(|t| (1..t.product.len()).filter_map(move |n| prefix(t, n)))
+        .filter(|parent| {
+            !(1..=parent.product.len())
+                .filter_map(|n| prefix(parent, n))
+                .any(|p| own.contains(&p))
+        })
+        .collect();
+    used.extend(held);
     // Two passes: first every tag that keeps its own number (on its own or on its strip's new
     // tag), then the ones whose number is taken there, so a taken number never pushes another
     // terminal off a number that was free (#1780).
@@ -170,6 +201,21 @@ pub fn place(
             // A terminal (or other sub-tag) of a strip the group holds follows the strip to its
             // new tag, keeping its own number when that is free there, else taking the next free
             // number on that strip.
+            // A part of a device the group holds but placed untagged (out of tags) is untagged
+            // too: on its own it would join the family of the project's device of that name.
+            let parent_untagged = old.product.split_last().is_some_and(|(_, rest)| {
+                !rest.is_empty()
+                    && renamed
+                        .get(&DeviceTag {
+                            product: rest.to_vec(),
+                            ..old.clone()
+                        })
+                        .is_some_and(Option::is_none)
+            });
+            if parent_untagged {
+                renamed.insert(old, None);
+                continue;
+            }
             let followed = under_renamed_parent(&renamed, old);
             if first {
                 let parent_deferred = old.product.split_last().is_some_and(|(_, rest)| {
@@ -299,6 +345,128 @@ mod tests {
         p.pages.push(page);
         p.devices.insert(tag("-K1"), device("project's"));
         p
+    }
+
+    #[test]
+    fn a_free_tag_is_not_the_strip_or_device_of_a_drawn_terminal_or_part() {
+        let mut p = project();
+        // Strip -X1 is drawn only as its terminal -X1.3, -K2 only as its part -K2.1.
+        p.pages[0].symbols.push(symbol("s2", "-X1.3"));
+        p.pages[0].symbols.push(symbol("s3", "-K2.1"));
+        let used = used_tags(&p);
+        assert_eq!(free_tag_like(&used, &tag("-X7")), Some(tag("-X2")));
+        assert_eq!(free_tag_like(&used, &tag("-K9")), Some(tag("-K3")));
+        // Another function's -X1 does not take this one's; a terminal still gets a free number.
+        assert_eq!(free_tag_like(&used, &tag("=A-X7")), Some(tag("=A-X1")));
+        assert_eq!(free_tag_like(&used, &tag("-X1.3")), Some(tag("-X1.1")));
+    }
+
+    #[test]
+    fn a_pasted_part_follows_its_device_when_only_the_part_is_drawn() {
+        // The project draws -K1 (page 1) and its part -K1.1.
+        let mut p = project();
+        p.pages[0].symbols.push(symbol("s2", "-K1.1"));
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1.1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        assert_eq!(new_tags, [Some("-K2".to_string()), Some("-K2.1".to_string())]);
+    }
+
+    #[test]
+    fn a_pasted_device_does_not_land_on_a_device_the_group_holds_only_as_a_part() {
+        // The project draws only -K1.1; the group holds device -K7 and the part -K2.1 alone.
+        let mut p = Project::new("t");
+        let mut page = Page::new("p1", "1", "One");
+        page.symbols.push(symbol("s1", "-K1.1"));
+        p.pages.push(page);
+        let symbols = [symbol("a", "-K7"), symbol("b", "-K2.1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        // -K1 is held by -K1.1 and -K2 by the pasted -K2.1, so -K7 becomes -K3.
+        assert_eq!(new_tags, [Some("-K3".to_string()), Some("-K2.1".to_string())]);
+    }
+
+    #[test]
+    fn a_pasted_device_keeps_its_tag_when_the_group_holds_its_nested_part() {
+        // An empty page; the group holds -K1 and -K1.1.1 but not -K1.1.
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("p1", "1", "One"));
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1.1.1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        assert_eq!(new_tags, [Some("-K1".to_string()), Some("-K1.1.1".to_string())]);
     }
 
     #[test]
@@ -452,6 +620,45 @@ mod tests {
         .unwrap();
         assert_eq!(cable_of(&p, &placed), Some(("-W1".into(), "BN".into())));
         assert!(!p.devices.contains_key(&tag("-W2")));
+    }
+
+    #[test]
+    fn a_part_of_a_device_placed_untagged_is_placed_untagged_too() {
+        let mut p = project();
+        // Every -K1 to -K9999 is taken, -K1 by its part -K1.1 only.
+        p.devices.insert(tag("-K1.1"), Device::default());
+        for n in 2..10_000 {
+            p.devices.insert(tag(&format!("-K{n}")), Device::default());
+        }
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1.2")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(5.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Untagged,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        // -K1.2 does not join the project's -K1.
+        assert_eq!(tags, [None, None]);
     }
 
     #[test]

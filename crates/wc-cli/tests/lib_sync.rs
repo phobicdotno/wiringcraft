@@ -61,6 +61,53 @@ fn lib_sync_goes_on_past_failing_sources_and_reports_them() -> TestResult {
     Ok(())
 }
 
+/// `lib add` puts a source after the existing ones, and the help of `lib add` and of
+/// `import swe-library` says so instead of telling the reader to add it "ahead of" others
+/// (#1827).
+#[test]
+fn lib_add_appends_the_source_and_the_help_says_so() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let cache = tmp.path().join("cache");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    for add in [
+        ["lib", "add", "old", "folder", "a"],
+        ["lib", "add", "new", "folder", "b"],
+    ] {
+        let out = wiringcraft(&dir, &cache, &add)?;
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let project = wc_core::store::load(&dir)?;
+    let names: Vec<&str> = project.meta.libraries.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names.last().copied(), Some("new"), "{names:?}");
+    let old = names.iter().position(|n| *n == "old");
+    assert!(
+        old.is_some() && old < names.iter().position(|n| *n == "new"),
+        "{names:?}"
+    );
+
+    for args in [["import", "swe-library", "--help"], ["lib", "add", "--help"]] {
+        let out = wiringcraft(&dir, &cache, &args)?;
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        // Wrapped lines are joined before the text is checked.
+        let help = String::from_utf8(out.stdout)?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!help.contains("ahead of"), "{args:?}: {help}");
+        assert!(
+            help.contains("arlier sources win") && help.contains("`[[library]]`") && help.contains("`project.toml`"),
+            "{args:?}: {help}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn lib_add_refuses_a_name_that_differs_only_in_case() -> TestResult {
     let tmp = tempfile::tempdir()?;

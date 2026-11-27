@@ -422,8 +422,9 @@ block has none). With `--lib` they are written into that folder; without it they
 into the project. A symbol or part the project already vendors is replaced by the new version
 when its copy is still the one the project pins; a copy changed in the project is refused, not
 replaced. To take the new version into such a project, import with `--lib`, add that folder as a
-source (`wiringcraft lib add`) ahead of any source with the same id, and run
-`wiringcraft lib update <id>`.
+source (`wiringcraft lib add`) and run `wiringcraft lib update <id>`. `lib add` puts the new
+source last and earlier sources win: when another source has the same id, first move the new
+source's `[[library]]` table above that source's in `project.toml`.
 
 ```sh
 wiringcraft import swe-library ContentPortal.tewzip --lib ../swe-lib
