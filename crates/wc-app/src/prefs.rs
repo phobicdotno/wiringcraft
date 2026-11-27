@@ -33,6 +33,53 @@ pub struct Prefs {
     pub layers: crate::layers::Layers,
     /// Run the project check again after each edit and mark what it finds on the canvas.
     pub live_check: bool,
+    /// The main window's size and whether it was maximized when the app was last closed.
+    pub window: Window,
+}
+
+/// The main window as it was left, so the app opens again the way it was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Window {
+    /// Inner size in points of the window when it was not maximized; None until it is known.
+    pub size: Option<[f32; 2]>,
+    pub maximized: bool,
+}
+
+impl Window {
+    /// The size the window opens at when none is kept, and the smallest it may be.
+    pub const DEFAULT: [f32; 2] = [1400.0, 860.0];
+    pub const MIN: [f32; 2] = [900.0, 560.0];
+
+    /// Note the window as it is now. A maximized window keeps the size it had before, so
+    /// leaving the maximized state after a restart goes back to that size.
+    pub fn remember(&mut self, size: Option<[f32; 2]>, maximized: Option<bool>) {
+        if let Some(m) = maximized {
+            self.maximized = m;
+        }
+        if self.maximized {
+            return;
+        }
+        if let Some([w, h]) = size
+            && w.is_finite()
+            && h.is_finite()
+            && w > 0.0
+            && h > 0.0
+        {
+            self.size = Some([w, h]);
+        }
+    }
+
+    /// The size to open the window at: the kept one, made at least the smallest size and at
+    /// most a size no screen has (a hand-edited or broken value), or the default.
+    pub fn open_size(&self) -> [f32; 2] {
+        match self.size {
+            Some([w, h]) if w.is_finite() && h.is_finite() => {
+                [w.clamp(Self::MIN[0], 16384.0), h.clamp(Self::MIN[1], 16384.0)]
+            }
+            _ => Self::DEFAULT,
+        }
+    }
 }
 
 impl Default for Prefs {
@@ -48,6 +95,7 @@ impl Default for Prefs {
             assistant: wc_agent::Settings::default(),
             layers: crate::layers::Layers::default(),
             live_check: true,
+            window: Window::default(),
         }
     }
 }
@@ -286,6 +334,47 @@ impl Prefs {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_opens_at_the_size_it_was_closed_at() {
+        let mut w = Window::default();
+        assert_eq!(w.open_size(), Window::DEFAULT);
+        w.remember(Some([1200.0, 700.0]), Some(false));
+        assert_eq!(w.open_size(), [1200.0, 700.0]);
+        // Maximized: the size before is kept for when the window is made smaller again.
+        w.remember(Some([2560.0, 1400.0]), Some(true));
+        assert!(w.maximized);
+        assert_eq!(w.open_size(), [1200.0, 700.0]);
+        w.remember(Some([1000.0, 600.0]), Some(false));
+        assert!(!w.maximized);
+        assert_eq!(w.open_size(), [1000.0, 600.0]);
+        // A minimized window reports no usable size; the last one stays.
+        w.remember(Some([0.0, 0.0]), None);
+        assert_eq!(w.open_size(), [1000.0, 600.0]);
+    }
+
+    #[test]
+    fn a_kept_window_size_the_app_cannot_use_is_corrected() {
+        let small = Window {
+            size: Some([10.0, 10.0]),
+            maximized: false,
+        };
+        assert_eq!(small.open_size(), Window::MIN);
+        let broken = Window {
+            size: Some([f32::NAN, 700.0]),
+            maximized: false,
+        };
+        assert_eq!(broken.open_size(), Window::DEFAULT);
+        let p: Prefs = toml::from_str("[window]\nsize = [1111.0, 777.0]\nmaximized = true\n").unwrap();
+        assert_eq!(
+            p.window,
+            Window {
+                size: Some([1111.0, 777.0]),
+                maximized: true
+            }
+        );
+        assert_eq!(toml::from_str::<Prefs>("").unwrap().window, Window::default());
+    }
 
     #[test]
     fn the_default_projects_folder_is_absolute() {

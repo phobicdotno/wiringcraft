@@ -5051,11 +5051,12 @@ fn window_icon() -> egui::IconData {
         })
 }
 
-/// The main window: size, title and icon.
-fn main_viewport() -> egui::ViewportBuilder {
+/// The main window: size (as it was last closed), title and icon.
+fn main_viewport(window: &prefs::Window) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_inner_size([1400.0, 860.0])
-        .with_min_inner_size([900.0, 560.0])
+        .with_inner_size(window.open_size())
+        .with_min_inner_size(prefs::Window::MIN)
+        .with_maximized(window.maximized)
         .with_title("WiringCraft")
         .with_icon(window_icon())
 }
@@ -5852,6 +5853,11 @@ fn export_drawings_logged(open: &Open, dir: &Path) -> (String, String) {
 }
 
 impl eframe::App for App {
+    /// The window's size and maximized state are kept for the next start.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.prefs.save();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // A close that waited a frame for a typed value: the field gives up the keyboard, so
         // the panels enter its value before the close asks about unsaved changes.
@@ -5864,6 +5870,13 @@ impl eframe::App for App {
         }
         self.hold_close_while_importing(ctx);
         self.ask_before_closing(ctx);
+        ctx.input(|i| {
+            let v = i.viewport();
+            if v.minimized != Some(true) {
+                let size = v.inner_rect.map(|r| [r.width(), r.height()]);
+                self.prefs.window.remember(size, v.maximized);
+            }
+        });
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -6840,7 +6853,7 @@ fn main() -> eframe::Result {
     let dir = std::env::args_os().nth(1).map(PathBuf::from);
     let wanted = std::env::var(RENDERER_VAR).ok();
     let options = eframe::NativeOptions {
-        viewport: main_viewport(),
+        viewport: main_viewport(&Prefs::load().window),
         renderer: renderer_for(wanted.as_deref()),
         ..Default::default()
     };
@@ -7128,7 +7141,7 @@ mod icon_tests {
 
     #[test]
     fn the_main_window_carries_the_icon() {
-        let icon = super::main_viewport().icon;
+        let icon = super::main_viewport(&Default::default()).icon;
         assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
     }
 }
