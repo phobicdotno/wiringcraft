@@ -1413,11 +1413,12 @@ enum ImportCmd {
         /// The CSV file from the configurator.
         file: PathBuf,
     },
-    /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later). Ids are
+    /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later, or an old
+    /// `.lib` of KiCad 5 and before). Ids are
     /// `<prefix>.<symbol name>`; the first pin becomes the origin. Fails when no symbol
     /// could be imported.
     SymbolKicad {
-        /// The `.kicad_sym` file.
+        /// The `.kicad_sym` or old `.lib` file.
         file: PathBuf,
         /// The library folder to write into.
         #[arg(long)]

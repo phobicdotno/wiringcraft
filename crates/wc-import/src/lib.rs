@@ -15,6 +15,7 @@ pub mod dxf;
 pub mod edz;
 pub mod eplan;
 pub mod kicad;
+pub mod kicad_legacy;
 pub mod pdf;
 mod pdf_codecs;
 pub mod qet;

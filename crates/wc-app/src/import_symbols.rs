@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The file extensions the import takes, for the file picker's filter.
-pub const EXTENSIONS: &[&str] = &["dxf", "svg", "kicad_sym", "elmt"];
+pub const EXTENSIONS: &[&str] = &["dxf", "svg", "kicad_sym", "lib", "elmt"];
 
 /// The largest file read; a bigger one fails without being read whole.
 const MAX_LEN: usize = 16 << 20;
@@ -176,7 +176,8 @@ fn read(file: &Path) -> Result<FileSymbols, String> {
             let (s, w) = wc_import::svg::symbol_with_warnings(&text, &id, &display_name).map_err(|e| e.to_string())?;
             Ok((vec![(s, display_name)], w))
         }
-        Some("kicad_sym") => {
+        // `.lib`: an old KiCad library (KiCad 5 and before); another kind of `.lib` is refused.
+        Some("kicad_sym" | "lib") => {
             let text = read_text(file, MAX_LEN)?;
             let prefix = format!("kicad.{}", stem(file));
             let (symbols, w) = wc_import::kicad::symbols(&text, &prefix, 1.0).map_err(|e| e.to_string())?;
