@@ -337,14 +337,22 @@ impl SymbolEditor {
         }
     }
 
-    /// Edit an existing symbol, saving back into the source it came from when that is one of
-    /// `targets`.
-    pub fn edit(symbol: Symbol, source: &str, targets: Vec<Target>) -> Self {
+    /// Edit an existing symbol, read from file `file_id` of `source`, saving back into that
+    /// source when it is one of `targets`. Only that file may be replaced by a save: a file that
+    /// declares another id than its name does not make the editor take the file of that id for
+    /// its own (#1265).
+    pub fn edit(file_id: &str, symbol: Symbol, source: &str, targets: Vec<Target>) -> Self {
         let mut e = Self::new(targets);
         let from = e.targets.iter().position(|(n, _)| n == source);
         e.target = from.unwrap_or(0);
         e.opened_from = from.and_then(|i| e.targets.get(i)).map(|(_, root)| root.clone());
-        e.opened_as = Some(symbol.id.clone());
+        if symbol.id != file_id {
+            e.message = format!(
+                "The file of symbol {file_id} declares id {}; saving writes it as {}, not over {file_id}.",
+                symbol.id, symbol.id
+            );
+        }
+        e.opened_as = Some(file_id.to_owned());
         e.pin_name = symbol.pins.last().map_or_else(|| "1".into(), |p| next_name(&p.name));
         e.symbol = symbol;
         e.tool = Tool::Select;
@@ -959,7 +967,7 @@ impl SymbolEditor {
                     Ok((s, source)) => {
                         let choices = std::mem::take(&mut self.choices);
                         let owner = self.owner.take();
-                        *self = Self::edit(s, &source, std::mem::take(&mut self.targets));
+                        *self = Self::edit(&id, s, &source, std::mem::take(&mut self.targets));
                         self.choices = choices;
                         self.owner = owner;
                     }
@@ -1511,7 +1519,7 @@ mod tests {
         assert_eq!(wires.len(), 1, "A2 of the upper coil meets A1 of the lower one");
 
         // Opened again, changed and saved: same file, new hash; a new symbol with that id is refused.
-        let mut again = SymbolEditor::edit(back, &source, vec![("mine".into(), lib.clone())]);
+        let mut again = SymbolEditor::edit(&back.id.clone(), back, &source, vec![("mine".into(), lib.clone())]);
         again.set_tool(Tool::Line);
         again.click(Point::new(-5.0, 0.0));
         again.click(Point::new(5.0, 0.0));
@@ -1903,7 +1911,12 @@ mod tests {
         // An opened symbol (from an import, say) with pin A2 on top of pin A1.
         let mut symbol = drawn.symbol;
         symbol.pins[1].at = symbol.pins[0].at;
-        let mut e = SymbolEditor::edit(symbol, "mine", vec![("mine".into(), tmp.path().join("lib"))]);
+        let mut e = SymbolEditor::edit(
+            &symbol.id.clone(),
+            symbol,
+            "mine",
+            vec![("mine".into(), tmp.path().join("lib"))],
+        );
         assert_eq!(e.problems(), ["Pins A1 and A2 are at the same place."]);
         assert!(e.save().is_err_and(|m| m.contains("Pins A1 and A2")));
         // Moving A2 off A1 clears it.
@@ -2459,7 +2472,7 @@ mod tests {
 
         // Opened from A, then pointed at B: B's own symbol stays.
         let (s, _) = (first.symbol.clone(), ());
-        let mut e = SymbolEditor::edit(s, "a", targets);
+        let mut e = SymbolEditor::edit(&s.id.clone(), s, "a", targets);
         e.target = 1;
         assert!(e.save().is_err_and(|m| m.contains("already has")));
         let kept: Symbol = wc_core::store::read_json(&b.join("symbols").join("test.coil.json"))?;
@@ -2467,6 +2480,34 @@ mod tests {
         // Back to A it saves.
         e.target = 0;
         assert_eq!(e.save()?.source, "a");
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_declaring_another_id_does_not_overwrite_that_ids_file() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let lib = tmp.path().join("lib");
+        let targets = vec![("mine".to_owned(), lib.clone())];
+        let mut coil = SymbolEditor::new(targets.clone());
+        draw_coil(&mut coil);
+        coil.save()?;
+        // test.other.json holds a copy of the coil that still declares id test.coil.
+        let mut copy = coil.symbol.clone();
+        copy.name = "Copied coil".into();
+        let copied = lib.join("symbols").join("test.other.json");
+        std::fs::write(&copied, wc_core::store::to_json(&copy)?)?;
+
+        let mut e = SymbolEditor::edit("test.other", copy, "mine", targets);
+        assert!(e.message.contains("declares id test.coil"), "{}", e.message);
+        e.symbol.name = "Changed copy".into();
+        assert!(e.save().is_err_and(|m| m.contains("already has a symbol test.coil")));
+        let kept: Symbol = wc_core::store::read_json(&lib.join("symbols").join("test.coil.json"))?;
+        assert_eq!(kept.name, coil.symbol.name, "the coil's own file stays");
+        // Given an id of its own, it saves as a new symbol.
+        e.symbol.id = "test.other".into();
+        e.save()?;
+        let saved: Symbol = wc_core::store::read_json(&copied)?;
+        assert_eq!((saved.id.as_str(), saved.name.as_str()), ("test.other", "Changed copy"));
         Ok(())
     }
 }
