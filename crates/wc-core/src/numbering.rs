@@ -86,6 +86,8 @@ pub fn number_wires_keeping(
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();
+    // Every number on a kept page stays there, also a second one on the same connection.
+    let mut reserved: BTreeSet<String> = BTreeSet::new();
     for (pi, page) in project.pages.iter().enumerate() {
         for w in &page.wires {
             let Some(&n) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
@@ -93,6 +95,9 @@ pub fn number_wires_keeping(
             };
             // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
             if let Some(num) = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                if kept(page) {
+                    reserved.insert(num.to_string());
+                }
                 // With `overwrite` only the numbers on kept pages count as existing.
                 if !overwrite || kept(page) {
                     existing.entry(n).or_insert_with(|| num.to_string());
@@ -113,7 +118,7 @@ pub fn number_wires_keeping(
     let mut order: Vec<(usize, (usize, f64, f64))> = start.into_iter().collect();
     order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut used: BTreeSet<String> = existing.values().cloned().collect();
+    let mut used: BTreeSet<String> = existing.values().cloned().chain(reserved).collect();
     let mut counter = 0usize;
     let mut next_sequential = |used: &mut BTreeSet<String>| loop {
         counter += 1;
@@ -299,6 +304,12 @@ mod tests {
         // The only page is kept: a/b keep 1 and nothing else gets it, as without overwrite.
         number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
         assert_eq!(numbers(&p), [Some("1"), Some("1"), Some("2"), None, Some("3")]);
+        // One kept connection with two numbers: neither is given to another connection.
+        let mut p = project();
+        p.pages[0].wires[0].number = Some("2".into());
+        p.pages[0].wires[1].number = Some("1".into());
+        number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("2"), Some("2"), Some("3"), None, Some("4")]);
     }
 
     #[test]
