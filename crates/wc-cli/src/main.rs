@@ -1648,13 +1648,15 @@ enum VcsCmd {
 }
 
 fn parse_point(s: &str) -> Result<Point, String> {
-    let (x, y) = s.split_once(',').ok_or("expected x,y")?;
-    let x: f64 = x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?;
-    let y: f64 = y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?;
+    let (x, y) = s
+        .split_once(',')
+        .ok_or("expected two numbers in mm with a comma between, e.g. 10,20")?;
+    let x: f64 = x.trim().parse().map_err(|_| "the first value is not a number")?;
+    let y: f64 = y.trim().parse().map_err(|_| "the second value is not a number")?;
     if x.is_finite() && y.is_finite() {
         Ok(Point::new(x, y))
     } else {
-        Err("coordinates must be finite".into())
+        Err("coordinates must be plain numbers, not inf or NaN".into())
     }
 }
 
@@ -2629,7 +2631,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.panels.iter().any(|x| x.id == id) {
-                        return Err(format!("panel {id:?} exists"));
+                        return Err(format!("panel {id:?} exists; pick another id"));
                     }
                     check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
@@ -2870,7 +2872,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.page(&id).is_some() {
-                        return Err(format!("page {id:?} exists"));
+                        return Err(format!("page {id:?} exists; pick another id"));
                     }
                     let number = p.free_page_number(&number, None).map_err(e)?;
                     let mut page = Page::new(id, number, title);
@@ -2906,7 +2908,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let i = page_index(&p, &id)?;
                     // Same rule as the app: a project keeps at least one page.
                     if p.pages.len() <= 1 {
-                        return Err("A project needs at least one page.".into());
+                        return Err("a project needs at least one page".into());
                     }
                     p.pages.remove(i);
                 }
@@ -4145,7 +4147,7 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::NumberWires { rule, overwrite } => {
             let rule = wc_core::numbering::Rule::parse(&rule)
-                .ok_or_else(|| format!("unknown rule {rule:?} (sequential, page-column, potential)"))?;
+                .ok_or_else(|| format!("unknown rule {rule:?}: use sequential, page-column or potential"))?;
             let mut p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
             let done = wc_core::numbering::number_wires(
@@ -4230,7 +4232,7 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::Report { kind, format, out, sep } => {
             if !matches!(sep, ',' | ';') {
-                return Err(format!("unknown separator {sep:?} (, or ;)"));
+                return Err(format!("unknown separator {sep:?}: use , or ;"));
             }
             if sep != ',' && format != "csv" {
                 return Err("--sep is for --format csv".into());
@@ -4453,10 +4455,10 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
         } => {
             store::check_id(&name).map_err(e)?;
             if p.meta.libraries.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
-                return Err(format!("source {name:?} exists"));
+                return Err(format!("source {name:?} exists; pick another name"));
             }
             if kind != "folder" && kind != "git" {
-                return Err("kind must be folder or git".into());
+                return Err(format!("unknown source kind {kind:?}: use folder or git"));
             }
             p.meta.libraries.push(LibrarySource {
                 name,
@@ -6108,7 +6110,7 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
         } else {
             vec![wc_report::Kind::parse(n).ok_or_else(|| {
                 format!(
-                    "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, all)"
+                    "unknown report {n:?}: use contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks or all"
                 )
             })?]
         };
@@ -6244,7 +6246,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
     let kinds = wc_report::parse_kinds(&args.kinds)?;
     let lines = wc_report::parse_lines(&args.lines)?;
     let language = wc_report::Language::parse(&args.lang)
-        .ok_or_else(|| format!("unknown language {:?} (en, de, nb)", args.lang))?;
+        .ok_or_else(|| format!("unknown language {:?}: use en, de or nb", args.lang))?;
     let p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     let mut warnings: Vec<String> = missing

@@ -117,9 +117,32 @@ pub fn check_with_unreadable(
     }
 
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
+    // A symbol with two pins of one name is told once, where it is first drawn: a wire names a
+    // pin only by its name, so the second pin can never be reached.
+    let mut twice_told: BTreeSet<&str> = BTreeSet::new();
     for page in &p.pages {
         for s in &page.symbols {
-            if !i.symbols.contains_key(&s.symbol) {
+            if let Some(sym) = i.symbols.get(&s.symbol) {
+                let mut names = BTreeSet::new();
+                let twice: BTreeSet<&str> = sym
+                    .pins
+                    .iter()
+                    .map(|q| q.name.as_str())
+                    .filter(|n| !names.insert(*n))
+                    .collect();
+                if !twice.is_empty() && twice_told.insert(&s.symbol) {
+                    let list = twice.into_iter().collect::<Vec<_>>().join(", ");
+                    out.push(at(
+                        page,
+                        &s.id,
+                        Severity::Warning,
+                        format!(
+                            "symbol {} has more than one pin named {list}: wires reach only the first",
+                            s.symbol
+                        ),
+                    ));
+                }
+            } else {
                 out.push(at(
                     page,
                     &s.id,
@@ -248,15 +271,10 @@ pub fn check_with_unreadable(
     }
     for (tag, (count, uses)) in &drawn {
         let Some(device) = p.devices.get(*tag) else { continue };
-        let fitted = device
-            .part
-            .iter()
-            .map(|id| (id.as_str(), 1))
-            .chain(device.accessories.iter().map(|a| (a.part.as_str(), a.qty)));
         let mut has = wc_core::Contacts::default();
         let mut listed = false;
         let mut unknown = false;
-        for (id, qty) in fitted {
+        for (id, qty) in device.all_parts() {
             match i.parts.get(id) {
                 Some(part) => {
                     if let Some(c) = &part.contacts {
@@ -610,7 +628,11 @@ pub fn check_with_unreadable(
         }
     }
     for tag in crate::all_tags(i) {
-        if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
+        if p.devices
+            .get(&tag)
+            .and_then(|d| d.part.as_deref())
+            .is_none_or(|part| part.trim().is_empty())
+        {
             out.push(Finding {
                 severity: Severity::Note,
                 page_id: None,

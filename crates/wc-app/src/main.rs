@@ -556,6 +556,8 @@ impl chrome::Status for StatusView<'_> {
                 Action::Undo => return se.can_undo(),
                 Action::Redo => return se.can_redo(),
                 Action::Delete => return se.selected.is_some(),
+                // Refused while the editor is open (`carry_out`): not offered either (#1345).
+                a if held_by_symbol_editor(a) => return false,
                 _ => {}
             }
         }
@@ -2549,6 +2551,10 @@ impl App {
             Dialog::Reports(_) | Dialog::ReportLayout { .. } | Dialog::Check(_) | Dialog::Translations(_)
         );
         let screen = ctx.screen_rect();
+        // The symbol editor (its window shows after this one) owns an Escape that drops its
+        // half-drawn shape or cancels its drag: one press does one thing.
+        let editor_escape = self.symbol_editor.as_ref().is_some_and(|e| e.wants_escape(ctx));
+        let escape = !editor_escape && escape_cancels(ctx);
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
@@ -2724,7 +2730,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             then = Some(Box::new(|app: &mut App| {
                                 if let Some(open) = &app.open {
                                     app.dialog = Some(Dialog::Macros(open.macros()));
@@ -3049,7 +3055,7 @@ impl App {
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                         }
                     });
@@ -3121,7 +3127,7 @@ impl App {
                             }));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.show_check()));
                         }
@@ -3375,7 +3381,7 @@ impl App {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_template(*since, before);
                             }
@@ -3432,7 +3438,7 @@ impl App {
                         if ui.button("OK").clicked() {
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || escape {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_racks(*since, before);
                             }
@@ -3713,7 +3719,7 @@ impl App {
                             if ui.button("Built-in layout").on_hover_text("Clear the form to the report's own columns").clicked() {
                                 **form = form.cleared();
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button("Cancel").clicked() || escape {
                                 let k = form.kind;
                                 then = Some(Box::new(move |app: &mut App| app.dialog = Some(Dialog::Reports(k))));
                                 keep = false;
@@ -5483,6 +5489,27 @@ fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool)
     i.events
         .iter()
         .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && ok(modifiers)))
+}
+
+/// Whether Escape, pressed this frame, cancels the open form dialog (rules, translations, macro
+/// placeholders, page template, PLC racks, report layout). An Escape that closes a drop-down
+/// list open since last frame only closes that list, so the form and its edits stay. A key
+/// repeat of a held Escape does not count: holding it to close a list would cancel the form.
+fn escape_cancels(ctx: &egui::Context) -> bool {
+    let pressed = ctx.input(|i| {
+        i.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::Escape,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                }
+            )
+        })
+    });
+    pressed && !ctx.memory(|m| m.any_popup_open())
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -7952,6 +7979,60 @@ mod marking_tests {
 }
 
 #[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> bool {
+        let mut esc = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| esc = escape_cancels(ctx),
+        );
+        esc
+    }
+
+    fn escape() -> egui::Event {
+        key(false)
+    }
+
+    fn release() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    pub(super) fn key(repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn escape_cancels_a_form_dialog_unless_it_closes_an_open_drop_down() {
+        let ctx = egui::Context::default();
+        assert!(!frame(&ctx, vec![]));
+        assert!(frame(&ctx, vec![escape()]));
+        // Escape held down: its repeats do not cancel the form.
+        assert!(!frame(&ctx, vec![key(true)]));
+        // Let go of Escape so the popup case below is a fresh press, not a repeat.
+        assert!(!frame(&ctx, vec![release()]));
+        ctx.memory_mut(|m| m.open_popup(egui::Id::new("combo")));
+        assert!(!frame(&ctx, vec![escape()]));
+    }
+}
+
+#[cfg(test)]
 mod page_size_tests {
     use super::*;
 
@@ -8034,6 +8115,42 @@ mod nudge_tests {
             closing: Closing::No,
         };
         (tmp, app, egui::Context::default())
+    }
+
+    /// The menu and toolbars do not offer what the symbol editor holds back: the commands it
+    /// refuses show disabled while it is open, and enabled again once it is closed (#1345).
+    #[test]
+    fn commands_held_by_the_symbol_editor_show_disabled() {
+        use chrome::Status;
+        let (_tmp, mut app, _) = app(Point::new(80.0, 60.0), false);
+        app.clipboard = app.open.as_ref().unwrap().copy(app.ed.page, &app.ed.selection);
+        let held = [
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::Duplicate,
+            Action::Rotate,
+            Action::Mirror,
+            Action::SelectAll,
+        ];
+        let se = symbol_editor::SymbolEditor::new(Vec::new());
+        for editor in [None, Some(&se)] {
+            let status = StatusView {
+                open: app.open.as_ref(),
+                ed: &app.ed,
+                prefs: &app.prefs,
+                clipboard: &app.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+                symbol_editor: editor,
+            };
+            for a in held {
+                assert!(held_by_symbol_editor(a));
+                assert_eq!(status.enabled(a), editor.is_none(), "{a:?}");
+            }
+        }
     }
 
     /// One frame with `key` pressed; `focus_text` gives a text field the keyboard first.
@@ -9909,6 +10026,50 @@ mod menu_action_tests {
             .find(|s| s.id == id)
             .unwrap()
             .rotation
+    }
+
+    /// Runs one frame of the dialogs with these events.
+    fn dialog_frame(a: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| a.dialogs(ctx),
+        );
+    }
+
+    #[test]
+    fn escape_cancels_the_racks_form_once_and_is_the_symbol_editors_while_it_draws() {
+        let (_tmp, mut a, _) = app();
+        let ctx = egui::Context::default();
+        a.ed.menu_action = Some(Action::PlcRacks);
+        a.run_menu_action();
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // The symbol editor drawing a shape takes the Escape: the form stays.
+        let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(symbol_editor::Tool::Line);
+        ed.click(wc_core::Point::new(0.0, 0.0));
+        assert!(ed.drawing_shape());
+        a.symbol_editor = Some(ed);
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Escape still held: its key repeat does not cancel the form either.
+        a.symbol_editor = None;
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(true)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Released and pressed again, with nothing half drawn, Escape cancels the form.
+        let release = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        dialog_frame(&mut a, &ctx, vec![release]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(a.dialog.is_none());
     }
 
     #[test]
