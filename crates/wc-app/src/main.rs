@@ -2233,11 +2233,7 @@ impl App {
             Action::Reports => self.dialog = Some(Dialog::Reports(wc_report::Kind::Parts)),
             Action::Check => {
                 let found = run_check(open);
-                let errors = found
-                    .iter()
-                    .filter(|f| f.severity == wc_report::Severity::Error)
-                    .count();
-                self.ed.message = format!("Project check: {errors} errors, {} findings in all.", found.len());
+                self.ed.message = live_check::check_message(&found);
                 self.dialog = Some(Dialog::Check(found));
             }
             Action::NewSymbol | Action::EditSymbol => {
