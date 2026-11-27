@@ -5397,15 +5397,33 @@ mod tests {
         call(&mut a, "update_page", json!({"page": first, "number": "99"})).unwrap();
         assert_eq!(ids(&a).last(), Some(&first));
         assert_eq!(shown(&a), mine);
-        // Deleting another page keeps the page shown.
+        // Deleting another page keeps the page shown, its selection and a wire started on it.
+        let line = Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(5.0, 0.0),
+        };
+        a.open.as_mut().unwrap().project.pages[a.ed.page].graphics = vec![line];
+        let sel = vec![crate::state::Selection::Graphic(0)];
+        let wire = Some((
+            wc_core::Endpoint::Point {
+                at: Point::new(10.0, 10.0),
+            },
+            Vec::new(),
+        ));
+        a.ed.selection = sel.clone();
+        a.ed.wire = wire.clone();
         let other = ids(&a).into_iter().find(|id| *id != mine).unwrap();
         call(&mut a, "delete_page", json!({"page": other})).unwrap();
         assert_eq!(shown(&a), mine);
-        // Deleting the page shown shows the next one.
+        assert_eq!(a.ed.selection, sel);
+        assert_eq!(a.ed.wire, wire);
+        // Deleting the page shown shows the next one, with no selection and no started wire.
         let at = a.ed.page;
         let next = ids(&a)[at + 1].clone();
         call(&mut a, "delete_page", json!({"page": mine})).unwrap();
         assert_eq!(shown(&a), next);
+        assert!(a.ed.selection.is_empty());
+        assert_eq!(a.ed.wire, None);
     }
 
     #[test]
