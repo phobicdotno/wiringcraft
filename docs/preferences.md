@@ -2,12 +2,16 @@
 
 The desktop app keeps your own settings in one file, `prefs.toml`. It is yours, not the
 project's: nothing in it goes into a project folder, a commit or a shared session. The
-command line does not read it.
+command line does not read it. One exception: a settings variable set to an empty value (see
+below) makes the app write `wiringcraft/prefs.toml` in the folder it was started from, which can
+be a project folder. Leave `XDG_CONFIG_HOME` and `APPDATA` unset, or set them to a full path
+outside every project.
 
 ## Where the file is
 
 The app picks its settings folder from the first of these environment variables that is set,
-then adds `wiringcraft`:
+then adds `wiringcraft`. A variable set to an empty value counts as set, and the folder is then
+`wiringcraft` in the current folder:
 
 1. `XDG_CONFIG_HOME`
 2. `APPDATA`
@@ -77,7 +81,7 @@ Layer names: `drawings` (drawings and notes), `wire-numbers`, `cross-references`
 | `login_model` | text | empty (left out of the file) | the model to ask Claude Code for; empty keeps Claude Code's default | Settings, Model (Claude login, once Claude Code is running) |
 | `model` | text | `"claude-opus-5-5"` | the API model: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-2` or `claude-haiku-5-5` | Settings, Model (API key) |
 | `effort` | text | `"high"` | effort for API requests: `low`, `medium`, `high`, `xhigh` or `max` | Settings, Effort (API key) |
-| `api_key` | text | empty (left out of the file) | the Anthropic API key, used only when `ANTHROPIC_API_KEY` is not set. Stored as plain text | Settings, API key (hidden while `ANTHROPIC_API_KEY` is set) |
+| `api_key` | text | empty (left out of the file) | the Anthropic API key, used only when `ANTHROPIC_API_KEY` is unset or blank (only spaces). Stored as plain text | Settings, API key (hidden while `ANTHROPIC_API_KEY` is set and not blank) |
 | `max_rounds` | whole number | `60` | with an API key, the most requests in one turn before the assistant stops and asks to go on. 0 counts as 1 | file only |
 
 ### Example
@@ -110,7 +114,7 @@ These are read by the desktop app (`crates/wc-app`) and its assistant (`crates/w
 | Variable | What it does |
 |---|---|
 | `XDG_CONFIG_HOME`, `APPDATA`, `HOME` | pick the settings folder, in that order (see above) |
-| `ANTHROPIC_API_KEY` | the API key for the assistant; wins over `api_key` in the file |
+| `ANTHROPIC_API_KEY` | the API key for the assistant; wins over `api_key` in the file unless it is blank (only spaces), which is ignored |
 | `WIRINGCRAFT_RENDERER` | `wgpu` starts on wgpu (Direct3D, Metal or Vulkan). Any other value uses OpenGL with no fallback. Unset: OpenGL, and the app starts again on wgpu when OpenGL cannot start |
 | `WIRINGCRAFT_USER` | your name on review comments and in shared sessions. Unset or blank: `git config user.name`, then `USER`, then `USERNAME`, then `someone` |
 | `WIRINGCRAFT_EMAIL` | the email in a request to join a shared session. Unset or blank: `git config user.email`, else empty |
