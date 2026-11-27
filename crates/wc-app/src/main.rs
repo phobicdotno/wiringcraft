@@ -4641,9 +4641,13 @@ impl App {
     /// a typed value, which first goes into the project it was asked for, nor while a close is
     /// under way, which asks about the project open now. Nor while an Open waits for its file
     /// dialog: it asks about the project open now too, and once the dialog has run (or was
-    /// cancelled) the fetch is taken up again.
+    /// cancelled) the fetch is taken up again. Nor while an assistant's open waits for a typed
+    /// value (#1091).
     fn fetch_may_open(&self) -> bool {
-        self.after_typed.is_empty() && self.closing == Closing::No && !matches!(self.pending, Some(Pending::Open))
+        self.after_typed.is_empty()
+            && !self.assistant.enter_typed
+            && self.closing == Closing::No
+            && !matches!(self.pending, Some(Pending::Open))
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
@@ -8194,6 +8198,7 @@ mod nudge_tests {
             "refused for the typed value: {r:?}"
         );
         assert_eq!(app.open.as_ref().unwrap().dir, first, "not replaced");
+        assert!(!app.fetch_may_open(), "a fetched base project waits for the value too");
         app_frame(&mut app, &ctx, Vec::new(), false);
         // The frame the field gives up the keyboard: the tools run before the panels enter the
         // value, so an open asked again in it (through the assistant's poll) is refused too.
