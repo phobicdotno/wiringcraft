@@ -51,11 +51,13 @@ in `crates/wc-app/assets/fonts`).
 
 ![dark mode](docs/screenshots/app-dark.png)
 
-Tools: select and drag (Esc; Esc during a drag puts it back, else clears the selection), place
+Tools: select and drag (Esc; Esc first cancels a drag and puts it back, then drops the shape,
+wire or black box being drawn, then clears the selection, and only then goes back to Select), place
 symbol (S, pick one in the library; R and M turn and mirror it before the click), draw wire (W:
 click a pin, click bends, click a pin to finish or double-click a free point), rotate (R), mirror
 (M), delete (Del),
 duplicate the selection one grid step down and right (Ctrl+D).
+[docs/app-shortcuts.md](docs/app-shortcuts.md) has the full list of keys.
 Wheel zooms around the pointer, right or middle drag pans, F fits the page, G toggles the grid.
 New devices get the next free tag, with the function and location used on that page.
 Versions → Commit / Branch / History records versions and shows the subway map.
@@ -81,15 +83,20 @@ npm install -g @agentclientprotocol/claude-agent-acp   # the Claude Code connect
 claude                                                 # then /login once
 ```
 
-Claude Code only gets WiringCraft's tools in this chat (no shell, file or web tools), and it
-reaches them through a local port only this computer can use, with a fresh token each run. It
+WiringCraft turns off Claude Code's own shell, file and web tools for this chat and declines
+any other permission request, so it works only through WiringCraft's tools. It reaches them
+through a local port only this computer can use, with a fresh token each time the app runs. It
 starts in WiringCraft's own settings folder, never in the project folder, so settings inside
 a project you were sent cannot run anything when the assistant starts.
 
 To use an Anthropic API key instead, choose **API key** under Settings in the panel, then paste
 the key there or set `ANTHROPIC_API_KEY` (setting the variable alone does not switch). A pasted
 key is kept in your WiringCraft preferences, never in a project.
-Settings also pick the model and the effort. The connections are in `crates/wc-agent`
+With an API key, Settings also pick the model and the effort; with the Claude login they show
+the connector command and the model. With an API key a turn pauses after `max_rounds` requests
+(default 60, under `[assistant]` in `prefs.toml` in the WiringCraft settings folder) and asks
+you to say "go on". [docs/assistant.md](docs/assistant.md) has more.
+The connections are in `crates/wc-agent`
 (`acp.rs` for Claude Code, `bridge.rs` for the tool bridge); the tools are in
 `crates/wc-app/src/agent.rs`.
 
@@ -148,6 +155,28 @@ gives the details.
 | `eplan` | an Eplan Electric P8 project (.elk, its .edb folder, or a zip of it): pages as drawn, plus overview pages |
 | `swe` | a SolidWorks Electrical project (.tewzip or `tew_project_data.sqlite`): pages, symbols, wires and devices |
 | `swe-library` | the libraries of a SolidWorks Electrical archive (.tewzip): catalog parts, cable types and symbol blocks |
+
+## Documentation
+
+- [docs/getting-started.md](docs/getting-started.md): a first small project, built step by step on the command line
+- [docs/cli/pages-and-drawing.md](docs/cli/pages-and-drawing.md): projects, pages, symbols, black boxes and wires from the command line
+- [docs/cli/devices-and-terminals.md](docs/cli/devices-and-terminals.md): devices, locations, jumpers, terminal strips, PLC racks and variable lists
+- [docs/cli/reports-and-export.md](docs/cli/reports-and-export.md): reports, PDF, drawings and exports
+- [docs/cli/library-and-macros.md](docs/cli/library-and-macros.md): libraries, macros, templates, logos and translations
+- [docs/cli/versions-and-review.md](docs/cli/versions-and-review.md): versions, branches, merges, comments, revisions and the project check
+- [docs/cli/panel-layouts.md](docs/cli/panel-layouts.md): panel layouts
+- [docs/cli/imports.md](docs/cli/imports.md): the `wiringcraft import` commands
+- [docs/project-format.md](docs/project-format.md): the project folder format
+- [docs/app-shortcuts.md](docs/app-shortcuts.md): every key and mouse gesture in the desktop app
+- [docs/assistant.md](docs/assistant.md): the assistant
+- [docs/share-sessions.md](docs/share-sessions.md): working in one project together over the office network
+- [docs/packaging.md](docs/packaging.md): how the install packages and releases are built
+- [docs/feature-matrix.md](docs/feature-matrix.md): EPLAN and SolidWorks Electrical functions and where WiringCraft stands
+- [docs/known-gaps.md](docs/known-gaps.md): known limitations and the todos that track them
+- [docs/manufacturer-data.md](docs/manufacturer-data.md): where component makers publish symbols, macros and part data
+- [docs/wago-marking.md](docs/wago-marking.md): WAGO smartScript marker export
+- [docs/wago-configurator.md](docs/wago-configurator.md): WAGO configurator export
+- [examples/README.md](examples/README.md): the examples and how to run them
 
 ## Rules
 
