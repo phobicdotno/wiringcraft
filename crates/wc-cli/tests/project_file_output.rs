@@ -82,6 +82,27 @@ fn an_export_through_a_link_to_a_missing_project_file_is_refused() -> TestResult
 
 #[cfg(unix)]
 #[test]
+fn an_export_through_a_long_chain_of_links_to_a_missing_project_file_is_refused() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    project(tmp.path())?;
+    let target = tmp.path().join("p/pages/new.page.json");
+    // As many links as one look-up follows: out0 -> out1 -> ... -> out39 -> the missing page.
+    for i in 0..40 {
+        let next = if i == 39 {
+            target.clone()
+        } else {
+            tmp.path().join(format!("out{}", i + 1))
+        };
+        std::os::unix::fs::symlink(next, tmp.path().join(format!("out{i}")))?;
+    }
+    let out = wiringcraft(tmp.path(), &["-C", "p", "pdf", "out0"])?;
+    assert!(!out.status.success());
+    assert!(!target.exists(), "an export was written into the pages folder");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn an_export_onto_a_project_file_that_links_out_of_its_folder_is_refused() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let before = project(tmp.path())?;

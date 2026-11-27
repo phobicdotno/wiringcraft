@@ -1801,6 +1801,10 @@ fn project_data_at(dir: &Path, path: &Path) -> Option<&'static str> {
             _ => next,
         };
     }
+    // Where the walk stopped, the last link followed included.
+    if let Some(at) = placed(&hop) {
+        places.push(at);
+    }
     let root = std::fs::canonicalize(dir).ok()?;
     PROJECT_DATA.into_iter().find(|name| {
         let at = std::fs::canonicalize(root.join(name)).unwrap_or_else(|_| root.join(name));
