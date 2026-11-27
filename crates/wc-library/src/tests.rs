@@ -980,3 +980,21 @@ fn the_starter_changeover_contact_has_its_pins_on_the_5_mm_grid() -> Result<()> 
     assert_eq!(pins, [("11", 0.0, 0.0), ("12", -5.0, 15.0), ("14", 5.0, 15.0)]);
     Ok(())
 }
+
+#[test]
+fn every_starter_pin_sits_on_the_5_mm_grid() -> Result<()> {
+    // #1149: pins off the grid cannot be reached by a wire drawn on it.
+    let on_grid = |v: f64| ((v / 5.0).round() * 5.0 - v).abs() < 1e-9;
+    let (_tmp, lib) = starter_library()?;
+    let mut off = Vec::new();
+    for id in lib.index(ItemKind::Symbol).keys() {
+        let (s, _) = lib.symbol(id)?;
+        for p in &s.pins {
+            if !on_grid(p.at.x) || !on_grid(p.at.y) {
+                off.push(format!("{id} {} at ({}, {})", p.name, p.at.x, p.at.y));
+            }
+        }
+    }
+    assert!(off.is_empty(), "pins off the 5 mm grid: {off:?}");
+    Ok(())
+}
