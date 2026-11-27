@@ -974,6 +974,125 @@ mod tests {
         assert_eq!(p, before, "nothing is placed");
         Ok(())
     }
+
+    #[test]
+    fn placed_terminals_follow_their_strip_to_its_new_tag() -> Result<()> {
+        let sym = |id: &str, tag: &str| -> Result<PlacedSymbol> {
+            Ok(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            })
+        };
+        let m = Macro {
+            name: "Strip".into(),
+            symbols: vec![sym("t1", "-X1.1")?, sym("t2", "-X1.2")?, sym("x", "-X1")?],
+            devices: [(
+                DeviceTag::parse("-X1.2")?,
+                Device {
+                    part: Some("PT 2.5".into()),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // The project has its own strip -X1 with terminal 1.
+        let mut p = Project::new("x");
+        let mut page = crate::project::Page::new("p1", "1", "Terminals");
+        page.symbols.push(sym("s1", "-X1")?);
+        page.symbols.push(sym("s2", "-X1.1")?);
+        p.pages.push(page);
+        let ids = place(&mut p, "p1", &m, Point::new(0.0, 0.0))?;
+        let tags: Vec<String> = ids
+            .iter()
+            .filter_map(|id| {
+                p.pages[0]
+                    .symbol(id)
+                    .and_then(|s| s.tag.as_ref())
+                    .map(ToString::to_string)
+            })
+            .collect();
+        assert_eq!(
+            tags,
+            ["-X2.1", "-X2.2", "-X2"],
+            "the terminals stay on the macro's strip"
+        );
+        assert_eq!(p.devices[&DeviceTag::parse("-X2.2")?].part.as_deref(), Some("PT 2.5"));
+
+        // Without the strip in the macro, a terminal takes a free number as before.
+        let lone = Macro {
+            symbols: vec![sym("t1", "-X1.1")?],
+            ..m.clone()
+        };
+        let ids = place(&mut p, "p1", &lone, Point::new(0.0, 0.0))?;
+        let tag = p.pages[0].symbol(&ids[0]).and_then(|s| s.tag.clone());
+        assert_eq!(tag.map(|t| t.to_string()).as_deref(), Some("-X1.2"));
+
+        // When a terminal's number is taken on the new strip, it takes the next free one there,
+        // not one on the project's own strip.
+        let mut p = Project::new("x");
+        let mut page = crate::project::Page::new("p1", "1", "Terminals");
+        page.symbols.push(sym("s1", "-X1")?);
+        page.symbols.push(sym("s2", "-X1.1")?);
+        p.pages.push(page);
+        p.devices.insert(DeviceTag::parse("-X2.1")?, Device::default());
+        let ids = place(&mut p, "p1", &m, Point::new(0.0, 0.0))?;
+        let tags: Vec<String> = ids
+            .iter()
+            .filter_map(|id| {
+                p.pages[0]
+                    .symbol(id)
+                    .and_then(|s| s.tag.as_ref())
+                    .map(ToString::to_string)
+            })
+            .collect();
+        assert_eq!(
+            tags,
+            ["-X2.3", "-X2.2", "-X2"],
+            "terminal 2 keeps its free number, terminal 1 takes the next free one on the new strip"
+        );
+        assert_eq!(p.devices[&DeviceTag::parse("-X2.2")?].part.as_deref(), Some("PT 2.5"));
+        Ok(())
+    }
+
+    #[test]
+    fn placed_terminals_keep_their_numbers_when_the_strip_keeps_its_tag() -> Result<()> {
+        let sym = |id: &str, tag: &str| -> Result<PlacedSymbol> {
+            Ok(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0, 10.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            })
+        };
+        let m = Macro {
+            name: "Strip".into(),
+            symbols: vec![sym("t7", "-X1.7")?, sym("x", "-X1")?],
+            ..Default::default()
+        };
+        // -X1 is free in this project, so the strip keeps its tag and terminal 7 its number.
+        let mut p = Project::new("x");
+        p.pages.push(crate::project::Page::new("p1", "1", "Terminals"));
+        let ids = place(&mut p, "p1", &m, Point::new(0.0, 0.0))?;
+        let tags: Vec<String> = ids
+            .iter()
+            .filter_map(|id| {
+                p.pages[0]
+                    .symbol(id)
+                    .and_then(|s| s.tag.as_ref())
+                    .map(ToString::to_string)
+            })
+            .collect();
+        assert_eq!(tags, ["-X1.7", "-X1"]);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1186,6 +1186,30 @@ fn project_check_warns_about_parts_missing_from_the_library_copy() {
 }
 
 #[test]
+fn project_check_notes_a_drawn_device_whose_main_part_is_blank() {
+    let (mut p, s, parts) = fixture();
+    // A blank main part is no part: the device gets the "has no part" note, not silence.
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some("  ".into()),
+            ..Default::default()
+        },
+    );
+    let found = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert!(
+        found
+            .iter()
+            .any(|f| f.severity == Severity::Note && f.message == "-P1 has no part"),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn project_check_warns_about_a_missing_part_of_a_device_drawn_only_as_interruption_points() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
@@ -3552,6 +3576,16 @@ fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
     overview.symbols.push(place("s30", "nc", 10.0, Some("=A+C1-K1")));
     p.pages.push(overview);
     assert!(overflow(&p, &s, &parts).is_empty());
+
+    // A hand-edited quantity of 0 counts the block once, as the parts list does (#1330):
+    // its NO covers the second NO drawn, and one of the two NCs drawn is too many.
+    p.devices.get_mut(&k1).unwrap().accessories[0].qty = 0;
+    let found = overflow(&p, &s, &parts);
+    assert!(!found.is_empty(), "{found:?}");
+    assert!(
+        found.iter().all(|f| f.message.ends_with("(1 NC too many)")),
+        "{found:?}"
+    );
 }
 
 #[test]
