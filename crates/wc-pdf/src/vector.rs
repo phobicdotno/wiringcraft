@@ -875,3 +875,250 @@ pub fn dxf(page: &PageDrawing) -> String {
     pair(0, "EOF");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THIN: Stroke = Stroke {
+        rgb: (0.0, 0.0, 0.0),
+        width: 0.25,
+    };
+
+    fn page(prims: Vec<Prim>) -> PageDrawing {
+        PageDrawing {
+            id: "p-1".into(),
+            number: "1".into(),
+            title: String::new(),
+            size_mm: (100.0, 50.0),
+            prims,
+            pictures: Vec::new(),
+            panel: false,
+        }
+    }
+
+    fn text(s: &str) -> Prim {
+        Prim::Text {
+            at: (1.0, 2.0),
+            height: 2.5,
+            angle: 0.0,
+            text: s.into(),
+            ink: THIN,
+            layer: None,
+        }
+    }
+
+    /// The DXF as `(code, value)` pairs.
+    fn pairs(dxf: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = dxf.lines().collect();
+        lines
+            .chunks(2)
+            .filter_map(|c| match c {
+                [code, value] => Some(((*code).to_owned(), (*value).to_owned())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The pairs of the first entity named `kind`, up to the next entity.
+    fn entity(dxf: &str, kind: &str) -> Vec<(String, String)> {
+        let all = pairs(dxf);
+        let Some(start) = all.iter().position(|(c, v)| c == "0" && v == kind) else {
+            unreachable!("no {kind} in {dxf}")
+        };
+        all.iter()
+            .skip(start + 1)
+            .take_while(|(c, _)| c != "0")
+            .cloned()
+            .collect()
+    }
+
+    fn value<'a>(pairs: &'a [(String, String)], code: &str) -> Option<&'a str> {
+        pairs.iter().find(|(c, _)| c == code).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn num_rounds_to_three_decimals_and_never_writes_minus_zero_or_nan() {
+        assert_eq!(num(1.0), "1");
+        assert_eq!(num(1.5), "1.5");
+        assert_eq!(num(0.12349), "0.123");
+        assert_eq!(num(2.0004), "2");
+        assert_eq!(num(-0.0001), "0");
+        assert_eq!(num(-0.0), "0");
+        assert_eq!(num(-3.25), "-3.25");
+        assert_eq!(num(100.0), "100");
+        assert_eq!(num(f64::NAN), "0");
+        assert_eq!(num(f64::INFINITY), "0");
+        assert_eq!(num(f64::NEG_INFINITY), "0");
+    }
+
+    #[test]
+    fn bulge_num_keeps_six_decimals() {
+        assert_eq!(bulge_num(1.0), "1");
+        assert_eq!(bulge_num(-0.4142135), "-0.414214");
+        assert_eq!(bulge_num(-0.0000001), "0");
+        assert_eq!(bulge_num(0.0), "0");
+    }
+
+    #[test]
+    fn xml_escapes_markup_and_drops_characters_xml_forbids() {
+        assert_eq!(xml("a<b>&\"c\""), "a&lt;b&gt;&amp;&quot;c&quot;");
+        assert_eq!(xml("x\u{0}y\u{1B}z\n\t"), "xyz");
+        assert_eq!(xml("\u{FFFE}ok\u{FFFF}"), "ok");
+        // An apostrophe and non-ASCII text stay as they are.
+        assert_eq!(xml("it's Ålesund \u{1F600}"), "it's Ålesund \u{1F600}");
+    }
+
+    #[test]
+    fn colours_clamp_to_hex_and_map_to_the_nearest_aci() {
+        let ink = |r, g, b| Stroke {
+            rgb: (r, g, b),
+            width: 0.25,
+        };
+        assert_eq!(rgb(&ink(0.0, 0.5, 1.0)), "#0080ff");
+        assert_eq!(rgb(&ink(-1.0, 2.0, 0.2)), "#00ff33");
+        // Greys: black/dark is 7, mid grey 8, light grey 9.
+        assert_eq!(aci(&ink(0.0, 0.0, 0.0)), 7);
+        assert_eq!(aci(&ink(0.4, 0.42, 0.38)), 8);
+        assert_eq!(aci(&ink(0.8, 0.8, 0.8)), 9);
+        // Colours go to red, green or blue by their largest channel.
+        assert_eq!(aci(&ink(0.9, 0.1, 0.1)), 1);
+        assert_eq!(aci(&ink(0.1, 0.8, 0.2)), 3);
+        assert_eq!(aci(&ink(0.1, 0.2, 0.9)), 5);
+    }
+
+    #[test]
+    fn arc_vertices_cut_sweeps_into_quarter_turns_with_signed_bulges() {
+        let full = arc_vertices((10.0, 10.0), 2.0, 0.0, 360.0, true);
+        assert_eq!(full, vec![((8.0, 10.0), 1.0), ((12.0, 10.0), 1.0)]);
+
+        // A half turn is two quarter pieces: three vertices, the last without a bulge.
+        let half = arc_vertices((0.0, 0.0), 1.0, 0.0, 180.0, false);
+        assert_eq!(half.len(), 3);
+        let quarter = (std::f64::consts::FRAC_PI_2 / 4.0).tan();
+        let [(a, ba), (b, bb), (c, bc)] = half.as_slice() else {
+            unreachable!("{half:?}")
+        };
+        assert!((a.0 - 1.0).abs() < 1e-9 && a.1.abs() < 1e-9, "{a:?}");
+        assert!(b.0.abs() < 1e-9 && (b.1 - 1.0).abs() < 1e-9, "{b:?}");
+        assert!((c.0 + 1.0).abs() < 1e-9 && c.1.abs() < 1e-9, "{c:?}");
+        assert!((ba + quarter).abs() < 1e-12 && (bb + quarter).abs() < 1e-12);
+        assert_eq!(*bc, 0.0);
+
+        // A negative sweep bends the other way; a small one is one piece.
+        let back = arc_vertices((0.0, 0.0), 1.0, 30.0, 0.0, false);
+        assert_eq!(back.len(), 2);
+        let Some((_, bulge)) = back.first() else { unreachable!() };
+        assert!(*bulge > 0.0, "{back:?}");
+        // A sweep just over a quarter turn needs two pieces.
+        assert_eq!(arc_vertices((0.0, 0.0), 1.0, 0.0, 91.0, false).len(), 3);
+    }
+
+    #[test]
+    fn wide_only_for_finite_strokes_over_the_default_pen() {
+        let w = |width| Stroke {
+            rgb: (0.0, 0.0, 0.0),
+            width,
+        };
+        assert!(!wide(&w(0.25)));
+        assert!(!wide(&w(0.1)));
+        assert!(wide(&w(0.35)));
+        assert!(!wide(&w(f64::NAN)));
+        assert!(!wide(&w(f64::INFINITY)));
+    }
+
+    #[test]
+    fn superscript_port_numbers_name_devices_too() {
+        assert!(names_a_device("COM¹"));
+        assert!(names_a_device("lpt³.txt"));
+        assert!(names_a_device("prn"));
+        assert!(!names_a_device("COM⁴"));
+        assert!(!names_a_device("COM"));
+        assert!(!names_a_device("NULL"));
+    }
+
+    #[test]
+    fn dxf_flips_y_and_writes_thin_and_wide_lines_differently() {
+        let line = |width| Prim::Path {
+            points: vec![(10.0, 5.0), (20.0, 15.0)],
+            closed: false,
+            filled: false,
+            ink: Stroke {
+                rgb: (0.0, 0.0, 0.0),
+                width,
+            },
+            layer: None,
+        };
+        let out = dxf(&page(vec![line(0.25)]));
+        assert!(out.ends_with("0\nEOF\n"), "{out}");
+        let l = entity(&out, "LINE");
+        assert_eq!(value(&l, "8"), Some("0"));
+        assert_eq!(value(&l, "10"), Some("10"));
+        assert_eq!(value(&l, "20"), Some("45"));
+        assert_eq!(value(&l, "21"), Some("35"));
+        assert_eq!(value(&l, "62"), Some("7"));
+
+        let out = dxf(&page(vec![line(0.5)]));
+        assert!(!out.contains("\nLINE\n"), "{out}");
+        let p = entity(&out, "POLYLINE");
+        assert_eq!(value(&p, "70"), Some("0"));
+        assert_eq!(value(&p, "40"), Some("0.5"));
+        assert_eq!(value(&p, "41"), Some("0.5"));
+        assert_eq!(out.matches("\nVERTEX\n").count(), 2);
+        assert!(out.contains("0\nSEQEND\n"));
+    }
+
+    #[test]
+    fn dxf_mirrors_arc_angles_and_keeps_text_rotation() {
+        let arc = Prim::Arc {
+            center: (50.0, 20.0),
+            radius: 5.0,
+            start: 0.0,
+            end: 90.0,
+            filled: false,
+            ink: THIN,
+            layer: None,
+        };
+        let turned = Prim::Text {
+            at: (3.0, 4.0),
+            height: 2.5,
+            angle: -90.0,
+            text: "50%%".into(),
+            ink: THIN,
+            layer: None,
+        };
+        let out = dxf(&page(vec![arc, turned]));
+        let a = entity(&out, "ARC");
+        assert_eq!(value(&a, "10"), Some("50"));
+        assert_eq!(value(&a, "20"), Some("30"));
+        assert_eq!(value(&a, "40"), Some("5"));
+        // Clockwise 0..90 on the y-down page runs 270..0 counter-clockwise with y up.
+        assert_eq!(value(&a, "50"), Some("270"));
+        assert_eq!(value(&a, "51"), Some("0"));
+        let t = entity(&out, "TEXT");
+        assert_eq!(value(&t, "50"), Some("270"));
+        assert_eq!(value(&t, "1"), Some("50\\U+0025\\U+0025"));
+        assert_eq!(value(&t, "20"), Some("46"));
+    }
+
+    #[test]
+    fn dxf_warnings_quote_each_text_once_with_how_it_is_written() {
+        let d = page(vec![
+            text("ok"),
+            text("go \u{1F680}\n"),
+            text("go \u{1F680}\n"),
+            text("\u{1F600}"),
+        ]);
+        let warnings = dxf_warnings(&d, true);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let [first, second] = warnings.as_slice() else {
+            unreachable!("{warnings:?}")
+        };
+        assert!(
+            first.starts_with("page 1: the text \"go \u{1F680}\n\" is written as \"go ?\" in the DXF"),
+            "{first}"
+        );
+        assert!(second.contains("is written as \"?\""), "{second}");
+        assert!(dxf_warnings(&page(vec![text("plain Æ")]), true).is_empty());
+    }
+}
