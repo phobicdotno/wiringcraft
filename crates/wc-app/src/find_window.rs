@@ -141,6 +141,7 @@ impl FindState {
                     if ui
                         .add_enabled(any, egui::Button::new("Replace ticked"))
                         .on_hover_text("Replace in the ticked hits, as one undo step. A device tag is renamed everywhere it appears.")
+                        .on_disabled_hover_text(self.replace_blocked())
                         .clicked()
                     {
                         out = FindOutcome::Replace;
@@ -157,6 +158,20 @@ impl FindState {
             out = FindOutcome::Close;
         }
         out
+    }
+}
+
+impl FindState {
+    /// Why Replace ticked is greyed out: egui shows no hover text on a disabled button, so
+    /// this one says what is missing instead.
+    fn replace_blocked(&self) -> &'static str {
+        if self.query.is_empty() {
+            "Type what to find first."
+        } else if self.hits.is_empty() {
+            "Nothing found to replace."
+        } else {
+            "Tick a hit to replace in it."
+        }
     }
 }
 
@@ -278,6 +293,23 @@ mod tests {
         q.pages[0].graphics.clear();
         f.refresh(&q);
         assert!(f.hits.is_empty());
+    }
+
+    #[test]
+    fn a_greyed_out_replace_says_what_is_missing() {
+        let p = project();
+        let mut f = FindState::default();
+        f.refresh(&p);
+        assert_eq!(f.replace_blocked(), "Type what to find first.");
+        f.query = "no such text anywhere".into();
+        f.refresh(&p);
+        assert!(f.hits.is_empty());
+        assert_eq!(f.replace_blocked(), "Nothing found to replace.");
+        f.query = "pump".into();
+        f.refresh(&p);
+        assert!(!f.hits.is_empty());
+        f.chosen.iter_mut().for_each(|c| *c = false);
+        assert_eq!(f.replace_blocked(), "Tick a hit to replace in it.");
     }
 
     #[test]

@@ -1656,6 +1656,27 @@ mod discovery {
     }
 
     #[test]
+    fn a_listed_session_name_has_no_control_characters() -> TestResult {
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let from: SocketAddr = "127.0.0.1:5000".parse()?;
+        let wire = beacon("Pump\nstation\u{1b}[2J", "\tOla\r\n", 7004).encode();
+        let mut sent = false;
+        b.receive(|buf| {
+            if sent {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            sent = true;
+            buf[..wire.len()].copy_from_slice(&wire);
+            Ok((wire.len(), from))
+        })?;
+        let list = b.poll()?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].project, "Pump station [2J");
+        assert_eq!(list[0].host, "Ola");
+        Ok(())
+    }
+
+    #[test]
     fn the_session_list_stops_at_its_limit_and_keeps_refreshing_listed_sessions() -> TestResult {
         use crate::discovery::MAX_SESSIONS;
         let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
