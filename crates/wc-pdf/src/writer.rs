@@ -645,10 +645,16 @@ impl Pen {
         if !all_finite(&[c, (r, start), (end, 0.0)]) {
             return;
         }
+        // A negative radius puts every point on the far side of the centre: the same circle, the
+        // arc turned half round. Stored as such, so the SVG and DXF, which need a radius of at
+        // least 0, draw what the PDF does.
+        // The sweep comes from the angles as given: turned first, a tiny arc could round to a full
+        // turn (0° and 1e-14° both become 180°).
         let mut sweep = end - start;
         if sweep <= 0.0 {
             sweep += 360.0;
         }
+        let (r, start) = if r < 0.0 { (-r, start + 180.0) } else { (r, start) };
         self.prims.push(Prim::Arc {
             center: c,
             radius: r,
@@ -772,4 +778,304 @@ fn page_label(s: &str) -> String {
     }
     out.push('>');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Parse the trailer, check `startxref` lands on the table and that every entry points at
+    /// its own `N 0 obj` header. Returns the object count (the table's size minus entry 0).
+    fn check_xref(pdf: &[u8]) -> usize {
+        assert!(pdf.starts_with(b"%PDF-1.7\n"));
+        assert!(pdf.ends_with(b"%%EOF\n"));
+        let Some(sx) = pdf.windows(10).rposition(|w| w == b"startxref\n") else {
+            unreachable!("no startxref")
+        };
+        let Some(tail) = pdf.get(sx + 10..).and_then(|t| std::str::from_utf8(t).ok()) else {
+            unreachable!("startxref tail is not text")
+        };
+        let Some(start) = tail.lines().next().and_then(|l| l.parse::<usize>().ok()) else {
+            unreachable!("startxref offset: {tail}")
+        };
+        let Some(table) = pdf.get(start..).and_then(|t| std::str::from_utf8(t).ok()) else {
+            unreachable!("xref at {start} is not text")
+        };
+        let mut lines = table.lines();
+        assert_eq!(lines.next(), Some("xref"));
+        let Some(size) = lines
+            .next()
+            .and_then(|l| l.strip_prefix("0 "))
+            .and_then(|l| l.parse::<usize>().ok())
+        else {
+            unreachable!("xref subsection header")
+        };
+        assert_eq!(lines.next(), Some("0000000000 65535 f "));
+        for num in 1..size {
+            let Some(line) = lines.next() else {
+                unreachable!("xref ends before object {num}")
+            };
+            assert_eq!(line.len(), 19, "fixed-width entry: {line:?}");
+            let Some(off) = line.strip_suffix(" 00000 n ").and_then(|o| o.parse::<usize>().ok()) else {
+                unreachable!("entry {num}: {line:?}")
+            };
+            let header = format!("{num} 0 obj\n");
+            assert!(
+                pdf.get(off..).is_some_and(|b| b.starts_with(header.as_bytes())),
+                "object {num} at {off}"
+            );
+        }
+        assert_eq!(lines.next(), Some("trailer"));
+        assert_eq!(
+            lines.next(),
+            Some(format!("<< /Size {size} /Root 1 0 R /Info 5 0 R >>").as_str())
+        );
+        // Object headers appear exactly once each, so no object is written twice.
+        for num in 1..size {
+            let header = format!("\n{num} 0 obj\n");
+            let text = String::from_utf8_lossy(pdf);
+            assert_eq!(text.matches(&header).count(), 1, "object {num} written once");
+        }
+        size - 1
+    }
+
+    /// The body of object `num`, between `N 0 obj` and `endobj`, as lossy text.
+    fn object(pdf: &[u8], num: usize) -> String {
+        let header = format!("\n{num} 0 obj\n");
+        let Some(at) = find(pdf, header.as_bytes()) else {
+            unreachable!("no object {num}")
+        };
+        let rest = pdf.get(at + header.len()..).unwrap_or_default();
+        let end = find(rest, b"\nendobj\n").unwrap_or(rest.len());
+        String::from_utf8_lossy(rest.get(..end).unwrap_or_default()).into_owned()
+    }
+
+    fn image(alpha: Option<Vec<u8>>) -> PageImage {
+        PageImage {
+            width: 2,
+            height: 1,
+            colour_space: "DeviceRGB",
+            filter: "FlateDecode",
+            extra: "",
+            data: vec![1, 2, 3, 4, 5, 6],
+            alpha,
+            min: (0.0, 0.0),
+            max: (10.0, 5.0),
+        }
+    }
+
+    #[test]
+    fn empty_document_is_well_formed() {
+        let pdf = Doc::new("Empty").finish(&BTreeMap::new());
+        assert_eq!(check_xref(&pdf), 5, "catalog, pages, font, outlines, info");
+        assert_eq!(object(&pdf, 2), "<< /Type /Pages /Kids [] /Count 0 >>");
+        assert_eq!(object(&pdf, 4), "<< /Type /Outlines /Count 0 >>");
+        let catalog = object(&pdf, 1);
+        assert!(!catalog.contains("/PageLabels"), "{catalog}");
+        assert!(!catalog.contains("/OCProperties"), "{catalog}");
+    }
+
+    #[test]
+    fn pages_outline_chain_and_content_lengths() {
+        let mut doc = Doc::new("Three");
+        for (k, ops) in ["0 0 m 1 1 l S\n", "", "BT (\u{e6}\u{f8}) Tj ET\n"].iter().enumerate() {
+            let drawn = Drawn {
+                ops: (*ops).to_owned(),
+                ..Drawn::default()
+            };
+            doc.add_page((297.0, 210.0), &format!("{}", k + 1), &format!("Sheet {k}"), drawn);
+        }
+        let pdf = doc.finish(&BTreeMap::new());
+        assert_eq!(check_xref(&pdf), 5 + 3 * 3);
+        assert_eq!(
+            object(&pdf, 2),
+            "<< /Type /Pages /Kids [6 0 R 9 0 R 12 0 R] /Count 3 >>"
+        );
+        assert_eq!(
+            object(&pdf, 4),
+            "<< /Type /Outlines /First 8 0 R /Last 14 0 R /Count 3 >>"
+        );
+        let first = object(&pdf, 8);
+        assert!(!first.contains("/Prev") && first.contains("/Next 11 0 R"), "{first}");
+        let mid = object(&pdf, 11);
+        assert!(mid.contains("/Prev 8 0 R /Next 14 0 R"), "{mid}");
+        assert!(mid.contains("/Dest [9 0 R /Fit]"), "{mid}");
+        let last = object(&pdf, 14);
+        assert!(last.contains("/Prev 11 0 R") && !last.contains("/Next"), "{last}");
+        // A4 landscape in points, and each content stream's /Length counts its bytes (the
+        // non-ASCII letters are two UTF-8 bytes each).
+        assert!(object(&pdf, 6).contains("/MediaBox [0 0 841.89 595.28]"));
+        for (num, ops) in [(7, "0 0 m 1 1 l S\n"), (10, ""), (13, "BT (\u{e6}\u{f8}) Tj ET\n")] {
+            let body = object(&pdf, num);
+            let expected = format!("<< /Length {} >>\nstream\n{ops}\nendstream", ops.len());
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[test]
+    fn links_flip_y_and_drop_unknown_targets() {
+        let mut doc = Doc::new("Links");
+        let drawn = Drawn {
+            links: vec![
+                Link {
+                    min: (10.0, 20.0),
+                    max: (30.0, 40.0),
+                    target_page_id: "b".to_owned(),
+                },
+                Link {
+                    min: (0.0, 0.0),
+                    max: (1.0, 1.0),
+                    target_page_id: "gone".to_owned(),
+                },
+            ],
+            ..Drawn::default()
+        };
+        doc.add_page((100.0, 100.0), "", "A", drawn);
+        doc.add_page((100.0, 100.0), "", "B", Drawn::default());
+        let index = BTreeMap::from([("a".to_owned(), 0), ("b".to_owned(), 1)]);
+        let pdf = doc.finish(&index);
+        check_xref(&pdf);
+        let page = object(&pdf, 6);
+        assert_eq!(page.matches("/Subtype /Link").count(), 1, "{page}");
+        let (x0, x1) = (10.0 * PT_PER_MM, 30.0 * PT_PER_MM);
+        let (y0, y1) = (60.0 * PT_PER_MM, 80.0 * PT_PER_MM);
+        let rect = format!("/Rect [{x0:.2} {y0:.2} {x1:.2} {y1:.2}]");
+        assert!(page.contains(&rect), "{rect} in {page}");
+        assert!(page.contains("/Dest [9 0 R /Fit]"), "{page}");
+        assert!(object(&pdf, 9).contains("/Annots []"));
+        // Unnumbered sheets count on in decimal from their position.
+        let catalog = object(&pdf, 1);
+        assert!(
+            catalog.contains("/PageLabels << /Nums [0 << /S /D /St 1 >> 1 << /S /D /St 2 >>] >>"),
+            "{catalog}"
+        );
+    }
+
+    #[test]
+    fn page_label_escapes_literal_strings() {
+        assert_eq!(page_label("R1"), "(R1)");
+        assert_eq!(page_label(""), "()");
+        assert_eq!(page_label(r"a(b)\c"), r"(a\(b\)\\c)");
+        assert_eq!(page_label("\u{c5}1"), "<FEFF00C50031>");
+        // A tab is not printable ASCII, so it goes as UTF-16 rather than raw in a literal.
+        assert_eq!(page_label("a\tb"), "<FEFF006100090062>");
+    }
+
+    #[test]
+    fn pdf_text_maps_winansi_and_falls_back() {
+        assert_eq!(pdf_text(""), "<>");
+        assert_eq!(pdf_text("A("), "<4128>");
+        assert_eq!(
+            pdf_text("\u{e9}\u{20ac}"),
+            "<E980>",
+            "e-acute is Latin-1, the euro WinAnsi 0x80"
+        );
+        assert_eq!(pdf_text("a\u{2192}b"), "<613E62>", "an arrow becomes '>'");
+        assert_eq!(pdf_text("\u{65e5}"), "<3F>", "outside WinAnsi becomes '?'");
+    }
+
+    #[test]
+    fn pdf_text_string_writes_surrogate_pairs() {
+        assert_eq!(pdf_text_string(""), "<>");
+        assert_eq!(
+            pdf_text_string("(x)"),
+            "<287829>",
+            "ASCII parentheses need no escape in hex"
+        );
+        assert_eq!(pdf_text_string("\u{1F600}"), "<FEFFD83DDE00>");
+        assert_eq!(
+            pdf_text_string("a\nb"),
+            "<FEFF0061000A0062>",
+            "a newline is not printable"
+        );
+    }
+
+    #[test]
+    fn info_entries_are_trimmed_and_blanks_skipped() {
+        let mut doc = Doc::new("T");
+        doc.set_info("Author", "  Kari  ");
+        doc.set_info("Subject", "   ");
+        doc.set_info("Keywords", "");
+        let pdf = doc.finish(&BTreeMap::new());
+        check_xref(&pdf);
+        assert_eq!(
+            object(&pdf, 5),
+            format!("<< /Title <54> /Producer (WiringCraft) /Author {} >>", pdf_text("Kari"))
+        );
+    }
+
+    #[test]
+    fn shared_picture_is_stored_once_with_one_soft_mask() {
+        let logo = Arc::new(image(Some(vec![9, 9])));
+        let mut doc = Doc::new("Pics");
+        for _ in 0..2 {
+            let drawn = Drawn {
+                pictures: vec![
+                    Placed {
+                        image: Arc::clone(&logo),
+                        min: (0.0, 0.0),
+                        max: (10.0, 10.0),
+                    },
+                    Placed {
+                        image: Arc::clone(&logo),
+                        min: (20.0, 0.0),
+                        max: (30.0, 10.0),
+                    },
+                ],
+                ..Drawn::default()
+            };
+            doc.add_page((100.0, 100.0), "", "P", drawn);
+        }
+        let pdf = doc.finish(&BTreeMap::new());
+        // 5 fixed + 2 pages x 3, then the image (12) and its soft mask (13).
+        assert_eq!(check_xref(&pdf), 13);
+        let img = object(&pdf, 12);
+        assert!(
+            img.contains("/ColorSpace /DeviceRGB") && img.contains("/SMask 13 0 R"),
+            "{img}"
+        );
+        assert!(img.contains("/Length 6 >>"), "{img}");
+        let mask = object(&pdf, 13);
+        assert!(
+            mask.contains("/ColorSpace /DeviceGray") && mask.contains("/Length 2 >>"),
+            "{mask}"
+        );
+        for page in [6, 9] {
+            let body = object(&pdf, page);
+            assert!(body.contains("/XObject << /Pic0 12 0 R /Pic1 12 0 R >>"), "{body}");
+        }
+        let text = String::from_utf8_lossy(&pdf);
+        assert_eq!(text.matches("/Subtype /Image").count(), 2, "one image and one mask");
+    }
+
+    #[test]
+    fn underlay_turns_on_scans_layer_and_numbers_after_it() {
+        let mut doc = Doc::new("Scan");
+        let drawn = Drawn {
+            underlay: Some(image(None)),
+            ..Drawn::default()
+        };
+        doc.add_page((100.0, 100.0), "S1", "Scan", drawn);
+        doc.add_page((100.0, 100.0), "S2", "Plain", Drawn::default());
+        let pdf = doc.finish(&BTreeMap::new());
+        // 5 fixed + 2 pages x 3, one layer (12), one underlay image (13), no mask.
+        assert_eq!(check_xref(&pdf), 13);
+        assert_eq!(
+            object(&pdf, 12),
+            format!("<< /Type /OCG /Name {} >>", pdf_text_string(Layer::Scans.title()))
+        );
+        let catalog = object(&pdf, 1);
+        assert!(catalog.contains("/OCProperties << /OCGs [12 0 R]"), "{catalog}");
+        assert!(catalog.contains("/Nums [0 << /P (S1) >> 1 << /P (S2) >>]"), "{catalog}");
+        let first = object(&pdf, 6);
+        assert!(first.contains("/XObject << /Im0 13 0 R >>"), "{first}");
+        assert!(!object(&pdf, 9).contains("/XObject"));
+        assert!(object(&pdf, 7).contains("/Im0 Do Q EMC"));
+        assert!(!object(&pdf, 13).contains("/SMask"));
+    }
 }

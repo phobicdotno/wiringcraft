@@ -263,7 +263,7 @@ impl Action {
             Action::Open => i("Open", "Open a project folder", Icon::Open, "Ctrl+O"),
             Action::ProjectProps => i(
                 "Project properties",
-                "Project name and title-block fields",
+                "Edit the project's name, title-block fields, locations and revisions",
                 Icon::Properties,
                 "",
             ),
@@ -281,7 +281,12 @@ impl Action {
                 "Ctrl+Shift+S",
             ),
             Action::Undo => i("Undo", "Undo the last change", Icon::Undo, "Ctrl+Z"),
-            Action::Redo => i("Redo", "Redo", Icon::Redo, "Ctrl+Y"),
+            Action::Redo => i(
+                "Redo",
+                "Redo the last change you undid (Ctrl+Shift+Z works too)",
+                Icon::Redo,
+                "Ctrl+Y",
+            ),
             Action::Select => i("Select", "Select and move", Icon::Select, "Esc"),
             Action::PlaceSymbol => i(
                 "Symbol",
@@ -390,7 +395,7 @@ impl Action {
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
             Action::Rotate => i(
                 "Rotate",
-                "Rotate the selected symbols 90°, or the symbol being placed",
+                "Rotate the selected symbols 90°, the symbol being placed, or the device picked on a panel layout",
                 Icon::Rotate,
                 "R",
             ),
@@ -442,7 +447,7 @@ impl Action {
             ),
             Action::PageProps => i(
                 "Page properties",
-                "Number, title and sheet size of this page",
+                "Edit this page's number, title, sheet size and its own title-block values",
                 Icon::PageProps,
                 "",
             ),
@@ -460,7 +465,7 @@ impl Action {
             ),
             Action::PrevPage => i("Previous page", "Open the page before this one", Icon::PagePrev, "PgUp"),
             Action::NextPage => i("Next page", "Open the page after this one", Icon::PageNext, "PgDn"),
-            Action::DeletePage => i("Delete page", "Delete this page", Icon::PageDelete, ""),
+            Action::DeletePage => i("Delete page", "Delete this page (asks first)", Icon::PageDelete, ""),
             Action::NewPanel => i(
                 "Panel layout",
                 "Add a cabinet panel layout: a 600 x 800 mm mounting plate with wire ducts and DIN rails",
@@ -479,8 +484,8 @@ impl Action {
                 Icon::PageDelete,
                 "",
             ),
-            Action::ZoomIn => i("Zoom in", "Zoom in", Icon::ZoomIn, "+"),
-            Action::ZoomOut => i("Zoom out", "Zoom out", Icon::ZoomOut, "-"),
+            Action::ZoomIn => i("Zoom in", "Show the page larger", Icon::ZoomIn, "+"),
+            Action::ZoomOut => i("Zoom out", "Show the page smaller", Icon::ZoomOut, "-"),
             Action::ZoomFit => i("Fit page", "Show the whole page", Icon::ZoomFit, "F"),
             Action::ToggleGrid => i("Grid", "Show or hide the grid", Icon::Grid, "G"),
             Action::Layers => i(
@@ -501,7 +506,12 @@ impl Action {
                 Icon::Library,
                 "",
             ),
-            Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
+            Action::LibraryUpdate => i(
+                "Update",
+                "Take the newer library versions of the project's symbols and parts, then show the library status",
+                Icon::Update,
+                "",
+            ),
             Action::NewSymbol => i(
                 "New symbol",
                 "Draw a new symbol and save it into a library folder",
@@ -632,7 +642,7 @@ impl Action {
             ),
             Action::Check => i(
                 "Check",
-                "Check the project: devices drawn twice, missing coils, shorts, open pins",
+                "Check the project for problems such as devices drawn twice, contacts without a coil, shorts and open pins",
                 Icon::Check,
                 "Ctrl+E",
             ),
@@ -644,7 +654,7 @@ impl Action {
             ),
             Action::Reports => i(
                 "Reports",
-                "Contents, parts, devices, wires, nets, terminals, cables, PLC I/O and locations as tables",
+                "Show the contents, parts, devices, wires, nets, terminals, cables, PLC I/O, PLC cards, locations and networks as tables",
                 Icon::Reports,
                 "Ctrl+R",
             ),
@@ -683,7 +693,7 @@ impl Action {
             ),
             Action::Assistant => i(
                 "Assistant",
-                "Show the AI assistant: tell it what to draw or change and it works in the open project",
+                "Show or hide the AI assistant: tell it what to draw or change and it works in the open project",
                 Icon::Assistant,
                 "Ctrl+J",
             ),
