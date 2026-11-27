@@ -142,15 +142,22 @@ pub fn plc_csv_bytes(dir: &Path, bytes: &[u8], log: &mut Log) -> Res<()> {
     Ok(())
 }
 
-/// Parts from a BMEcat catalogue into the library folder `lib` (`import parts-bmecat`).
+/// Parts from a BMEcat catalogue into the library folder `lib` (`import parts-bmecat`). A
+/// catalogue that gives no part is an error.
 pub fn parts_bmecat(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     let (n, warnings) = import_bmecat(file, lib)?;
     for w in warnings {
         err!(log, "warning: {}", escape_field(&w));
     }
+    if n == 0 {
+        return Err(NO_PART.into());
+    }
     out!(log, "imported {n} part(s) into {}", lib.display());
     Ok(())
 }
+
+/// Why `import parts-csv` and `import parts-bmecat` fail on a file that gives no part.
+const NO_PART: &str = "no part could be imported from the file";
 
 /// Parts from an EDZ archive into the library folder `lib` (`import parts-edz`).
 pub fn parts_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>, log: &mut Log) -> Res<()> {
@@ -165,7 +172,8 @@ pub fn parts_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>, log: &mut L
     Ok(())
 }
 
-/// Parts from a CSV list into the library folder `lib` (`import parts-csv`).
+/// Parts from a CSV list into the library folder `lib` (`import parts-csv`). A list that gives
+/// no part is an error.
 pub fn parts_csv(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     let bytes = read_file(file)?;
     let (parts, warnings) = crate::csv::file_rows(&bytes)
@@ -176,6 +184,9 @@ pub fn parts_csv(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     }
     for w in warnings {
         err!(log, "warning: {}", escape_field(&w));
+    }
+    if parts.is_empty() {
+        return Err(NO_PART.into());
     }
     out!(log, "imported {} part(s) into {}", parts.len(), lib.display());
     Ok(())
@@ -2360,6 +2371,28 @@ mod tests {
                 .ends_with(&format!("imported 2 part(s) into {}", lib.display())),
             "{log:?}"
         );
+    }
+
+    #[test]
+    fn a_parts_list_or_catalogue_that_gives_no_part_fails() {
+        let t = tmp();
+        let lib = t.path().join("lib");
+        let csv = t.path().join("parts.csv");
+        assert!(std::fs::write(&csv, "order number;manufacturer\n").is_ok());
+        let mut log = Log::default();
+        assert_eq!(parts_csv(&csv, &lib, &mut log), Err(NO_PART.to_owned()));
+        assert!(!log.text().contains("imported"), "{log:?}");
+        let xml = t.path().join("cat.xml");
+        assert!(
+            std::fs::write(
+                &xml,
+                "<BMECAT version=\"2005\"><T_NEW_CATALOG></T_NEW_CATALOG></BMECAT>"
+            )
+            .is_ok()
+        );
+        let mut log = Log::default();
+        assert_eq!(parts_bmecat(&xml, &lib, &mut log), Err(NO_PART.to_owned()));
+        assert!(!lib.exists());
     }
 
     /// Every file under `dir` with its bytes.

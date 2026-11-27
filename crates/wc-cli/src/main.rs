@@ -1419,6 +1419,7 @@ enum ImportCmd {
     },
     /// Parts from a BMEcat catalogue (XML, version 1.2 or 2005): order number, maker,
     /// description, the maker's part number, GTIN, and ECLASS class and features as properties.
+    /// Fails when no part could be imported.
     PartsBmecat {
         /// The BMEcat XML file.
         file: PathBuf,
@@ -1467,7 +1468,8 @@ enum ImportCmd {
         letter_code: String,
     },
     /// Parts from a CSV or semicolon-separated export, or straight from an Excel workbook
-    /// (`.xlsx`, its first visible sheet), with the same column names either way.
+    /// (`.xlsx`, its first visible sheet), with the same column names either way. Fails when no
+    /// part could be imported.
     PartsCsv {
         /// The CSV or `.xlsx` file.
         file: PathBuf,
