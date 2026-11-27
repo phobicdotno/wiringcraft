@@ -1033,10 +1033,21 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
     t
 }
 
-/// Net list: each electrically connected group of pins, across pages.
+/// Net list: each electrically connected group of pins, across pages. Overview pages
+/// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
+/// and would list each net and pin twice.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
-    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let schematic;
+    let project = if i.project.pages.iter().any(|pg| pg.overview) {
+        let mut p = i.project.clone();
+        p.pages.retain(|pg| !pg.overview);
+        schematic = p;
+        &schematic
+    } else {
+        i.project
+    };
+    let nets = connectivity::nets_linked(project, |id| i.symbols.get(id).map(|s| s.role));
     let auto = auto_net_names(i, &nets);
     let mut rows: Vec<(String, Vec<String>)> = nets
         .iter()

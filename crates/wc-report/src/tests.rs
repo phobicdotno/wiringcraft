@@ -3958,3 +3958,31 @@ fn markdown_email_with_text_after_it_is_bracketed_only_when_commonmark_takes_it(
          | a\\@x\\_y.no\\* <a_b@x.no>\\&amp; a\\@-x.no\\_ a@x.no |\n"
     );
 }
+
+#[test]
+fn an_overview_page_adds_no_net_list_rows() {
+    let (mut p, s, parts) = fixture();
+    let nets = |p: &Project| {
+        net_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .rows
+    };
+    let before = nets(&p);
+    assert!(
+        before.iter().any(|r| r[0] == "0V" && r[1] == "2"),
+        "the fixture has a 0V net with two pins: {before:?}"
+    );
+    // The same schematic again, tags kept, drawn on a line diagram.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    assert_eq!(nets(&p), before, "an overview page adds no net rows or pins");
+    // A normal page with the same drawing does add its pins.
+    p.pages.last_mut().unwrap().overview = false;
+    assert_ne!(nets(&p), before);
+}
