@@ -4116,14 +4116,23 @@ impl Open {
             self.terminals_before.clone(),
         );
         self.ensure_symbols(ids)?;
+        // A symbol loaded here can renumber terminals already placed (a strip-only tag): that
+        // is settled in the live project before the copy is made, so the copy keeps it.
+        self.follow_terminals();
         let extent = generate::extent(&copies, |id| self.symbols.get(id).cloned());
         let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
         let mut project = self.project.clone();
         match generate::generate(&mut project, &copies, extent, size, &m.name) {
             Ok(done) => {
-                self.project = before;
+                // The undo step is the project as it was, taken as it is (nothing followed in
+                // it); the change in progress is then measured from the settled project.
+                let settled = std::mem::replace(&mut self.project, before);
+                self.forget_terminal_change();
                 self.checkpoint();
+                self.project = settled;
+                let base = self.project.meta.follows_terminals().then(|| self.terminal_numbers());
                 self.project = project;
+                self.terminals_before = base;
                 Ok(done)
             }
             Err(e) => {
