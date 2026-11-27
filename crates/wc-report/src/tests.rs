@@ -2431,6 +2431,58 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
 }
 
 #[test]
+fn parts_list_counts_the_strip_devices_part_once_per_terminal_tagged_with_only_the_strip() {
+    // -X2 in the fixture is drawn with the tag of the strip itself; two more such terminals,
+    // one of them drawn again on an overview page (no terminal of its own).
+    let (mut p, s, mut parts) = fixture();
+    p.pages[0].symbols.extend([
+        place("s20", "term", 140.0, Some("-X2")),
+        place("s21", "term", 145.0, Some("-X2")),
+    ]);
+    let mut overview = Page::new("p9", "9", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("o1", "term", 10.0, Some("-X2")));
+    p.pages.push(overview);
+    let term = Part {
+        id: "wago.2002-1201".into(),
+        order_number: "2002-1201".into(),
+        ..Default::default()
+    };
+    parts.insert(term.id.clone(), term.clone());
+    p.devices.insert(
+        DeviceTag::parse("-X2").unwrap(),
+        Device {
+            part: Some(term.id.clone()),
+            accessories: vec![wc_core::DevicePart {
+                part: "acme.marker".into(),
+                qty: 2,
+            }],
+            ..Default::default()
+        },
+    );
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = parts_list(&i);
+    let row = |order: &str| t.rows.iter().find(|r| r[3] == order).unwrap().clone();
+    // Three terminals, as the configurator lists them; the accessory keeps its own quantity.
+    assert_eq!(
+        (row("2002-1201")[1].as_str(), row("2002-1201")[5].as_str()),
+        ("3", "-X2")
+    );
+    assert_eq!(row("acme.marker")[1], "2");
+    let configured = configurator_list(&i)
+        .table
+        .rows
+        .iter()
+        .filter(|r| r[1] == "Terminal" && r[6] == "2002-1201")
+        .count();
+    assert_eq!(configured, 3);
+}
+
+#[test]
 fn an_accessory_of_terminals_drawn_as_the_strip_keeps_its_index_when_the_strip_is_reordered() {
     use wc_core::DevicePart;
     // Two terminals drawn with the tag of the strip itself: one device, -X2, for both.
