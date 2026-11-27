@@ -563,8 +563,11 @@ impl LibraryEntry {
 
 /// What [`Open::take_parts`] took into the project: parts loaded and part copies written.
 #[derive(Default)]
-struct TakenParts {
+pub(crate) struct TakenParts {
     loaded: Vec<String>,
+    /// Parts that were loaded and were loaded again (another version, the pinned one), with
+    /// what was loaded before.
+    replaced: Vec<(String, Part)>,
     copies: Vec<PathBuf>,
 }
 
@@ -608,7 +611,7 @@ pub struct Open {
     pub picture_problems: BTreeMap<String, String>,
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
-    terminals_before: Option<wc_core::project::TerminalNumbers>,
+    pub(crate) terminals_before: Option<wc_core::project::TerminalNumbers>,
     /// How far the running select-tool move drag has moved its items in `project`: kept with
     /// every undo and redo step taken during the drag, so Escape can take back from each just
     /// the part of the move it holds (#863). Zero outside a drag.
@@ -1161,7 +1164,12 @@ impl Open {
     /// Make sure a part is in the project (taken from the library when needed) and loaded.
     fn ensure_part(&mut self, id: &str) -> Result<(), String> {
         let pin = self.project.lock.parts.get(id).cloned();
-        if pin.is_some() && self.parts.contains_key(id) {
+        // A loaded part is used as it is only when it is the version the pin names; one loaded
+        // from a copy changed since is checked against the pin below.
+        if let (Some(pin), Some(loaded)) = (&pin, self.parts.get(id))
+            && loaded.id == id
+            && loaded.hash() == pin.hash
+        {
             return Ok(());
         }
         let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
@@ -1203,6 +1211,13 @@ impl Open {
             // is, never replaced by a newer library version, to the library that has the part.
             (None, true) => {
                 let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
+                // A copy holding another part is not pinned under this one's name.
+                if copy.id != id {
+                    return Err(format!(
+                        "part {id}: its copy in the project declares id {:?}; put the right copy back or update the part from the library",
+                        copy.id
+                    ));
+                }
                 let (found, source) = lib()?.part(id).map_err(|e| match e {
                     wc_library::Error::NotFound { .. } => {
                         format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")
@@ -1261,17 +1276,22 @@ impl Open {
 
     /// [`Open::ensure_part`] for each part until one cannot be used, with what this call added:
     /// the parts loaded here and the copies written that were not there.
-    fn take_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> (TakenParts, Result<(), String>) {
+    pub(crate) fn take_parts<'a>(
+        &mut self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> (TakenParts, Result<(), String>) {
         let mut taken = TakenParts::default();
         let mut r = Ok(());
         for id in ids {
-            let was_loaded = self.parts.contains_key(id);
+            let was = self.parts.get(id).cloned();
             let missing = store::vendor_path(&self.dir, ItemKind::Part, id)
                 .ok()
                 .filter(|path| !path.try_exists().unwrap_or(true));
             r = self.ensure_part(id);
-            if !was_loaded && self.parts.contains_key(id) {
-                taken.loaded.push(id.to_owned());
+            match was {
+                None if self.parts.contains_key(id) => taken.loaded.push(id.to_owned()),
+                Some(was) if self.parts.get(id) != Some(&was) => taken.replaced.push((id.to_owned(), was)),
+                _ => {}
             }
             taken.copies.extend(missing.filter(|path| path.exists()));
             if r.is_err() {
@@ -1283,9 +1303,17 @@ impl Open {
 
     /// Take back what [`Open::take_parts`] added and put `lock` back, for a change refused with
     /// `r`; a copy that cannot be removed is named in the error.
-    fn give_back<R>(&mut self, taken: TakenParts, lock: wc_core::Lockfile, r: Result<R, String>) -> Result<R, String> {
+    pub(crate) fn give_back<R>(
+        &mut self,
+        taken: TakenParts,
+        lock: wc_core::Lockfile,
+        r: Result<R, String>,
+    ) -> Result<R, String> {
         for id in taken.loaded {
             self.parts.remove(&id);
+        }
+        for (id, was) in taken.replaced {
+            self.parts.insert(id, was);
         }
         let mut left = Vec::new();
         for path in taken.copies {
@@ -1309,6 +1337,65 @@ impl Open {
                 )
             })
         }
+    }
+
+    /// The devices placing a group (`symbols`, `wires` and the group's own `devices`) gives the
+    /// tags it places, as [`wc_core::placement::place`] picks them: the group's device for a
+    /// tag, else (with `project_too`, its own data first) the project's; without it (its data
+    /// only, as macros are placed) none. The tags are those of the symbols and the cables of
+    /// the wires.
+    pub(crate) fn group_devices<'a>(
+        &'a self,
+        symbols: &'a [PlacedSymbol],
+        wires: &'a [Wire],
+        devices: &'a BTreeMap<DeviceTag, wc_core::Device>,
+        project_too: bool,
+    ) -> impl Iterator<Item = &'a wc_core::Device> + 'a {
+        let tags = symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref())
+            .chain(wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)));
+        tags.filter_map(move |t| {
+            devices
+                .get(t)
+                .or_else(|| project_too.then(|| self.project.devices.get(t)).flatten())
+        })
+    }
+
+    /// The parts `devices` name (their main parts and accessories) that a macro or a copy from
+    /// another project takes into the project when it is placed (#1855), as the CLI's `macro
+    /// place` does: those the project pins, and those a library has. A part no library has
+    /// stays a name on the device; `check` reports it. Libraries that cannot be opened refuse
+    /// with why, as a part they hold would otherwise be left out unnoticed.
+    pub(crate) fn parts_to_take<'a>(
+        &self,
+        devices: impl IntoIterator<Item = &'a wc_core::Device>,
+    ) -> Result<Vec<String>, String> {
+        let ids: std::collections::BTreeSet<&str> = devices
+            .into_iter()
+            .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect();
+        // The library is opened only when a part is not pinned.
+        let mut lib: Option<wc_library::Library> = None;
+        let mut out = Vec::new();
+        for id in ids {
+            if !self.project.lock.parts.contains_key(id) {
+                let lib = match &mut lib {
+                    Some(lib) => &*lib,
+                    None => &*lib.insert(
+                        wc_library::Library::open(&self.dir, &self.project)
+                            .map_err(|e| format!("part {id}: the libraries cannot be opened to look for it: {e}"))?,
+                    ),
+                };
+                if lib.locate(ItemKind::Part, id).is_none() {
+                    continue;
+                }
+            }
+            out.push(id.to_owned());
+        }
+        Ok(out)
     }
 
     /// Replace a device's accessories (its parts after the main part). New parts are taken from
@@ -1399,7 +1486,7 @@ impl Open {
     /// Take a snapshot before a change, so it can be undone.
     /// [`Open::checkpoint`] for a change that pinned library items before it: the undo step
     /// keeps the lock as it was (`lock`), so Undo takes those pins back and Redo brings them.
-    fn checkpoint_with_lock(&mut self, lock: wc_core::Lockfile) {
+    pub(crate) fn checkpoint_with_lock(&mut self, lock: wc_core::Lockfile) {
         let now = std::mem::replace(&mut self.project.lock, lock);
         self.checkpoint();
         self.project.lock = now;
@@ -4116,6 +4203,28 @@ impl Open {
             self.terminals_before.clone(),
         );
         self.ensure_symbols(ids)?;
+        // The parts the copies' devices name are taken too, all or none (#1855); the undo step
+        // below goes back to the lock before them.
+        let parts = self.parts_to_take(
+            copies
+                .iter()
+                // Placed with the macro's own data only (`macros::place`).
+                .flat_map(|c| self.group_devices(&c.symbols, &c.wires, &c.devices, false)),
+        );
+        let lock = self.project.lock.clone();
+        let (taken, r) = match parts {
+            Ok(parts) => self.take_parts(parts.iter().map(String::as_str)),
+            Err(e) => (TakenParts::default(), Err(e)),
+        };
+        if let Err(e) = r {
+            let r = self.give_back(taken, lock, Err(e));
+            self.project = before;
+            self.symbols = symbols;
+            self.library = library;
+            self.terminals_before = terminals;
+            self.touch();
+            return r;
+        }
         // A symbol loaded here can renumber terminals already placed (a strip-only tag): that
         // is settled in the live project before the copy is made, so the copy keeps it.
         self.follow_terminals();
@@ -4136,12 +4245,13 @@ impl Open {
                 Ok(done)
             }
             Err(e) => {
+                let r = self.give_back(taken, lock, Err(e.to_string()));
                 self.project = before;
                 self.symbols = symbols;
                 self.library = library;
                 self.terminals_before = terminals;
                 self.touch();
-                Err(e.to_string())
+                r
             }
         }
     }
