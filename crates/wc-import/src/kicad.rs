@@ -307,6 +307,11 @@ fn convert(
             continue;
         }
         for g in unit.items() {
+            // KiCad 8+: `(text private "text" ...)`, `(polyline private ...)`: a private item
+            // shows only in KiCad's symbol editor. A text that reads "private" is not one.
+            if g.arg(1) == Some("private") && (g.arg(2).is_some() || !matches!(g.head(), Some("text" | "text_box"))) {
+                continue;
+            }
             match g.head() {
                 Some("polyline") => {
                     let mut points: Vec<Point> = g
@@ -428,10 +433,6 @@ fn convert(
                 // KiCad 7+: a text with an optional border, `at` its top-left corner. Its lines
                 // are joined with a space into one text; margins are not kept.
                 Some("text_box") => {
-                    // `(text_box private "text" ...)`: a private box shows only in KiCad's editor.
-                    if g.arg(1) == Some("private") && g.arg(2).is_some() {
-                        continue;
-                    }
                     let (Some(t), Some(at)) = (g.arg(1), g.first("at")) else {
                         continue;
                     };
@@ -1053,6 +1054,36 @@ mod tests {
                 .any(|s| matches!(s, Shape::Text { text, .. } if text == "hidden" || text == "private"))
         );
         assert_eq!(warnings, ["T: 2 image item(s) not read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn private_texts_and_shapes_are_left_out() -> Result<()> {
+        // KiCad 8+: a private item shows only in KiCad's symbol editor.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "P" (property "Reference" "P" (at 0 0 0))
+    (symbol "P_0_1"
+      (text private "editor note" (at 0 5 0) (effects (font (size 1 1))))
+      (text "private" (at 0 8 0) (effects (font (size 1 1))))
+      (polyline private (pts (xy 0 0) (xy 5 5)))
+      (rectangle private (start 0 0) (end 2 2))
+      (circle private (center 0 0) (radius 1))
+      (arc private (start 0 1) (mid 1 0) (end 0 -1))
+      (polyline (pts (xy 0 0) (xy 3 0))))
+    (symbol "P_1_1"
+      (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let g = &syms[0].symbol.graphics;
+        // Only the public line and the text that reads "private" are drawn.
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert!(g.iter().any(|s| matches!(s, Shape::Line { .. })), "{g:?}");
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Text { text, at, .. } if text == "private" && at.y < -7.0)),
+            "{g:?}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
         Ok(())
     }
 
