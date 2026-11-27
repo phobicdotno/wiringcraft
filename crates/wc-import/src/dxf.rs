@@ -157,9 +157,21 @@ fn parse(text: &str) -> Result<Drawing> {
                   block: &mut Option<(String, Vec<Entity>)>,
                   polyline: &mut Option<Entity>,
                   d: &mut Drawing| match e.kind.as_str() {
-        "POLYLINE" => *polyline = Some(e),
+        "POLYLINE" => {
+            // The header's own 10/20/30 point is a dummy (always the origin): the line's points
+            // are its VERTEX entities, so it must not become the first of them.
+            let mut e = e;
+            e.codes.retain(|(c, _)| !matches!(c, 10 | 20 | 30));
+            *polyline = Some(e);
+        }
         "VERTEX" => {
-            if let Some(p) = polyline.as_mut() {
+            // A spline frame control point (flag 16) of a spline-fitted polyline lies off the
+            // curve and is not drawn: the points on the curve are the other vertices.
+            let frame = e
+                .get(70)
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .is_some_and(|f| f & 16 != 0);
+            if let Some(p) = polyline.as_mut().filter(|_| !frame) {
                 p.codes.push((10, e.get(10).unwrap_or("0").into()));
                 p.codes.push((20, e.get(20).unwrap_or("0").into()));
                 if let Some(bulge) = e.get(42) {
@@ -3662,6 +3674,31 @@ mod tests {
 
     fn near(a: Point, b: Point) -> bool {
         a.distance(b) < 1e-6
+    }
+
+    #[test]
+    fn a_spline_fitted_polyline_leaves_out_its_frame_control_points() -> Result<()> {
+        // PEDIT > Spline: the frame control point (flag 16) at (5, 50) is off the curve; the
+        // curve-fit vertices (flag 8) are the line that is drawn.
+        // The header carries the usual dummy point at the origin, which is not a vertex.
+        let ents = "0\nPOLYLINE\n8\n0\n66\n1\n10\n0\n20\n0\n30\n0\n70\n4\n\
+                    0\nVERTEX\n8\n0\n10\n0\n20\n0\n70\n16\n\
+                    0\nVERTEX\n8\n0\n10\n5\n20\n50\n70\n16\n\
+                    0\nVERTEX\n8\n0\n10\n10\n20\n0\n70\n16\n\
+                    0\nVERTEX\n8\n0\n10\n0\n20\n0\n70\n8\n\
+                    0\nVERTEX\n8\n0\n10\n5\n20\n10\n70\n8\n\
+                    0\nVERTEX\n8\n0\n10\n10\n20\n0\n70\n8\n\
+                    0\nSEQEND\n";
+        let (shapes, _) = drawn(ents, "")?;
+        let [s] = shapes.as_slice() else {
+            unreachable!("one polyline: {shapes:?}")
+        };
+        let (points, closed, _) = poly(s);
+        assert!(!closed);
+        let want = [Point::new(0.0, 0.0), Point::new(5.0, -10.0), Point::new(10.0, 0.0)];
+        assert_eq!(points.len(), want.len(), "{points:?}");
+        assert!(points.iter().zip(want).all(|(a, b)| near(*a, b)), "{points:?}");
+        Ok(())
     }
 
     #[test]
