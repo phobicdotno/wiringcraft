@@ -419,10 +419,7 @@ fn convert(
                         continue;
                     }
                     if length > 0.0 {
-                        graphics.push(Shape::Line {
-                            a: tip,
-                            b: Point::new(tip.x + inward.x, tip.y + inward.y),
-                        });
+                        graphics.extend(pin_shapes(g, tip, inward, length, scale));
                     }
                     pins.push(Pin {
                         name: pin_name,
@@ -531,6 +528,62 @@ fn convert(
             .unwrap_or("")
             .to_owned(),
     })
+}
+
+/// The pin line from `tip` to the body (`tip + inward`, `length` long) with KiCad's marks for
+/// the pin's shape, the word after its type: `inverted` draws a circle at the body end (radius
+/// half the pin number's text size), `clock` a triangle into the body (half the pin name's
+/// size), `inverted_clock` both. Other shapes draw the plain line.
+fn pin_shapes(pin: &Sexp, tip: Point, inward: Point, length: f64, scale: f64) -> Vec<Shape> {
+    let font = |head: &str| {
+        pin.first(head)
+            .and_then(|n| n.first("effects"))
+            .and_then(|e| e.first("font"))
+            .and_then(|f| f.first("size"))
+            .and_then(|s| s.num(1))
+            .filter(|v| *v > 0.0)
+    };
+    let number_size = font("number").unwrap_or(1.27);
+    let radius = number_size / 2.0 * scale;
+    let clock = font("name").unwrap_or(number_size) / 2.0 * scale;
+    let shape = pin.arg(2).unwrap_or("line");
+    let (inverted, clocked) = match shape {
+        "inverted" => (true, false),
+        "clock" => (false, true),
+        "inverted_clock" => (true, true),
+        _ => (false, false),
+    };
+    // `u` points from the tip into the body, `n` square to it.
+    let u = Point::new(inward.x / length, inward.y / length);
+    let n = Point::new(-u.y, u.x);
+    let root = Point::new(tip.x + inward.x, tip.y + inward.y);
+    let at = |from: Point, along: f64, across: f64| {
+        Point::new(from.x + u.x * along + n.x * across, from.y + u.y * along + n.y * across)
+    };
+    let mut out = Vec::new();
+    if inverted {
+        out.push(Shape::Circle {
+            center: at(root, -radius, 0.0),
+            radius,
+            filled: false,
+        });
+        if length > 2.0 * radius {
+            out.push(Shape::Line {
+                a: tip,
+                b: at(root, -2.0 * radius, 0.0),
+            });
+        }
+    } else {
+        out.push(Shape::Line { a: tip, b: root });
+    }
+    if clocked {
+        out.push(Shape::Polyline {
+            points: vec![at(root, 0.0, clock), at(root, clock, 0.0), at(root, 0.0, -clock)],
+            closed: false,
+            filled: false,
+        });
+    }
+    out
 }
 
 /// A KiCad text at `at` with its `effects` (size, justification), as one text per line.
@@ -1226,6 +1279,65 @@ mod tests {
         assert!((at.x - 4.0).abs() < 1e-9 && (at.y + 0.5).abs() < 1e-9, "{at:?}");
         assert!((height - 1.0).abs() < 1e-9);
         assert_eq!(align, Align::Center);
+        Ok(())
+    }
+
+    #[test]
+    fn inverted_and_clock_pins_draw_their_circle_and_triangle() -> Result<()> {
+        // A NAND output with its inversion circle, and a flip-flop's clock input.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "Nand" (property "Reference" "U" (at 0 0 0))
+    (symbol "Nand_1_1"
+      (pin output inverted (at 10 0 180) (length 5) (name "~") (number "3" (effects (font (size 1.27 1.27)))))))
+  (symbol "Clk" (property "Reference" "U" (at 0 0 0))
+    (symbol "Clk_1_1"
+      (pin input clock (at 0 0 0) (length 5) (name "C" (effects (font (size 1 1)))) (number "1"))))
+  (symbol "Both" (property "Reference" "U" (at 0 0 0))
+    (symbol "Both_1_1"
+      (pin input inverted_clock (at 0 0 0) (length 5) (name "C") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 3, "{warnings:?}");
+        let near = |p: Point, x: f64, y: f64| (p.x - x).abs() < 1e-6 && (p.y - y).abs() < 1e-6;
+        let graphics = |name: &str| {
+            syms.iter()
+                .find(|s| s.kicad_name == name)
+                .map(|s| s.symbol.graphics.clone())
+                .unwrap_or_default()
+        };
+        // The tip is the origin; the body is 5 mm to the left. The circle touches the body end
+        // and the line stops at the circle.
+        let g = graphics("Nand");
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Circle { center, radius, filled: false }
+                if near(*center, -4.365, 0.0) && (radius - 0.635).abs() < 1e-6)),
+            "{g:?}"
+        );
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Line { a, b } if near(*a, 0.0, 0.0) && near(*b, -3.73, 0.0))),
+            "{g:?}"
+        );
+        // The clock triangle points into the body, half the name's text size deep.
+        let g = graphics("Clk");
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Line { a, b } if near(*a, 0.0, 0.0) && near(*b, 5.0, 0.0))),
+            "{g:?}"
+        );
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Polyline { points, closed: false, .. }
+                if points.len() == 3 && near(points[1], 5.5, 0.0)
+                    && near(points[0], 5.0, 0.5) && near(points[2], 5.0, -0.5))),
+            "{g:?}"
+        );
+        // Both marks at once.
+        let g = graphics("Both");
+        assert!(g.iter().any(|s| matches!(s, Shape::Circle { .. })), "{g:?}");
+        assert!(g.iter().any(|s| matches!(s, Shape::Polyline { .. })), "{g:?}");
         Ok(())
     }
 
