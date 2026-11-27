@@ -5778,7 +5778,8 @@ impl eframe::App for App {
         // A close that waited a frame for a typed value: the field gives up the keyboard, so
         // the panels enter its value before the close asks about unsaved changes.
         let close_waited = self.closing == Closing::WaitsForTyped;
-        if close_waited {
+        // An assistant's open waited for a typed value the same way (#1091).
+        if close_waited || std::mem::take(&mut self.assistant.enter_typed) {
             enter_typed_value(ctx);
         }
         self.hold_close_while_importing(ctx);
@@ -5842,6 +5843,9 @@ impl eframe::App for App {
         }
         self.poll_import(ctx);
         self.log_messages();
+        self.assistant.typed_field = ctx
+            .memory(egui::Memory::focused)
+            .is_some_and(|f| Some(f) != self.assistant.input_id);
         self.assistant_poll(ctx);
         self.ask_pending();
         if self.applied_theme != self.prefs.theme {
@@ -8138,6 +8142,68 @@ mod nudge_tests {
         assert!(app.open.as_ref().unwrap().dirty, "with the typed value entered");
         // The folder picker is not shown in a test.
         app.pending = None;
+    }
+
+    /// The assistant's open_project while a field has a value typed and not entered yet is
+    /// refused once: the field gives up the keyboard in the next frame, the value is entered,
+    /// and asked again the assistant's open asks about the unsaved change (#1091).
+    #[test]
+    fn the_assistant_open_enters_a_typed_value_first() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let tag = |app: &App| {
+            app.open.as_ref().unwrap().project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let typed = format!("{}7", tag(&app).unwrap());
+        app_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())], false);
+        assert!(ctx.memory(|m| m.has_focus(field)), "the field still has the keyboard");
+        assert!(!app.open.as_ref().unwrap().dirty, "typed, not entered yet");
+        let path = serde_json::json!({ "path": other.display().to_string() });
+        let r = app.agent_tool("open_project", &path);
+        assert!(
+            matches!(&r, Err(e) if e.contains("typed in a field")),
+            "refused for the typed value: {r:?}"
+        );
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "not replaced");
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert_eq!(tag(&app).as_ref(), Some(&typed), "entered");
+        assert!(app.open.as_ref().unwrap().dirty, "an unsaved change now");
+        let r = app.agent_tool("open_project", &path);
+        assert!(matches!(&r, Ok(m) if m.contains("unsaved changes")), "{r:?}");
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Open(_)))));
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "still not replaced");
+
+        // With the keyboard in the assistant's own message box the open goes ahead.
+        let (tmp, mut app, ctx) = self::app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        theme::install_fonts(&ctx);
+        app.prefs.show_assistant = true;
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let Some(input) = app.assistant.input_id else {
+            unreachable!("the assistant panel shows its message box")
+        };
+        ctx.memory_mut(|m| m.request_focus(input));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(ctx.memory(|m| m.has_focus(input)), "the message box has the keyboard");
+        assert!(!app.assistant.typed_field, "not a field with a typed value");
+        let path = serde_json::json!({ "path": other.display().to_string() });
+        assert!(app.agent_tool("open_project", &path).is_ok());
+        assert_eq!(app.open.as_ref().unwrap().dir, other);
     }
 
     /// A session join that would replace the open project waits while a save waits for a

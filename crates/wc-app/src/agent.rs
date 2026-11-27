@@ -101,6 +101,14 @@ pub struct Assistant {
     /// refused once someone else changed the page's drawings (a session sync, the user).
     /// Shared, so the copy a tool call keeps to put back costs nothing.
     graphics_read: HashMap<(PathBuf, String), Arc<[Shape]>>,
+    /// The message box's id, so its keyboard is not taken for a field with a typed value.
+    pub input_id: Option<egui::Id>,
+    /// A field of the window other than the message box has the keyboard this frame: a value
+    /// typed in it may not be entered yet (set by `App::update` before the tools run).
+    pub typed_field: bool,
+    /// `open_project` was refused for a typed value: the field gives up the keyboard in the
+    /// next frame, so the panels enter the value before the assistant asks again (#1091).
+    pub enter_typed: bool,
 }
 
 impl Default for Assistant {
@@ -127,6 +135,9 @@ impl Assistant {
             clipboard: screenshot::Clipboard::default(),
             command_base: None,
             graphics_read: HashMap::new(),
+            input_id: None,
+            typed_field: false,
+            enter_typed: false,
         }
     }
 
@@ -168,6 +179,11 @@ impl Assistant {
 /// Why a changing tool waits while the unsaved-changes question is open.
 const UNSAVED_ASKED: &str = "the person is being asked whether to save the open project's unsaved \
                              changes; wait for their answer.";
+
+/// What `open_project` says while a field still has a value typed and not entered yet.
+const OPEN_TYPED: &str = "Not opened yet: a value typed in a field of the window was not entered yet. \
+                          It is entered now; call open_project again (the person may then be asked \
+                          whether to save the changes).";
 
 /// What `open_project` says while the person is asked about the open project's unsaved changes.
 const OPEN_ASKED: &str = "Not opened yet: the open project has unsaved changes, and the person was \
@@ -2233,6 +2249,13 @@ impl App {
             }
             "open_project" => {
                 let path = PathBuf::from(need_s(v, "path")?);
+                // A value typed in a field is entered when the field gives up the keyboard, as
+                // Ctrl+O and a window close wait a frame for it: opening now would drop it on a
+                // clean project without asking (#1091).
+                if self.assistant.typed_field && self.open.is_some() {
+                    self.assistant.enter_typed = true;
+                    return Err(OPEN_TYPED.into());
+                }
                 if v.get("create").and_then(Value::as_bool).unwrap_or(false) {
                     self.new_project(&path, s(v, "name").unwrap_or_default(), s(v, "base"));
                 } else {
