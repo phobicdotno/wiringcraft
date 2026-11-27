@@ -251,8 +251,12 @@ impl Shape {
                 Point::new(center.x + radius, center.y + radius),
             ],
             Shape::Text { at, .. } => vec![*at],
-            Shape::Dimension { .. } => {
+            Shape::Dimension { a, b, .. } => {
                 let parts = self.dimension_parts().unwrap_or_default();
+                if parts.is_empty() {
+                    // Nothing is drawn, but the dimension still sits where its points are.
+                    return bounds_of(&[*a, *b]);
+                }
                 parts
                     .iter()
                     .flat_map(|s| {
@@ -566,5 +570,212 @@ mod tests {
     fn rotation_from_degrees() {
         assert_eq!(Rotation::from_degrees(-90), Some(Rotation::R270));
         assert_eq!(Rotation::from_degrees(45), None);
+    }
+
+    #[test]
+    fn a_dimension_of_no_length_is_bounded_at_its_point() {
+        // Nothing is drawn, but the bounds must not jump to the page origin.
+        let d = dim((100.0, 80.0), (100.0, 80.0), 5.0);
+        assert_eq!(d.bounds(), (Point::new(100.0, 80.0), Point::new(100.0, 80.0)));
+        // A dimension with a NaN point draws nothing either.
+        let nan = dim((f64::NAN, 0.0), (5.0, 0.0), 5.0);
+        assert!(nan.dimension_parts().is_some_and(|p| p.is_empty()));
+    }
+
+    #[test]
+    fn bounds_of_points_handles_empty_single_and_nan() {
+        assert_eq!(bounds_of(&[]), (Point::default(), Point::default()));
+        let p = Point::new(-3.0, 7.5);
+        assert_eq!(bounds_of(&[p]), (p, p));
+        let pts = [Point::new(4.0, -1.0), Point::new(-2.0, 6.0), Point::new(1.0, 1.0)];
+        assert_eq!(bounds_of(&pts), (Point::new(-2.0, -1.0), Point::new(4.0, 6.0)));
+        // A NaN coordinate is skipped, the finite ones still count.
+        let with_nan = [
+            Point::new(f64::NAN, 2.0),
+            Point::new(1.0, f64::NAN),
+            Point::new(3.0, 4.0),
+        ];
+        assert_eq!(bounds_of(&with_nan), (Point::new(1.0, 2.0), Point::new(3.0, 4.0)));
+    }
+
+    #[test]
+    fn shape_bounds_cover_circles_arcs_texts_and_degenerate_shapes() {
+        let c = Point::new(10.0, 20.0);
+        let circle = Shape::Circle {
+            center: c,
+            radius: 2.0,
+            filled: false,
+        };
+        let full = (Point::new(8.0, 18.0), Point::new(12.0, 22.0));
+        assert_eq!(circle.bounds(), full);
+        // An arc is bounded by its whole circle, whatever its sweep.
+        let arc = Shape::Arc {
+            center: c,
+            radius: 2.0,
+            start: 0.0,
+            end: 10.0,
+        };
+        assert_eq!(arc.bounds(), full);
+        let text = Shape::Text {
+            at: c,
+            text: "a long label".into(),
+            height: 5.0,
+            align: Align::Center,
+            angle: 0.0,
+        };
+        assert_eq!(text.bounds(), (c, c));
+        let dot = Shape::Line { a: c, b: c };
+        assert_eq!(dot.bounds(), (c, c));
+        let empty = Shape::Polyline {
+            points: Vec::new(),
+            closed: true,
+            filled: false,
+        };
+        assert_eq!(empty.bounds(), (Point::default(), Point::default()));
+        assert_eq!(empty.placed(c, Rotation::R90, true), empty);
+    }
+
+    #[test]
+    fn a_placed_rect_keeps_min_below_max() {
+        let r = Shape::Rect {
+            min: Point::new(1.0, 2.0),
+            max: Point::new(4.0, 3.0),
+        };
+        for rot in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            for mirror in [false, true] {
+                let Shape::Rect { min, max } = r.placed(Point::new(10.0, 10.0), rot, mirror) else {
+                    unreachable!("a rect stays a rect")
+                };
+                assert!(min.x <= max.x && min.y <= max.y, "{rot:?} {mirror}: {min:?} {max:?}");
+                // Its size survives, swapped on a quarter turn.
+                let (w, h) = (max.x - min.x, max.y - min.y);
+                let quarter = matches!(rot, Rotation::R90 | Rotation::R270);
+                assert_eq!((w, h), if quarter { (1.0, 3.0) } else { (3.0, 1.0) });
+            }
+        }
+        let Shape::Rect { min, max } = r.placed(Point::default(), Rotation::R90, false) else {
+            unreachable!("a rect stays a rect")
+        };
+        assert_eq!((min, max), (Point::new(-3.0, 1.0), Point::new(-2.0, 4.0)));
+    }
+
+    #[test]
+    fn transforms_compose_as_expected() {
+        let p = Point::new(3.0, -2.0);
+        let twice = p.transform(Rotation::R90, false).transform(Rotation::R90, false);
+        assert_eq!(twice, p.transform(Rotation::R180, false));
+        let thrice = twice.transform(Rotation::R90, false);
+        assert_eq!(thrice, p.transform(Rotation::R270, false));
+        // Mirroring twice is a no-op; the mirror applies before the turn.
+        assert_eq!(p.transform(Rotation::R0, true).transform(Rotation::R0, true), p);
+        assert_eq!(p.transform(Rotation::R90, true), Point::new(2.0, -3.0));
+        // The origin stays put and distances are kept.
+        let o = Point::default();
+        for rot in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            assert_eq!(o.transform(rot, true), o);
+            assert_eq!(p.transform(rot, true).distance(o), p.distance(o));
+        }
+        assert_eq!(p.distance(p), 0.0);
+        assert!(p.distance(Point::new(f64::NAN, 0.0)).is_nan());
+    }
+
+    #[test]
+    fn rotation_degrees_round_trip_and_serialise_as_strings() {
+        for rot in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            assert_eq!(Rotation::from_degrees(rot.degrees()), Some(rot));
+            assert_eq!(Rotation::from_degrees(rot.degrees() + 720), Some(rot));
+            assert_eq!(Rotation::from_degrees(rot.degrees() - 360), Some(rot));
+            let json = serde_json::to_string(&rot).unwrap_or_default();
+            assert_eq!(json, format!("\"{}\"", rot.degrees()));
+            assert_eq!(serde_json::from_str::<Rotation>(&json).ok(), Some(rot));
+        }
+        assert_eq!(Rotation::from_degrees(-270), Some(Rotation::R90));
+        assert_eq!(Rotation::from_degrees(1), None);
+        assert_eq!(Rotation::from_degrees(i64::MIN), None);
+        assert!(serde_json::from_str::<Rotation>("90").is_err());
+        assert!(serde_json::from_str::<Rotation>("\"45\"").is_err());
+        assert!(Rotation::default().is_default());
+        assert!(!Rotation::R180.is_default());
+    }
+
+    #[test]
+    fn a_placed_arc_turns_and_flips_its_sweep() {
+        let arc = Shape::Arc {
+            center: Point::new(1.0, 0.0),
+            radius: 2.0,
+            start: 10.0,
+            end: 80.0,
+        };
+        let Shape::Arc { center, start, end, .. } = arc.placed(Point::new(5.0, 5.0), Rotation::R90, false) else {
+            unreachable!("an arc stays an arc")
+        };
+        assert_eq!((center, start, end), (Point::new(5.0, 6.0), 100.0, 170.0));
+        // A mirror reflects the sweep about the vertical, keeping it counter-clockwise.
+        let Shape::Arc { start, end, .. } = arc.placed(Point::default(), Rotation::R0, true) else {
+            unreachable!("an arc stays an arc")
+        };
+        assert_eq!((start, end), (100.0, 170.0));
+        let Shape::Arc { start, end, .. } = arc.placed(Point::default(), Rotation::R270, true) else {
+            unreachable!("an arc stays an arc")
+        };
+        assert_eq!((start, end), (370.0, 440.0));
+    }
+
+    #[test]
+    fn scaling_scales_sizes_but_not_angles() {
+        let arc = Shape::Arc {
+            center: Point::new(2.0, -1.0),
+            radius: 1.5,
+            start: 30.0,
+            end: 120.0,
+        };
+        assert_eq!(
+            arc.scaled(2.0),
+            Shape::Arc {
+                center: Point::new(4.0, -2.0),
+                radius: 3.0,
+                start: 30.0,
+                end: 120.0,
+            }
+        );
+        let text = Shape::Text {
+            at: Point::new(1.0, 1.0),
+            text: "x".into(),
+            height: 2.5,
+            align: Align::Right,
+            angle: 90.0,
+        };
+        let Shape::Text {
+            at,
+            height,
+            angle,
+            align,
+            ..
+        } = text.scaled(0.5)
+        else {
+            unreachable!("a text stays a text")
+        };
+        assert_eq!(
+            (at, height, angle, align),
+            (Point::new(0.5, 0.5), 1.25, 90.0, Align::Right)
+        );
+        assert_eq!(
+            dim((1.0, 0.0), (3.0, 0.0), 4.0).scaled(1.0),
+            dim((1.0, 0.0), (3.0, 0.0), 4.0)
+        );
+        let Shape::Dimension { offset, height, .. } = dim((1.0, 0.0), (3.0, 0.0), 4.0).scaled(3.0) else {
+            unreachable!("a dimension stays a dimension")
+        };
+        assert_eq!((offset, height), (12.0, 7.5));
+    }
+
+    #[test]
+    fn lengths_round_to_one_decimal() {
+        assert_eq!(format_length(0.0), "0");
+        assert_eq!(format_length(0.04), "0");
+        assert_eq!(format_length(0.25), "0.3");
+        assert_eq!(format_length(9.96), "10");
+        assert_eq!(format_length(100.0), "100");
+        assert_eq!(format_length(1.05e3), "1050");
     }
 }
