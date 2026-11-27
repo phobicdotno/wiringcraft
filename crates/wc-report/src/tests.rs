@@ -4423,6 +4423,36 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
         parts: &parts,
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
+    // A bit card ignores its step, so a stray one still has it compared by bits: %IX8.0 to
+    // %IX8.7 lie in byte 8, which a byte card at %IB8 also covers, whichever card came first.
+    p.meta.racks[0].cards.push(PlcCard {
+        step: Some(4),
+        ..card(5, 8, "%IX8.0")
+    });
+    p.meta.racks[0].cards.push(card(6, 1, "%IB8"));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("slot 6: address %IB8 is also on PLC rack \"R\" slot 5")),
+        "{w:?}"
+    );
+    p.meta.racks[0].cards.swap(4, 5);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("slot 5: address %IX8.0 is also on PLC rack \"R\" slot 6")),
+        "{w:?}"
+    );
 }
 
 #[test]
