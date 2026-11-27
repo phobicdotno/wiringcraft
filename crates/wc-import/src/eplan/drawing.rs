@@ -681,3 +681,251 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
     out.symbols = symbols.into_values().collect();
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eplan::{EplanGraphic, EplanPage};
+
+    fn function(tag: &str, kind: u16, pins: &[&str]) -> EplanFunction {
+        EplanFunction {
+            tag: tag.into(),
+            kind,
+            pins: pins.iter().map(|p| (*p).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn placed(tag: &str, kind: u16, pins: &[&str], page: u32, x: f64, y: f64) -> EplanFunction {
+        EplanFunction {
+            page: Some(page),
+            at: Some(Point::new(x, y)),
+            ..function(tag, kind, pins)
+        }
+    }
+
+    fn page(id: u32, name: &str, scale: f64) -> EplanPage {
+        EplanPage {
+            id,
+            name: name.into(),
+            description: String::new(),
+            scale,
+        }
+    }
+
+    fn pin_ref(item: &str, pin: &str) -> Endpoint {
+        Endpoint::Pin {
+            item: item.into(),
+            pin: pin.into(),
+        }
+    }
+
+    #[test]
+    fn unique_names_mark_three_repeats_then_number_them() {
+        let mut names = UniqueNames::default();
+        let got: Vec<String> = (0..6).map(|_| names.unique("1".into())).collect();
+        assert_eq!(got, ["1", "1'", "1''", "1'''", "1#4", "1#5"]);
+        // A name that already looks like a mark is skipped when the repeats reach it.
+        let mut names = UniqueNames::default();
+        assert_eq!(names.unique("A'".into()), "A'");
+        assert_eq!(names.unique("A".into()), "A");
+        assert_eq!(names.unique("A".into()), "A''");
+        // Blank pin names are numbered by position and then made unique like the rest.
+        let f = function("-X1", KIND_TERMINAL, &["", " 2 ", "", "1"]);
+        assert_eq!(pin_names(&f), ["1", "2", "3", "1'"]);
+    }
+
+    #[test]
+    fn variants_turn_in_quarter_steps_and_mirror_from_four() {
+        let want = [Rotation::R0, Rotation::R270, Rotation::R180, Rotation::R90];
+        for v in 0..8u8 {
+            assert_eq!(rotation_of(v), (want[usize::from(v % 4)], v >= 4), "variant {v}");
+        }
+        for d in [PinDir::Up, PinDir::Right, PinDir::Down, PinDir::Left] {
+            let i = dir_index(vector(d));
+            assert_eq!([PinDir::Up, PinDir::Right, PinDir::Down, PinDir::Left].get(i), Some(&d));
+        }
+        // Corner variants wrap every four.
+        assert_eq!(node_directions(70, 4), node_directions(70, 0));
+        assert_eq!(node_directions(70, 2), Some([true, false, false, true]));
+    }
+
+    #[test]
+    fn symbols_by_kind() {
+        assert!(symbol_for(&function("-U1", 0, &[])).is_none());
+        let id = |f: &EplanFunction| symbol_for(f).map(|s| s.id);
+        assert_eq!(
+            id(&function("-K1", 0, &["A1", "A2"])).as_deref(),
+            Some("eplan.coil.a1-a2")
+        );
+        // A fuse named A1/A2 stays a fuse.
+        assert_eq!(
+            id(&function("-F1", KIND_FUSE, &["A1", "A2"])).as_deref(),
+            Some("eplan.fuse.a1-a2")
+        );
+        assert_eq!(
+            id(&function("-H1", KIND_LAMP, &["X1", "X2"])).as_deref(),
+            Some("eplan.lamp.x1-x2")
+        );
+        let mut button = function("-S1", KIND_BUTTON_CONTACT, &["13", "14"]);
+        assert_eq!(id(&button).as_deref(), Some("eplan.button-make.13-14"));
+        button.detail = 2;
+        assert_eq!(id(&button).as_deref(), Some("eplan.button-break.13-14"));
+        // A breaker with an odd pin count falls back to a box.
+        assert_eq!(
+            id(&function("-Q1", KIND_BREAKER, &["1", "2", "3"])).as_deref(),
+            Some("eplan.box.1-2-3")
+        );
+        let mut t = function("-X1", KIND_TERMINAL, &["", ""]);
+        t.terminal = "7".into();
+        let Some(term) = symbol_for(&t) else { unreachable!() };
+        assert_eq!(term.id, "eplan.terminal.7");
+        assert_eq!(term.role, SymbolRole::Terminal);
+    }
+
+    #[test]
+    fn breaker_poles_sit_a_grid_step_apart() {
+        let Some(s) = symbol_for(&function("-Q1", KIND_BREAKER, &["1", "2", "3", "4", "5", "6"])) else {
+            unreachable!()
+        };
+        assert_eq!(s.id, "eplan.switch.1-2-3-4-5-6");
+        let at: Vec<(&str, Point, PinDir)> = s.pins.iter().map(|p| (p.name.as_str(), p.at, p.dir)).collect();
+        assert_eq!(
+            at,
+            [
+                ("1", Point::new(0.0, 0.0), PinDir::Up),
+                ("2", Point::new(0.0, LENGTH), PinDir::Down),
+                ("3", Point::new(GRID, 0.0), PinDir::Up),
+                ("4", Point::new(GRID, LENGTH), PinDir::Down),
+                ("5", Point::new(2.0 * GRID, 0.0), PinDir::Up),
+                ("6", Point::new(2.0 * GRID, LENGTH), PinDir::Down),
+            ]
+        );
+    }
+
+    #[test]
+    fn symbol_ids_are_safe_and_bounded() {
+        assert_eq!(safe("--A/b c--"), "a-b-c");
+        assert_eq!(safe(&"x".repeat(100)).len(), 60);
+        let long: Vec<String> = (0..40).map(|k| format!("P{k}")).collect();
+        let pins: Vec<&str> = long.iter().map(String::as_str).collect();
+        let Some(s) = symbol_for(&function("-A1", 0, &pins)) else {
+            unreachable!()
+        };
+        assert!(s.id.starts_with("eplan.box."));
+        assert!(s.id.len() <= "eplan.box.".len() + 60);
+    }
+
+    #[test]
+    fn facing_pins_on_one_line_are_wired() {
+        let project = EplanProject {
+            pages: vec![page(1, "1", 1.0)],
+            functions: vec![
+                placed("K1", 0, &["A1", "A2"], 1, 100.0, 200.0),
+                placed("K2", 0, &["A1", "A2"], 1, 100.0, 180.0),
+                // Off the line by more than the tolerance: not joined.
+                placed("K3", 0, &["A1", "A2"], 1, 100.2, 160.0),
+            ],
+            ..Default::default()
+        };
+        let d = pages(&project, 1);
+        let [pg] = d.pages.as_slice() else { unreachable!() };
+        assert_eq!(pg.symbols.len(), 3);
+        let Some(k1) = pg.symbols.first() else { unreachable!() };
+        assert_eq!(k1.at, Point::new(110.0, 93.0));
+        let ends: Vec<(&Endpoint, &Endpoint)> = pg.wires.iter().map(|w| (&w.from, &w.to)).collect();
+        assert_eq!(ends, [(&pin_ref("s1", "A2"), &pin_ref("s2", "A1"))]);
+        assert_eq!(d.symbols.len(), 1, "one shared coil symbol");
+        assert!(d.warnings.is_empty());
+    }
+
+    #[test]
+    fn unknown_nodes_join_every_way_and_warn() {
+        let project = EplanProject {
+            pages: vec![page(1, "1", 1.0)],
+            functions: vec![
+                placed("K1", 0, &["A1", "A2"], 1, 100.0, 200.0),
+                placed("K2", 0, &["A1", "A2"], 1, 100.0, 180.0),
+            ],
+            nodes: vec![EplanNode {
+                page: 1,
+                at: Point::new(100.0, 190.0),
+                symbol: 5,
+                variant: 0,
+            }],
+            ..Default::default()
+        };
+        let d = pages(&project, 1);
+        let [pg] = d.pages.as_slice() else { unreachable!() };
+        let node = Endpoint::Point {
+            at: Point::new(110.0, 103.0),
+        };
+        let ends: Vec<(&Endpoint, &Endpoint)> = pg.wires.iter().map(|w| (&w.from, &w.to)).collect();
+        assert_eq!(ends, [(&pin_ref("s1", "A2"), &node), (&pin_ref("s2", "A1"), &node)]);
+        let [w] = d.warnings.as_slice() else { unreachable!() };
+        assert!(w.starts_with("1 wire corner(s)"), "{w}");
+    }
+
+    #[test]
+    fn layouts_get_graphics_only_and_empty_pages_are_skipped() {
+        let project = EplanProject {
+            pages: vec![
+                page(1, "1", 1.0),
+                EplanPage {
+                    description: "Mounting".into(),
+                    ..page(2, "2", 5.0)
+                },
+                page(3, "3", f64::NAN),
+            ],
+            functions: vec![
+                placed("K1", 0, &["A1", "A2"], 2, 100.0, 200.0),
+                placed("K2", 0, &["A1", "A2"], 3, 50.0, 50.0),
+            ],
+            graphics: vec![EplanGraphic {
+                page: 2,
+                shape: line(0.0, 0.0, 50.0, 0.0),
+            }],
+            ..Default::default()
+        };
+        let d = pages(&project, 10);
+        let [layout, schematic] = d.pages.as_slice() else {
+            unreachable!()
+        };
+        assert_eq!((layout.id.as_str(), layout.number.as_str()), ("eplan-page-1", "10"));
+        assert_eq!(layout.title, "Eplan page 2: Mounting");
+        assert!(layout.symbols.is_empty());
+        assert_eq!(layout.graphics, [line(10.0, 293.0, 20.0, 293.0)]);
+        // A page with no usable scale is drawn at 1:1.
+        assert_eq!(
+            (schematic.id.as_str(), schematic.number.as_str()),
+            ("eplan-page-2", "11")
+        );
+        assert_eq!(schematic.title, "Eplan page 3");
+        let Some(k2) = schematic.symbols.first() else {
+            unreachable!()
+        };
+        assert_eq!(k2.at, Point::new(60.0, 243.0));
+        assert_eq!(d.drawn.iter().collect::<Vec<_>>(), ["K2"]);
+    }
+
+    #[test]
+    fn cables_show_their_name_and_terminals_their_number() {
+        let mut terminal = placed("X1", KIND_TERMINAL, &["", ""], 1, 20.0, 20.0);
+        terminal.terminal = "7".into();
+        let project = EplanProject {
+            pages: vec![page(1, "1", 1.0)],
+            functions: vec![placed("W1", 400, &[], 1, 0.0, 0.0), terminal],
+            ..Default::default()
+        };
+        let d = pages(&project, 1);
+        let [pg] = d.pages.as_slice() else { unreachable!() };
+        assert!(
+            pg.graphics
+                .iter()
+                .any(|g| matches!(g, Shape::Text { text, at, .. } if text == "W1" && *at == Point::new(10.0, 293.0)))
+        );
+        let [x1] = pg.symbols.as_slice() else { unreachable!() };
+        assert_eq!(x1.tag, device_tag("X1-7"));
+        assert_eq!(d.drawn.iter().collect::<Vec<_>>(), ["X1"]);
+    }
+}

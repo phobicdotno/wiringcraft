@@ -17,6 +17,8 @@ pub enum Chrome {
 #[serde(default)]
 pub struct Prefs {
     pub chrome: Chrome,
+    /// The ribbon tab that was open last, so the ribbon opens on it again.
+    pub ribbon_tab: usize,
     /// Light or dark interface.
     pub theme: crate::theme::Mode,
     pub show_grid: bool,
@@ -27,36 +29,103 @@ pub struct Prefs {
     pub recent: Vec<PathBuf>,
     /// The assistant panel is shown.
     pub show_assistant: bool,
+    /// The Layers window (View > Layers) is open.
+    pub show_layers: bool,
     /// The assistant's model, effort and (when not in the environment) API key.
     pub assistant: wc_agent::Settings,
     /// Editor layers this user hid or locked on the canvas.
     pub layers: crate::layers::Layers,
     /// Run the project check again after each edit and mark what it finds on the canvas.
     pub live_check: bool,
+    /// The main window's size and whether it was maximized when the app was last closed.
+    pub window: Window,
+}
+
+/// The main window as it was left, so the app opens again the way it was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Window {
+    /// Inner size in points of the window when it was not maximized; None until it is known.
+    pub size: Option<[f32; 2]>,
+    pub maximized: bool,
+}
+
+impl Window {
+    /// The size the window opens at when none is kept, and the smallest it may be.
+    pub const DEFAULT: [f32; 2] = [1400.0, 860.0];
+    pub const MIN: [f32; 2] = [900.0, 560.0];
+
+    /// Note the window as it is now. A maximized window keeps the size it had before, so
+    /// leaving the maximized state after a restart goes back to that size.
+    pub fn remember(&mut self, size: Option<[f32; 2]>, maximized: Option<bool>) {
+        if let Some(m) = maximized {
+            self.maximized = m;
+        }
+        if self.maximized {
+            return;
+        }
+        if let Some([w, h]) = size
+            && w.is_finite()
+            && h.is_finite()
+            && w > 0.0
+            && h > 0.0
+        {
+            self.size = Some([w, h]);
+        }
+    }
+
+    /// The size to open the window at: the kept one, made at least the smallest size and at
+    /// most a size no screen has (a hand-edited or broken value), or the default.
+    pub fn open_size(&self) -> [f32; 2] {
+        match self.size {
+            Some([w, h]) if w.is_finite() && h.is_finite() => {
+                [w.clamp(Self::MIN[0], 16384.0), h.clamp(Self::MIN[1], 16384.0)]
+            }
+            _ => Self::DEFAULT,
+        }
+    }
 }
 
 impl Default for Prefs {
     fn default() -> Self {
         Self {
             chrome: Chrome::Classic,
+            ribbon_tab: 0,
             theme: crate::theme::Mode::Light,
             show_grid: true,
             auto_wire: true,
             snap: 2.5,
             recent: Vec::new(),
             show_assistant: false,
+            show_layers: false,
             assistant: wc_agent::Settings::default(),
             layers: crate::layers::Layers::default(),
             live_check: true,
+            window: Window::default(),
         }
     }
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("APPDATA").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// The settings folder from the values of `XDG_CONFIG_HOME`, `APPDATA` and `HOME`, taken in that
+/// order. An empty or relative value is skipped, as the XDG spec asks, so the settings never land
+/// in whatever folder the app was started from.
+fn config_dir_from(
+    xdg: Option<&std::ffi::OsStr>,
+    appdata: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let absolute = |v: Option<&std::ffi::OsStr>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = absolute(xdg)
+        .or_else(|| absolute(appdata))
+        .or_else(|| absolute(home).map(|h| h.join(".config")))?;
     Some(base.join("wiringcraft"))
 }
 
@@ -247,6 +316,13 @@ pub fn assistant_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The preferences saved as `on_disk` with only the window replaced.
+fn with_window(on_disk: Option<&str>, window: Window) -> Prefs {
+    let mut p: Prefs = on_disk.and_then(|t| toml::from_str(t).ok()).unwrap_or_default();
+    p.window = window;
+    p
+}
+
 impl Prefs {
     pub fn load() -> Self {
         path()
@@ -262,6 +338,19 @@ impl Prefs {
         }
         let Some(p) = path() else { return };
         if let Ok(text) = toml::to_string_pretty(self) {
+            let _ = wc_core::store::write_if_changed(&p, &text);
+        }
+    }
+
+    /// Save only the window's size and state over the preferences on disk, so closing one
+    /// instance never undoes a setting another instance saved meanwhile.
+    pub fn save_window(window: Window) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(p) = path() else { return };
+        let on_disk = std::fs::read_to_string(&p).ok();
+        if let Ok(text) = toml::to_string_pretty(&with_window(on_disk.as_deref(), window)) {
             let _ = wc_core::store::write_if_changed(&p, &text);
         }
     }
@@ -286,6 +375,105 @@ impl Prefs {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_opens_at_the_size_it_was_closed_at() {
+        let mut w = Window::default();
+        assert_eq!(w.open_size(), Window::DEFAULT);
+        w.remember(Some([1200.0, 700.0]), Some(false));
+        assert_eq!(w.open_size(), [1200.0, 700.0]);
+        // Maximized: the size before is kept for when the window is made smaller again.
+        w.remember(Some([2560.0, 1400.0]), Some(true));
+        assert!(w.maximized);
+        assert_eq!(w.open_size(), [1200.0, 700.0]);
+        w.remember(Some([1000.0, 600.0]), Some(false));
+        assert!(!w.maximized);
+        assert_eq!(w.open_size(), [1000.0, 600.0]);
+        // A minimized window reports no usable size; the last one stays.
+        w.remember(Some([0.0, 0.0]), None);
+        assert_eq!(w.open_size(), [1000.0, 600.0]);
+    }
+
+    #[test]
+    fn closing_saves_the_window_over_what_another_instance_saved() {
+        let window = Window {
+            size: Some([1000.0, 700.0]),
+            maximized: false,
+        };
+        let on_disk = "live_check = false\n[window]\nsize = [1400.0, 860.0]\nmaximized = true\n";
+        let p = with_window(Some(on_disk), window);
+        assert!(!p.live_check, "a setting saved by another instance is kept");
+        assert_eq!(p.window, window);
+        assert_eq!(with_window(None, window).window, window);
+    }
+
+    #[test]
+    fn a_kept_window_size_the_app_cannot_use_is_corrected() {
+        let small = Window {
+            size: Some([10.0, 10.0]),
+            maximized: false,
+        };
+        assert_eq!(small.open_size(), Window::MIN);
+        let broken = Window {
+            size: Some([f32::NAN, 700.0]),
+            maximized: false,
+        };
+        assert_eq!(broken.open_size(), Window::DEFAULT);
+        let p: Prefs = toml::from_str("[window]\nsize = [1111.0, 777.0]\nmaximized = true\n").unwrap();
+        assert_eq!(
+            p.window,
+            Window {
+                size: Some([1111.0, 777.0]),
+                maximized: true
+            }
+        );
+        assert_eq!(toml::from_str::<Prefs>("").unwrap().window, Window::default());
+    }
+
+    #[test]
+    fn the_open_ribbon_tab_is_kept_and_older_files_open_on_the_first() {
+        let p = Prefs {
+            ribbon_tab: 2,
+            ..Prefs::default()
+        };
+        let back: Prefs = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back.ribbon_tab, 2);
+        let old: Prefs = toml::from_str("chrome = \"ribbon\"\n").unwrap();
+        assert_eq!(old.ribbon_tab, 0);
+    }
+
+    #[test]
+    fn an_empty_or_relative_config_variable_is_skipped() {
+        use std::ffi::OsStr;
+        let abs = std::env::temp_dir();
+        let a = abs.join("xdg");
+        let b = abs.join("appdata");
+        let h = abs.join("home");
+        // A good XDG_CONFIG_HOME wins.
+        assert_eq!(
+            config_dir_from(Some(a.as_os_str()), Some(b.as_os_str()), Some(h.as_os_str())),
+            Some(a.join("wiringcraft"))
+        );
+        // Empty or relative XDG_CONFIG_HOME falls through to APPDATA, then to HOME/.config.
+        for bad in ["", "rel", "./cfg"] {
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), Some(b.as_os_str()), Some(h.as_os_str())),
+                Some(b.join("wiringcraft")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), Some(OsStr::new(bad)), Some(h.as_os_str())),
+                Some(h.join(".config").join("wiringcraft")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), None, Some(OsStr::new(bad))),
+                None,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(config_dir_from(None, None, None), None);
+    }
 
     #[test]
     fn the_default_projects_folder_is_absolute() {
@@ -409,5 +597,17 @@ mod tests {
             home.join("Documents").join("WiringCraft")
         );
         assert!(projects_dir_in(None, None).is_absolute());
+    }
+
+    #[test]
+    fn the_layers_window_stays_open_across_a_restart_and_older_files_keep_it_closed() {
+        let p = Prefs {
+            show_layers: true,
+            ..Prefs::default()
+        };
+        let back: Prefs = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert!(back.show_layers);
+        let old: Prefs = toml::from_str("show_grid = false\n").unwrap();
+        assert!(!old.show_layers);
     }
 }

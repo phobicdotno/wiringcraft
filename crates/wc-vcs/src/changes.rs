@@ -340,13 +340,10 @@ pub fn page_history(git: &Git, page: &str, limit: usize) -> Result<Vec<PageVersi
     wc_core::store::check_id(page)?;
     let path = format!("pages/{page}.page.json");
     let n = format!("-n{}", limit.max(1));
-    let text = git.run(&["log", &n, "--format=%H%x1f%an%x1f%at%x1f%s%x1e", "--", &path])?;
+    let text = git.run(&["log", &n, "--format=%H%x00%an%x00%at%x00%s%x00", "--", &path])?;
     let mut out = Vec::new();
-    for record in text.split('\u{1e}') {
-        let fields: Vec<&str> = record.trim().split('\u{1f}').collect();
-        let [commit, author, time, subject] = fields.as_slice() else {
-            continue;
-        };
+    // NUL-ended fields, so a subject holding any other character keeps its record whole.
+    for [commit, author, time, subject] in crate::log_records(&text) {
         let old_text = git.show(&format!("{commit}^"), &path);
         let new_text = git.show(commit, &path);
         let (had, has) = (old_text.is_some(), new_text.is_some());
@@ -365,12 +362,236 @@ pub fn page_history(git: &Git, page: &str, limit: usize) -> Result<Vec<PageVersi
             }],
         };
         out.push(PageVersion {
-            commit: (*commit).to_owned(),
-            author: (*author).to_owned(),
-            time: time.parse().unwrap_or(0),
-            subject: (*subject).to_owned(),
+            commit: commit.to_owned(),
+            author: author.to_owned(),
+            time: time.trim().parse().unwrap_or(0),
+            subject: subject.to_owned(),
             changes,
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wc_core::geom::{Point, Shape};
+    use wc_core::project::{Endpoint, Wire};
+    use wc_core::{DeviceTag, PlacedSymbol, store};
+
+    fn symbol(id: &str, lib: &str, tag: Option<&str>) -> wc_core::Result<PlacedSymbol> {
+        Ok(PlacedSymbol {
+            id: id.into(),
+            symbol: lib.into(),
+            at: Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: tag.map(DeviceTag::parse).transpose()?,
+        })
+    }
+
+    fn wire(id: &str, x: f64) -> Wire {
+        Wire {
+            id: id.into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point { at: Point::new(x, 0.0) },
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        }
+    }
+
+    fn shown(old: Option<&Page>, new: Option<&Page>) -> Vec<String> {
+        page_changes(old, new).iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_page_added_removed_or_renamed_is_named() {
+        let a = Page::new("p", "3", "Motor");
+        assert!(page_changes(None, None).is_empty());
+        assert_eq!(shown(None, Some(&a)), ["page 3 added (Motor)"]);
+        assert_eq!(shown(Some(&a), None), ["page 3 removed (Motor)"]);
+        let mut b = a.clone();
+        b.title = "Pump".into();
+        b.number = "4".into();
+        // Renumbered first, then renamed, both under the new number.
+        assert_eq!(
+            page_changes(Some(&a), Some(&b)),
+            [
+                Change::PageRenumbered {
+                    page: "4".into(),
+                    from: "3".into(),
+                },
+                Change::PageRenamed {
+                    page: "4".into(),
+                    from: "Motor".into(),
+                    to: "Pump".into(),
+                },
+            ]
+        );
+        assert_eq!(shown(Some(&a), Some(&b))[1], r#"page 4 renamed "Motor" -> "Pump""#);
+    }
+
+    #[test]
+    fn wires_added_removed_and_changed_are_listed_by_id() {
+        let mut a = Page::new("p", "3", "X");
+        a.wires = vec![wire("w1", 10.0), wire("w2", 20.0), wire("w3", 30.0)];
+        let mut b = a.clone();
+        b.wires.retain(|w| w.id != "w2");
+        b.wires[0].number = Some("101".into());
+        b.wires.push(wire("w4", 40.0));
+        // w3 is untouched and not listed; additions and changes come before removals.
+        assert_eq!(
+            shown(Some(&a), Some(&b)),
+            [
+                "page 3: wire w1 changed",
+                "page 3: wire w4 added",
+                "page 3: wire w2 removed",
+            ]
+        );
+        // Only the wire order changed: matched by id, no wire is named, but the file differs.
+        let mut c = a.clone();
+        c.wires.reverse();
+        assert_eq!(shown(Some(&a), Some(&c)), ["page 3: page changed"]);
+    }
+
+    #[test]
+    fn a_symbol_without_a_tag_is_named_by_its_library_symbol() -> wc_core::Result<()> {
+        let mut a = Page::new("p", "3", "X");
+        a.symbols = vec![symbol("s1", "terminal", None)?, symbol("s2", "coil", Some("-K1"))?];
+        let mut b = a.clone();
+        b.symbols.retain(|s| s.id != "s1");
+        assert_eq!(shown(Some(&a), Some(&b)), ["page 3: terminal terminal removed"]);
+        assert_eq!(
+            page_changes(Some(&b), Some(&a)),
+            [Change::SymbolAdded {
+                page: "3".into(),
+                item: "terminal".into(),
+                what: "terminal".into(),
+            }]
+        );
+        // Tagged for the first time: the old tag is empty, the item is the symbol's id.
+        let mut c = a.clone();
+        c.symbols[0].tag = Some(DeviceTag::parse("-X1")?);
+        assert_eq!(
+            page_changes(Some(&a), Some(&c)),
+            [Change::SymbolRetagged {
+                page: "3".into(),
+                item: "s1".into(),
+                from: String::new(),
+                to: "-X1".into(),
+            }]
+        );
+        // Turned or mirrored in place is a move too.
+        let mut d = a.clone();
+        d.symbols[1].mirror = true;
+        assert_eq!(shown(Some(&a), Some(&d)), ["page 3: coil -K1 moved"]);
+        Ok(())
+    }
+
+    #[test]
+    fn graphics_changes_are_reported_once() {
+        let a = Page::new("p", "3", "X");
+        let mut b = a.clone();
+        b.graphics.push(Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(10.0, 0.0),
+        });
+        b.graphics.push(Shape::Line {
+            a: Point::new(0.0, 5.0),
+            b: Point::new(10.0, 5.0),
+        });
+        assert_eq!(shown(Some(&a), Some(&b)), ["page 3: graphics changed"]);
+    }
+
+    #[test]
+    fn other_files_are_listed_with_their_status() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+        let dir = tmp.path();
+        store::create(dir, "Demo")?;
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).map_err(|e| wc_core::Error::io(&path, e))
+        };
+        write("keep.txt", "one\n")?;
+        write("drop.txt", "one\n")?;
+        let git = Git::new(dir);
+        git.init()?;
+        let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+
+        write("keep.txt", "two\n")?;
+        std::fs::remove_file(dir.join("drop.txt")).map_err(|e| wc_core::Error::io("drop.txt", e))?;
+        // Not recorded yet, and in the pages folder without being a page file.
+        write("pages/notes.txt", "new\n")?;
+        let file = |path: &str, status: &str| Change::File {
+            path: path.into(),
+            status: status.into(),
+        };
+        let mut working = changes(&git, &base, None)?;
+        working.sort_by_key(ToString::to_string);
+        assert_eq!(
+            working,
+            [
+                file("drop.txt", "removed"),
+                file("keep.txt", "changed"),
+                file("pages/notes.txt", "added"),
+            ]
+        );
+
+        git.commit("Edit")?;
+        let mut recorded = changes(&git, &base, Some("HEAD"))?;
+        recorded.sort_by_key(ToString::to_string);
+        assert_eq!(recorded, working, "the same once recorded");
+        // The other way round: what was removed is added back, what was added is removed.
+        let mut back = changes(&git, "HEAD", Some(&base))?;
+        back.sort_by_key(ToString::to_string);
+        assert_eq!(
+            back,
+            [
+                file("drop.txt", "added"),
+                file("keep.txt", "changed"),
+                file("pages/notes.txt", "removed"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn page_history_keeps_to_the_limit() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = store::create(dir, "Demo")?;
+        let git = Git::new(dir);
+        git.init()?;
+        for title in ["One", "Two"] {
+            if let Some(page) = p.page_mut("p0001") {
+                page.title = title.into();
+            }
+            store::save(dir, &p)?;
+            git.commit(&format!("Title {title}"))?;
+        }
+        assert_eq!(page_history(&git, "p0001", 10)?.len(), 3);
+        let newest = page_history(&git, "p0001", 1)?;
+        let [only] = newest.as_slice() else {
+            unreachable!("one version: {newest:?}")
+        };
+        assert_eq!(only.subject, "Title Two");
+        assert_eq!(only.commit, git.head().unwrap_or_default());
+        assert!(only.time > 0);
+        assert!(
+            matches!(only.changes.as_slice(), [Change::PageRenamed { from, to, .. }] if from == "One" && to == "Two"),
+            "{:?}",
+            only.changes
+        );
+        // A limit of 0 still shows the newest version.
+        assert_eq!(page_history(&git, "p0001", 0)?, newest);
+        // A page that was never recorded has no history.
+        assert!(page_history(&git, "p9999", 10)?.is_empty());
+        Ok(())
+    }
 }
