@@ -2105,8 +2105,22 @@ impl Attach {
     }
 }
 
-/// The smallest and largest mounting plate side, in mm, that the panel layout fields take.
-const PLATE_SIDE: std::ops::RangeInclusive<f64> = 10.0..=10_000.0;
+/// The smallest and largest mounting plate side, in mm, that the panel layout fields and the
+/// assistant take.
+pub(crate) const PLATE_SIDE: std::ops::RangeInclusive<f64> = 10.0..=10_000.0;
+
+/// Refuses a plate `width` x `height` with a side outside [`PLATE_SIDE`].
+pub(crate) fn check_plate_size(width: f64, height: f64) -> Result<(), String> {
+    if PLATE_SIDE.contains(&width) && PLATE_SIDE.contains(&height) {
+        Ok(())
+    } else {
+        Err(format!(
+            "The plate width and height must be {} to {} mm, got {width} x {height} mm.",
+            PLATE_SIDE.start(),
+            PLATE_SIDE.end()
+        ))
+    }
+}
 
 /// The panel layout fields, in order: name, plate width, plate height.
 const PANEL_FIELDS: [&str; 3] = ["Name", "Plate width", "Plate height"];

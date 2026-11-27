@@ -3530,12 +3530,9 @@ impl App {
                 .unwrap_or(1);
             let id = format!("panel{n}");
             let name = s(v, "name").map(str::to_owned).unwrap_or_else(|| format!("Panel {n}"));
-            let panel = wc_core::panel::Panel::with_rails(
-                id.clone(),
-                name,
-                num(v, "width").unwrap_or(600.0),
-                num(v, "height").unwrap_or(800.0),
-            );
+            let (width, height) = (num(v, "width").unwrap_or(600.0), num(v, "height").unwrap_or(800.0));
+            crate::panels::check_plate_size(width, height)?;
+            let panel = wc_core::panel::Panel::with_rails(id.clone(), name, width, height);
             open.checkpoint();
             open.project.panels.push(panel);
             open.project.panels.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3587,6 +3584,11 @@ impl App {
                 content["id"] = json!(id);
                 let new: wc_core::panel::Panel =
                     serde_json::from_value(content).map_err(|e| format!("Not a panel layout: {e}"))?;
+                crate::panels::check_plate_size(new.width, new.height)?;
+                // Rails, ducts and devices must lie on the plate, as everywhere else they are placed.
+                new.clone()
+                    .resize(new.width, new.height)
+                    .map_err(|e| format!("Not replaced: {e}."))?;
                 open.checkpoint();
                 open.project.panels[pi] = new;
                 self.ed.panel_pick = None;
@@ -11297,6 +11299,46 @@ mod tests {
             a.agent_start("todo", &json!({"action": "file"})),
             Started::Done(Err(_))
         ));
+    }
+
+    #[test]
+    fn panels_new_and_replace_refuse_a_plate_size_or_item_off_the_plate() {
+        let (_tmp, mut a) = app(vec![]);
+        let project = a.open.as_ref().unwrap().project.clone();
+        for (w, h) in [(-600.0, 800.0), (0.0, 800.0), (600.0, 5.0), (600.0, 1e9)] {
+            let r = call(&mut a, "panels", json!({"action": "new", "width": w, "height": h}));
+            assert!(r.as_ref().is_err_and(|e| e.contains("plate width and height")), "{r:?}");
+            assert_eq!(
+                a.open.as_ref().unwrap().project,
+                project,
+                "no layout added for {w} x {h}"
+            );
+        }
+        call(&mut a, "panels", json!({"action": "new", "width": 600, "height": 800})).unwrap();
+        let project = a.open.as_ref().unwrap().project.clone();
+        let rail = json!({"kind": "rail", "at": {"x": 10.0, "y": 100.0}, "length": 100.0});
+        let off =
+            json!({"kind": "device", "tag": "-K1", "at": {"x": 550.0, "y": 100.0}, "width": 90.0, "height": 90.0});
+        for content in [
+            json!({"name": "P", "width": -1.0, "height": 800.0, "items": [rail]}),
+            json!({"name": "P", "width": 600.0, "height": 800.0, "items": [rail, off]}),
+        ] {
+            let r = call(&mut a, "panels", json!({"action": "replace", "content": content}));
+            assert!(r.is_err(), "{r:?}");
+            assert_eq!(a.open.as_ref().unwrap().project, project, "the layout stays as it was");
+        }
+        let r = call(
+            &mut a,
+            "panels",
+            json!({"action": "replace", "content": {"name": "P", "width": 600.0, "height": 800.0, "items": [off]}}),
+        );
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("-K1")),
+            "names what sticks out: {r:?}"
+        );
+        let ok = json!({"name": "P", "width": 600.0, "height": 800.0, "items": [rail]});
+        call(&mut a, "panels", json!({"action": "replace", "content": ok})).unwrap();
+        assert_eq!(a.open.as_ref().unwrap().project.panels[0].items.len(), 1);
     }
 
     #[test]
