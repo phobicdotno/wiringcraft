@@ -3967,6 +3967,11 @@ fn run(mut cli: Cli) -> Res<()> {
                 };
                 let changed = wc_core::translate::set_translation(dir, text, &lang, translation).map_err(e)?;
                 let file = wc_core::translate::TRANSLATIONS_FILE;
+                // Nothing removed means the text had no translation into this language: say so,
+                // as `location remove` does for a missing location, so a typo is not missed.
+                if matches!(edit, TranslationsCmd::Remove { .. }) && !changed {
+                    return Err(format!("{text:?} has no translation into {lang} in {file}"));
+                }
                 println!(
                     "{}",
                     match (&edit, changed) {
@@ -8782,6 +8787,16 @@ mod tests {
         cli(&dir, &["translations", "remove", "Cover", "--lang", "nb"]).unwrap();
         let err = cli(&dir, &["translations", "--lang", "nb"]).unwrap_err();
         assert!(err.contains("1 text(s)"), "{err}");
+        // Removing a translation that is not there is refused, like a missing location, and
+        // the file is left as it was.
+        let file = dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        let before = std::fs::read_to_string(&file).unwrap();
+        let err = cli(&dir, &["translations", "remove", "Cover", "--lang", "nb"]).unwrap_err();
+        assert!(err.contains("no translation") && err.contains("nb"), "{err}");
+        assert!(cli(&dir, &["translations", "remove", "Pumpz", "--lang", "de"]).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        // Setting a translation to what it already is stays a quiet success.
+        cli(&dir, &["translations", "--lang", "de", "set", "Pumps", "Pumpen"]).unwrap();
         assert!(
             cli(&dir, &["translations", "set", "Pumps", "x"]).is_err(),
             "no language"
