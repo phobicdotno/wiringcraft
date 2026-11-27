@@ -149,10 +149,21 @@ pub fn check_with_unreadable(
         }
     }
 
-    // Devices drawn twice: one tag on two coils, or on two copies of the same standalone symbol
-    // or terminal. Contacts may repeat (a relay has several). An overview page (line diagram)
-    // shows devices again on purpose, so its symbols do not count here.
-    let mut seen: BTreeMap<(DeviceTag, String), Vec<(&Page, &str)>> = BTreeMap::new();
+    // Devices drawn twice: one tag on two coils, or on two copies of the same standalone symbol,
+    // or one terminal number of a strip on two terminals of any symbol. Terminals tagged with
+    // only their strip (`-X1`) are numbered one by one, so each is its own terminal. Contacts
+    // may repeat (a relay has several). An overview page (line diagram) shows devices again on
+    // purpose, so its symbols do not count here.
+    let terminals = wc_core::project::terminal_numbers(p, role);
+    // What a tag is drawn as: its coil, a numbered terminal (the tag is the strip with the
+    // number), or a symbol, by id. Kept apart so that no symbol id can pass for the others.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum DrawnAs {
+        Main,
+        NumberedTerminal,
+        Symbol(String),
+    }
+    let mut seen: BTreeMap<(DeviceTag, DrawnAs), Vec<(&Page, &str)>> = BTreeMap::new();
     let mut mains: BTreeSet<DeviceTag> = BTreeSet::new();
     for page in &p.pages {
         for s in &page.symbols {
@@ -163,12 +174,25 @@ pub fn check_with_unreadable(
                     if page.overview {
                         continue;
                     }
-                    seen.entry((tag.clone(), "main".into()))
+                    seen.entry((tag.clone(), DrawnAs::Main))
                         .or_default()
                         .push((page, &s.id));
                 }
-                Some(SymbolRole::Standalone | SymbolRole::Terminal) if !page.overview => {
-                    seen.entry((tag.clone(), s.symbol.clone()))
+                Some(SymbolRole::Terminal) if !page.overview => {
+                    let key = match terminals.get(&(page.id.clone(), s.id.clone())) {
+                        Some((strip, number)) => {
+                            let mut terminal = strip.clone();
+                            terminal.product.push(number.clone());
+                            (terminal, DrawnAs::NumberedTerminal)
+                        }
+                        // Not numbered (no strip in its tag, or a strip already at the largest
+                        // number): by its tag and symbol.
+                        None => (tag.clone(), DrawnAs::Symbol(s.symbol.clone())),
+                    };
+                    seen.entry(key).or_default().push((page, &s.id));
+                }
+                Some(SymbolRole::Standalone) if !page.overview => {
+                    seen.entry((tag.clone(), DrawnAs::Symbol(s.symbol.clone())))
                         .or_default()
                         .push((page, &s.id));
                 }

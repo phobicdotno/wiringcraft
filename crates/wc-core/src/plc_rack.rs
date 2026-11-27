@@ -82,10 +82,15 @@ pub const MAX_SLOT: u32 = 999;
 pub const MAX_STEP: u32 = 64;
 
 /// Why `racks` holds a number the PLC racks form would not let the user type (a slot past
-/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]);
-/// `None` when every number is in range. The assistant and the command line check racks they
-/// are given by this.
+/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]), or
+/// has two racks with one name (spaces around it do not count), which the command line could
+/// not tell apart; `None` when all is well. The assistant and the command line check racks
+/// they are given by this.
 pub fn problem(racks: &[PlcRack]) -> Option<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(twice) = racks.iter().map(|r| r.name.trim()).find(|n| !names.insert(*n)) {
+        return Some(format!("two racks are named {twice:?}"));
+    }
     racks.iter().find_map(|rack| {
         rack.cards.iter().find_map(|c| {
             let at = || format!("rack {:?}, card in slot {}", rack.name, c.slot);
@@ -387,6 +392,23 @@ mod tests {
             let got = problem(&[rack(bad)]).unwrap_or_default();
             assert!(got.contains(why) && got.starts_with("rack \"-A1\""), "{got}");
         }
+    }
+
+    #[test]
+    fn problem_names_a_rack_name_used_twice() {
+        let rack = |name: &str| PlcRack {
+            name: name.into(),
+            ..PlcRack::default()
+        };
+        assert_eq!(problem(&[rack("-A1"), rack("-A2")]), None);
+        assert_eq!(
+            problem(&[rack("-A1"), rack("-A2"), rack(" -A1 ")]).as_deref(),
+            Some("two racks are named \"-A1\"")
+        );
+        assert_eq!(
+            problem(&[rack(""), rack("  ")]).as_deref(),
+            Some("two racks are named \"\"")
+        );
     }
 
     #[test]
