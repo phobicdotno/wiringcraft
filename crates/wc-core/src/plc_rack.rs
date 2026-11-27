@@ -82,10 +82,15 @@ pub const MAX_SLOT: u32 = 999;
 pub const MAX_STEP: u32 = 64;
 
 /// Why `racks` holds a number the PLC racks form would not let the user type (a slot past
-/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]);
-/// `None` when every number is in range. The assistant and the command line check racks they
-/// are given by this.
+/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]), or
+/// has two racks with one name (spaces around it do not count), which the command line could
+/// not tell apart; `None` when all is well. The assistant and the command line check racks
+/// they are given by this.
 pub fn problem(racks: &[PlcRack]) -> Option<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(twice) = racks.iter().map(|r| r.name.trim()).find(|n| !names.insert(*n)) {
+        return Some(format!("two racks are named {twice:?}"));
+    }
     racks.iter().find_map(|rack| {
         rack.cards.iter().find_map(|c| {
             let at = || format!("rack {:?}, card in slot {}", rack.name, c.slot);
@@ -117,8 +122,9 @@ pub struct PlcAddress {
 
 impl PlcAddress {
     /// Reads `%IX0.0`, `%I0.0`, `I0.0`, `E0.0`, `IW64`, `A4.1`, `%QD8` and the like (spaces and
-    /// case do not matter). `None` when it is not a PLC address, a bit number is past 7 or a
-    /// bit address has no bit (or a word address has one).
+    /// case do not matter). Siemens peripheral spellings (`PEW256`, `PIW256`, `PAB4`, `PQD8`,
+    /// `%IW256:P`) read as the address they access directly. `None` when it is not a PLC
+    /// address, a bit number is past 7 or a bit address has no bit (or a word address has one).
     pub fn parse(address: &str) -> Option<Self> {
         Self::parse_any_bit(address).filter(|a| a.bit.is_none_or(|b| b <= 7))
     }
@@ -132,6 +138,14 @@ impl PlcAddress {
             .collect::<String>()
             .to_ascii_uppercase();
         let a = a.strip_prefix('%').unwrap_or(&a);
+        // TIA Portal marks a peripheral access with `:P` after the address.
+        let a = a.strip_suffix(":P").unwrap_or(a);
+        // STEP 7 writes it with a `P` in front of a byte, word or double word (`PEW256`).
+        let a = match a.strip_prefix('P') {
+            Some(rest) if matches!(rest.get(1..2), Some("B" | "W" | "D")) => rest,
+            Some(_) => return None,
+            None => a,
+        };
         let mut chars = a.chars();
         let output = match chars.next()? {
             'I' | 'E' => false,
@@ -281,7 +295,17 @@ mod tests {
         assert_eq!(iec("A4.1").as_deref(), Some("%QX4.1"));
         assert_eq!(iec("IW064").as_deref(), Some("%IW64"));
         assert_eq!(iec("%qd8").as_deref(), Some("%QD8"));
-        for bad in ["", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "%I0.1.2", "Slot 2"] {
+        // Siemens peripheral access names the same address.
+        assert_eq!(iec("PEW256").as_deref(), Some("%IW256"));
+        assert_eq!(iec("piw 256").as_deref(), Some("%IW256"));
+        assert_eq!(iec("PAB4").as_deref(), Some("%QB4"));
+        assert_eq!(iec("PQD8").as_deref(), Some("%QD8"));
+        assert_eq!(iec("%IW256:P").as_deref(), Some("%IW256"));
+        assert_eq!(iec("%I0.1:P").as_deref(), Some("%IX0.1"));
+        for bad in [
+            "", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "%I0.1.2", "Slot 2", "PE0.0", "PEX0.0", "P", "PW4",
+            "PPEW4", ":P", "%IW4:PP", "%IW4P",
+        ] {
             assert_eq!(PlcAddress::parse(bad), None, "{bad}");
         }
         // Bit 10 is read only when asked for.
@@ -312,6 +336,7 @@ mod tests {
         );
         assert_eq!(list(card("QW64", 3, None)).unwrap(), ["%QW64", "%QW66", "%QW68"]);
         assert_eq!(list(card("%IW0", 2, Some(1))).unwrap(), ["%IW0", "%IW1"]);
+        assert_eq!(list(card("PEW256", 2, None)).unwrap(), ["%IW256", "%IW258"]);
         assert!(list(card("Slot 1", 4, None)).is_err());
         assert!(list(card("%IX0.0", 0, None)).is_err());
         assert!(list(card("%IX0.0", MAX_CHANNELS + 1, None)).is_err());
@@ -379,6 +404,23 @@ mod tests {
         assert_eq!(card("  ", " DI 16x24 V DC ").label(), "DI 16x24 V DC");
         assert_eq!(card(" ", "\t").label(), "slot 3");
         assert_eq!(card("", "").label(), "slot 3");
+    }
+
+    #[test]
+    fn problem_names_a_rack_name_used_twice() {
+        let rack = |name: &str| PlcRack {
+            name: name.into(),
+            ..PlcRack::default()
+        };
+        assert_eq!(problem(&[rack("-A1"), rack("-A2")]), None);
+        assert_eq!(
+            problem(&[rack("-A1"), rack("-A2"), rack(" -A1 ")]).as_deref(),
+            Some("two racks are named \"-A1\"")
+        );
+        assert_eq!(
+            problem(&[rack(""), rack("  ")]).as_deref(),
+            Some("two racks are named \"\"")
+        );
     }
 
     #[test]
