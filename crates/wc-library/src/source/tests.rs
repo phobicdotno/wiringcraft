@@ -243,6 +243,27 @@ fn redact_location_hides_the_user_and_password_of_a_url() {
     assert_eq!(redact_location("../lib"), "../lib");
 }
 
+#[test]
+fn redact_location_hides_the_query_and_fragment_of_a_url() {
+    assert_eq!(
+        redact_location("https://u:p@host/path?token=x#f"),
+        "https://***@host/path?***"
+    );
+    assert_eq!(redact_location("https://host/path?token=x"), "https://host/path?***");
+    assert_eq!(redact_location("https://host/path#f"), "https://host/path#***");
+    assert_eq!(redact_location("https://u@host?token=x"), "https://***@host?***");
+}
+
+#[test]
+fn git_error_text_is_redacted_in_every_form_of_the_url() {
+    let location = "https://u:p@host/lib.git?token=x";
+    let shown = "https://***@host/lib.git?***";
+    for printed in [location, "https://host/lib.git?token=x", "host/lib.git?token=x"] {
+        let text = redact_text(&format!("fatal: unable to access '{printed}': refused"), location);
+        assert_eq!(text, format!("fatal: unable to access '{shown}': refused"));
+    }
+}
+
 // A file URL with a host needs a Unix path after it.
 #[cfg(unix)]
 #[test]

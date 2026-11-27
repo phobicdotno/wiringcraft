@@ -111,20 +111,54 @@ fn git(args: &[&str], cwd: Option<&Path>, name: &str) -> Result<()> {
     }
 }
 
-/// A source location as it may be shown: the user name and password of a URL
-/// (`https://user:token@host/path`) are replaced by `***`, so `https://***@host/path`.
+/// A source location as it may be shown: the user name and password of a URL are replaced by
+/// `***`, and so are its query and fragment, which can hold a token:
+/// `https://user:token@host/path?key=x#f` is shown as `https://***@host/path?***`.
 pub fn redact_location(location: &str) -> String {
     let Some((scheme, rest)) = location.split_once("://") else {
         return location.to_owned();
     };
+    let (had_userinfo, host_path, secret) = split_url(rest);
+    let userinfo = if had_userinfo { "***@" } else { "" };
+    let tail = match secret.chars().next() {
+        Some(mark) => format!("{mark}***"),
+        None => String::new(),
+    };
+    format!("{scheme}://{userinfo}{host_path}{tail}")
+}
+
+/// The part of a URL after `scheme://` split into whether it had a user name or password, its
+/// host and path without them, and its query and fragment (from the first `?` or `#`, empty
+/// when there is none).
+fn split_url(rest: &str) -> (bool, &str, &str) {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    match authority.rsplit_once('@') {
-        Some((_, host)) => {
-            let after = rest.strip_prefix(authority).unwrap_or_default();
-            format!("{scheme}://***@{host}{after}")
+    let (had_userinfo, host_path) = match authority.rfind('@').and_then(|at| rest.get(at + 1..)) {
+        Some(after) => (true, after),
+        None => (false, rest),
+    };
+    let (host_path, secret) = match host_path.find(['?', '#']) {
+        Some(at) => host_path.split_at_checked(at).unwrap_or((host_path, "")),
+        None => (host_path, ""),
+    };
+    (had_userinfo, host_path, secret)
+}
+
+/// `text` with every form of `location` that shows a secret replaced by [`redact_location`]:
+/// the location as given, and (when it has a query or fragment) the location without its user
+/// name and password and its bare host and path, as git may print it.
+fn redact_text(text: &str, location: &str) -> String {
+    let shown = redact_location(location);
+    let mut text = text.replace(location, &shown);
+    if let Some((scheme, rest)) = location.split_once("://") {
+        let (_, host_path, secret) = split_url(rest);
+        if !secret.is_empty() {
+            let bare = format!("{host_path}{secret}");
+            text = text
+                .replace(&format!("{scheme}://{bare}"), &shown)
+                .replace(&bare, &shown);
         }
-        None => location.to_owned(),
     }
+    text
 }
 
 /// Sync every source in order, one outcome each, going on past a source that fails.
@@ -160,7 +194,7 @@ fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> R
     sync_one_raw(project_dir, s, cache).map_err(|e| match e {
         Error::Source { name, message } if s.location.contains("://") => Error::Source {
             name,
-            message: message.replace(&s.location, &redact_location(&s.location)),
+            message: redact_text(&message, &s.location),
         },
         other => other,
     })
