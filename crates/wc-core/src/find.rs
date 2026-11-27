@@ -430,7 +430,8 @@ pub fn replace_renaming(
             let (mut old, mut new) = (from.clone(), to.clone());
             old.product.push(spare.clone());
             new.product.push(spare.clone());
-            if !p.devices.contains_key(&old) || renames.contains_key(&old) {
+            // Every spare of the layout moves, with device data or without.
+            if renames.contains_key(&old) {
                 continue;
             }
             let held = (p.devices.contains_key(&new) || drawn.contains_key(&new) || cables.contains(&new))
@@ -916,6 +917,35 @@ mod tests {
             "the spare's part goes with it"
         );
         assert!(!p.devices.contains_key(&tag("-X1.S1")));
+    }
+
+    #[test]
+    fn a_spare_without_data_may_not_move_onto_a_cable_tag() {
+        let mut p = sample();
+        p.meta.strips.push(crate::project::StripLayout {
+            strip: tag("-X1"),
+            order: Vec::new(),
+            spares: vec!["S1".into()],
+        });
+        p.devices.insert(tag("-X1"), Device::default());
+        p.devices.insert(
+            tag("-X2.S1"),
+            Device {
+                description: "Cable".into(),
+                ..Default::default()
+            },
+        );
+        let opts = FindOptions { match_case: true };
+        let hits: Vec<Hit> = find(&p, "X1", opts)
+            .into_iter()
+            .filter(|h| h.kind == FindKind::Tag && h.value == "-X1")
+            .collect();
+        let before = p.clone();
+        assert_eq!(
+            replace(&mut p, &hits, "X1", "X2", opts),
+            Err("-X2.S1 is already used.".into())
+        );
+        assert_eq!(p, before);
     }
 
     #[test]
