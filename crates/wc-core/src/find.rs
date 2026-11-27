@@ -360,11 +360,9 @@ pub fn replace_renaming(
             return Err(format!("{other} and {from} would both become {to}."));
         }
     }
-    let taken: Vec<DeviceTag> = p
-        .devices
-        .keys()
-        .cloned()
-        .chain(p.tag_index().into_keys())
+    // A cable that only wire cores name is taken too.
+    let taken: Vec<DeviceTag> = crate::placement::used_tags(&p)
+        .into_iter()
         .filter(|t| !renames.contains_key(t))
         .collect();
     if let Some(to) = renames.values().find(|to| taken.contains(to)) {
@@ -373,13 +371,8 @@ pub fn replace_renaming(
     // Renamed in two steps through placeholders, so `-K1` -> `-K2` and `-K2` -> `-K3` in one
     // replace do not run into each other. A placeholder is a tag nothing in the project uses
     // and no rename gives.
-    let mut used: std::collections::BTreeSet<DeviceTag> = p
-        .devices
-        .keys()
-        .cloned()
-        .chain(p.tag_index().into_keys())
-        .chain(renames.values().cloned())
-        .collect();
+    let mut used = crate::placement::used_tags(&p);
+    used.extend(renames.values().cloned());
     let mut next = 0usize;
     let mut placed: Vec<(DeviceTag, DeviceTag)> = Vec::new();
     for (from, to) in &renames {
@@ -598,6 +591,27 @@ mod tests {
         // -K1 -> -F1 is taken; -K12 -> -F12 would be fine.
         assert!(replace(&mut p, &both, "K1", "F1", opts).is_err());
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn a_cable_only_wire_cores_name_is_taken() {
+        let mut p = sample();
+        // -W1 has a core drawn but no cable symbol and no device entry.
+        p.pages[0].wires[0].cable = Some(crate::project::CableCore {
+            cable: tag("-W1"),
+            core: "1".into(),
+        });
+        let before = p.clone();
+        let opts = FindOptions { match_case: true };
+        let hits = find(&p, "-F1", opts);
+        assert_eq!(
+            replace(&mut p, &hits, "-F1", "-W1", opts),
+            Err("-W1 is already used.".into())
+        );
+        assert_eq!(p, before, "the cores of -W1 are not joined by -F1");
+        assert!(crate::placement::used_tags(&p).contains(&tag("-W1")));
+        let free = crate::placement::free_tag_like(&crate::placement::used_tags(&p), &tag("-W1"));
+        assert_eq!(free, Some(tag("-W2")), "a new cable does not take over -W1's cores");
     }
 
     #[test]

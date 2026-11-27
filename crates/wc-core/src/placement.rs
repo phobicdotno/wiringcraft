@@ -64,10 +64,18 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
-/// Every tag the project uses: on its pages and in its device data.
+/// Every tag the project uses: on its pages, in its device data and as the cable of a wire
+/// core (a cable with cores but no symbol drawn and no device entry is still taken).
 pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
     let mut used: BTreeSet<DeviceTag> = project.tag_index().into_keys().collect();
     used.extend(project.devices.keys().cloned());
+    used.extend(
+        project
+            .pages
+            .iter()
+            .flat_map(|p| &p.wires)
+            .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone())),
+    );
     used
 }
 
