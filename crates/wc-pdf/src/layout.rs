@@ -107,8 +107,8 @@ pub fn tag_lines(placed: &PlacedSymbol, symbol: &Symbol, tag: &DeviceTag) -> (Al
     (align, lines)
 }
 
-/// Cross-reference texts for a page: a coil lists its contacts with their pins and locations,
-/// a contact points back to its coil, an interruption point lists where the wire continues.
+/// Cross-reference texts for a page: a coil (or a breaker with aux contacts) lists its contacts
+/// with their pins and locations, a contact points back to it, an interruption point lists where the wire continues.
 /// Problems (a contact without a coil, an interruption point without a partner) go to `warnings`.
 pub fn xref_marks(
     page: &Page,
@@ -131,7 +131,11 @@ pub fn xref_marks(
         let right = placed.iter().map(|g| g.bounds().1.x).fold(s.at.x, f64::max);
         let (tag_align, tag_at) = tag_lines(s, sym, tag);
         match sym.role {
-            SymbolRole::Main => {
+            // A breaker or MPCB lists its aux contacts as a coil does, unless a coil of its
+            // tag lists them already (#1467).
+            SymbolRole::Main | SymbolRole::Standalone
+                if sym.role == SymbolRole::Main || !xref.mains.contains_key(tag) =>
+            {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
                     // Only named pins are listed; a contact without any shows its location alone.
                     let pins: Vec<&str> = a.pins.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
@@ -229,6 +233,10 @@ impl CrossRefs {
             .map(|p| p.id.as_str())
             .collect();
         for list in x.mains.values_mut() {
+            list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
+        }
+        // The same for a breaker: its contacts point to its schematic drawing (#1467).
+        for list in x.standalones.values_mut() {
             list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
         }
         x

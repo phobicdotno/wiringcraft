@@ -1648,13 +1648,15 @@ enum VcsCmd {
 }
 
 fn parse_point(s: &str) -> Result<Point, String> {
-    let (x, y) = s.split_once(',').ok_or("expected x,y")?;
-    let x: f64 = x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?;
-    let y: f64 = y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?;
+    let (x, y) = s
+        .split_once(',')
+        .ok_or("expected two numbers in mm with a comma between, e.g. 10,20")?;
+    let x: f64 = x.trim().parse().map_err(|_| "the first value is not a number")?;
+    let y: f64 = y.trim().parse().map_err(|_| "the second value is not a number")?;
     if x.is_finite() && y.is_finite() {
         Ok(Point::new(x, y))
     } else {
-        Err("coordinates must be finite".into())
+        Err("coordinates must be plain numbers, not inf or NaN".into())
     }
 }
 
@@ -2629,7 +2631,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.panels.iter().any(|x| x.id == id) {
-                        return Err(format!("panel {id:?} exists"));
+                        return Err(format!("panel {id:?} exists; pick another id"));
                     }
                     check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
@@ -2870,7 +2872,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 } => {
                     store::check_id(&id).map_err(e)?;
                     if p.page(&id).is_some() {
-                        return Err(format!("page {id:?} exists"));
+                        return Err(format!("page {id:?} exists; pick another id"));
                     }
                     let number = p.free_page_number(&number, None).map_err(e)?;
                     let mut page = Page::new(id, number, title);
@@ -2887,8 +2889,8 @@ fn run(mut cli: Cli) -> Res<()> {
                     for pg in &p.pages {
                         println!(
                             "{:<10} {:<6} {} ({} symbols, {} wires){}",
-                            pg.id,
-                            pg.number,
+                            escape_field(&pg.id),
+                            escape_field(&pg.number),
                             escape_field(&pg.title),
                             pg.symbols.len(),
                             pg.wires.len(),
@@ -2906,7 +2908,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let i = page_index(&p, &id)?;
                     // Same rule as the app: a project keeps at least one page.
                     if p.pages.len() <= 1 {
-                        return Err("A project needs at least one page.".into());
+                        return Err("a project needs at least one page".into());
                     }
                     p.pages.remove(i);
                 }
@@ -3453,22 +3455,60 @@ fn run(mut cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
-                    // A pinned symbol keeps its pinned version: a missing copy is put back from
-                    // a library that still has that version, never from a newer one. A symbol
-                    // without a pin is taken from the library and pinned, also when a copy is
-                    // left from an earlier attempt that failed before it was pinned.
+                    // A pinned symbol or part keeps its pinned version: a missing copy is put
+                    // back from a library that still has that version, never from a newer one.
+                    // One without a pin is taken from the library and pinned, also when a copy
+                    // is left from an earlier attempt that failed before it was pinned. The
+                    // parts are those the macro's devices and their accessories name, as
+                    // `device --part` takes them; a part no library has is left as it is.
                     let symbols: std::collections::BTreeSet<&str> =
                         m.symbols.iter().map(|s| s.symbol.as_str()).collect();
-                    // The library is opened only when a symbol needs it, so a macro whose
-                    // symbols all have their pinned copies works without it.
+                    let parts: std::collections::BTreeSet<&str> = m
+                        .devices
+                        .values()
+                        .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+                        .map(|id| id.trim())
+                        .filter(|id| !id.is_empty())
+                        .collect();
+                    let items = symbols
+                        .into_iter()
+                        .map(|id| (ItemKind::Symbol, id))
+                        .chain(parts.into_iter().map(|id| (ItemKind::Part, id)));
+                    // The library is opened only when an item needs it, so a macro whose
+                    // symbols and parts all have their pinned copies works without it.
                     let mut lib: Option<wc_library::Library> = None;
-                    for id in symbols {
-                        let pin = p.lock.symbols.get(id).cloned();
+                    for (kind, id) in items {
+                        let what = match kind {
+                            ItemKind::Symbol => "symbol",
+                            ItemKind::Part => "part",
+                        };
+                        let pin = match kind {
+                            ItemKind::Symbol => p.lock.symbols.get(id),
+                            ItemKind::Part => p.lock.parts.get(id),
+                        }
+                        .cloned();
                         if pin.is_some() {
-                            let vendored = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+                            let vendored = store::vendor_path(dir, kind, id).map_err(e)?;
                             if vendored.exists() {
                                 // A copy that cannot be read is reported now, not after saving.
-                                store::read_vendored_symbol(dir, id).map_err(e)?;
+                                match kind {
+                                    ItemKind::Symbol => store::read_vendored_symbol(dir, id).map(drop),
+                                    ItemKind::Part => store::read_vendored_part(dir, id).map(drop),
+                                }
+                                .map_err(e)?;
+                                continue;
+                            }
+                        }
+                        // A part no library has stays a name on the device, as before: `check`
+                        // reports it, and value sets may name parts kept elsewhere.
+                        if pin.is_none() && kind == ItemKind::Part {
+                            if lib.is_none() {
+                                match wc_library::Library::open(dir, &p) {
+                                    Ok(opened) => lib = Some(opened),
+                                    Err(_) => continue,
+                                }
+                            }
+                            if lib.as_ref().is_none_or(|lib| lib.locate(kind, id).is_none()) {
                                 continue;
                             }
                         }
@@ -3478,24 +3518,41 @@ fn run(mut cli: Cli) -> Res<()> {
                         };
                         match pin {
                             Some(pin) => {
-                                let fits = |s: &wc_core::Symbol| {
-                                    if s.id != id {
-                                        Err(format!("its file holds {}", s.id))
-                                    } else if s.hash() != pin.hash {
+                                let fits = |found: &str, hash: String| {
+                                    if found != id {
+                                        Err(format!("its file holds {found}"))
+                                    } else if hash != pin.hash {
                                         Err("another version".to_owned())
                                     } else {
                                         Ok(())
                                     }
                                 };
-                                let s = lib.find_version(ItemKind::Symbol, id, &pin.source, fits).map_err(|why| {
+                                let missing = |why: String| {
                                     format!(
-                                        "symbol {id}: its copy in the project is missing and no library has the version the project pins ({why})"
+                                        "{what} {id}: its copy in the project is missing and no library has the version the project pins ({why})"
                                     )
-                                })?;
-                                store::write_vendored_symbol(dir, &s).map_err(e)?;
+                                };
+                                match kind {
+                                    ItemKind::Symbol => {
+                                        let s = lib
+                                            .find_version(kind, id, &pin.source, |s: &wc_core::Symbol| {
+                                                fits(&s.id, s.hash())
+                                            })
+                                            .map_err(missing)?;
+                                        store::write_vendored_symbol(dir, &s).map_err(e)?;
+                                    }
+                                    ItemKind::Part => {
+                                        let part = lib
+                                            .find_version(kind, id, &pin.source, |part: &wc_core::Part| {
+                                                fits(&part.id, part.hash())
+                                            })
+                                            .map_err(missing)?;
+                                        store::write_vendored_part(dir, &part).map_err(e)?;
+                                    }
+                                }
                             }
                             None => {
-                                wc_library::take(dir, &mut p, lib, ItemKind::Symbol, id).map_err(e)?;
+                                wc_library::take(dir, &mut p, lib, kind, id).map_err(e)?;
                             }
                         }
                     }
@@ -4090,7 +4147,7 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::NumberWires { rule, overwrite } => {
             let rule = wc_core::numbering::Rule::parse(&rule)
-                .ok_or_else(|| format!("unknown rule {rule:?} (sequential, page-column, potential)"))?;
+                .ok_or_else(|| format!("unknown rule {rule:?}: use sequential, page-column or potential"))?;
             let mut p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
             let done = wc_core::numbering::number_wires(
@@ -4147,7 +4204,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     .page_id
                     .as_deref()
                     .and_then(|id| p.page(id))
-                    .map(|pg| format!("page {}: ", pg.number))
+                    .map(|pg| format!("page {}: ", escape_field(&pg.number)))
                     .unwrap_or_default();
                 println!("{:<7} {page}{}", f.severity.label(), escape_field(&f.message));
             }
@@ -4175,7 +4232,7 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::Report { kind, format, out, sep } => {
             if !matches!(sep, ',' | ';') {
-                return Err(format!("unknown separator {sep:?} (, or ;)"));
+                return Err(format!("unknown separator {sep:?}: use , or ;"));
             }
             if sep != ',' && format != "csv" {
                 return Err("--sep is for --format csv".into());
@@ -4398,10 +4455,10 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
         } => {
             store::check_id(&name).map_err(e)?;
             if p.meta.libraries.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
-                return Err(format!("source {name:?} exists"));
+                return Err(format!("source {name:?} exists; pick another name"));
             }
             if kind != "folder" && kind != "git" {
-                return Err("kind must be folder or git".into());
+                return Err(format!("unknown source kind {kind:?}: use folder or git"));
             }
             p.meta.libraries.push(LibrarySource {
                 name,
@@ -6053,7 +6110,7 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
         } else {
             vec![wc_report::Kind::parse(n).ok_or_else(|| {
                 format!(
-                    "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, all)"
+                    "unknown report {n:?}: use contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks or all"
                 )
             })?]
         };
@@ -6189,7 +6246,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
     let kinds = wc_report::parse_kinds(&args.kinds)?;
     let lines = wc_report::parse_lines(&args.lines)?;
     let language = wc_report::Language::parse(&args.lang)
-        .ok_or_else(|| format!("unknown language {:?} (en, de, nb)", args.lang))?;
+        .ok_or_else(|| format!("unknown language {:?}: use en, de or nb", args.lang))?;
     let p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     let mut warnings: Vec<String> = missing

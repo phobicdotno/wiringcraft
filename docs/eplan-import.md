@@ -127,8 +127,8 @@ drawn: 85 devices, 240 connections`. Before it, it may print:
 - `no pages or devices were recognised; the project may use a newer format`: the tables were
   found but nothing in them could be read.
 - `<n> connection(s) without named ends were skipped`.
-- `<n> connection(s) to a name without a pin (potentials, cable ends) are listed in the device
-  properties only`: these connections are not imported (see above).
+- `<n> connection(s) to a name without a pin (potentials, cable ends) were not imported`: see
+  the list above. They are not kept in the device properties either.
 - `<n> connection(s) of the connection list to devices on drawn pages were left out; their wires
   are traced from the drawing`: expected. Compare the drawn pages with EPLAN's if a wire is
   missing.
