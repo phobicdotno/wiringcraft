@@ -305,19 +305,26 @@ fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
             radius,
             start,
             end,
-        } if arc_sweep(*start, *end).is_some_and(|s| s < 360.0) => {
+        } if arc_sweep(*start, *end).is_some_and(|s| s.abs() < 360.0) => {
             let sweep = arc_sweep(*start, *end).unwrap_or(360.0);
-            // Taken round to one turn first, so a large angle still steps by quarter turns.
+            // Taken round to one turn first, so a large angle still steps by quarter turns. A
+            // negative sweep (`end` more than a turn before `start`) is drawn backwards: the
+            // same points as the arc from its end forwards.
             let from = start.rem_euclid(360.0);
+            let (lo, len) = if sweep < 0.0 {
+                (from + sweep, -sweep)
+            } else {
+                (from, sweep)
+            };
             let at = |deg: f64| {
                 let r = deg.to_radians();
                 Point::new(center.x + radius * r.cos(), center.y + radius * r.sin())
             };
-            pts.extend([at(from), at(from + sweep)]);
-            let first = (from / 90.0).floor() as i32 + 1;
+            pts.extend([at(lo), at(lo + len)]);
+            let first = (lo / 90.0).floor() as i32 + 1;
             for k in first..first + 4 {
                 let q = f64::from(k) * 90.0;
-                if q < from + sweep {
+                if q < lo + len {
                     pts.push(at(q));
                 }
             }
@@ -330,7 +337,8 @@ fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
 }
 
 /// The degrees an arc from `start` to `end` turns through as the PDF draws it: `end - start`,
-/// one more turn when that is 0 or less. `None` for angles that are not finite.
+/// one more turn when that is 0 or less (still negative for `end` more than a turn before
+/// `start`, which is drawn backwards). `None` for angles that are not finite.
 fn arc_sweep(start: f64, end: f64) -> Option<f64> {
     let sweep = end - start;
     sweep
@@ -945,6 +953,13 @@ mod tests {
         assert!(close(arc(30.0, 30.0), circle), "{:?}", arc(30.0, 30.0));
         // Large angles end, and measure as the same quarter as small ones.
         assert!(close(arc(3600.0, 3690.0), arc(0.0, 90.0)), "{:?}", arc(3600.0, 3690.0));
+        // 405 to -135 sweeps -180 degrees, backwards from 45 through 0 and -90 to -135.
+        assert!(close(arc(405.0, -135.0), arc(-135.0, 45.0)), "{:?}", arc(405.0, -135.0));
+        let (min, max) = arc(405.0, -135.0);
+        assert!(
+            (max.x - 10.0).abs() < 1e-6 && (min.y + 10.0).abs() < 1e-6,
+            "{min:?} {max:?}"
+        );
         let huge = arc(2.2204913818014264e18, 2.2204913818014264e18 + 1e6);
         assert!(huge.0.x.is_finite() && huge.1.x.is_finite());
         // A wire with only a number adds nothing: placing clears the number.
