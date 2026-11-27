@@ -13,7 +13,8 @@ publish part data and which formats WiringCraft reads, see
 A part lives in a library source as one JSON file under `parts/`. It has:
 
 - an id, usually `<maker>.<order number>` in lower case with other characters turned into `-`
-  (`Acme` and `AB-123` give `acme.ab-123`),
+  and any `-` at the start or end of each half dropped (`Acme` and `AB-123` give
+  `acme.ab-123`, `Acme` and `AB-123 (24V)` give `acme.ab-123--24v`),
 - the maker, the order number and a description,
 - free properties, such as `Rated current` or `Coil voltage`,
 - optionally: the symbol it is usually drawn with, the contacts it has (main, NO, NC,
