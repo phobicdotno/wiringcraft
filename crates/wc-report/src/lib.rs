@@ -763,8 +763,9 @@ fn pages_of(p: &Project, uses: &[(String, String)]) -> String {
 }
 
 /// Parts list (bill of materials): one row per part, with quantity and the devices using it.
-/// A device's accessories count with their quantity. Devices without any part come last so the
-/// gaps are visible. Tags are sorted with numbers by value (`-K2` before `-K10`).
+/// A device's accessories count with their quantity. A device that terminals tagged with only
+/// their strip are drawn as (`-X2`) counts its part once per terminal. Devices without any part
+/// come last so the gaps are visible. Tags are sorted with numbers by value (`-K2` before `-K10`).
 pub fn parts_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Parts list",
@@ -772,11 +773,35 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
     );
     let mut by_part: BTreeMap<String, (u64, Vec<DeviceTag>)> = BTreeMap::new();
     let mut without: Vec<DeviceTag> = Vec::new();
+    // Terminals tagged with only their strip (`-X2`) are each a terminal of the strip device's
+    // part, as in the WAGO configurator: that part counts once per terminal number.
+    let mut strip_terminals: BTreeMap<DeviceTag, BTreeSet<String>> = BTreeMap::new();
+    let numbers = wc_core::project::terminal_numbers(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    for ((page, item), (strip, number)) in numbers {
+        let drawn_as_strip = i
+            .project
+            .page(&page)
+            .and_then(|pg| pg.symbol(&item))
+            .and_then(|s| s.tag.as_ref())
+            .is_some_and(|t| *t == strip);
+        if drawn_as_strip {
+            strip_terminals.entry(strip).or_default().insert(number);
+        }
+    }
     for tag in all_tags(i) {
-        let parts = i.project.devices.get(&tag).map(|d| d.all_parts()).unwrap_or_default();
+        let Some(device) = i.project.devices.get(&tag) else {
+            without.push(tag);
+            continue;
+        };
+        let mut parts = device.all_parts();
         if parts.is_empty() {
             without.push(tag);
             continue;
+        }
+        if device.part.is_some()
+            && let (Some(main), Some(terminals)) = (parts.first_mut(), strip_terminals.get(&tag))
+        {
+            main.1 = u32::try_from(terminals.len()).unwrap_or(u32::MAX).max(1);
         }
         for (part, qty) in parts {
             let (n, tags) = by_part.entry(part.to_owned()).or_default();
