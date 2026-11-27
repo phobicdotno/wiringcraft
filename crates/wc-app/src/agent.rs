@@ -3570,9 +3570,8 @@ impl App {
             }
             "branch" => {
                 let name = need_s(v, "name")?;
-                git.create_branch(name)
-                    .and_then(|()| git.switch(name))
-                    .map_err(|e| e.to_string())?;
+                // Switches too, keeping changes not yet recorded (a second `switch` would refuse them).
+                git.create_branch(name).map_err(|e| e.to_string())?;
                 open.branch = name.to_owned();
                 Ok(format!("Now on branch {name}."))
             }
@@ -5108,6 +5107,20 @@ mod tests {
 
     fn call(app: &mut App, name: &str, input: Value) -> Result<String, String> {
         wc_agent::Tools::run(&mut AppTools(app), name, &input)
+    }
+
+    #[test]
+    fn versions_branch_works_with_changes_not_yet_recorded() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let git = wc_vcs::Git::new(&dir);
+        git.init().unwrap();
+        std::fs::write(dir.join("notes.txt"), "not recorded yet").unwrap();
+        let said = call(&mut a, "versions", json!({"action": "branch", "name": "draft"})).unwrap();
+        assert!(said.contains("Now on branch draft"), "{said}");
+        assert_eq!(a.open.as_ref().unwrap().branch, "draft");
+        assert_eq!(git.current_branch().as_deref(), Some("draft"));
+        assert!(dir.join("notes.txt").exists(), "the change came along");
     }
 
     #[test]

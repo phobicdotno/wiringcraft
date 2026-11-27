@@ -4479,7 +4479,8 @@ impl App {
     fn branch(&mut self, name: &str) {
         let Some(open) = self.open.as_mut() else { return };
         let git = wc_vcs::Git::new(&open.dir);
-        match git.create_branch(name).and_then(|()| git.switch(name)) {
+        // Switches too, keeping changes not yet recorded (a second `switch` would refuse them).
+        match git.create_branch(name) {
             Ok(()) => {
                 open.branch = name.to_owned();
                 self.ed.message = format!("Now on branch {name}.");

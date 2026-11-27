@@ -496,7 +496,9 @@ impl Git {
             .collect())
     }
 
-    /// Create a branch at the current version and switch to it.
+    /// Create a branch at the current version and switch to it. Changes not yet recorded come
+    /// along unchanged, so there is no need (and, with such changes, no way) to [`Git::switch`]
+    /// to it afterwards.
     pub fn create_branch(&self, name: &str) -> Result<()> {
         self.run(&["check-ref-format", "--branch", name])?;
         self.run(&["switch", "-q", "-c", name])?;
