@@ -5864,6 +5864,17 @@ fn export_drawings_logged(open: &Open, dir: &Path) -> (String, String) {
     }
 }
 
+/// Note the main window from one frame's viewport. Its size is kept in points at GUI zoom 1,
+/// the unit the window opens with, so a window closed while zoomed in opens at the same size.
+/// A minimized window reports no usable size and changes nothing.
+fn remember_window(window: &mut prefs::Window, v: &egui::ViewportInfo, zoom: f32) {
+    if v.minimized == Some(true) {
+        return;
+    }
+    let size = v.inner_rect.map(|r| [r.width() * zoom, r.height() * zoom]);
+    window.remember(size, v.maximized);
+}
+
 impl eframe::App for App {
     /// The window's size and maximized state are kept for the next start.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -5882,13 +5893,8 @@ impl eframe::App for App {
         }
         self.hold_close_while_importing(ctx);
         self.ask_before_closing(ctx);
-        ctx.input(|i| {
-            let v = i.viewport();
-            if v.minimized != Some(true) {
-                let size = v.inner_rect.map(|r| [r.width(), r.height()]);
-                self.prefs.window.remember(size, v.maximized);
-            }
-        });
+        let zoom = ctx.zoom_factor();
+        ctx.input(|i| remember_window(&mut self.prefs.window, i.viewport(), zoom));
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -7161,6 +7167,8 @@ mod library_tests {
 
 #[cfg(test)]
 mod icon_tests {
+    use eframe::egui;
+
     #[test]
     fn the_window_icon_is_built_in() {
         let icon = super::window_icon();
@@ -7172,6 +7180,38 @@ mod icon_tests {
     fn the_main_window_carries_the_icon() {
         let icon = super::main_viewport(&Default::default()).icon;
         assert_eq!(icon.map(|i| (i.width, i.height)), Some((256, 256)));
+    }
+
+    #[test]
+    fn the_main_window_opens_at_the_kept_size_and_state() {
+        let window = super::prefs::Window {
+            size: Some([1200.0, 700.0]),
+            maximized: true,
+        };
+        let v = super::main_viewport(&window);
+        assert_eq!(v.inner_size, Some(egui::vec2(1200.0, 700.0)));
+        assert_eq!(v.maximized, Some(true));
+    }
+
+    #[test]
+    fn the_window_size_is_kept_without_the_gui_zoom() {
+        let mut window = super::prefs::Window::default();
+        let mut v = egui::ViewportInfo {
+            inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        // At GUI zoom 1.2 a 1440 x 960 window measures 1200 x 800 points.
+        super::remember_window(&mut window, &v, 1.2);
+        let [w, h] = window.size.unwrap();
+        assert!((w - 1440.0).abs() < 0.01 && (h - 960.0).abs() < 0.01, "{w} x {h}");
+        // A minimized window changes nothing, not even the maximized state.
+        v.minimized = Some(true);
+        v.maximized = Some(true);
+        v.inner_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.0, 0.0)));
+        super::remember_window(&mut window, &v, 1.0);
+        assert!(!window.maximized);
+        assert_eq!(window.size, Some([w, h]));
     }
 }
 
