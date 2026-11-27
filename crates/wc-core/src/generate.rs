@@ -131,8 +131,10 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
         for s in &m.symbols {
             match symbol(&s.symbol) {
                 Some(def) => {
-                    let (a, b) = def.placed_bounds(s.at, s.rotation, s.mirror);
-                    pts.extend([a, b]);
+                    pts.push(s.at);
+                    for g in &def.graphics {
+                        drawn_points(&g.placed(s.at, s.rotation, s.mirror), &mut pts);
+                    }
                     pts.extend(def.pins.iter().map(|pin| s.at + pin.at.transform(s.rotation, s.mirror)));
                 }
                 None => {
@@ -150,25 +152,35 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
             pts.extend(w.via.iter().copied());
         }
         for g in &m.graphics {
-            match g {
-                Shape::Text {
-                    at,
-                    text,
-                    height,
-                    align,
-                    angle,
-                } => pts.extend(text_corners(*at, text, *height, *align, *angle)),
-                _ => {
-                    let (a, b) = g.bounds();
-                    pts.extend([a, b]);
-                }
-            }
+            drawn_points(g, &mut pts);
         }
     }
     if pts.is_empty() {
         pts.extend(copies.first().map(|m| m.anchor));
     }
     bounds_of(&pts)
+}
+
+/// Points round what a shape draws: a text as wide as it is drawn ([`text_corners`]), and a
+/// dimension through its parts, so its measured-length label counts the same way.
+fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
+    match g {
+        Shape::Text {
+            at,
+            text,
+            height,
+            align,
+            angle,
+        } => pts.extend(text_corners(*at, text, *height, *align, *angle)),
+        Shape::Dimension { a, b, .. } => match g.dimension_parts() {
+            Some(parts) if !parts.is_empty() => parts.iter().for_each(|p| drawn_points(p, pts)),
+            _ => pts.extend([*a, *b]),
+        },
+        _ => {
+            let (a, b) = g.bounds();
+            pts.extend([a, b]);
+        }
+    }
 }
 
 /// The corners of the box a text is drawn in: `at` on its baseline, as wide as the PDF draws it
@@ -509,8 +521,55 @@ mod tests {
         let one = m.apply(Some("small"), &BTreeMap::new())?;
         let ext = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
         assert_eq!(ext.1.x, 420.0);
-        let err = err_of(generate(&mut Project::new("x"), &[one], ext, PageSize::A4, "Wide"));
+        let err = err_of(generate(
+            &mut Project::new("x"),
+            std::slice::from_ref(&one),
+            ext,
+            PageSize::A4,
+            "Wide",
+        ));
         assert!(err.contains("does not fit"), "{err}");
+        // A symbol drawn as text alone counts as wide as the text is drawn.
+        let words = "Emergency stop, main cabinet";
+        let def = Symbol {
+            pins: Vec::new(),
+            graphics: vec![Shape::Text {
+                at: Point::default(),
+                text: words.into(),
+                height: 5.0,
+                align: Align::Left,
+                angle: 0.0,
+            }],
+            ..def
+        };
+        let at = one.symbols.first().map(|s| s.at).unwrap_or_default();
+        let ext = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
+        let width = crate::font::text_width_mm(words, 5.0);
+        assert!(ext.1.x >= at.x + width - 1e-9, "{ext:?} {at:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_s_label_counts_as_wide_as_it_is_drawn() -> Result<()> {
+        let mut c = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        // A 1 mm dimension whose label is wider than its line.
+        let dim = Shape::Dimension {
+            a: Point::new(200.0, 40.0),
+            b: Point::new(201.0, 40.0),
+            offset: 10.0,
+            height: 5.0,
+        };
+        c.graphics.push(dim.clone());
+        let (min, max) = extent(std::slice::from_ref(&c), |_| None);
+        let parts = dim.dimension_parts().unwrap_or_default();
+        let mut label = Vec::new();
+        for p in parts.iter().filter(|p| matches!(p, Shape::Text { .. })) {
+            drawn_points(p, &mut label);
+        }
+        assert!(!label.is_empty());
+        let (lmin, lmax) = bounds_of(&label);
+        assert!(lmax.x > 201.0 && lmin.x < 200.0, "{lmin:?} {lmax:?}");
+        assert!(min.x <= lmin.x && min.y <= lmin.y && max.x >= lmax.x && max.y >= lmax.y);
         Ok(())
     }
 

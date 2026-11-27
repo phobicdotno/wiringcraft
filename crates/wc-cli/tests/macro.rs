@@ -632,6 +632,47 @@ fn a_generation_whose_save_fails_leaves_the_project_as_it_was() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn a_generation_refuses_project_files_that_are_links() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    // The cover page is a link to a file kept elsewhere: a save would put a plain file there.
+    let cover = dir.join("pages/p0001.page.json");
+    let kept = tmp.path().join("cover.page.json");
+    std::fs::rename(&cover, &kept)?;
+    std::os::unix::fs::symlink(&kept, &cover)?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "set\n3 kW\n")?;
+    let err = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )
+    .err()
+    .ok_or("a linked page is refused")?
+    .to_string();
+    assert!(err.contains("is a link; macro generate"), "{err}");
+    assert!(
+        std::fs::symlink_metadata(&cover)?.file_type().is_symlink(),
+        "the link stays"
+    );
+    assert!(!dir.join("pages/p0002.page.json").exists(), "nothing is written");
+    Ok(())
+}
+
 #[test]
 fn a_table_cut_short_inside_a_quoted_cell_places_nothing() -> TestResult {
     let tmp = tempfile::tempdir()?;

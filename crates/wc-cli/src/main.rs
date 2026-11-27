@@ -3392,22 +3392,7 @@ fn run(mut cli: Cli) -> Res<()> {
             // The same for the project's own files (pages, panels, lock, ...): both the save and
             // the rollback would put a plain file where the link was (#614), so refuse before any
             // write.
-            let mut linked: Vec<String> = Vec::new();
-            for (path, _) in &before {
-                if is_link(path)? {
-                    linked.push(escape_field(&path.display().to_string()));
-                }
-            }
-            if !linked.is_empty() {
-                return Err(format!(
-                    "{} a link; box-edit does not replace project files that are links (copy each target over its link first)",
-                    if linked.len() == 1 {
-                        format!("{} is", linked[0])
-                    } else {
-                        format!("{} are", linked.join(", "))
-                    }
-                ));
-            }
+            refuse_linked_files(&before, "box-edit")?;
             // A run that stops between these writes leaves the journal: the next run puts the
             // files back from it (#653).
             let mut journaled = before.clone();
@@ -3635,6 +3620,8 @@ fn run(mut cli: Cli) -> Res<()> {
                     // does not place the rows already written again.
                     let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
                     let before = snapshot_project(dir, &new_pages, &[])?;
+                    // A link would become a plain file on the save and on the rollback (#614).
+                    refuse_linked_files(&before, "macro generate")?;
                     if let Err(err) = save(dir, &p) {
                         let failed = put_files_back(&before);
                         if failed.is_empty() {
@@ -6104,6 +6091,25 @@ fn same_file(at: &std::fs::Metadata, file: &std::fs::File) -> std::io::Result<bo
 
 /// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
 /// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
+/// Refuse, before any write, when a project file about to be saved is a link: the save and a
+/// rollback would both put a plain file where the link was (#614).
+fn refuse_linked_files<T>(files: &[(PathBuf, T)], command: &str) -> Result<(), String> {
+    let mut linked: Vec<String> = Vec::new();
+    for (path, _) in files {
+        if is_link(path)? {
+            linked.push(escape_field(&path.display().to_string()));
+        }
+    }
+    if linked.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} {} a link; {command} does not replace project files that are links (copy each target over its link first)",
+        linked.join(", "),
+        if linked.len() == 1 { "is" } else { "are" }
+    ))
+}
+
 fn is_link(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(m) => Ok(m.file_type().is_symlink()),
