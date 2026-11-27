@@ -91,7 +91,8 @@ impl Macro {
     }
 
     /// Check the placeholders and value sets: names are unique and not empty, value sets only
-    /// fill declared placeholders, and every placeholder the texts use is declared.
+    /// fill declared placeholders, every placeholder the texts use is declared, symbol ids are
+    /// unique and wires only end on the macro's own symbols.
     pub fn check(&self) -> Result<()> {
         let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
         let mut names: Vec<&str> = Vec::new();
@@ -105,7 +106,15 @@ impl Macro {
             }
             names.push(n);
         }
-        let symbols: BTreeSet<&str> = self.symbols.iter().map(|s| s.id.as_str()).collect();
+        let mut symbols: BTreeSet<&str> = BTreeSet::new();
+        for s in &self.symbols {
+            if !symbols.insert(s.id.as_str()) {
+                return bad(format!(
+                    "two symbols share the id {}, so wires to it would join the wrong one",
+                    s.id
+                ));
+            }
+        }
         for w in &self.wires {
             for end in [&w.from, &w.to] {
                 if let Endpoint::Pin { item, .. } = end
@@ -760,6 +769,16 @@ mod tests {
             pin: "1".into(),
         };
         assert!(err_of(dangling.check()).contains("s9"));
+
+        // Two symbols with one id are refused: placing would hang the wires on the wrong one.
+        let mut shared = starter()?;
+        let first = shared.symbols[0].id.clone();
+        let mut twin = shared.symbols[0].clone();
+        twin.tag = None;
+        shared.symbols.push(twin);
+        let err = err_of(shared.check());
+        assert!(err.contains(&format!("two symbols share the id {first}")), "{err}");
+        assert!(shared.apply(Some("3 kW"), &none).is_err());
 
         let mut stray = starter()?;
         stray.value_sets[0].values.insert("voltage".into(), "400".into());
