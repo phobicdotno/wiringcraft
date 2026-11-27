@@ -215,7 +215,7 @@ impl Network {
             // A link from a port to itself is one link on that port, and one warning about a
             // stranger: its second end is not counted again.
             let looped = matches!(&ends, [Ok(a), Ok(b)] if a == b);
-            for end in &ends[..if looped { 1 } else { 2 }] {
+            for end in ends.iter().take(if looped { 1 } else { 2 }) {
                 match end {
                     Ok(p) => {
                         if !devices.contains(&p.device) {
@@ -232,7 +232,7 @@ impl Network {
                     Err(e) => out.push(format!("network {name}: link {}: {e}", i + 1)),
                 }
             }
-            if looped && let Ok(a) = &ends[0] {
+            if looped && let [Ok(a), _] = &ends {
                 out.push(format!("network {name}: link {} joins {a} to itself", i + 1));
             }
         }
