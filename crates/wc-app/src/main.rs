@@ -3093,7 +3093,11 @@ impl App {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                        if ui
+                            .add_enabled(bad.is_none(), egui::Button::new("OK"))
+                            .on_disabled_hover_text(bad.as_deref().unwrap_or_default())
+                            .clicked()
+                        {
                             let (rows, loaded, dir) = (rows.clone(), loaded.clone(), dir.clone());
                             then = Some(Box::new(move |app: &mut App| {
                                 if let Err(e) = app.apply_rules(&rows, &loaded, &dir) {
@@ -3677,7 +3681,11 @@ impl App {
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                            if ui
+                                .add_enabled(bad.is_none(), egui::Button::new("OK"))
+                                .on_disabled_hover_text(bad.as_deref().unwrap_or_default())
+                                .clicked()
+                            {
                                 let (form, dir) = (form.as_ref().clone(), dir.clone());
                                 then = Some(Box::new(move |app: &mut App| {
                                     if let Err(e) = app.apply_report_layout(&form, &dir) {
