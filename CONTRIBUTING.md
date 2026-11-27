@@ -48,7 +48,8 @@ python tools/todo.py release 12
 
 ## Sending a change
 
-Nothing is pushed to `main`; every change is a pull request.
+Nothing is pushed to `main`; every change is a pull request. Agents also follow `AGENTS.md`: who
+a commit is authored as, what a commit and merge message may carry, and how to merge.
 
 1. Claim the todo, then branch from the latest `main` (`area/topic`, for example `panel/step`).
 2. Open the pull request early, as a draft if it is not finished. Name the issue in the title,
