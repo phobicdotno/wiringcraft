@@ -3999,7 +3999,14 @@ impl Open {
         let mut skipped = Vec::new();
         if !self.held_by_others.is_empty() {
             for (new, old) in project.pages.iter_mut().zip(&self.project.pages) {
-                if self.held_by_others.contains_key(&new.id) && new != old {
+                // With overwrite a held page with numbered wires is left out even when its
+                // numbers happen to stay: it is reported, as its numbers were not replaced.
+                let numbered = overwrite
+                    && old
+                        .wires
+                        .iter()
+                        .any(|w| w.number.as_deref().is_some_and(|n| !n.trim().is_empty()));
+                if self.held_by_others.contains_key(&new.id) && (new != old || numbered) {
                     skipped.push(old.number.clone());
                     *new = old.clone();
                 }

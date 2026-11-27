@@ -5397,7 +5397,9 @@ mod tests {
         open.project.pages[pages[0]].wires[0].number = Some("2".into());
         let held = open.project.pages[pages[0]].id.clone();
         open.held_by_others.insert(held, "Ola".into());
-        call(&mut a, "number_wires", json!({"rule": "sequential", "overwrite": true})).unwrap();
+        let done = call(&mut a, "number_wires", json!({"rule": "sequential", "overwrite": true})).unwrap();
+        // Its numbers stay as they were, but it is still reported as left out.
+        assert!(done.contains("Page(s) 2 were left as they are"), "{done}");
         let open = a.open.as_ref().unwrap();
         let on = |i: usize| open.project.pages[i].wires[0].number.clone();
         assert_eq!(on(pages[0]).as_deref(), Some("2"), "the held page is not changed");
