@@ -3119,9 +3119,16 @@ impl App {
                     .and_then(|i| open.project.pages.get(i))
                     .map(|p| p.id.clone())
                     .ok_or("No such page.")?;
-                let at = match (num(v, "x"), num(v, "y")) {
-                    (Some(x), Some(y)) => Some(Point::new(x, y)),
-                    _ => None,
+                // Both or neither: one alone, or a value that is not a number, is refused
+                // rather than quietly turned into a comment about the whole page.
+                let given = |key: &str| v.get(key).is_some_and(|x| !x.is_null());
+                let at = match (given("x"), given("y")) {
+                    (false, false) => None,
+                    (true, true) => match (num(v, "x"), num(v, "y")) {
+                        (Some(x), Some(y)) => Some(Point::new(x, y)),
+                        _ => return Err("`x` and `y` must be numbers.".into()),
+                    },
+                    _ => return Err("Give both `x` and `y` to pin the comment, or neither for the whole page.".into()),
                 };
                 let mut project = open.project.clone();
                 let id = project
@@ -10964,6 +10971,35 @@ mod tests {
                 .contains('|')
         );
         call(&mut a, "run_check", json!({})).unwrap();
+    }
+
+    #[test]
+    fn comments_add_refuses_half_a_position() {
+        let (_tmp, mut a) = app(vec![]);
+        for bad in [
+            json!({"action": "add", "page": "1", "text": "Here", "x": 10}),
+            json!({"action": "add", "page": "1", "text": "Here", "y": 10}),
+            json!({"action": "add", "page": "1", "text": "Here", "x": "10", "y": 10}),
+            json!({"action": "add", "page": "1", "text": "Here", "x": 10, "y": null}),
+        ] {
+            assert!(call(&mut a, "comments", bad.clone()).is_err(), "{bad}");
+        }
+        assert!(a.open.as_ref().unwrap().project.comments.is_empty());
+        call(
+            &mut a,
+            "comments",
+            json!({"action": "add", "page": "1", "text": "Page"}),
+        )
+        .unwrap();
+        call(
+            &mut a,
+            "comments",
+            json!({"action": "add", "page": "1", "text": "Pin", "x": 10, "y": 20}),
+        )
+        .unwrap();
+        let comments = &a.open.as_ref().unwrap().project.comments;
+        assert_eq!(comments[0].at, None);
+        assert_eq!(comments[1].at, Some(Point::new(10.0, 20.0)));
     }
 
     #[test]
