@@ -1749,3 +1749,98 @@ pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
     rows.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
     rows.into_iter().map(|(_, _, p)| p).collect()
 }
+
+#[cfg(test)]
+mod lib_tests {
+    use super::*;
+
+    #[test]
+    fn parse_level_takes_whole_numbers_from_one_and_says_why_others_are_not_levels() {
+        assert_eq!(parse_level("1"), Ok(1));
+        assert_eq!(parse_level(" 3 "), Ok(3));
+        assert_eq!(parse_level("0"), Err("levels start at 1".to_owned()));
+        for bad in ["", "-1", "1.5", "two", "1 2"] {
+            let Err(why) = parse_level(bad) else {
+                unreachable!("{bad:?} parsed as a level")
+            };
+            assert!(why.starts_with("not a whole number ("), "{bad:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn kind_parse_takes_only_the_exact_names() {
+        for s in ["Parts", " parts", "parts ", "plc_cards", "plccards", ""] {
+            assert_eq!(Kind::parse(s), None, "{s:?}");
+        }
+        assert_eq!(Kind::parse("plc-cards"), Some(Kind::PlcCards));
+        let names: std::collections::BTreeSet<_> = Kind::ALL.iter().map(|k| k.name()).collect();
+        assert_eq!(names.len(), Kind::ALL.len());
+    }
+
+    #[test]
+    fn column_of_looks_up_built_in_names_through_the_sources() {
+        let mut t = Table::new("Parts", &["Pos", "Qty"]);
+        assert_eq!(t.column_of("Qty"), Some(1));
+        assert_eq!(t.column_of("Count"), None);
+        // A layout showed Qty first as "Count" and Pos second.
+        t.columns = vec!["Count".into(), "Pos".into()];
+        t.sources = vec!["Qty".into(), "Pos".into()];
+        assert_eq!(t.column_of("Qty"), Some(0));
+        assert_eq!(t.column_of("Pos"), Some(1));
+        // The shown heading is not a built-in name.
+        assert_eq!(t.column_of("Count"), None);
+    }
+
+    #[test]
+    fn csv_quotes_only_fields_with_the_separator_a_quote_or_a_line_end() {
+        let mut t = Table::new("T", &["A", "B"]);
+        t.rows.push(vec!["a,b".into(), "say \"hi\"".into()]);
+        t.rows.push(vec!["one\ntwo".into(), "cr\rhere".into()]);
+        t.rows.push(vec!["a;b".into(), "plain".into()]);
+        assert_eq!(
+            t.to_csv(),
+            "A,B\r\n\"a,b\",\"say \"\"hi\"\"\"\r\n\"one\ntwo\",\"cr\rhere\"\r\na;b,plain\r\n"
+        );
+        // With `;` a comma needs no quotes but a semicolon does.
+        assert_eq!(
+            t.to_csv_with(';'),
+            "A;B\r\na,b;\"say \"\"hi\"\"\"\r\n\"one\ntwo\";\"cr\rhere\"\r\n\"a;b\";plain\r\n"
+        );
+    }
+
+    #[test]
+    fn csv_of_a_table_without_rows_is_the_header_line() {
+        assert_eq!(Table::new("T", &["A", "B"]).to_csv(), "A,B\r\n");
+        assert_eq!(Table::new("T", &["Only"]).to_csv_with(';'), "Only\r\n");
+    }
+
+    #[test]
+    fn a_guarded_cell_with_the_separator_is_guarded_then_quoted() {
+        let mut t = Table::new("T", &["A"]);
+        t.rows.push(vec!["=1,2".into()]);
+        t.rows.push(vec!["-K1 \"x\"".into()]);
+        assert_eq!(t.to_csv(), "A\r\n\"'=1,2\"\r\n\"'-K1 \"\"x\"\"\"\r\n");
+        assert_eq!(t.to_csv_raw_with(','), "A\r\n\"=1,2\"\r\n\"-K1 \"\"x\"\"\"\r\n");
+    }
+
+    #[test]
+    fn minus_cells_that_are_not_one_plain_number_are_guarded() {
+        for cell in ["-1.2.3", "-1,2.5", "-.", "-", "-1e3", "- 5"] {
+            assert_eq!(formula_safe(cell), format!("'{cell}"), "{cell:?}");
+        }
+        for cell in ["-.5", "-5.", "-007"] {
+            assert_eq!(formula_safe(cell), cell, "{cell:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_title_and_cells_are_one_line_and_never_html() {
+        let mut t = Table::new("Plan\r\nfor <A1>", &["Tag", "Note"]);
+        t.rows
+            .push(vec!["-K1".into(), "line one\r\nline two\rthree\nfour".into()]);
+        assert_eq!(
+            t.to_markdown(),
+            "## Plan for &lt;A1&gt;\n\n| Tag | Note |\n|---|---|\n| -K1 | line one line two three four |\n"
+        );
+    }
+}
