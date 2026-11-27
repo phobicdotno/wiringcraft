@@ -206,7 +206,7 @@ fn drawings(
     }
     if !with_pictures {
         for d in &out {
-            report.warnings.extend(dxf_warnings(d));
+            report.warnings.extend(dxf_warnings(d, true));
         }
     }
     if let Some(l) = project.meta.logo.as_ref().filter(|_| logo_left_out) {
@@ -558,8 +558,9 @@ pub(crate) fn dxf_text(s: &str) -> String {
 }
 
 /// A warning for each text on `page` that the DXF writes with a `?` (a character beyond U+FFFF),
-/// naming the page and the text, once per text however often it is on the page.
-pub fn dxf_warnings(page: &PageDrawing) -> Vec<String> {
+/// naming the page, once per text however often it is on the page. With `name_texts` it quotes
+/// the text and how it is written; without, it leaves the text out (for a log).
+pub fn dxf_warnings(page: &PageDrawing, name_texts: bool) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     page.prims
         .iter()
@@ -569,14 +570,19 @@ pub fn dxf_warnings(page: &PageDrawing) -> Vec<String> {
         })
         .filter(|text| seen.insert(text.as_str()))
         .map(|text| {
-            let shown: String = text
-                .chars()
-                .filter(|c| !c.is_control())
-                .map(|c| if u32::from(c) > 0xFFFF { '?' } else { c })
-                .collect();
+            let what = if name_texts {
+                let shown: String = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .map(|c| if u32::from(c) > 0xFFFF { '?' } else { c })
+                    .collect();
+                format!("the text \"{text}\" is written as \"{shown}\"")
+            } else {
+                "a text is written with \"?\"".to_string()
+            };
             format!(
-                "page {}: the text \"{text}\" is written as \"{shown}\" in the DXF: a DXF has no code for \
-                 characters beyond U+FFFF, such as emoji (the SVG export keeps them)",
+                "page {}: {what} in the DXF: a DXF has no code for characters beyond U+FFFF, such as \
+                 emoji (the SVG export keeps them)",
                 page.number
             )
         })

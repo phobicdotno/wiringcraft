@@ -2251,6 +2251,15 @@ fn page_lines_say_which_texts_lose_a_character_beyond_u_ffff() {
                 .to_string()
         ]
     );
+    // For a log, the same warning without the text.
+    assert_eq!(
+        dxf_warnings(&pages[0], false),
+        vec![
+            "page 1: a text is written with \"?\" in the DXF: a DXF has no code for characters beyond \
+             U+FFFF, such as emoji (the SVG export keeps them)"
+                .to_string()
+        ]
+    );
     // The SVG export keeps the character, so it says nothing.
     let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
     assert!(svg_report.warnings.is_empty(), "{:?}", svg_report.warnings);

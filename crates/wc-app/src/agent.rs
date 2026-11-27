@@ -4229,6 +4229,7 @@ mod tests {
             assistant: Assistant::with_transport(Arc::new(Script(Mutex::new(answers)))),
             open_url: Vec::new(),
             logged: Default::default(),
+            log_instead: None,
             share: Default::default(),
             symbol_editor: None,
             find: None,
@@ -9608,6 +9609,44 @@ mod tests {
         a.new_messages();
         a.dialog = fail();
         assert_eq!(boxes(&mut a), 1, "the second failure is logged too");
+    }
+
+    #[test]
+    fn a_dxf_warning_shows_the_drawing_text_but_the_log_does_not_get_it() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.pages.truncate(1);
+        open.project.pages[0].number = "1".into();
+        open.project.pages[0].graphics.push(wc_core::Shape::Text {
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            text: "Secret pump \u{1F600}".into(),
+            height: 3.0,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let open = a.open.as_ref().unwrap();
+        let dir = open.dir.join("export").join("drawings");
+        let (shown, logged) = crate::export_drawings_logged(open, &dir);
+        a.show_message_logged_as(shown, logged);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("a message box shows")
+        };
+        assert!(m.contains("the text \"Secret pump \u{1F600}\" is written as"), "{m}");
+        let new = a.new_messages();
+        let [(crate::applog::Level::Warn, text)] = new.as_slice() else {
+            unreachable!("one message box is logged: {new:?}")
+        };
+        assert!(!text.contains("Secret"), "drawing text stays out of the log: {text}");
+        assert!(
+            text.contains("page 1: a text is written with \"?\" in the DXF"),
+            "{text}"
+        );
+        // Another message box is logged as it is.
+        a.dialog = Some(Dialog::Message("Export failed".into()));
+        assert_eq!(
+            a.new_messages(),
+            [(crate::applog::Level::Warn, "Export failed".to_owned())]
+        );
     }
 
     #[test]
