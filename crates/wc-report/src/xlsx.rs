@@ -444,8 +444,10 @@ mod edge_tests {
         out
     }
 
-    /// Every cell of a worksheet as (reference, text), read with an XML parser.
-    fn cells(xml: &str) -> Vec<(String, String)> {
+    /// Every cell of a worksheet as (reference, text), read with an XML parser; a parser error
+    /// is returned with its reason, so malformed XML fails the test.
+    fn cells(xml: &str) -> Result<Vec<(String, String)>, String> {
+        let err = |e: &dyn std::fmt::Display| format!("the XML does not parse: {e}");
         use quick_xml::events::Event;
         let mut reader = quick_xml::Reader::from_str(xml);
         let mut out = Vec::new();
@@ -454,20 +456,24 @@ mod edge_tests {
         loop {
             match reader.read_event() {
                 Ok(Event::Start(e)) if e.name().as_ref() == b"c" => {
-                    let r = e.try_get_attribute("r").ok().flatten();
-                    cell = r.and_then(|a| a.unescape_value().ok()).map(|v| v.into_owned());
+                    let r = e.try_get_attribute("r").map_err(|e| err(&e))?;
+                    cell = match r {
+                        Some(a) => Some(a.unescape_value().map_err(|e| err(&e))?.into_owned()),
+                        None => None,
+                    };
                 }
                 Ok(Event::Start(e)) if e.name().as_ref() == b"t" => in_t = true,
                 Ok(Event::End(e)) if e.name().as_ref() == b"t" => in_t = false,
                 Ok(Event::Text(t)) if in_t => {
-                    let text = t.unescape().map(|v| v.into_owned()).unwrap_or_default();
+                    let text = t.unescape().map_err(|e| err(&e))?.into_owned();
                     out.push((cell.clone().unwrap_or_default(), unescape_xstring(&text)));
                 }
-                Ok(Event::Eof) | Err(_) => break,
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(err(&e)),
                 _ => {}
             }
         }
-        out
+        Ok(out)
     }
 
     #[test]
@@ -482,10 +488,10 @@ mod edge_tests {
         let xml = part(&t.to_xlsx()?, "xl/worksheets/sheet1.xml")?;
         assert_eq!(
             cells(&xml),
-            [
+            Ok(vec![
                 ("A1".to_owned(), "Value".to_owned()),
                 ("A2".to_owned(), tricky.to_owned())
-            ]
+            ])
         );
         Ok(())
     }
@@ -502,7 +508,10 @@ mod edge_tests {
         assert!(!xml.contains(" s=\"1\""), "{xml}");
         assert_eq!(
             cells(&xml),
-            [("A1".to_owned(), "x".to_owned()), ("A2".to_owned(), "y".to_owned())]
+            Ok(vec![
+                ("A1".to_owned(), "x".to_owned()),
+                ("A2".to_owned(), "y".to_owned())
+            ])
         );
         // A refused cell is named by its sheet row, which here starts with the first data row.
         let long = Table {
@@ -530,11 +539,11 @@ mod edge_tests {
         let xml = sheet_xml(&t);
         assert_eq!(
             cells(&xml),
-            [
+            Ok(vec![
                 ("A1".to_owned(), "A".to_owned()),
                 ("C1".to_owned(), "C".to_owned()),
                 ("B2".to_owned(), "b".to_owned()),
-            ]
+            ])
         );
         // An empty row is still written, so the rows after it keep their numbers.
         assert!(xml.contains("<row r=\"3\"></row>"), "{xml}");
@@ -601,10 +610,14 @@ mod edge_tests {
         loop {
             match reader.read_event() {
                 Ok(Event::Empty(e)) if e.name().as_ref() == b"sheet" => {
-                    let a = e.try_get_attribute("name").ok().flatten();
-                    name = a.and_then(|a| a.unescape_value().ok()).map(|v| v.into_owned());
+                    let a = e.try_get_attribute("name").map_err(std::io::Error::other)?;
+                    name = match a {
+                        Some(a) => Some(a.unescape_value().map_err(std::io::Error::other)?.into_owned()),
+                        None => None,
+                    };
                 }
-                Ok(Event::Eof) | Err(_) => break,
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(std::io::Error::other(e)),
                 _ => {}
             }
         }
