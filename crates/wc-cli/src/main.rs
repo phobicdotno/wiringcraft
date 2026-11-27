@@ -6373,8 +6373,13 @@ fn panel_show(panel: &wc_core::panel::Panel) -> String {
 
 /// A report as aligned plain text for the terminal.
 fn plain_table(t: &wc_report::Table) -> String {
-    let mut w: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
-    for r in &t.rows {
+    // Every value is written with `escape_field`: a line break in a cell would end its row
+    // early and a control character could steer the terminal.
+    let escape = |cells: &[String]| cells.iter().map(|c| escape_field(c)).collect::<Vec<_>>();
+    let columns = escape(&t.columns);
+    let rows: Vec<Vec<String>> = t.rows.iter().map(|r| escape(r)).collect();
+    let mut w: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+    for r in &rows {
         for (i, c) in r.iter().enumerate() {
             if let Some(x) = w.get_mut(i) {
                 *x = (*x).max(c.chars().count());
@@ -6385,10 +6390,10 @@ fn plain_table(t: &wc_report::Table) -> String {
         let parts: Vec<String> = cells.iter().zip(&w).map(|(c, n)| format!("{c:<n$}")).collect();
         parts.join("  ").trim_end().to_owned()
     };
-    let mut out = format!("{}\n{}\n", t.title, line(&t.columns));
+    let mut out = format!("{}\n{}\n", escape_field(&t.title), line(&columns));
     out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
     out.push('\n');
-    for r in &t.rows {
+    for r in &rows {
         out.push_str(&line(r));
         out.push('\n');
     }
@@ -6471,6 +6476,29 @@ fn utc_date(secs: i64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_text_report_keeps_each_row_on_one_line() {
+        let t = wc_report::Table {
+            title: "Locations\u{1b}[2J".into(),
+            columns: vec!["Location".into(), "Note".into()],
+            rows: vec![
+                vec!["+A1".into(), "first line\nsecond\tline".into()],
+                vec!["+A2".into(), "red \u{1b}[31m".into()],
+            ],
+            ..Default::default()
+        };
+        let text = plain_table(&t);
+        assert_eq!(
+            text,
+            "Locations\\u{1b}[2J\n\
+             Location  Note\n\
+             --------  ------------------------\n\
+             +A1       first line\\nsecond\\tline\n\
+             +A2       red \\u{1b}[31m\n"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
+    }
 
     thread_local! {
         /// Set by a test to stop `box-edit` after its symbol write, as a kill would.
