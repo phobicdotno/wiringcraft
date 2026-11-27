@@ -106,10 +106,6 @@ impl std::fmt::Display for Change {
     }
 }
 
-fn parse_page(text: Option<String>) -> Option<Page> {
-    text.and_then(|t| serde_json::from_str(&t).ok())
-}
-
 /// One side of a page file: `Ok(None)` when the file is not there, `Err` (saying why) when it
 /// is there but cannot be read as a page.
 fn read_side(path: &str, text: Option<String>) -> wc_core::Result<Option<Page>> {
@@ -353,14 +349,29 @@ pub fn page_history(git: &Git, page: &str, limit: usize) -> Result<Vec<PageVersi
         let [commit, author, time, subject] = fields.as_slice() else {
             continue;
         };
-        let old = parse_page(git.show(&format!("{commit}^"), &path));
-        let new = parse_page(git.show(commit, &path));
+        let old_text = git.show(&format!("{commit}^"), &path);
+        let new_text = git.show(commit, &path);
+        let (had, has) = (old_text.is_some(), new_text.is_some());
+        // As in [`changes`]: a side whose file is there but is no page cannot be compared, so
+        // the file itself is listed instead of a page that seems removed or added.
+        let changes = match (read_side(&path, old_text), read_side(&path, new_text)) {
+            (Ok(old), Ok(new)) => page_changes(old.as_ref(), new.as_ref()),
+            _ => vec![Change::File {
+                path: path.clone(),
+                status: match (had, has) {
+                    (false, _) => "added",
+                    (_, false) => "removed",
+                    _ => "changed",
+                }
+                .into(),
+            }],
+        };
         out.push(PageVersion {
             commit: (*commit).to_owned(),
             author: (*author).to_owned(),
             time: time.parse().unwrap_or(0),
             subject: (*subject).to_owned(),
-            changes: page_changes(old.as_ref(), new.as_ref()),
+            changes,
         });
     }
     Ok(out)
