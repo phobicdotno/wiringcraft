@@ -832,8 +832,7 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
     }
     if skipped > 0 {
         warnings.push(format!(
-            "{skipped} connection(s) to a name without a pin (potentials, cable ends) are listed in the device \
-             properties only"
+            "{skipped} connection(s) to a name without a pin (potentials, cable ends) were not imported"
         ));
     }
 

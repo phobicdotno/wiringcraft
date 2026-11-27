@@ -819,6 +819,22 @@ fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
         "cable core -W1:1 is on 2 connections".to_owned(),
     )];
     assert_eq!(found(&p), expected);
+    // Core names match ignoring case and surrounding spaces: "bn" and " BN " are one core.
+    for w in p.pages[0].wires.iter_mut() {
+        let core = if w.id == "w1" { "bn" } else { " BN " };
+        if let Some(c) = w.cable.as_mut() {
+            c.core = core.into();
+        }
+    }
+    let bn = [(
+        Some("p2".to_owned()),
+        Some("w4".to_owned()),
+        "cable core -W1:bn is on 2 connections".to_owned(),
+    )];
+    assert_eq!(found(&p), bn);
+    for c in p.pages[0].wires.iter_mut().filter_map(|w| w.cable.as_mut()) {
+        c.core = "1".into();
+    }
     // An overview page whose wiring joins the 24V and 0V potentials into one net.
     let mut overview = Page::new("ov", "1", "Overview");
     overview.overview = true;
@@ -1003,6 +1019,39 @@ fn a_cable_named_only_on_wires_is_a_device_without_a_part() {
 }
 
 #[test]
+fn a_blank_potential_name_does_not_hide_a_wire_end_in_the_air() {
+    let (mut p, s, parts) = fixture();
+    let air = |id: &str, y: f64, potential: Option<&str>| {
+        wire(
+            id,
+            pin("s6", "X2"),
+            Endpoint::Point {
+                at: Point::new(400.0, y),
+            },
+            None,
+            potential,
+        )
+    };
+    p.pages[0].wires.push(air("w20", 400.0, Some("  ")));
+    p.pages[0].wires.push(air("w21", 500.0, Some("")));
+    p.pages[0].wires.push(air("w22", 600.0, Some("24V")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    let air_at = |y: &str| {
+        found
+            .iter()
+            .any(|f| f.message == format!("wire ends in the air at 400.0, {y}"))
+    };
+    assert!(air_at("400.0"), "a blank name is no potential: {found:?}");
+    assert!(air_at("500.0"), "an empty name is no potential: {found:?}");
+    assert!(!air_at("600.0"), "a named potential joins across pages");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
@@ -1044,6 +1093,29 @@ fn project_check_finds_the_usual_mistakes() {
     assert_eq!(found[0].severity, Severity::Error);
     assert!(found.iter().filter(|f| f.page_id.is_some()).all(|f| f.item.is_some()));
     assert_eq!(check_table(&i).rows.len(), found.len());
+}
+
+#[test]
+fn project_check_finds_a_short_made_only_of_wires() {
+    let (mut p, s, parts) = fixture();
+    let at = |x: f64| Endpoint::Point {
+        at: Point::new(x, 500.0),
+    };
+    // An L1 wire and an L2 wire meet at a junction, with no device pin on either.
+    p.pages[0].wires.push(wire("w8", at(0.0), at(10.0), None, Some("L1")));
+    p.pages[0].wires.push(wire("w9", at(10.0), at(20.0), None, Some("L2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    assert!(
+        found
+            .iter()
+            .any(|f| f.severity == Severity::Error && f.message == "potentials L1 and L2 are connected to each other"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -1203,6 +1275,23 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
 }
 
 #[test]
+fn an_auxiliary_contact_of_a_standalone_breaker_has_no_missing_coil() {
+    // A breaker or MPCB is one standalone symbol; its aux contact belongs to it (#1467).
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s11", "no", 320.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s12", "lamp", 360.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s13", "no", 400.0, Some("-Q8")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let findings = check(&i);
+    assert!(!findings.iter().any(|f| f.message.contains("contact -Q9 has no coil")));
+    assert!(findings.iter().any(|f| f.message.contains("contact -Q8 has no coil")));
+}
+
+#[test]
 fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
@@ -1229,6 +1318,38 @@ fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
         lonely(&p),
         vec![Some(p.pages[0].id.clone())],
         "the schematic point has no partner; the overview copy still has the schematic one"
+    );
+}
+
+#[test]
+fn check_warns_about_a_coil_or_contact_without_a_tag() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s10", "coil", 200.0, None));
+    p.pages[0].symbols.push(place("s11", "no", 230.0, None));
+    p.pages[0].symbols.push(place("s12", "lamp", 260.0, None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let untagged: Vec<(Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("has no tag"))
+        .map(|f| (f.item, f.message))
+        .collect();
+    assert_eq!(
+        untagged,
+        vec![
+            (
+                Some("s10".into()),
+                "coil has no tag, so it links nothing in cross-references".into()
+            ),
+            (
+                Some("s11".into()),
+                "contact has no tag, so it links nothing in cross-references".into()
+            ),
+        ],
+        "a lamp needs no tag to work; the tagged coil and contact are fine"
     );
 }
 
@@ -1305,6 +1426,324 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
     assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
+}
+
+/// An XML element's name and its attributes, unescaped.
+type XmlElement = (String, BTreeMap<String, String>);
+
+/// Every element of `xml` as (name, attributes), read with an XML reader, or why the document
+/// is not well formed: a reader error, a bad attribute or entity reference, text outside the
+/// root element, a second root, or an element left open.
+fn xml_elements(xml: &str) -> Result<Vec<XmlElement>, String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut root_closed = false;
+    loop {
+        let at = reader.buffer_position();
+        let event = reader.read_event().map_err(|e| format!("at byte {at}: {e}"))?;
+        let (e, opens) = match event {
+            Event::Start(e) => (e, true),
+            Event::Empty(e) => (e, false),
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("at byte {at}: end tag without a start"))?;
+                root_closed = depth == 0;
+                continue;
+            }
+            Event::Text(t) => {
+                let text = t.unescape().map_err(|e| format!("at byte {at}: {e}"))?;
+                if depth == 0 && !text.trim().is_empty() {
+                    return Err(format!("at byte {at}: text outside the root element: {text:?}"));
+                }
+                continue;
+            }
+            Event::Eof if depth == 0 && root_closed => return Ok(out),
+            Event::Eof => return Err(format!("ended with {depth} element(s) open or no root")),
+            _ => continue,
+        };
+        if depth == 0 && root_closed {
+            return Err(format!("at byte {at}: a second root element"));
+        }
+        if opens {
+            depth += 1;
+        } else if depth == 0 {
+            root_closed = true;
+        }
+        let name = String::from_utf8(e.name().as_ref().to_vec()).map_err(|e| format!("at byte {at}: {e}"))?;
+        let mut attrs = BTreeMap::new();
+        for a in e.attributes() {
+            let a = a.map_err(|e| format!("at byte {at}: {e}"))?;
+            let k = String::from_utf8(a.key.as_ref().to_vec()).map_err(|e| format!("at byte {at}: {e}"))?;
+            let v = a.unescape_value().map_err(|e| format!("at byte {at}: {k}: {e}"))?;
+            attrs.insert(k, v.into_owned());
+        }
+        out.push((name, attrs));
+    }
+}
+
+#[test]
+fn the_xml_helper_rejects_documents_that_are_not_well_formed() {
+    assert!(xml_elements("<a x=\"1\"><b/></a>\n").is_ok());
+    for bad in [
+        "<a>&unknown;</a>",
+        "<a x=\"&unknown;\"/>",
+        "stray<a/>",
+        "<a/>stray",
+        "<a/><b/>",
+        "<a><b></a>",
+        "<a>",
+        "",
+    ] {
+        assert!(xml_elements(bad).is_err(), "{bad:?} was accepted");
+    }
+}
+
+#[test]
+fn automationml_of_an_empty_project_is_a_well_formed_skeleton() {
+    let p = Project::new("   ");
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "", "");
+    assert_eq!(counts, AmlCounts::default());
+    // A blank name falls back to "Project", and a missing time stamp to the epoch.
+    assert!(xml.contains("<CAEXFile FileName=\"Project.aml\""), "{xml}");
+    assert!(xml.contains("LastWritingDateTime=\"1970-01-01T00:00:00Z\""), "{xml}");
+    assert!(xml.contains("<InstanceHierarchy Name=\"Project\""), "{xml}");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let names: Vec<&str> = elements.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "CAEXFile",
+            "SourceDocumentInformation",
+            "InstanceHierarchy",
+            "InternalElement"
+        ]
+    );
+    assert!(xml.ends_with("</CAEXFile>\n"));
+}
+
+#[test]
+fn automationml_trims_and_escapes_the_project_name_and_time_stamp() {
+    let p = Project::new("  A&B <\"plant\">  ");
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "x<y", "");
+    assert!(
+        xml.contains("<CAEXFile FileName=\"A&amp;B &lt;&quot;plant&quot;&gt;.aml\""),
+        "{xml}"
+    );
+    assert!(xml.contains("LastWritingDateTime=\"x&lt;y\""), "{xml}");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let get = |el: &str, attr: &str| {
+        elements
+            .iter()
+            .find(|(n, _)| n == el)
+            .and_then(|(_, a)| a.get(attr).cloned())
+    };
+    // A reader gets the trimmed name back in every place it is used.
+    assert_eq!(get("CAEXFile", "FileName").as_deref(), Some("A&B <\"plant\">.aml"));
+    assert_eq!(get("InstanceHierarchy", "Name").as_deref(), Some("A&B <\"plant\">"));
+    assert_eq!(get("InternalElement", "Name").as_deref(), Some("A&B <\"plant\">"));
+}
+
+#[test]
+fn automationml_keeps_register_devices_without_symbols_and_unknown_parts() {
+    let mut p = Project::new("t");
+    p.devices.insert(
+        DeviceTag::parse("-Q1").unwrap(),
+        Device {
+            part: Some("not.in.library".into()),
+            properties: [
+                ("OrderNumber".to_string(), "shadowed".to_string()),
+                ("Function text".to_string(), "shadowed".to_string()),
+                ("Rated current".to_string(), "16 A".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+    );
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "t.aml");
+    assert_eq!((counts.devices, counts.links), (1, 0), "{xml}");
+    let q1 = xml.split("<InternalElement Name=\"-Q1\" ID=\"d1\">").nth(1).unwrap();
+    let q1 = q1.split("</InternalElement>").next().unwrap();
+    // A part id with no library entry is written as the order number.
+    assert!(q1.contains("Name=\"OrderNumber\" AttributeDataType=\"xs:string\"><Value>not.in.library</Value>"));
+    // Properties named like a built-in attribute do not repeat it; others are kept.
+    assert!(!q1.contains("shadowed"), "{q1}");
+    assert_eq!(q1.matches("Name=\"OrderNumber\"").count(), 1);
+    assert!(q1.contains("Name=\"Rated current\" AttributeDataType=\"xs:string\"><Value>16 A</Value>"));
+    // No empty description and no connection points without a symbol.
+    assert!(!q1.contains("Function text"), "{q1}");
+    assert!(!q1.contains("<ExternalInterface"), "{q1}");
+}
+
+#[test]
+fn automationml_numbers_devices_in_natural_tag_order() {
+    let mut p = Project::new("t");
+    for t in ["-K10", "-K2", "-K1"] {
+        p.devices.insert(DeviceTag::parse(t).unwrap(), Default::default());
+    }
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "", "");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let devices: Vec<(&str, &str)> = elements
+        .iter()
+        .filter(|(n, a)| n == "InternalElement" && a.get("ID").is_some_and(|id| id != "project"))
+        .filter_map(|(_, a)| Some((a.get("Name")?.as_str(), a.get("ID")?.as_str())))
+        .collect();
+    assert_eq!(devices, [("-K1", "d1"), ("-K2", "d2"), ("-K10", "d3")]);
+}
+
+#[test]
+fn automationml_chains_a_net_of_three_pins_with_numbered_link_names() {
+    let (mut p, s, parts) = fixture();
+    // 0V joins -K1:A2 and -X2:1 already; add -P1:X2 to the same potential.
+    p.pages[0]
+        .wires
+        .push(wire("w6", pin("s5", "1"), pin("s6", "X2"), None, None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "", "");
+    assert_eq!(counts.links, 4, "{xml}");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let links: Vec<&str> = elements
+        .iter()
+        .filter(|(n, _)| n == "InternalLink")
+        .filter_map(|(_, a)| a.get("Name").map(String::as_str))
+        .filter(|n| n.starts_with("0V"))
+        .collect();
+    assert_eq!(links, ["0V", "0V#2"], "{xml}");
+}
+
+#[test]
+fn automationml_links_only_name_interfaces_that_exist() {
+    let (p, s, parts) = fixture();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let ids: Vec<&str> = elements
+        .iter()
+        .filter_map(|(_, a)| a.get("ID").map(String::as_str))
+        .collect();
+    let unique: BTreeSet<&str> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), ids.len(), "IDs repeat: {ids:?}");
+    let interfaces: BTreeSet<&str> = elements
+        .iter()
+        .filter(|(n, _)| n == "ExternalInterface")
+        .filter_map(|(_, a)| a.get("ID").map(String::as_str))
+        .collect();
+    let links: Vec<&BTreeMap<String, String>> = elements
+        .iter()
+        .filter(|(n, _)| n == "InternalLink")
+        .map(|(_, a)| a)
+        .collect();
+    assert_eq!(links.len(), counts.links);
+    for a in links {
+        for side in ["RefPartnerSideA", "RefPartnerSideB"] {
+            let Some(r) = a.get(side) else {
+                unreachable!("{side} missing: {a:?}")
+            };
+            assert!(interfaces.contains(r.as_str()), "{r} is not an interface: {xml}");
+        }
+        assert_ne!(a.get("RefPartnerSideA"), a.get("RefPartnerSideB"));
+    }
+}
+
+#[test]
+fn automationml_link_names_never_repeat() {
+    let (mut p, s, parts) = fixture();
+    // Potential `A` joins three terminals (links `A` and `A#2`); another potential is really
+    // named `A#2`.
+    let page = &mut p.pages[0];
+    for (n, x) in [(1, 300.0), (2, 310.0), (3, 320.0), (4, 330.0), (5, 340.0)] {
+        page.symbols
+            .push(place(&format!("t{n}"), "term", x, Some(&format!("-X9.{n}"))));
+    }
+    page.wires
+        .push(wire("a1", pin("t1", "1"), pin("t2", "1"), None, Some("A")));
+    page.wires
+        .push(wire("a2", pin("t2", "1"), pin("t3", "1"), None, Some("A")));
+    page.wires
+        .push(wire("b1", pin("t4", "1"), pin("t5", "1"), None, Some("A#2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let mut names: Vec<&str> = xml
+        .split("<InternalLink Name=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(names.contains(&"A") && names.contains(&"A#2"), "{xml}");
+    let all = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all, "{xml}");
+}
+
+#[test]
+fn automationml_link_names_differ_once_written() {
+    let (mut p, s, parts) = fixture();
+    // `A` and `A\u{FFFE}` differ, but the character XML cannot hold is left out when written,
+    // so both would be written as `A`.
+    let page = &mut p.pages[0];
+    for (n, x) in [(1, 300.0), (2, 310.0), (3, 320.0), (4, 330.0)] {
+        page.symbols
+            .push(place(&format!("t{n}"), "term", x, Some(&format!("-X9.{n}"))));
+    }
+    page.wires
+        .push(wire("a1", pin("t1", "1"), pin("t2", "1"), None, Some("A")));
+    page.wires
+        .push(wire("b1", pin("t3", "1"), pin("t4", "1"), None, Some("A\u{FFFE}")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let mut names: Vec<&str> = xml
+        .split("<InternalLink Name=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(names.contains(&"A") && names.contains(&"A#2"), "{xml}");
+    let all = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all, "{xml}");
 }
 
 #[test]
@@ -1998,6 +2437,44 @@ fn one_strips_markers_are_only_that_strips_terminals() {
     );
     assert!(both.rows.iter().any(|r| r[0] == "Wire"));
     assert!(!both.rows.iter().any(|r| r[1] == "-X2"));
+}
+
+#[test]
+fn check_flags_a_wire_section_not_above_0_and_a_colour_that_is_no_iec_code() {
+    let (mut p, s, parts) = fixture();
+    for w in p.pages.iter_mut().flat_map(|pg| pg.wires.iter_mut()) {
+        match w.id.as_str() {
+            "w1" => (w.spec.section, w.spec.colour) = (Some("0 mm²".into()), Some("gnye".into())),
+            "w2" => (w.spec.section, w.spec.colour) = (Some("1.5 mm²".into()), Some("BLUE".into())),
+            _ => {}
+        }
+        w.number = None;
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<(Severity, Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("cross-section") || f.message.contains("IEC 60757"))
+        .map(|f| (f.severity, f.item, f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                Severity::Warning,
+                Some("w1".into()),
+                "wire has cross-section 0 mm², which is not above 0".into()
+            ),
+            (
+                Severity::Note,
+                Some("w2".into()),
+                "wire has colour BLUE, which is not an IEC 60757 code such as BU or GNYE".into()
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -3318,6 +3795,30 @@ fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
 }
 
 #[test]
+fn a_sort_entry_with_spaces_around_its_minus_sorts_descending_without_a_warning() {
+    use wc_core::report_layout::ReportLayout;
+    let mut t = Table::new("T", &["Tag"]);
+    for tag in ["-K1", "-K3", "-K2"] {
+        t.rows.push(vec![tag.into()]);
+    }
+    let layout = ReportLayout {
+        kind: "devices".into(),
+        sort: vec![" -Tag ".into()],
+        ..Default::default()
+    };
+    let columns = t.columns.clone();
+    assert_eq!(
+        layout_problems_for(&columns, &layout, &wc_core::Project::new("P")),
+        Vec::<String>::new()
+    );
+    let sorted = t.with_layout(&layout);
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+        ["-K3", "-K2", "-K1"]
+    );
+}
+
+#[test]
 fn a_layout_groups_rows_by_a_column_and_the_csv_keeps_one_row_per_record() {
     use wc_core::report_layout::{ReportColumn, ReportLayout};
     let row = |loc: &str, wire: &str| vec![loc.to_string(), wire.to_string(), format!("page of {wire}")];
@@ -3922,6 +4423,36 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
         parts: &parts,
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
+    // A bit card ignores its step, so a stray one still has it compared by bits: %IX8.0 to
+    // %IX8.7 lie in byte 8, which a byte card at %IB8 also covers, whichever card came first.
+    p.meta.racks[0].cards.push(PlcCard {
+        step: Some(4),
+        ..card(5, 8, "%IX8.0")
+    });
+    p.meta.racks[0].cards.push(card(6, 1, "%IB8"));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("slot 6: address %IB8 is also on PLC rack \"R\" slot 5")),
+        "{w:?}"
+    );
+    p.meta.racks[0].cards.swap(4, 5);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("slot 5: address %IX8.0 is also on PLC rack \"R\" slot 6")),
+        "{w:?}"
+    );
 }
 
 #[test]
@@ -4361,6 +4892,40 @@ fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
 }
 
 #[test]
+fn markdown_titles_show_markdown_characters_as_typed() {
+    let heading = |title: &str| {
+        Table::new(title, &["Tag"])
+            .to_markdown()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(heading("Spare *draft* [rev](x)"), "## Spare \\*draft\\* \\[rev\\](x)");
+    // A trailing run of `#` is not the heading's closing sequence, so it stays.
+    assert_eq!(heading("Wires #"), "## Wires \\#");
+    assert_eq!(heading("Panel 2 ## "), "## Panel 2 \\## ");
+    assert_eq!(heading("#"), "## \\#");
+    // A run right after other text is not a closing sequence: it is shown as typed.
+    assert_eq!(heading("Wires#"), "## Wires#");
+    assert_eq!(heading("a \\#"), "## a \\\\#");
+    // A link ending in `#` keeps it without a backslash, which a viewer would take into it.
+    assert_eq!(heading("See https://example.com/#"), "## See https://example.com/#");
+    assert_eq!(heading("Parts list"), "## Parts list");
+    // Emphasis inside a link would show before the link is made: the word is written as text.
+    assert_eq!(
+        heading("See https://example.com/*draft*/x"),
+        "## See https\\://example.com/\\*draft\\*/x"
+    );
+    assert_eq!(
+        heading("https://example.com/_draft_/x"),
+        "## https\\://example.com/\\_draft\\_/x"
+    );
+    // A `_` between letters is not emphasis, so that link stays as typed.
+    assert_eq!(heading("https://example.com/a_b"), "## https://example.com/a_b");
+}
+
+#[test]
 fn markdown_cells_with_a_backslash_keep_their_columns() {
     let mut t = Table::new("Paths", &["Path", "Text", "Next"]);
     t.rows.push(vec!["C:\\".into(), "a\\|b".into(), "next".into()]);
@@ -4516,4 +5081,32 @@ fn a_device_drawn_twice_lists_its_pages_in_page_order() {
         "{found:?}"
     );
     assert!(found.iter().any(|m| m == "-P1 is drawn 2 times (page 2)"), "{found:?}");
+}
+
+#[test]
+fn terminals_tagged_with_only_their_strip_are_not_drawn_twice_but_one_number_is() {
+    let (mut p, mut s, parts) = fixture();
+    // Two more -X2 terminals: the strip numbers them 2 and 3, they are three terminals.
+    p.pages[0].symbols.push(place("s7", "term", 140.0, Some("-X2")));
+    p.pages[0].symbols.push(place("s8", "term", 160.0, Some("-X2")));
+    // -X1.1 again, with another terminal symbol: terminal 1 of -X1 is drawn twice.
+    s.insert("term.pe".into(), sym("term.pe", SymbolRole::Terminal, &["1", "2"]));
+    p.pages[0].symbols.push(place("s9", "term.pe", 170.0, Some("-X1.1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<(Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("is drawn"))
+        .map(|f| (f.item, f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (Some("s4".into()), "-X1.1 is drawn 2 times (page 2)".into()),
+            (Some("s9".into()), "-X1.1 is drawn 2 times (page 2)".into()),
+        ]
+    );
 }

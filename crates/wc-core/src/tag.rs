@@ -9,6 +9,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Error, Result};
 
+/// Hyphens, dashes and minus signs that a tag pasted from a document may carry for `-`.
+const LOOKS_LIKE_DASH: [char; 9] = [
+    '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}', '\u{FE63}', '\u{FF0D}',
+];
+/// Small and full-width plus signs, for `+`.
+const LOOKS_LIKE_PLUS: [char; 2] = ['\u{FE62}', '\u{FF0B}'];
+/// Small and full-width equals signs, for `=`.
+const LOOKS_LIKE_EQUALS: [char; 2] = ['\u{FE66}', '\u{FF1D}'];
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct DeviceTag {
     pub function: Vec<String>,
@@ -75,6 +84,17 @@ impl DeviceTag {
                     current = Some(c);
                 }
                 c if c.is_alphanumeric() || c == '.' || c == '_' => buf.push(c),
+                // Pasted from a word processor or a PDF, a sign is often one that only looks
+                // like the plain one.
+                c if LOOKS_LIKE_DASH.contains(&c) => {
+                    return Err(Error::Tag(s.into(), "a sign that only looks like -: type a plain -"));
+                }
+                c if LOOKS_LIKE_PLUS.contains(&c) => {
+                    return Err(Error::Tag(s.into(), "a sign that only looks like +: type a plain +"));
+                }
+                c if LOOKS_LIKE_EQUALS.contains(&c) => {
+                    return Err(Error::Tag(s.into(), "a sign that only looks like =: type a plain ="));
+                }
                 _ => return Err(Error::Tag(s.into(), "only letters, digits, '.', '_' allowed")),
             }
         }
@@ -197,9 +217,103 @@ mod tests {
     }
 
     #[test]
+    fn a_look_alike_sign_names_the_plain_one_to_type() {
+        let cases = [
+            (&LOOKS_LIKE_DASH[..], "=A+C1{}K1", '-'),
+            (&LOOKS_LIKE_PLUS[..], "=A{}C1-K1", '+'),
+            (&LOOKS_LIKE_EQUALS[..], "{}A+C1-K1", '='),
+        ];
+        for (signs, shape, plain) in cases {
+            for &c in signs {
+                let bad = shape.replace("{}", &c.to_string());
+                let Err(e) = DeviceTag::parse(&bad) else {
+                    unreachable!("{bad} should fail");
+                };
+                let why = format!("a sign that only looks like {plain}: type a plain {plain}");
+                assert_eq!(e.to_string(), format!("invalid device tag {bad:?}: {why}"));
+            }
+        }
+        // Every look-alike is caught, not only the common en dash.
+        let all = [LOOKS_LIKE_DASH.len(), LOOKS_LIKE_PLUS.len(), LOOKS_LIKE_EQUALS.len()];
+        assert_eq!(all, [9, 2, 2]);
+    }
+
+    #[test]
     fn rejects_bad_tags() {
         for bad in ["", "K1", "=A1", "-K1-K2", "-K 1", "=-K1", "-K1."] {
             assert!(DeviceTag::parse(bad).is_err(), "{bad} should fail");
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_edge_tests {
+    use super::*;
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_before_parsing() -> Result<()> {
+        assert_eq!(DeviceTag::parse("  =A+C1-K1\t\n")?.to_string(), "=A+C1-K1");
+        let Err(e) = DeviceTag::parse("   ") else {
+            unreachable!("blank tag should fail");
+        };
+        assert_eq!(e.to_string(), "invalid device tag \"\": empty");
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_without_a_product_aspect_is_rejected() {
+        for bad in ["=A", "+C1", "=A.B+C1"] {
+            let Err(e) = DeviceTag::parse(bad) else {
+                unreachable!("{bad} should fail");
+            };
+            assert_eq!(
+                e.to_string(),
+                format!("invalid device tag {bad:?}: needs a product aspect such as -K1")
+            );
+        }
+    }
+
+    #[test]
+    fn aspects_given_out_of_order_display_in_canonical_order() -> Result<()> {
+        let t = DeviceTag::parse("-K1+C1=A")?;
+        assert_eq!(t, DeviceTag::parse("=A+C1-K1")?);
+        assert_eq!(t.to_string(), "=A+C1-K1");
+        Ok(())
+    }
+
+    #[test]
+    fn underscores_and_non_ascii_letters_are_allowed_in_levels() -> Result<()> {
+        let t = DeviceTag::parse("=PUMP_1+SKAP_Ø-Ø1")?;
+        assert_eq!(t.function, vec!["PUMP_1"]);
+        assert_eq!(t.location, vec!["SKAP_Ø"]);
+        assert_eq!(t.letter_code(), "Ø");
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_matches_parse() -> Result<()> {
+        let t: DeviceTag = "=A.B+C1-X1.3".parse()?;
+        assert_eq!(t, DeviceTag::parse("=A.B+C1-X1.3")?);
+        assert!("-K 1".parse::<DeviceTag>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn serde_round_trips_as_a_plain_string_and_rejects_bad_tags() {
+        let Ok(t) = DeviceTag::parse("=PUMPS.P1+CAB1-K3") else {
+            unreachable!("valid tag");
+        };
+        let Ok(json) = serde_json::to_string(&t) else {
+            unreachable!("serializes");
+        };
+        assert_eq!(json, "\"=PUMPS.P1+CAB1-K3\"");
+        let Ok(back) = serde_json::from_str::<DeviceTag>(&json) else {
+            unreachable!("deserializes");
+        };
+        assert_eq!(back, t);
+        let Err(e) = serde_json::from_str::<DeviceTag>("\"-K1-K2\"") else {
+            unreachable!("bad tag should fail to deserialize");
+        };
+        assert!(e.to_string().contains("the product aspect (-) is given twice"), "{e}");
     }
 }
