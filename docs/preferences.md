@@ -2,16 +2,17 @@
 
 The desktop app keeps your own settings in one file, `prefs.toml`. It is yours, not the
 project's: nothing in it goes into a project folder, a commit or a shared session. The
-command line does not read it. One exception: a settings variable set to an empty value (see
-below) makes the app write `wiringcraft/prefs.toml` in the folder it was started from, which can
-be a project folder. Leave `XDG_CONFIG_HOME` and `APPDATA` unset, or set them to a full path
-outside every project.
+command line does not read it. One exception: when the variable that picks the settings folder
+(see below) is empty or a relative path, the folder is taken from the folder the app was started
+in, which can be a project folder. Make sure the first of `XDG_CONFIG_HOME`, `APPDATA` and `HOME`
+that is set holds a full path outside every project, or leave the first two unset.
 
 ## Where the file is
 
 The app picks its settings folder from the first of these environment variables that is set,
-then adds `wiringcraft`. A variable set to an empty value counts as set, and the folder is then
-`wiringcraft` in the current folder:
+then adds `wiringcraft`. A variable set to an empty value counts as set. An empty or relative
+value is read from the current folder: an empty `XDG_CONFIG_HOME` or `APPDATA` gives `wiringcraft`
+there, and an empty `HOME` gives `.config/wiringcraft` there:
 
 1. `XDG_CONFIG_HOME`
 2. `APPDATA`
