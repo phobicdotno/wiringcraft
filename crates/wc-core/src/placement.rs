@@ -89,7 +89,10 @@ pub fn place(
     let mut used = used_tags(project);
     let mut renamed: BTreeMap<&DeviceTag, Option<DeviceTag>> = BTreeMap::new();
     let mut devices: Vec<(DeviceTag, Device)> = Vec::new();
-    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()) {
+    // A cable is a device also when only its cores name it (no symbol draws it): the placed
+    // cores run in a new cable, not in the project's cable of the old tag.
+    let cables = group.wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable));
+    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()).chain(cables) {
         if renamed.contains_key(old) {
             continue;
         }
@@ -249,6 +252,62 @@ mod tests {
                 "{data:?}"
             );
         }
+    }
+
+    #[test]
+    fn cores_of_a_cable_no_symbol_draws_run_in_a_new_cable() {
+        // -W1 is named only by the cores of its two wires, as `wire --cable` makes it.
+        let core = |id: &str, name: &str| Wire {
+            id: id.into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: Some(crate::project::CableCore {
+                cable: tag("-W1"),
+                core: name.into(),
+            }),
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        let wires = [core("w1", "BN"), core("w2", "BU")];
+        let group_devices = BTreeMap::from([(tag("-W1"), device("Motor cable"))]);
+        let group = Group {
+            symbols: &[],
+            wires: &wires,
+            graphics: &[],
+            devices: &group_devices,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let mut p = project();
+        p.devices.insert(tag("-W1"), device("project's"));
+        let placed = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::GroupOnly,
+            OutOfTags::Fail,
+        )
+        .unwrap();
+        let cores: Vec<_> = placed
+            .wires
+            .iter()
+            .filter_map(|id| p.pages[0].wires.iter().find(|w| &w.id == id)?.cable.clone())
+            .map(|c| (c.cable.to_string(), c.core))
+            .collect();
+        assert_eq!(cores, [("-W2".into(), "BN".into()), ("-W2".into(), "BU".into())]);
+        assert_eq!(p.devices[&tag("-W2")].description, "Motor cable");
+        assert_eq!(
+            p.devices[&tag("-W1")].description,
+            "project's",
+            "the project's cable is untouched"
+        );
     }
 
     #[test]
