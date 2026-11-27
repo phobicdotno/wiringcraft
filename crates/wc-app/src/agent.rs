@@ -233,7 +233,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person).",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
             json!({}),
             &[],
         ),
@@ -650,7 +650,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_action",
-            "Run any toolbar or menu command by name, exactly as if the user clicked it. Commands that open a dialog show it to the user. Prefer the specific tools above; use this for view commands (ZoomIn, ZoomOut, ZoomFit, ToggleGrid, ToggleTheme, ToggleChrome) and anything they do not cover.",
+            "Run any toolbar or menu command by name, exactly as if the user clicked it. Commands that open a dialog show it to the user. Prefer the specific tools above; use this for view commands (ZoomIn, ZoomOut, ZoomFit, ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme, ToggleChrome) and anything they do not cover. The Toggle commands and LiveCheck flip a setting: get_state's `view` says how each is set.",
             json!({"action": {"type": "string", "enum": actions}}),
             &["action"],
         ),
@@ -2338,10 +2338,19 @@ impl App {
     }
 
     fn tool_state(&self) -> Result<String, String> {
+        // The drawing aids the Toggle commands flip, so the assistant sets one knowingly.
+        let view = json!({
+            "grid": self.prefs.show_grid,
+            "auto_wire": self.prefs.auto_wire,
+            "live_check": self.prefs.live_check,
+            "theme": self.prefs.theme,
+            "chrome": self.prefs.chrome,
+        });
         let Some(open) = &self.open else {
             return Ok(pretty(&json!({
                 "open": false,
                 "recent_projects": self.prefs.recent,
+                "view": view,
                 "session": Value::Null,
             })));
         };
@@ -2383,6 +2392,7 @@ impl App {
             "strips": strip_list(open, None),
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
+            "view": view,
             "selection": self
                 .ed
                 .selection
@@ -7838,6 +7848,44 @@ mod tests {
         assert!(m.starts_with("Export failed:"), "{m}");
         assert!(m.contains(wc_pdf::NOTHING_TO_EXPORT), "{m}");
         assert!(!crate::export_file(open, "pdf").exists());
+    }
+
+    #[test]
+    fn get_state_tells_how_the_drawing_aids_are_set() {
+        let (_tmp, mut a) = app(vec![]);
+        let view = |a: &mut App| -> Value {
+            let state: Value = serde_json::from_str(&call(a, "get_state", json!({})).unwrap()).unwrap();
+            state["view"].clone()
+        };
+        assert_eq!(
+            view(&mut a),
+            json!({"grid": true, "auto_wire": true, "live_check": true, "theme": "light", "chrome": "classic"})
+        );
+        for (action, key, flipped) in [
+            ("ToggleAutoWire", "auto_wire", json!(false)),
+            ("ToggleGrid", "grid", json!(false)),
+            ("LiveCheck", "live_check", json!(false)),
+            ("ToggleTheme", "theme", json!("dark")),
+            ("ToggleChrome", "chrome", json!("ribbon")),
+        ] {
+            let before = view(&mut a);
+            call(&mut a, "run_action", json!({"action": action})).unwrap();
+            let after = view(&mut a);
+            assert_eq!(after[key], flipped, "{action}");
+            for other in ["grid", "auto_wire", "live_check", "theme", "chrome"] {
+                if other != key {
+                    assert_eq!(after[other], before[other], "{action} leaves {other}");
+                }
+            }
+        }
+        call(&mut a, "run_action", json!({"action": "ToggleAutoWire"})).unwrap();
+        assert_eq!(view(&mut a)["auto_wire"], json!(true), "and back on");
+
+        // Without a project the settings are still told.
+        a.open = None;
+        let closed = view(&mut a);
+        assert_eq!(closed["auto_wire"], json!(true));
+        assert_eq!(closed["grid"], json!(false));
     }
 
     #[test]
