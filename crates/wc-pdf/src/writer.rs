@@ -295,14 +295,19 @@ impl Doc {
                 .collect();
             format!(" /PageLabels << /Nums [{}] >>", nums.join(" "))
         };
+        // DisplayDocTitle: readers show the project name (the Info /Title), not the file name.
+        // A project without a name has no title, so the reader shows the file name rather than
+        // an empty title bar (#1628).
+        let title = self.title.trim();
+        let viewer = if title.is_empty() {
+            ""
+        } else {
+            " /ViewerPreferences << /DisplayDocTitle true >>"
+        };
         objs.push((
             1,
-            // DisplayDocTitle: readers show the project name (the Info /Title), not the file name.
-            format!(
-                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines \
-                 /ViewerPreferences << /DisplayDocTitle true >>{oc}{labels} >>"
-            )
-            .into_bytes(),
+            format!("<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines{viewer}{oc}{labels} >>")
+                .into_bytes(),
         ));
         for (k, l) in used.iter().enumerate() {
             objs.push((
@@ -344,8 +349,12 @@ impl Doc {
         objs.push((
             5,
             format!(
-                "<< /Title {} /Producer (WiringCraft){} >>",
-                pdf_text_string(&self.title),
+                "<< {}/Producer (WiringCraft){} >>",
+                if title.is_empty() {
+                    String::new()
+                } else {
+                    format!("/Title {} ", pdf_text_string(title))
+                },
                 self.info
                     .iter()
                     .map(|(k, v)| format!(" /{k} {}", pdf_text_string(v)))
