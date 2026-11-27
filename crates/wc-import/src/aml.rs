@@ -190,9 +190,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                 }
             }
             Event::Text(t) if in_value => {
-                if let Ok(t) = t.unescape() {
-                    value.push_str(&t);
-                }
+                let t = t.unescape().map_err(|e| Error::Format(format!("AutomationML: {e}")))?;
+                value.push_str(&t);
             }
             Event::CData(t) if in_value => value.push_str(&String::from_utf8_lossy(&t)),
             Event::End(e) => {
@@ -1023,5 +1022,19 @@ mod tests {
         assert_eq!(props.get("Voltage").map(String::as_str), Some("24 V DC"));
         assert_eq!(build(&imp, 1).parts.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn value_with_a_bad_entity_between_cdata_pieces_is_refused_not_cut_short() {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="OrderNumber"><Value><![CDATA[R-]]>&unknown;<![CDATA[24]]></Value></Attribute>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        match parse(aml) {
+            Err(Error::Format(msg)) => assert!(msg.starts_with("AutomationML:"), "{msg}"),
+            Err(e) => panic!("wrong error: {e:?}"),
+            Ok(imp) => panic!("accepted a broken value: {:?}", imp.devices[0].properties),
+        }
     }
 }
