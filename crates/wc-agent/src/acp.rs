@@ -933,4 +933,205 @@ read l
         let Ok(p) = r else { unreachable!() };
         assert!(p.finished && !p.unanswered, "{p:?}");
     }
+
+    /// A permission question takes the "always" option when there is no "once" one, and is
+    /// cancelled when neither kind is offered; a question with no title is declined.
+    #[test]
+    fn permission_answers_fall_back_to_always_or_cancel() {
+        let tool = "mcp__wiringcraft-app__add_wire";
+        let only_always = json!({"toolCall": {"title": tool}, "options": [
+            {"optionId": "aa", "kind": "allow_always"}, {"optionId": "ra", "kind": "reject_always"}
+        ]});
+        let (yes, allowed) = permission_answer(&only_always);
+        assert!(allowed);
+        assert_eq!(yes, json!({"outcome": {"outcome": "selected", "optionId": "aa"}}));
+        let mut bash = only_always.clone();
+        bash["toolCall"]["title"] = json!("Bash");
+        let (no, allowed) = permission_answer(&bash);
+        assert!(!allowed);
+        assert_eq!(no["outcome"]["optionId"], "ra");
+        let reject_only = json!({"toolCall": {"title": tool}, "options": [{"optionId": "r", "kind": "reject_once"}]});
+        let (cancel, allowed) = permission_answer(&reject_only);
+        assert!(allowed);
+        assert_eq!(cancel, json!({"outcome": {"outcome": "cancelled"}}));
+        let (none, allowed) = permission_answer(&json!({"toolCall": {"title": tool}}));
+        assert!(allowed);
+        assert_eq!(none["outcome"]["outcome"], "cancelled");
+        let untitled =
+            json!({"options": [{"optionId": "a", "kind": "allow_once"}, {"optionId": "r", "kind": "reject_once"}]});
+        let (no, allowed) = permission_answer(&untitled);
+        assert!(!allowed);
+        assert_eq!(no["outcome"]["optionId"], "r");
+    }
+
+    /// Only a plain lower-case tool name after WiringCraft's own server name counts.
+    #[test]
+    fn bridge_tool_names_are_strict() {
+        assert!(is_bridge_tool("mcp__wiringcraft-app__add_wire2"));
+        assert!(!is_bridge_tool("mcp__wiringcraft-app__"));
+        assert!(!is_bridge_tool("mcp__wiringcraft-app"));
+        assert!(!is_bridge_tool("mcp__wiringcraft-app_place"));
+        assert!(!is_bridge_tool("mcp__wiringcraft-app__Place"));
+        assert!(!is_bridge_tool("mcp__wiringcraft-app__place-symbol"));
+        assert!(!is_bridge_tool("mcp__wiringcraft-appx__place"));
+        assert!(!is_bridge_tool("wiringcraft-app__place"));
+        assert!(!is_bridge_tool(""));
+    }
+
+    /// Quoting edge cases: quoted pieces join a word, single quotes keep backslashes, an
+    /// unclosed quote runs to the end, and any whitespace separates words.
+    #[test]
+    fn command_line_quoting_edge_cases() {
+        assert_eq!(split_command(r#"a"b c"'d'e"#), vec!["ab cde"]);
+        assert_eq!(split_command(r"'a\b' c\d"), vec![r"a\b", r"c\d"]);
+        assert_eq!(split_command(r#""a\nb" "x\\y""#), vec![r"a\nb", r"x\y"]);
+        assert_eq!(split_command(r#"run "open ended"#), vec!["run", "open ended"]);
+        assert_eq!(split_command("a\tb\n c"), vec!["a", "b", "c"]);
+        assert_eq!(split_command(r#"'it"s'"#), vec![r#"it"s"#]);
+        assert!(split_command("").is_empty());
+    }
+
+    /// A custom command line is used as given (trimmed), never searched for.
+    #[test]
+    fn a_custom_command_is_used_as_given() {
+        assert_eq!(
+            agent_command("  /bin/acp --verbose  "),
+            Some(vec!["/bin/acp".to_owned(), "--verbose".to_owned()])
+        );
+    }
+
+    /// The first folder holding the program wins; a folder of that name does not count.
+    #[cfg(unix)]
+    #[test]
+    fn finds_the_first_installed_program() {
+        let root = std::env::temp_dir().join(format!("wc-acp-find-{}", std::process::id()));
+        let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+        for d in [&a, &b, &c] {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::create_dir_all(a.join("tool"));
+        let wrote = std::fs::write(b.join("tool"), "").is_ok() && std::fs::write(c.join("tool"), "").is_ok();
+        assert!(wrote, "could not set up {}", root.display());
+        let dirs = vec![root.join("missing"), a.clone(), b.clone(), c];
+        let found = find_in("tool", &dirs);
+        let missing = find_in("other", &dirs);
+        let empty = find_in("tool", &[]);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(b.join("tool")));
+        assert_eq!(missing, None);
+        assert_eq!(empty, None);
+    }
+
+    /// The client offers no file or terminal access of its own; a null system-prompt
+    /// capability is not taken as an offer.
+    #[test]
+    fn the_client_offers_no_files_or_terminal() {
+        let p = initialize_params();
+        assert_eq!(p["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(p["clientCapabilities"]["fs"]["readTextFile"], false);
+        assert_eq!(p["clientCapabilities"]["fs"]["writeTextFile"], false);
+        assert_eq!(p["clientCapabilities"]["terminal"], false);
+        assert_eq!(p["clientInfo"]["name"], "wiringcraft");
+        let null = json!({"agentCapabilities": {"sessionCapabilities": {"systemPrompt": null}}});
+        let s = session_new_params(Path::new("/p"), &json!({}), &null, "n");
+        assert!(s.get("systemPrompt").is_none());
+        assert_eq!(s["cwd"], "/p");
+        assert_eq!(
+            s["_meta"]["claudeCode"]["options"]["allowDangerouslySkipPermissions"],
+            false
+        );
+    }
+
+    /// Start a stand-in adapter from `body` (a shell script), send `text` and poll until the
+    /// turn ends. Returns the session, the log and the last poll.
+    #[cfg(unix)]
+    fn run_stand_in(name: &str, body: &str, text: &str) -> Result<(Acp, Vec<Entry>, AcpPolled), String> {
+        let dir = std::env::temp_dir().join(format!("wc-acp-{name}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let script = dir.join("agent.sh");
+        std::fs::write(&script, body).map_err(|e| format!("writing {}: {e}", script.display()))?;
+        let argv = vec!["sh".to_owned(), script.to_string_lossy().into_owned()];
+        let mut acp = Acp::start(&argv, &dir, json!({}), "note", "", Arc::new(|| {}))?;
+        acp.prompt(text, &[]);
+        let mut log = Vec::new();
+        let mut polled = AcpPolled::default();
+        for _ in 0..400 {
+            polled = acp.poll(&mut log);
+            if polled.finished {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok((acp, log, polled))
+    }
+
+    /// The adapter's questions are answered: its own tools are declined with a note, an
+    /// unknown request gets "not offered", and a cancelled turn says it stopped.
+    #[cfg(unix)]
+    #[test]
+    fn answers_the_adapters_own_requests() {
+        let dir = std::env::temp_dir().join(format!("wc-acp-ask-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let seen = dir.join("answers.txt");
+        let body = format!(
+            r#"#!/bin/sh
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"S"}}}}'
+read l
+echo '{{"jsonrpc":"2.0","id":70,"method":"session/request_permission","params":{{"toolCall":{{"title":"Bash"}},"options":[{{"optionId":"y","kind":"allow_once"}},{{"optionId":"n","kind":"reject_once"}}]}}}}'
+read a; echo "$a" >> '{seen}'
+echo '{{"jsonrpc":"2.0","id":71,"method":"fs/read_text_file","params":{{}}}}'
+read a; echo "$a" >> '{seen}'
+echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"cancelled"}}}}'
+read l
+"#,
+            seen = seen.display()
+        );
+        let r = run_stand_in("ask", &body, "hi");
+        assert!(r.is_ok(), "stand-in adapter: {:?}", r.as_ref().err());
+        let Ok((acp, log, polled)) = r else { unreachable!() };
+        drop(acp);
+        let answers: Vec<Value> = std::fs::read_to_string(&seen)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(polled.finished && !polled.unanswered, "{polled:?} {log:?}");
+        assert_eq!(
+            log,
+            vec![
+                Entry::Note("Declined Bash: the assistant works through WiringCraft's tools.".into()),
+                Entry::Note("Stopped.".into()),
+            ]
+        );
+        assert_eq!(answers.len(), 2, "{answers:?}");
+        let (Some(perm), Some(unknown)) = (answers.first(), answers.get(1)) else {
+            unreachable!()
+        };
+        assert_eq!(perm["id"], 70);
+        assert_eq!(perm["result"]["outcome"]["optionId"], "n");
+        assert_eq!(unknown["id"], 71);
+        assert_eq!(unknown["error"]["code"], -32601);
+    }
+
+    /// An adapter that answers `session/new` without a session id is stopped, and the
+    /// message that waited for it is offered again.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_without_an_id_stops_the_adapter() {
+        let body = r#"#!/bin/sh
+read l; echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read l; echo '{"jsonrpc":"2.0","id":2,"result":{}}'
+read l
+"#;
+        let r = run_stand_in("nosession", body, "hi");
+        assert!(r.is_ok(), "stand-in adapter: {:?}", r.as_ref().err());
+        let Ok((acp, log, polled)) = r else { unreachable!() };
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("wc-acp-nosession-{}", std::process::id())));
+        assert!(polled.finished && polled.unanswered, "{polled:?}");
+        assert_eq!(log, vec![Entry::Error("Claude Code did not open a session.".into())]);
+        assert!(!acp.alive());
+        assert!(!acp.busy());
+    }
 }
