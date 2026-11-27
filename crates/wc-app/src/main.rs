@@ -5220,6 +5220,7 @@ mod status_colour_tests {
             assert_eq!(severity_colour(&t, Severity::Note), t.muted);
             assert_eq!(library_state_look(&t, State::UpToDate).0, t.success);
             assert_eq!(library_state_look(&t, State::NotLocked).0, t.accent);
+            assert_eq!(library_state_look(&t, State::Changed).0, t.warning);
         }
     }
 }
