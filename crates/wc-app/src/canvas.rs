@@ -1168,7 +1168,7 @@ pub fn show(
         wc_core::project::terminal_numbers(&open.project, |id| open.symbols.get(id).map(|s| s.role))
     };
     for j in &open.project.meta.jumpers {
-        let at = jumper_points(&page, &open.symbols, &numbers, j);
+        let at = wc_pdf::jumper_points(&page, &open.symbols, &numbers, j);
         if at.len() < 2 {
             continue;
         }
@@ -2882,36 +2882,6 @@ fn finish_wire(open: &mut Open, ed: &mut Editor, page: &Page, start: Endpoint, m
     ed.message = "Wire added.".into();
 }
 
-/// Where the jumper's bar passes on `page`: the terminal symbols of its terminals, in strip order.
-/// Other symbols with a terminal's tag (a device drawn with it) are no bar end.
-fn jumper_points(
-    page: &Page,
-    symbols: &std::collections::BTreeMap<String, wc_core::symbol::Symbol>,
-    numbers: &wc_core::project::TerminalNumbers,
-    j: &wc_core::project::Jumper,
-) -> Vec<Point> {
-    let mut at: Vec<(&str, Point)> = page
-        .symbols
-        .iter()
-        .filter(|s| {
-            symbols
-                .get(&s.symbol)
-                .is_some_and(|y| y.role == wc_core::symbol::SymbolRole::Terminal)
-                && j.has(numbers, page, s, true)
-        })
-        .filter_map(|s| {
-            let n = match numbers.get(&(page.id.clone(), s.id.clone())) {
-                Some((_, n)) => n.as_str(),
-                None => j.terminal_of(s.tag.as_ref()?)?,
-            };
-            Some((n, s.at))
-        })
-        .collect();
-    let key = wc_core::project::natural_key;
-    at.sort_by(|a, b| key(a.0).cmp(&key(b.0)).then_with(|| a.0.cmp(b.0)));
-    at.into_iter().map(|(_, p)| p).collect()
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -4576,7 +4546,7 @@ mod tests {
         o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
         let j = &o.project.meta.jumpers[0];
         let numbers = wc_core::project::terminal_numbers(&o.project, |id| o.symbols.get(id).map(|s| s.role));
-        let at = jumper_points(&o.project.pages[page], &o.symbols, &numbers, j);
+        let at = wc_pdf::jumper_points(&o.project.pages[page], &o.symbols, &numbers, j);
         assert_eq!(
             at,
             [Point::new(20.0, 20.0), Point::new(40.0, 20.0)],

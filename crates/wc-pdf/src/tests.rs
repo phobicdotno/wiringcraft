@@ -3505,6 +3505,54 @@ fn a_long_report_or_plc_card_heading_is_cut_to_the_frame_and_keeps_its_counter()
 }
 
 #[test]
+fn a_jumper_is_drawn_as_a_bar_with_dots_through_its_terminals() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("term".to_string(), sym("term", SymbolRole::Terminal, ["1", "2"]));
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = Project::new("Jumpers");
+    let mut p1 = Page::new("p1", "1", "Terminals");
+    p1.symbols.push(place("t2", "term", 80.0, "-X1.2"));
+    p1.symbols.push(place("t1", "term", 60.0, "-X1.1"));
+    // A device drawn with a terminal's tag is no bar end.
+    p1.symbols.push(place("k1", "coil", 120.0, "-X1.1"));
+    project.pages = vec![p1];
+    let Some(x1) = DeviceTag::parse("-X1").ok() else {
+        unreachable!("-X1 is a tag")
+    };
+    let Ok(()) = project.meta.add_jumper(&x1, &["1".into(), "2".into()]) else {
+        unreachable!("two terminals of the strip")
+    };
+    let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    let prims = &pages[0].prims;
+    let bar = prims.iter().any(|p| {
+        matches!(p, writer::Prim::Path { points, ink, .. }
+            if points == &[(60.0, 60.0), (80.0, 60.0)] && (ink.width - 0.6).abs() < 1e-9)
+    });
+    assert!(bar, "a bar from -X1.1 to -X1.2: {prims:?}");
+    let dots: Vec<(f64, f64)> = prims
+        .iter()
+        .filter_map(|p| match p {
+            writer::Prim::Arc {
+                center,
+                radius,
+                filled: true,
+                ..
+            } if (radius - 0.9).abs() < 1e-9 => Some(*center),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dots,
+        [(60.0, 60.0), (80.0, 60.0)],
+        "a dot on each terminal, none on the coil"
+    );
+    assert!(
+        svg(&pages[0]).contains("<polyline points=\"60,60 80,60\""),
+        "the SVG draws it too"
+    );
+}
+
+#[test]
 fn a_cable_list_page_names_the_cable_its_first_cores_belong_to() {
     let mut project = Project::new("x");
     project.pages = vec![Page::new("p1", "1", "Inputs")];

@@ -944,6 +944,26 @@ pub fn draw_page(
         pen.circle((x, y), 0.6, true);
     }
 
+    // Jumpers: a bar through the jumpered terminals on this page, in strip order, with a dot
+    // on each, as the editor draws them.
+    if !project.meta.jumpers.is_empty() {
+        let numbers = wc_core::project::terminal_numbers(project, |id| symbols.get(id).map(|s| s.role));
+        pen.width(0.6);
+        for j in &project.meta.jumpers {
+            let at: Vec<(f64, f64)> = jumper_points(page, symbols, &numbers, j)
+                .into_iter()
+                .map(tuple)
+                .collect();
+            if at.len() < 2 {
+                continue;
+            }
+            pen.polyline(&at, false);
+            for p in at {
+                pen.circle(p, 0.9, true);
+            }
+        }
+    }
+
     // Symbols. A symbol missing from the library copy is warned about once per page, with
     // how many placements it has there, however often it is placed.
     pen.width(0.3);
@@ -1016,6 +1036,34 @@ pub fn draw_page(
         underlay: None,
         pictures: Vec::new(),
     }
+}
+
+/// Where the jumper's bar passes on `page`: the terminal symbols of its terminals, in strip order.
+/// Other symbols with a terminal's tag (a device drawn with it) are no bar end. The editor and
+/// the page export both draw the bar through these points.
+pub fn jumper_points(
+    page: &Page,
+    symbols: &BTreeMap<String, Symbol>,
+    numbers: &wc_core::project::TerminalNumbers,
+    j: &wc_core::project::Jumper,
+) -> Vec<Point> {
+    let mut at: Vec<(&str, Point)> = page
+        .symbols
+        .iter()
+        .filter(|s| {
+            symbols.get(&s.symbol).is_some_and(|y| y.role == SymbolRole::Terminal) && j.has(numbers, page, s, true)
+        })
+        .filter_map(|s| {
+            let n = match numbers.get(&(page.id.clone(), s.id.clone())) {
+                Some((_, n)) => n.as_str(),
+                None => j.terminal_of(s.tag.as_ref()?)?,
+            };
+            Some((n, s.at))
+        })
+        .collect();
+    let key = wc_core::project::natural_key;
+    at.sort_by(|a, b| key(a.0).cmp(&key(b.0)).then_with(|| a.0.cmp(b.0)));
+    at.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Points where three or more wire branches meet: wire ends and bends count once per wire
