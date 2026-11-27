@@ -443,11 +443,16 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "set_device",
-            "Set a device's description, part (from find_parts; empty string removes it) and properties (empty value removes one), or rename its tag everywhere (symbols, cables, panel layouts).",
+            "Set a device's description, part (from find_parts; empty string removes it), accessories and properties (empty value removes one), or rename its tag everywhere (symbols, cables, panel layouts).",
             json!({
                 "tag": {"type": "string"},
                 "description": {"type": "string"},
                 "part": {"type": "string"},
+                "accessories": {
+                    "type": "array",
+                    "description": "The device's whole new list of accessories (its parts after the main part, from find_parts), in order; an empty list removes them all. qty defaults to 1.",
+                    "items": {"type": "object", "properties": {"part": {"type": "string"}, "qty": {"type": "integer", "minimum": 1}}, "required": ["part"]}
+                },
                 "properties": {"type": "object", "additionalProperties": {"type": "string"}},
                 "rename_to": {"type": "string"}
             }),
@@ -744,6 +749,34 @@ fn report_kind(text: &str) -> Result<wc_report::Kind, String> {
         let names: Vec<&str> = wc_report::Kind::ALL.iter().map(|k| k.name()).collect();
         format!("Unknown report {text:?}: use one of {}.", names.join(", "))
     })
+}
+
+/// `set_device`'s `accessories`: a list of `{part, qty}`, qty 1 when left out (a null qty is
+/// refused). An entry that is
+/// not one refuses the whole list, so no accessory is dropped or changed by a mistake.
+fn accessories(list: &Value) -> Result<Vec<wc_core::DevicePart>, String> {
+    let shape = "accessories must be a list of {part, qty} (qty a whole number of 1 or more)";
+    let list = list.as_array().ok_or(shape)?;
+    list.iter()
+        .map(|a| {
+            let part = a.get("part").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+            if part.is_empty() {
+                return Err(format!("{shape}: an entry has no part."));
+            }
+            let qty = match a.get("qty") {
+                None => 1,
+                Some(q) => q
+                    .as_u64()
+                    .and_then(|q| u32::try_from(q).ok())
+                    .filter(|q| *q >= 1)
+                    .ok_or_else(|| format!("{shape}: qty {q} of {part} is not one."))?,
+            };
+            Ok(wc_core::DevicePart {
+                part: part.to_owned(),
+                qty,
+            })
+        })
+        .collect()
 }
 
 fn need_num(v: &Value, key: &str) -> Result<f64, String> {
@@ -2877,6 +2910,16 @@ impl App {
     fn tool_set_device(&mut self, v: &Value) -> Result<String, String> {
         let mut t = tag(need_s(v, "tag")?)?;
         let open = need_open(self.open.as_mut())?;
+        // The accessories are checked before any field is applied, so a refused list leaves the
+        // project as it was.
+        let list = v
+            .get("accessories")
+            .filter(|l| !l.is_null())
+            .map(accessories)
+            .transpose()?;
+        if let Some(list) = &list {
+            open.check_parts(list.iter().map(|a| a.part.as_str()))?;
+        }
         let mut done = Vec::new();
         if let Some(to) = s(v, "rename_to") {
             let to = tag(to)?;
@@ -2904,6 +2947,15 @@ impl App {
                 "part removed".into()
             } else {
                 format!("part {p}")
+            });
+        }
+        if let Some(list) = list {
+            let n = list.len();
+            open.set_device_accessories(&t, list)?;
+            done.push(if n == 0 {
+                "accessories removed".into()
+            } else {
+                format!("{n} accessor{}", if n == 1 { "y" } else { "ies" })
             });
         }
         if let Some(map) = v.get("properties").and_then(Value::as_object) {
@@ -5389,6 +5441,85 @@ mod tests {
         // An empty list removes every rack.
         call(&mut a, "plc_racks", json!({"action": "replace", "racks": []})).unwrap();
         assert_eq!(read(&mut a), json!([]));
+    }
+
+    #[test]
+    fn set_device_replaces_and_removes_accessories_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let tag = DeviceTag::parse("-K1").unwrap();
+        let got = |a: &App| -> Vec<wc_core::DevicePart> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .devices
+                .get(&tag)
+                .map(|d| d.accessories.clone())
+                .unwrap_or_default()
+        };
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        // A list that is not one, or a part that does not exist, changes nothing.
+        for bad in [
+            json!("example.ex-tb-2-5"),
+            json!([{"qty": 2}]),
+            json!([{"part": "example.ex-tb-2-5", "qty": 0}]),
+            json!([{"part": "example.ex-tb-2-5", "qty": "2"}]),
+            json!([{"part": "example.ex-tb-2-5", "qty": null}]),
+            json!([{"part": "no.such"}]),
+        ] {
+            let r = call(&mut a, "set_device", json!({"tag": "-K1", "accessories": bad.clone()}));
+            assert!(r.is_err(), "{bad}: {r:?}");
+            // Nor does it let the call's other fields through.
+            let r = call(
+                &mut a,
+                "set_device",
+                json!({"tag": "-K1", "description": "New", "part": "example.ex-tb-2-5", "properties": {"k": "v"}, "accessories": bad.clone()}),
+            );
+            assert!(r.is_err(), "{bad} with other fields: {r:?}");
+        }
+        assert!(got(&a).is_empty());
+        assert!(!a.open.as_ref().unwrap().project.devices.contains_key(&tag));
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+
+        let said = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "accessories": [{"part": "example.ex-tb-2-5", "qty": 3}, {"part": " example.ex-tb-2-5 "}]}),
+        )
+        .unwrap();
+        assert!(said.contains("2 accessories"), "{said}");
+        let want = [
+            wc_core::DevicePart {
+                part: "example.ex-tb-2-5".into(),
+                qty: 3,
+            },
+            wc_core::DevicePart {
+                part: "example.ex-tb-2-5".into(),
+                qty: 1,
+            },
+        ];
+        assert_eq!(got(&a), want);
+        let listed: Value =
+            serde_json::from_str(&call(&mut a, "get_devices", json!({"query": "-K1"})).unwrap()).unwrap();
+        assert_eq!(listed[0]["accessories"][0]["qty"], json!(3), "{listed}");
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1, "one undo step");
+
+        // A null qty on a device that has accessories is refused and keeps the list it has.
+        let r = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "accessories": [{"part": "example.ex-tb-2-5", "qty": null}]}),
+        );
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(got(&a), want);
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1, "no new step");
+
+        // An empty list removes them, and undo brings them back.
+        let said = call(&mut a, "set_device", json!({"tag": "-K1", "accessories": []})).unwrap();
+        assert!(said.contains("accessories removed"), "{said}");
+        assert!(got(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(got(&a), want);
     }
 
     #[test]
