@@ -386,6 +386,10 @@ fn convert(
                     }
                 }
                 Some("text") => {
+                    // A hidden text shows only in KiCad's symbol editor.
+                    if g.first("effects").is_some_and(|e| hidden_from(e, 1)) {
+                        continue;
+                    }
                     if let (Some(t), Some(at)) = (g.arg(1), g.first("at")) {
                         graphics.extend(text_shapes(t, at, g.first("effects"), &pt, scale));
                     }
@@ -644,12 +648,6 @@ fn text_shapes(t: &str, at: &Sexp, effects: Option<&Sexp>, pt: &impl Fn(f64, f64
 /// usually Value. Hidden ones (KiCad 6/7 `(effects ... hide)`, KiCad 8+ `(hide yes)`) and
 /// KiCad's own `ki_` keys are left out.
 fn visible_fields(sym: &Sexp, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Vec<Shape> {
-    // A bare `hide` flag is read from item `from` on: a property's key and value come first,
-    // and a field whose key or text is "hide" is not hidden by it.
-    let hidden = |s: &Sexp, from: usize| {
-        s.items().iter().skip(from).any(|i| i.atom() == Some("hide"))
-            || s.first("hide").and_then(|h| h.arg(1)) == Some("yes")
-    };
     let mut out = Vec::new();
     for p in sym.all("property") {
         let (Some(key), Some(value), Some(at)) = (p.arg(1), p.arg(2), p.first("at")) else {
@@ -660,14 +658,22 @@ fn visible_fields(sym: &Sexp, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Ve
             || key.starts_with("ki_")
             || value.trim().is_empty()
             || value == "~"
-            || hidden(p, 3)
-            || effects.is_some_and(|e| hidden(e, 1))
+            || hidden_from(p, 3)
+            || effects.is_some_and(|e| hidden_from(e, 1))
         {
             continue;
         }
         out.extend(text_shapes(value, at, effects, pt, scale));
     }
     out
+}
+
+/// Whether `s` is hidden: a bare `hide` flag (KiCad 6/7), read from item `from` on so a
+/// property's key and value, or a text that reads "hide", do not count, or `(hide yes)`
+/// (KiCad 8+).
+fn hidden_from(s: &Sexp, from: usize) -> bool {
+    s.items().iter().skip(from).any(|i| i.atom() == Some("hide"))
+        || s.first("hide").and_then(|h| h.arg(1)) == Some("yes")
 }
 
 /// A rectangle from `min` to `max`. A rectangle has no fill of its own: a filled one becomes a
@@ -1107,6 +1113,35 @@ mod tests {
                 .any(|s| matches!(s, Shape::Text { text, .. } if text == "hidden" || text == "private"))
         );
         assert_eq!(warnings, ["T: 2 image item(s) not read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_texts_are_left_out() -> Result<()> {
+        // KiCad draws a hidden text only in its symbol editor: `hide` (KiCad 6/7) or
+        // `(hide yes)` (KiCad 8+) in its effects.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "H" (property "Reference" "H" (at 0 0 0))
+    (symbol "H_0_1"
+      (text "old" (at 0 5 0) (effects (font (size 1 1)) hide))
+      (text "new" (at 0 6 0) (effects (font (size 1 1)) (hide yes)))
+      (text "hide" (at 0 7 0) (effects (font (size 1 1))))
+      (text "shown" (at 0 8 0) (effects (font (size 1 1)) (hide no))))
+    (symbol "H_1_1"
+      (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let texts: Vec<&str> = syms[0]
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // A text that reads "hide" is not hidden by its own content.
+        assert_eq!(texts, ["hide", "shown"]);
         Ok(())
     }
 
