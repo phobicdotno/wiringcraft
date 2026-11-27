@@ -84,6 +84,14 @@ const TAG_ATTRIBUTES: [&str; 6] = [
     "BMK",
 ];
 
+/// CAEX class libraries: their elements describe classes, not the plant.
+const LIBRARIES: [&str; 4] = [
+    "SystemUnitClassLib",
+    "RoleClassLib",
+    "InterfaceClassLib",
+    "AttributeTypeLib",
+];
+
 #[derive(Default)]
 struct Elem {
     name: String,
@@ -119,6 +127,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
         }
     };
     let mut seen_caex = false;
+    // Depth inside class libraries: their elements are templates, not part of the plant.
+    let mut in_lib = 0usize;
     let mut events = 0usize;
     loop {
         events += 1;
@@ -132,6 +142,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let empty = matches!(ev, Event::Empty(_));
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if LIBRARIES.contains(&tag.as_str()) || in_lib > 0 {
+                    if !empty && LIBRARIES.contains(&tag.as_str()) {
+                        in_lib += 1;
+                    }
+                    continue;
+                }
                 match tag.as_str() {
                     "CAEXFile" => seen_caex = true,
                     "InternalElement" => {
@@ -182,6 +198,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
             }
             Event::End(e) => {
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if in_lib > 0 {
+                    if LIBRARIES.contains(&tag.as_str()) {
+                        in_lib -= 1;
+                    }
+                    continue;
+                }
                 match tag.as_str() {
                     "InternalElement" => {
                         if let Some(el) = stack.pop() {
@@ -829,6 +851,35 @@ mod tests {
             "{:?}",
             imp.warnings
         );
+        Ok(())
+    }
+
+    #[test]
+    fn class_libraries_are_not_devices() -> Result<()> {
+        // A system unit class may hold template elements with connection points; only the
+        // instance hierarchy gives devices, links and locations.
+        let text = r#"<CAEXFile>
+  <InterfaceClassLib Name="I"><InterfaceClass Name="Terminal"/></InterfaceClassLib>
+  <SystemUnitClassLib Name="Lib">
+    <SystemUnitClass Name="Relay">
+      <InternalElement Name="Coil" ID="t1">
+        <ExternalInterface Name="A1" ID="ti1"/>
+        <ExternalInterface Name="A2" ID="ti2"/>
+      </InternalElement>
+      <InternalElement Name="+L8" ID="t2"/>
+      <InternalLink Name="t" RefPartnerSideA="ti1" RefPartnerSideB="ti2"/>
+    </SystemUnitClass>
+  </SystemUnitClassLib>
+  <InstanceHierarchy Name="H">
+    <InternalElement Name="K1" ID="e1"><ExternalInterface Name="A1" ID="i1"/></InternalElement>
+  </InstanceHierarchy>
+</CAEXFile>"#;
+        let imp = parse(text)?;
+        let names: Vec<&str> = imp.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["K1"]);
+        assert!(imp.links.is_empty(), "{:?}", imp.links);
+        assert!(imp.locations.is_empty(), "{:?}", imp.locations);
+        assert!(imp.warnings.is_empty(), "{:?}", imp.warnings);
         Ok(())
     }
 }
