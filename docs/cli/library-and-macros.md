@@ -170,6 +170,7 @@ places them. Texts in a macro can hold placeholders, `{{name}}`, filled from a n
 | `macro show <name>` | Description, placeholders, value sets, the placeholders its texts use, and a problem `edit` would refuse to save. |
 | `macro edit <name> [options]` | Change a project macro's description, placeholders and value sets. A library's macros are not edited here. |
 | `macro place <page> <name> --at x,y` | Place it with its top-left corner at `--at` (mm). `--set <set>` picks the value set (needed when it has any); `--value name=value` (repeatable) overrides one value. The symbols it uses and the parts its devices and accessories name are copied into the project and pinned, as `device --part` does (a part no library has stays a plain name). When that would bring back a symbol the project already places but has no readable copy of, and a strip with jumpers or a rail order would be numbered differently with it, nothing is placed: restore the file first. Prints the new symbol ids. |
+| `macro generate <name> --table <file>` | Generate pages from a table (CSV or `.xlsx`): one copy of the macro per row, the cells filling its placeholders. See [Pages from a table](#pages-from-a-table). Prints the new page ids and the number of copies. |
 
 `macro edit` options, all repeatable except `--description`:
 
@@ -211,6 +212,46 @@ The symbols get the next free tags (here `-F2`), and the devices get the macro's
 placeholders filled (`Feeder Pump`). Symbols the project does not have yet are copied and pinned,
 and so are the parts the macro's devices and accessories name. A part no library source has stays
 a plain name on the device; `check` reports it.
+
+### Pages from a table
+
+`macro generate` places a macro once per row of a table, so a list of motors, valves or I/O
+channels becomes schematic pages in one step. The example needs a macro `starter` (made in the
+app like `feeder` above) with the placeholders `kW` and `Section` (default `2.5 mm²`) and the
+value sets `0.75 kW` (`kW` = `0.75`) and `3 kW` (`kW` = `3`):
+
+```sh
+wiringcraft macro generate starter --table motors.csv --set "3 kW" --title Motors --size A3
+```
+
+```text
+motors.csv:
+Set;kW;Section
+3 kW;;
+0.75 kW;0.8;
+;5.5;4 mm²
+```
+
+- The first row names the columns. A column named like one of the macro's placeholders (case
+  ignored) fills it. A column `set` picks the row's value set; rows without one use `--set`. (A
+  macro that declares a placeholder `set` takes the column as that placeholder.)
+- An empty cell gives no value, so the value set's value or the placeholder's default applies.
+- Any other column name is an error that lists the placeholders, so a typo is not ignored.
+- Every row is checked before anything is placed. A row that cannot be filled (no value set, an
+  unknown set, a placeholder left without a value) places nothing, and the error names its line.
+  So does a CSV file that ends inside a quoted cell. A row whose cells are all empty, such as
+  `;;`, is skipped like a blank line, as spreadsheets write those under the last row.
+- The copies go on new pages after the last page, numbered on from the last page's first number
+  (`12.3` gives `13`, `A7` gives `A8`) and
+  titled `--title` (the macro's name if left out), in the `--size` given (A3 if left out). They
+  are placed left to right, then row below row, inside the frame and above the title block,
+  10 mm apart (counting the widest text any copy draws), with the macro's anchor on the 5 mm
+  grid. A full page starts the next one. A
+  macro larger than the page's drawing area is refused.
+- Tags are renumbered as `macro place` does them: three rows of a `-Q1` starter give `-Q1`,
+  `-Q2` and `-Q3` (or the next free ones).
+- The table can be a CSV file (comma, semicolon or tab, UTF-8 or Windows-1252) or an Excel
+  `.xlsx` workbook, whose first visible sheet is read.
 
 ## template
 

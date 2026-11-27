@@ -11,6 +11,7 @@ pub mod connectivity;
 pub mod error;
 pub mod find;
 pub mod font;
+pub mod generate;
 pub mod geom;
 pub mod guard;
 pub mod hash;

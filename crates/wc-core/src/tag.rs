@@ -129,6 +129,42 @@ impl DeviceTag {
     }
 }
 
+/// A placed symbol's device tag as drawn: how its lines align, and each line (`=function`,
+/// `+location`, `-product`) with its baseline anchor in page mm, centred on the tag position.
+/// The lines are right-aligned there, so they grow away from a drawing to their right; where
+/// the placement turns that side round (a mirror, or half a turn) they are left-aligned.
+pub fn tag_lines(
+    placed: &crate::project::PlacedSymbol,
+    symbol: &crate::symbol::Symbol,
+    tag: &DeviceTag,
+) -> (crate::geom::Align, Vec<(crate::geom::Point, String)>) {
+    let ta = symbol.tag_at.transform(placed.rotation, placed.mirror) + placed.at;
+    let reversed = crate::geom::Point::new(1.0, 0.0)
+        .transform(placed.rotation, placed.mirror)
+        .x
+        < -0.5;
+    let align = if reversed {
+        crate::geom::Align::Left
+    } else {
+        crate::geom::Align::Right
+    };
+    let mut lines = Vec::new();
+    if !tag.function.is_empty() {
+        lines.push(format!("={}", tag.function.join(".")));
+    }
+    if !tag.location.is_empty() {
+        lines.push(format!("+{}", tag.location.join(".")));
+    }
+    lines.push(format!("-{}", tag.product.join(".")));
+    let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
+    let lines = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| (crate::geom::Point::new(ta.x, top + 3.0 * i as f64), l))
+        .collect();
+    (align, lines)
+}
+
 impl fmt::Display for DeviceTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.function.is_empty() {
