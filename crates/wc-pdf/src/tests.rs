@@ -341,6 +341,18 @@ fn a_negative_radius_is_drawn_in_svg_and_dxf_where_the_pdf_draws_it() {
     );
     assert!(d.contains("0\nCIRCLE\n8\n0\n62\n7\n10\n20\n20\n80\n40\n3\n"), "{d}");
     assert!(!d.contains("\n40\n-"), "{d}");
+    // A tiny arc stays tiny: turned before its sweep was taken, it rounded to a full circle.
+    let mut tiny = crate::writer::Pen::new(100.0);
+    tiny.arc((50.0, 50.0), -10.0, 0.0, 1e-14, false);
+    let sweeps: Vec<f64> = tiny
+        .prims
+        .iter()
+        .filter_map(|p| match p {
+            crate::writer::Prim::Arc { start, end, .. } => Some(end - start),
+            _ => None,
+        })
+        .collect();
+    assert!(sweeps.len() == 1 && sweeps[0] < 1.0, "{sweeps:?}");
 }
 
 #[test]
