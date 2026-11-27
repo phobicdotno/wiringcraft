@@ -442,18 +442,30 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
     let mut prev: Vec<usize> = (0..n).map(|i| (i + n - 1) % n).collect();
     let mut next: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
     let mut alive = vec![true; n];
+    // Every index below comes from the ring, so it is in range; an index that is not (a bug)
+    // gives `None`, and the shape is drawn as its outline rather than panicking.
+    let pt = |i: usize| pts.get(i).copied();
+    let link = |v: &[usize], i: usize| v.get(i).copied();
+    let set = |v: &mut [usize], i: usize, to: usize| v.get_mut(i).map(|x| *x = to);
 
     // The corners that are not convex, bucketed in a square grid over the outline's box. A
     // corner only ever turns from reflex to convex as ears are clipped, so the grid is built
     // once; clipped corners are skipped when looked up.
-    let (mut lo, mut hi) = (pts[0], pts[0]);
+    let first = pt(0)?;
+    let (mut lo, mut hi) = (first, first);
     for q in pts {
         lo = lo.min(*q);
         hi = hi.max(*q);
     }
-    let reflex: Vec<usize> = (0..n)
-        .filter(|&i| cross(pts[prev[i]], pts[i], pts[next[i]]) * turn <= 0.0)
-        .collect();
+    let corner = |prev: &[usize], next: &[usize], i: usize| -> Option<f32> {
+        Some(cross(pt(link(prev, i)?)?, pt(i)?, pt(link(next, i)?)?))
+    };
+    let mut reflex = Vec::new();
+    for i in 0..n {
+        if corner(&prev, &next, i)? * turn <= 0.0 {
+            reflex.push(i);
+        }
+    }
     let side = ((reflex.len() as f32).sqrt().ceil() as usize).clamp(1, 1024);
     let cell_w = ((hi.x - lo.x) / side as f32).max(f32::MIN_POSITIVE);
     let cell_h = ((hi.y - lo.y) / side as f32).max(f32::MIN_POSITIVE);
@@ -464,8 +476,8 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
     };
     let mut grid: Vec<Vec<usize>> = vec![Vec::new(); side * side];
     for &i in &reflex {
-        let (cx, cy) = cell(pts[i]);
-        grid[cy * side + cx].push(i);
+        let (cx, cy) = cell(pt(i)?);
+        grid.get_mut(cy * side + cx)?.push(i);
     }
 
     let mut work = 0usize;
@@ -479,8 +491,8 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
         if work > TRIANGULATE_BUDGET {
             return None;
         }
-        let (ia, ic) = (prev[ear], next[ear]);
-        let (a, b, c) = (pts[ia], pts[ear], pts[ic]);
+        let (ia, ic) = (link(&prev, ear)?, link(&next, ear)?);
+        let (a, b, c) = (pt(ia)?, pt(ear)?, pt(ic)?);
         let is_ear = cross(a, b, c) * turn > 0.0 && {
             // No other corner strictly inside the triangle.
             let (c0x, c0y) = cell(a.min(b).min(c));
@@ -488,12 +500,12 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
             let mut clear = true;
             'cells: for cy in c0y..=c1y {
                 for cx in c0x..=c1x {
-                    for &k in &grid[cy * side + cx] {
+                    for &k in grid.get(cy * side + cx)? {
                         work += 1;
-                        if !alive[k] || k == ia || k == ear || k == ic {
+                        if !alive.get(k).copied()? || k == ia || k == ear || k == ic {
                             continue;
                         }
-                        let q = pts[k];
+                        let q = pt(k)?;
                         if q == a || q == b || q == c {
                             continue;
                         }
@@ -509,41 +521,41 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
         };
         if is_ear {
             out.push([ia as u32, ear as u32, ic as u32]);
-            next[ia] = ic;
-            prev[ic] = ia;
-            alive[ear] = false;
+            set(&mut next, ia, ic)?;
+            set(&mut prev, ic, ia)?;
+            *alive.get_mut(ear)? = false;
             left -= 1;
             // Go on from the corner after the ear, as earcut does.
-            ear = next[ic];
+            ear = link(&next, ic)?;
             stop = ear;
             continue;
         }
-        ear = next[ear];
+        ear = link(&next, ear)?;
         if ear == stop {
             // Only flat corners left (a bridge, collinear points): drop one and go on.
             let mut k = ear;
             let mut flat = None;
             for _ in 0..left {
                 work += 1;
-                if cross(pts[prev[k]], pts[k], pts[next[k]]).abs() < 1e-6 {
+                if corner(&prev, &next, k)?.abs() < 1e-6 {
                     flat = Some(k);
                     break;
                 }
-                k = next[k];
+                k = link(&next, k)?;
             }
             let Some(k) = flat else { break };
-            let (p, q) = (prev[k], next[k]);
-            next[p] = q;
-            prev[q] = p;
-            alive[k] = false;
+            let (p, q) = (link(&prev, k)?, link(&next, k)?);
+            set(&mut next, p, q)?;
+            set(&mut prev, q, p)?;
+            *alive.get_mut(k)? = false;
             left -= 1;
             ear = q;
             stop = ear;
         }
     }
     if left == 3 {
-        let b = next[ear];
-        out.push([ear as u32, b as u32, next[b] as u32]);
+        let b = link(&next, ear)?;
+        out.push([ear as u32, b as u32, link(&next, b)? as u32]);
     }
     Some(out)
 }
