@@ -1839,8 +1839,13 @@ fn translated(dir: &Path, p: &Project, lang: &str) -> Res<(Project, Vec<wc_core:
 fn in_language(dir: &Path, p: Project, lang: Option<String>) -> Res<Project> {
     let Some(lang) = lang else { return Ok(p) };
     let (p, missing) = translated(dir, &p, &lang)?;
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
     for m in &missing {
-        eprintln!(
+        // As in `warn_levels`: a warning that cannot be written (stderr closed or full) is
+        // dropped, it must not stop the export.
+        let _ = writeln!(
+            err,
             "warning: no translation for {:?} ({})",
             escape_field(&m.text),
             escape_field(&m.used.join(", "))
