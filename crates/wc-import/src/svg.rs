@@ -687,6 +687,10 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             }
         }
         let show = shown(&e, &tag, shows.last().copied().unwrap_or((true, true)));
+        // Every `<path>` counts, hidden or not, so a warning names its place in the file.
+        if tag == "path" {
+            path_count += 1;
+        }
         // An invisible `<text>` still sets up its label: a `<tspan>` in it can be visible again,
         // and each run of words is checked on its own.
         if !show.0 || (!show.1 && tag != "text") {
@@ -777,7 +781,6 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 })
             }
             "path" => {
-                path_count += 1;
                 let (parts, stopped) = path(&attr(&e, "d").unwrap_or_default(), &m);
                 if let Some(why) = stopped {
                     let which = match attr(&e, "id") {
@@ -1625,6 +1628,19 @@ mod tests {
                 .1
                 .is_empty()
         );
+        // A hidden path still counts, so the bad one after it is path 2, and a hidden bad path
+        // gives no warning.
+        for svg in [
+            r#"<svg><defs><path d="M 0 0 L 1 0"/></defs><path d="M 0 0 L 1 0 A"/></svg>"#,
+            r#"<svg><path display="none" d="M 0 0 L 1 0 A"/><path d="M 0 0 L 1 0 A"/></svg>"#,
+        ] {
+            let (_, warnings) = symbol_with_warnings(svg, "x", "x")?;
+            assert_eq!(
+                warnings,
+                ["path 2 is drawn only in part: stopped at command 3 (A): an arc has no arguments"],
+                "{svg}"
+            );
+        }
         Ok(())
     }
 
