@@ -8178,8 +8178,10 @@ mod nudge_tests {
         app_frame(&mut app, &ctx, Vec::new(), false);
         assert!(matches!(app.pending, Some(Pending::Open)), "then asks for the folder");
         assert!(app.open.as_ref().unwrap().dirty, "with the typed value entered");
-        // The folder picker is not shown in a test.
-        app.pending = None;
+        PICKED_FOLDER.set(Some(Picked::Cancelled));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(PICKED_FOLDER.take().is_none(), "the folder picker was shown");
+        assert!(app.pending.is_none(), "and cancelled");
     }
 
     /// A session join that would replace the open project waits while a save waits for a
@@ -8610,7 +8612,9 @@ mod nudge_tests {
         assert!(matches!(app.pending, Some(Pending::Open)));
         assert!(!app.fetch_may_open(), "the Open asks first");
         // The file dialog ran, or was cancelled: the pending Open is gone.
-        app.pending = None;
+        PICKED_FOLDER.set(Some(Picked::Cancelled));
+        app.ask_pending();
+        assert!(PICKED_FOLDER.take().is_none(), "the folder picker was shown");
         assert!(app.fetch_may_open(), "the fetch is taken up again");
     }
 
@@ -8653,6 +8657,57 @@ mod nudge_tests {
         app_frame(&mut app, &ctx, Vec::new(), false);
         assert!(app.fetch.is_none(), "the fetch is taken up");
         assert_eq!(app.open.as_ref().unwrap().dir, new_dir, "the fetched project is open");
+    }
+
+    /// As above, with a project picked in the folder picker: the picked project opens, and the
+    /// base project fetched meanwhile does not replace it. It is recorded, remembered in the
+    /// recent projects, and the person is told it is ready to open from File, Open (#1111).
+    #[test]
+    fn a_fetched_project_waits_when_the_open_folder_picker_picks_a_project() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        // A first frame lays the window out, so the frames below each run their work once.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let was_open = app.open.as_ref().unwrap().dir.clone();
+        let new_dir = tmp.path().join("fetched");
+        wc_core::store::create(&new_dir, "Fetched").unwrap();
+        let picked = tmp.path().join("picked");
+        wc_core::store::create(&picked, "Picked").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        app.fetch = Some(BaseFetch {
+            dir: new_dir.clone(),
+            source: "https://example.invalid/base.git".into(),
+            was_open: Some(was_open.clone()),
+            made: false,
+            cancel: std::sync::Arc::default(),
+            done,
+        });
+        app.run(Action::Open);
+        assert!(matches!(app.pending, Some(Pending::Open)));
+        PICKED_FOLDER.set(Some(Picked::Path(picked.clone())));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(PICKED_FOLDER.take().is_none(), "the folder picker was shown");
+        assert!(app.pending.is_none(), "and answered");
+        assert!(app.fetch.is_some(), "the fetch waited");
+        assert_eq!(app.open.as_ref().unwrap().dir, picked, "the picked project is open");
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(app.fetch.is_none(), "the fetch is taken up");
+        assert_eq!(app.open.as_ref().unwrap().dir, picked, "the picked project stays open");
+        let Some(Dialog::Message(m)) = &app.dialog else {
+            unreachable!("the person is told about the fetched project")
+        };
+        assert!(
+            m.contains("is ready in") && m.contains(&new_dir.display().to_string()),
+            "{m}"
+        );
+        assert!(
+            app.prefs.recent.contains(&new_dir),
+            "the fetched project is in the recent ones"
+        );
+        assert!(new_dir.join(".git").is_dir(), "its first version is recorded");
     }
 
     /// A close asked for while a field has the keyboard waits a frame for the typed value; a
