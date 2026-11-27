@@ -157,7 +157,13 @@ fn parse(text: &str) -> Result<Drawing> {
                   block: &mut Option<(String, Vec<Entity>)>,
                   polyline: &mut Option<Entity>,
                   d: &mut Drawing| match e.kind.as_str() {
-        "POLYLINE" => *polyline = Some(e),
+        "POLYLINE" => {
+            // The header's own 10/20/30 point is a dummy (always the origin): the line's points
+            // are its VERTEX entities, so it must not become the first of them.
+            let mut e = e;
+            e.codes.retain(|(c, _)| !matches!(c, 10 | 20 | 30));
+            *polyline = Some(e);
+        }
         "VERTEX" => {
             // A spline frame control point (flag 16) of a spline-fitted polyline lies off the
             // curve and is not drawn: the points on the curve are the other vertices.
@@ -3674,7 +3680,8 @@ mod tests {
     fn a_spline_fitted_polyline_leaves_out_its_frame_control_points() -> Result<()> {
         // PEDIT > Spline: the frame control point (flag 16) at (5, 50) is off the curve; the
         // curve-fit vertices (flag 8) are the line that is drawn.
-        let ents = "0\nPOLYLINE\n8\n0\n70\n4\n\
+        // The header carries the usual dummy point at the origin, which is not a vertex.
+        let ents = "0\nPOLYLINE\n8\n0\n66\n1\n10\n0\n20\n0\n30\n0\n70\n4\n\
                     0\nVERTEX\n8\n0\n10\n0\n20\n0\n70\n16\n\
                     0\nVERTEX\n8\n0\n10\n5\n20\n50\n70\n16\n\
                     0\nVERTEX\n8\n0\n10\n10\n20\n0\n70\n16\n\
