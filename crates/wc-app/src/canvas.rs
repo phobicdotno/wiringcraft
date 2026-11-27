@@ -4332,11 +4332,19 @@ mod tests {
             origin: Pos2::new(200.0, 200.0),
             zoom: 1.0,
         };
+        let paint = || {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                let p = ctx.layer_painter(egui::LayerId::background());
+                paint_shape(&p, &xf, &shape, Stroke::new(1.0_f32, Color32::BLACK));
+            });
+            out.shapes
+                .iter()
+                .any(|c| matches!(&c.shape, EShape::Path(path) if path.closed && path.points.len() == 100_000))
+        };
+        let runs = || TRIANGULATIONS.with(|n| n.get());
+        let start = runs();
         let started = std::time::Instant::now();
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
-            let p = ctx.layer_painter(egui::LayerId::background());
-            paint_shape(&p, &xf, &shape, Stroke::new(1.0_f32, Color32::BLACK));
-        });
+        assert!(paint(), "the outline is painted");
         // Unbounded ear clipping takes minutes here; the budget keeps it to a fraction of that
         // even in a debug build.
         assert!(
@@ -4344,11 +4352,13 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        let drawn = out
-            .shapes
-            .iter()
-            .any(|c| matches!(&c.shape, EShape::Path(path) if path.closed && path.points.len() == 100_000));
-        assert!(drawn, "the outline is painted");
+        assert!(paint(), "the outline is painted on the next frame too");
+        assert!(paint());
+        assert_eq!(
+            runs() - start,
+            1,
+            "a fill too large to cut up is not tried again every frame"
+        );
     }
 
     #[test]
