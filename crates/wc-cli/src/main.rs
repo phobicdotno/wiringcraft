@@ -340,6 +340,7 @@ enum Cmd {
         #[arg(allow_hyphen_values = true)]
         tag: String,
         /// The part's library id; it is taken from the libraries when the project lacks it.
+        /// An empty id (`--part ""`) takes the device's part off.
         #[arg(long)]
         part: Option<String>,
         /// What the device does, e.g. `Pump motor`.
@@ -3723,15 +3724,17 @@ fn run(mut cli: Cli) -> Res<()> {
                 print!("{info}");
                 return Ok(());
             }
-            if let Some(part) = &part
+            // An empty id takes the part off, as the assistant's `set_device` does.
+            let part = part.map(|id| id.trim().to_owned());
+            if let Some(part) = part.as_deref().filter(|id| !id.is_empty())
                 && store::read_vendored_part(dir, part).is_err()
             {
                 let lib = wc_library::Library::open(dir, &p).map_err(e)?;
                 wc_library::take(dir, &mut p, &lib, ItemKind::Part, part).map_err(e)?;
             }
             let d = p.devices.entry(t).or_default();
-            if part.is_some() {
-                d.part = part;
+            if let Some(part) = part {
+                d.part = (!part.is_empty()).then_some(part);
             }
             if let Some(desc) = description {
                 d.description = desc;
@@ -7037,6 +7040,46 @@ mod tests {
         cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
+    }
+
+    #[test]
+    fn an_empty_part_takes_the_part_off_a_device() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("p");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let lib = tmp.path().join("lib");
+        let part = wc_core::Part {
+            id: "maker.contactor".into(),
+            ..wc_core::Part::default()
+        };
+        assert!(wc_library::write_part(&lib, &part).is_ok());
+        let Some(lib) = lib.to_str() else { unreachable!() };
+        assert!(cli(&dir, &["lib", "add", "shop", "folder", lib]).is_ok());
+        let set = cli(
+            &dir,
+            &["device", "-K1", "--part", "maker.contactor", "--description", "Pump"],
+        );
+        assert!(set.is_ok(), "{set:?}");
+        let Ok(k1) = DeviceTag::parse("-K1") else {
+            unreachable!()
+        };
+        let info = |dir: &Path| load(dir).and_then(|p| device_info(&p, &k1));
+        assert_eq!(
+            info(&dir),
+            Ok("part         maker.contactor\ndescription  Pump\n".to_owned())
+        );
+
+        // Empty or blank, the part goes and the description stays.
+        let off = cli(&dir, &["device", "-K1", "--part", ""]);
+        assert!(off.is_ok(), "{off:?}");
+        assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
+        let again = cli(&dir, &["device", "-K1", "--part", " "]);
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
     }
 
     #[test]
