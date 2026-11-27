@@ -418,6 +418,53 @@ fn dxf_keeps_a_filled_path_that_is_not_convex_as_a_closed_outline() {
 }
 
 #[test]
+fn dxf_strokes_wider_than_the_default_pen_keep_their_width() {
+    let stroke = |points: Vec<(f64, f64)>, width: f64| crate::writer::Prim::Path {
+        points,
+        closed: false,
+        filled: false,
+        ink: crate::writer::Stroke {
+            rgb: (0.0, 0.0, 0.0),
+            width,
+        },
+        layer: None,
+    };
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: vec![
+            stroke(vec![(0.0, 0.0), (10.0, 0.0)], 0.25),
+            stroke(vec![(0.0, 10.0), (10.0, 10.0)], 0.35),
+            stroke(vec![(0.0, 20.0), (10.0, 20.0), (10.0, 30.0)], 0.5),
+        ],
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let d = dxf(&page);
+    // A thin stroke stays a plain LINE.
+    assert!(
+        d.contains("0\nLINE\n8\n0\n62\n7\n10\n0\n20\n100\n11\n10\n21\n100\n"),
+        "{d}"
+    );
+    assert_eq!(d.matches("0\nLINE\n").count(), 1, "{d}");
+    // A wide two-point stroke is a two-vertex polyline with its width on each part.
+    assert!(
+        d.contains(
+            "0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n0\n40\n0.35\n41\n0.35\n\
+             0\nVERTEX\n8\n0\n10\n0\n20\n90\n40\n0.35\n41\n0.35\n\
+             0\nVERTEX\n8\n0\n10\n10\n20\n90\n40\n0.35\n41\n0.35\n0\nSEQEND\n"
+        ),
+        "{d}"
+    );
+    // A longer one carries its width too.
+    assert!(d.contains("70\n0\n40\n0.5\n41\n0.5\n0\nVERTEX\n"), "{d}");
+    assert_eq!(d.matches("0\nVERTEX\n").count(), 5, "{d}");
+    assert!(d.contains("$ACADVER\n1\nAC1009\n") && !d.contains("LWPOLYLINE") && !d.contains("\n370\n"));
+}
+
+#[test]
 fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     let mut project = Project::new("Layers");
     let mut p1 = Page::new("p1", "1", "Control");

@@ -3578,6 +3578,44 @@ mod tests {
     }
 
     #[test]
+    fn a_page_exported_to_dxf_reads_back_its_wide_wires() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        let at = |x: f64, y: f64| wc_core::Endpoint::Point { at: Point::new(x, y) };
+        drawn.wires.push(wc_core::Wire {
+            id: "w1".into(),
+            from: at(100.0, 50.0),
+            to: at(160.0, 50.0),
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("40\n0.35\n41\n0.35\n"), "the wire keeps its width");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        // The import moves the drawing to the page corner, so look for the wire by its shape:
+        // an open two-point polyline, level and 60 mm long.
+        let wire = p.graphics.iter().any(|g| match g {
+            Shape::Polyline {
+                points, closed: false, ..
+            } => match points.as_slice() {
+                [a, b] => (a.y - b.y).abs() < 1e-6 && ((a.x - b.x).abs() - 60.0).abs() < 1e-6,
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(wire, "the wide wire reads back as a line: {:?}", p.graphics);
+        Ok(())
+    }
+
+    #[test]
     fn a_tag_that_is_not_a_device_tag_is_said() -> Result<()> {
         let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
         let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\nK\\U+00C51\n";
