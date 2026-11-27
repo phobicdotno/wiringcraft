@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::geom::{Point, Shape};
-use crate::project::{Device, Endpoint, PlacedSymbol, Project, Wire};
+use crate::project::{Device, Endpoint, PlacedSymbol, Project, Wire, WireSpec};
 use crate::store::{check_id, read_json, to_json, write_if_changed};
 use crate::{DeviceTag, Error, Result};
 
@@ -209,12 +209,10 @@ impl Macro {
             missing.retain(|n| seen.insert(key(n)));
             return bad(format!("no value for {}", missing.join(", ")));
         }
-        // A wire value that came out empty is no value.
+        // A wire value is stored as typed in anywhere else: trimmed, and no value when empty.
         for w in &mut out.wires {
             for v in [&mut w.spec.section, &mut w.spec.colour, &mut w.spec.kind] {
-                if v.as_deref().is_some_and(|s| s.trim().is_empty()) {
-                    *v = None;
-                }
+                *v = v.as_deref().and_then(WireSpec::value);
             }
         }
         for d in out.devices.values_mut() {
@@ -597,7 +595,7 @@ mod tests {
                 potential: None,
                 cable: None,
                 route: Default::default(),
-                spec: crate::project::WireSpec {
+                spec: WireSpec {
                     section: Some("{{section}}".into()),
                     colour: Some("BK".into()),
                     kind: None,
@@ -685,6 +683,18 @@ mod tests {
         assert_eq!(d.properties["Setting"], "5.5 A");
         let wrong: BTreeMap<String, String> = [("voltage".to_owned(), "400".to_owned())].into_iter().collect();
         assert!(m.apply(Some("3 kW"), &wrong).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_wire_value_from_a_placeholder_is_stored_trimmed() -> Result<()> {
+        let m = starter()?;
+        let spaced: BTreeMap<String, String> = [("section".to_owned(), " 2.5 mm² ".to_owned())].into_iter().collect();
+        let w = &m.apply(Some("3 kW"), &spaced)?.wires[0];
+        assert_eq!(w.spec.section.as_deref(), Some("2.5 mm²"));
+        assert_eq!(w.spec.colour.as_deref(), Some("BK"));
+        let blank: BTreeMap<String, String> = [("section".to_owned(), "  ".to_owned())].into_iter().collect();
+        assert_eq!(m.apply(Some("3 kW"), &blank)?.wires[0].spec.section, None);
         Ok(())
     }
 
