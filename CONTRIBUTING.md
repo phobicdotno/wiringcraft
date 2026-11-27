@@ -68,13 +68,15 @@ Nothing is pushed to `main`; every change is a pull request.
    `cargo test --workspace`. In PowerShell the docs check is
    `$env:RUSTDOCFLAGS = "-D warnings"; cargo doc --workspace --no-deps; Remove-Item Env:RUSTDOCFLAGS`.
    Some tests run the `wiringcraft` program only when `WIRINGCRAFT_CLI` points at it; CI builds it
-   first (`cargo build -p wc-cli`) and sets it to `target/debug/wiringcraft`, so do the same to run
-   them. CI also runs these, so run them when you touch the files:
+   first (`cargo build -p wc-cli`) and sets it to the absolute path of `target/debug/wiringcraft`
+   (`wiringcraft.exe` on Windows), so do the same to run them. A relative path does not work,
+   because cargo runs each crate's tests from that crate's folder. CI also runs these, so run them when you touch the files:
    - `.github/scripts/claim.js`: `node --test .github/scripts/claim.test.js` (Node 22).
    - `tools/todo.py`: `python3 -m py_compile tools/todo.py`.
-   - `library/symbols`: every starter symbol must come from `tools/gen_starter_symbols.py`. Run it
-     and check that `git status -- library/symbols` shows no change. CI first deletes
-     `library/symbols/*.json`, so a symbol file the generator does not write fails the check.
+   - `library/symbols`: every starter symbol must come from `tools/gen_starter_symbols.py`. Run
+     `rm -f library/symbols/*.json`, then `python3 tools/gen_starter_symbols.py`, and check that
+     `git status -- library/symbols` shows no change. This is what CI does: deleting the files
+     first makes a symbol file the generator no longer writes show as deleted, which fails the check.
 4. CI uses the stable Rust toolchain. It builds and tests on Linux, Windows and macOS, and the Build
    workflow makes release builds of the app and the command line for each system, to download from
    the run's page under "Artifacts". CodeRabbit reviews the pull request when you
