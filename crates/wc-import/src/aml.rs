@@ -190,8 +190,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                 }
             }
             Event::Text(t) if in_value => {
-                let t = t.unescape().map_err(|e| Error::Format(format!("AutomationML: {e}")))?;
-                value.push_str(&t);
+                // A value inside an interface is never kept, so a piece of it that cannot be read
+                // does not stop the import; one that is kept must be read whole.
+                if !attr_stack.iter().any(|a| a == "\u{0}interface") {
+                    let t = t.unescape().map_err(|e| Error::Format(format!("AutomationML: {e}")))?;
+                    value.push_str(&t);
+                }
             }
             Event::CData(t) if in_value => value.push_str(&String::from_utf8_lossy(&t)),
             Event::End(e) => {
@@ -1037,5 +1041,21 @@ mod tests {
             "a broken value must be refused, got {:?}",
             res.map(|imp| imp.devices.first().map(|d| d.properties.clone()))
         );
+    }
+
+    #[test]
+    fn a_bad_entity_in_an_interface_value_does_not_stop_the_import() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="Manufacturer"><Value>ACME</Value></Attribute>
+    <ExternalInterface Name="A1" ID="i1"><Attribute Name="Note"><Value>&unknown;</Value></Attribute></ExternalInterface>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(
+            imp.devices[0].properties.get("Manufacturer").map(String::as_str),
+            Some("ACME")
+        );
+        Ok(())
     }
 }
