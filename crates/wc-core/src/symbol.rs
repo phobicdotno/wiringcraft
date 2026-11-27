@@ -193,7 +193,7 @@ pub fn black_box(id: &str, name: &str, width: f64, height: f64, pins: &[BoxPin])
             return bad(format!("two connection points are named {pin_name}"));
         }
         // Closer than 0.01 mm is one place, as auto-wiring and free wire ends see it (#1696).
-        if let Some(q) = out.iter().find(|q| q.at.distance(at) < 0.01) {
+        if let Some(q) = out.iter().find(|q| q.at.distance(at) < crate::autowire::SAME) {
             return bad(format!(
                 "connection points {} and {pin_name} are at the same place",
                 q.name
