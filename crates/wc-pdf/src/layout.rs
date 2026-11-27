@@ -1215,7 +1215,7 @@ pub fn draw_table_page(
     }
     // The group column is shown in the group headings, not in the rows.
     let shown: Vec<usize> = (0..table.columns.len()).filter(|i| Some(*i) != table.group).collect();
-    let view = wc_report::Table {
+    let mut view = wc_report::Table {
         columns: shown.iter().map(|&i| table.columns[i].clone()).collect(),
         rows: table
             .rows
@@ -1224,6 +1224,7 @@ pub fn draw_table_page(
             .collect(),
         ..wc_report::Table::default()
     };
+    carry_cable_onto_page(table, &shown, lines, &mut view.rows);
     let widths = column_widths(&view, x1 - x0);
     // Header row on a grey band.
     pen.colour(0.88, 0.89, 0.91);
@@ -1306,6 +1307,40 @@ pub fn draw_table_page(
         layers: pen.layers,
         underlay: None,
         pictures: Vec::new(),
+    }
+}
+
+/// The cable list names a cable, its type and description only on its first core's row
+/// ([`wc_report::cable_list`]). When a cable's cores run onto this page, its first row names
+/// the cable again, so the page can be read on its own. `shown` maps `rows`' columns to the
+/// table's; other tables are left as they are.
+fn carry_cable_onto_page(table: &wc_report::Table, shown: &[usize], lines: &[TableLine], rows: &mut [Vec<String>]) {
+    let (Some(cable), Some(_)) = (table.column_of("Cable"), table.column_of("Core")) else {
+        return;
+    };
+    let Some(first) = lines.iter().find_map(|l| match l {
+        TableLine::Row(ri) => Some(*ri),
+        TableLine::Group { .. } => None,
+    }) else {
+        return;
+    };
+    let cell = |r: usize, c: usize| table.rows.get(r).and_then(|row| row.get(c)).map_or("", String::as_str);
+    if !cell(first, cable).is_empty() {
+        return;
+    }
+    let Some(above) = (0..first).rev().find(|&r| !cell(r, cable).is_empty()) else {
+        return;
+    };
+    for name in ["Cable", "Type", "Description"] {
+        let Some(c) = table.column_of(name) else { continue };
+        let Some(v) = shown.iter().position(|&i| i == c) else {
+            continue;
+        };
+        if let Some(slot) = rows.get_mut(first).and_then(|r| r.get_mut(v))
+            && slot.is_empty()
+        {
+            *slot = cell(above, c).to_owned();
+        }
     }
 }
 

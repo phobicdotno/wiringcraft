@@ -3396,3 +3396,46 @@ fn a_long_report_or_plc_card_heading_is_cut_to_the_frame_and_keeps_its_counter()
         headings(&drawn)
     );
 }
+
+#[test]
+fn a_cable_list_page_names_the_cable_its_first_cores_belong_to() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let row = |cells: [&str; 7]| cells.iter().map(|c| (*c).to_owned()).collect::<Vec<String>>();
+    let table = wc_report::Table {
+        title: "Cable list".into(),
+        columns: ["Cable", "Type", "Description", "Core", "Page", "From", "To"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect(),
+        rows: vec![
+            row(["-W1", "Lapp 1119304", "Motor feed", "1", "1", "-X1.1", "-M1:U"]),
+            row(["", "", "", "2", "1", "-X1.2", "-M1:V"]),
+            row(["", "", "", "3", "1", "-X1.3", "-M1:W"]),
+        ],
+        ..Default::default()
+    };
+    let page = Page::new("r", "R2", "Cable list");
+    let texts = |lines: &[layout::TableLine]| -> Vec<String> {
+        layout::draw_table_page(&project, &page, 0, 2, &table, lines, (2, 2), "")
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // The second page starts at core 2: it names -W1, its type and description once.
+    let second = texts(&[layout::TableLine::Row(1), layout::TableLine::Row(2)]);
+    for value in ["-W1", "Lapp 1119304", "Motor feed"] {
+        assert_eq!(
+            second.iter().filter(|t| t.as_str() == value).count(),
+            1,
+            "{value} on {second:?}"
+        );
+    }
+    // The first page names it on its first row only, as before.
+    let first = texts(&[layout::TableLine::Row(0), layout::TableLine::Row(1)]);
+    assert_eq!(first.iter().filter(|t| t.as_str() == "-W1").count(), 1, "{first:?}");
+}
