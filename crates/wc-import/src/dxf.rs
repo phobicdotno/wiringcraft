@@ -467,8 +467,8 @@ fn shapes(
         }
         // Code 60 = 1: the entity is invisible, so it is not drawn (an INSERT draws nothing of
         // its block), except on the layers `hidden_text` names (a symbol's pin layers, where it
-        // still marks or names a pin).
-        if e.f(60) as i64 == 1 && !hidden_text(&layer) {
+        // still marks or names a pin; an INSERT there is left out like anywhere else).
+        if e.f(60) as i64 == 1 && (e.kind == "INSERT" || !hidden_text(&layer)) {
             continue;
         }
         // An extrusion pointing down (left by mirroring in AutoCAD) mirrors the entity's own
@@ -2518,6 +2518,12 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
             attribs.push(&d.entities[j]);
             j += 1;
         }
+        // An invisible INSERT (code 60 = 1) places no symbol and draws nothing, nor do the
+        // attributes that come with it.
+        if e.kind == "INSERT" && e.f(60) as i64 == 1 {
+            i = j;
+            continue;
+        }
         let symbol = (e.kind == "INSERT")
             .then(|| e.get(2).and_then(|n| known.get(&normalise_block_name(n))))
             .flatten();
@@ -3136,6 +3142,28 @@ mod tests {
             "S",
         )?;
         assert_eq!(sym.pins.len(), 1);
+        // An invisible INSERT on a pin layer is left out with its whole block: neither the
+        // line nor the pin inside it is kept.
+        let blocks = "0\nBLOCK\n2\nPINBOX\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n0\n21\n7\n\
+                      0\nPOINT\n8\nPIN\n10\n0\n20\n7\n0\nENDBLK\n";
+        let ents = "0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n\
+                    0\nINSERT\n8\nPIN\n2\nPINBOX\n60\n1\n10\n20\n20\n0\n";
+        let sym = symbol(&dxf(ents, blocks), "s", "S")?;
+        assert_eq!(sym.pins.len(), 0);
+        let lines = sym.graphics.iter().filter(|s| matches!(s, Shape::Line { .. })).count();
+        assert_eq!(lines, 1, "{:?}", sym.graphics);
+        // On a page an invisible INSERT of a known symbol places nothing, and its attributes
+        // are not drawn; the visible one is placed as before.
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n60\n1\n10\n0\n20\n0\n66\n1\n\
+                    0\nATTRIB\n2\nTAG\n1\n-K1\n10\n0\n20\n5\n\
+                    0\nATTRIB\n2\nNOTE\n1\nHidden\n10\n0\n20\n9\n\
+                    0\nINSERT\n2\nWC.COIL\n10\n50\n20\n0\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K2\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 1, "{:?}", p.symbols);
+        assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K2"));
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
         Ok(())
     }
 
