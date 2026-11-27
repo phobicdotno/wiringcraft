@@ -35,21 +35,12 @@ pub struct Row {
     pub through: Vec<usize>,
 }
 
-const SEP: char = '\u{1f}';
-
 fn parse_log(text: &str) -> Vec<Commit> {
-    text.split('\u{1e}')
-        .filter_map(|rec| {
-            let rec = rec.trim_matches('\n');
-            if rec.is_empty() {
-                return None;
-            }
-            let f: Vec<&str> = rec.split(SEP).collect();
-            if f.len() < 6 {
-                return None;
-            }
+    crate::log_records(text)
+        .into_iter()
+        .map(|[id, parents, refs, subject, author, time]| {
             let mut head = false;
-            let refs = f[2]
+            let refs = refs
                 .split(", ")
                 .filter(|r| !r.is_empty())
                 .filter_map(|r| {
@@ -68,15 +59,19 @@ fn parse_log(text: &str) -> Vec<Commit> {
                     }
                 })
                 .collect();
-            Some(Commit {
-                id: f[0].to_owned(),
-                parents: f[1].split(' ').filter(|p| !p.is_empty()).map(str::to_owned).collect(),
+            Commit {
+                id: id.to_owned(),
+                parents: parents
+                    .split(' ')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
                 refs,
                 head,
-                subject: f[3].to_owned(),
-                author: f[4].to_owned(),
-                time: f[5].trim().parse().unwrap_or(0),
-            })
+                subject: subject.to_owned(),
+                author: author.to_owned(),
+                time: time.trim().parse().unwrap_or(0),
+            }
         })
         .collect()
 }
@@ -158,7 +153,7 @@ pub fn history(git: &Git, limit: usize) -> Result<Vec<Row>> {
         "--all",
         "--topo-order",
         &n,
-        "--format=%H%x1f%P%x1f%D%x1f%s%x1f%an%x1f%at%x1e",
+        "--format=%H%x00%P%x00%D%x00%s%x00%an%x00%at%x00",
     ])?;
     Ok(layout(parse_log(&text)))
 }
@@ -168,8 +163,14 @@ const LINE_COLOURS: [&str; 8] = [
     "#d9480f", "#1971c2", "#2b8a3e", "#ae3ec9", "#e8590c", "#0c8599", "#c2255c", "#5c940d",
 ];
 
+/// `s` as SVG text: `& < > "` escaped, and characters XML 1.0 does not allow (control
+/// characters other than tab, line feed and carriage return, U+FFFE and U+FFFF) left out, so
+/// one odd commit message cannot make the whole file unreadable.
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
+    s.chars()
+        .filter(|&c| matches!(c, '\t' | '\n' | '\r' | ' '..='\u{FFFD}' | '\u{10000}'..))
+        .collect::<String>()
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
@@ -265,10 +266,11 @@ pub fn subway_svg(rows: &[Row]) -> String {
         let short: String = r.commit.id.chars().take(7).collect();
         let _ = write!(
             s,
-            r##"<text x="{tx}" y="{}" fill="#212529">{}</text><text x="{tx}" y="{}" fill="#868e96" font-size="10">{short} · {}</text>"##,
+            r##"<text x="{tx}" y="{}" fill="#212529">{}</text><text x="{tx}" y="{}" fill="#868e96" font-size="10">{} · {}</text>"##,
             cy - 1.0,
             esc(&r.commit.subject),
             cy + 11.0,
+            esc(&short),
             esc(&r.commit.author)
         );
     }
@@ -347,6 +349,22 @@ mod tests {
         assert_eq!(subway_text(&rows).lines().count(), 5);
     }
 
+    #[test]
+    fn control_characters_are_left_out_of_the_svg() {
+        let mut k = c("k", &[]);
+        k.subject = "fix\u{1b}[31m relay\u{0} <K1>".into();
+        k.author = "Ann\u{7}e".into();
+        k.refs = vec!["main\u{8}\u{FFFF}".into()];
+        let svg = subway_svg(&layout(vec![k]));
+        assert!(
+            !svg.chars()
+                .any(|ch| (ch < ' ' && ch != '\n') || matches!(ch, '\u{FFFE}' | '\u{FFFF}')),
+            "{svg:?}"
+        );
+        assert!(svg.contains("fix[31m relay &lt;K1&gt;"), "{svg}");
+        assert!(svg.contains("Anne") && svg.contains(">main<"), "{svg}");
+    }
+
     fn svg_width(svg: &str) -> f64 {
         let rest = &svg[svg.find("width=\"").map_or(0, |i| i + 7)..];
         rest[..rest.find('"').unwrap_or(0)].parse().unwrap_or(0.0)
@@ -395,7 +413,8 @@ mod tests {
 
     #[test]
     fn parses_git_log_records() {
-        let text = "h1\u{1f}p1 p2\u{1f}HEAD -> main, tag: v1\u{1f}Merge x\u{1f}Ann\u{1f}100\u{1e}\nh2\u{1f}\u{1f}\u{1f}Root\u{1f}Ann\u{1f}50\u{1e}\n";
+        let text =
+            "h1\x00p1 p2\x00HEAD -> main, tag: v1\x00Merge x\x00Ann\x00100\x00\nh2\x00\x00\x00Root\x00Ann\x0050\x00\n";
         let cs = parse_log(text);
         assert_eq!(cs.len(), 2);
         assert!(cs[0].head);
