@@ -171,6 +171,12 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
         }
         // Unit 0 (common to every unit) alone: one symbol, as for a single unit.
         let several = units.len() > 1;
+        if units.len() > MAX_UNITS {
+            let n = units.len() - MAX_UNITS;
+            warnings.push(format!(
+                "{name}: only the first {MAX_UNITS} units were read, {n} skipped"
+            ));
+        }
         for unit in units.into_iter().take(MAX_UNITS) {
             let unit_name = if several {
                 format!("{name}_{}", unit_letter(unit))
@@ -1205,6 +1211,23 @@ mod tests {
         assert_eq!(
             [1, 2, 26, 27, 28, 52, 53].map(unit_letter),
             ["A", "B", "Z", "AA", "AB", "AZ", "BA"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn units_past_the_limit_are_reported() -> Result<()> {
+        let units: String = (1..=MAX_UNITS + 2)
+            .map(|u| format!("(symbol \"Big_{u}_1\" (pin passive line (at 0 0 0) (length 1) (number \"1\")))"))
+            .collect();
+        let lib = format!("(kicad_symbol_lib (symbol \"Big\" {units}))");
+        let (out, warnings) = symbols(&lib, "kicad", 1.0)?;
+        assert_eq!(out.len(), MAX_UNITS);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w == "Big: only the first 64 units were read, 2 skipped"),
+            "{warnings:?}"
         );
         Ok(())
     }
