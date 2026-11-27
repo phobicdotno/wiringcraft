@@ -759,11 +759,18 @@ impl SymbolEditor {
         self.selected = Some(Item::Shape(self.symbol.graphics.len() - 1));
     }
 
-    /// The pin at `p`, else the last drawn shape whose box (1 mm wider) holds `p`.
+    /// The pin at `p`, else an empty text there, else the last drawn shape whose box (1 mm
+    /// wider) holds `p`. An empty text draws nothing, so it comes before the shapes over it:
+    /// otherwise it could not be picked to type its words or delete it.
     fn pick(&self, p: Point) -> Option<Item> {
+        let g = &self.symbol.graphics;
         let pins = (0..self.symbol.pins.len()).map(Item::Pin);
-        let shapes = (0..self.symbol.graphics.len()).rev().map(Item::Shape);
-        pins.chain(shapes).find(|&item| self.under(item, p))
+        let empty_texts = (0..g.len())
+            .rev()
+            .filter(|&i| matches!(&g[i], Shape::Text { text, .. } if text.trim().is_empty()))
+            .map(Item::Shape);
+        let shapes = (0..g.len()).rev().map(Item::Shape);
+        pins.chain(empty_texts).chain(shapes).find(|&item| self.under(item, p))
     }
 
     pub fn delete_selected(&mut self) {
@@ -2012,6 +2019,28 @@ mod tests {
         assert!(e.problems().is_empty(), "{:?}", e.problems());
         e.save()?;
         Ok(())
+    }
+
+    #[test]
+    fn an_empty_text_under_a_later_shape_can_still_be_picked() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.text = "K1".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(5.0, 5.0));
+        e.set_tool(Tool::Rect);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(10.0, 10.0));
+        e.set_tool(Tool::Select);
+        // With words the text is picked as before: the later rectangle is on top.
+        e.click(Point::new(5.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Shape(1)));
+        if let Shape::Text { text, .. } = &mut e.symbol.graphics[0] {
+            text.clear();
+        }
+        e.click(Point::new(5.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        e.delete_selected();
+        assert!(matches!(e.symbol.graphics[..], [Shape::Rect { .. }]));
     }
 
     #[test]
