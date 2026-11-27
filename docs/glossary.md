@@ -83,13 +83,13 @@ point with the same tag, usually on another page. `check` reports one without a 
 potential. A jumper can have a part (for example a WAGO 2-way jumper) that is counted in the
 parts list. See `wiringcraft jumper`.
 
-**Library source.** A folder or git repository of symbols and parts that a project draws from
-(`lib add`). Earlier sources win over later ones. The items a project uses are copied into its
-`vendor/` folder, so it opens the same without the source.
-
 **Library lock (`library.lock`).** The exact version (source and content hash) of every library
 item the project uses. `lib status` compares it with the sources and `lib update` takes newer
 versions.
+
+**Library source.** A folder or git repository of symbols and parts that a project draws from
+(`lib add`). Earlier sources win over later ones. The items a project uses are copied into its
+`vendor/` folder, so it opens the same without the source.
 
 **Location.** The `+` aspect of a device tag: where the device is, such as a cabinet or a room
 (`+CAB1`, or `+L1.L3` with levels). The project keeps a list of locations with descriptions
@@ -145,12 +145,12 @@ potential name are connected across pages, and the `potential` wire numbering ru
 a library source, for example `wc.terminal` or `iec.contactor.coil`. A placed symbol on a page
 has its own id (`s1`, `s2`, ...) that wires refer to.
 
+**Terminal level.** The level of a terminal on a multi-level terminal block, 1 being the
+bottom. Set with `strip level`.
+
 **Terminal strip.** A device whose terminals are tagged as one extra level of the strip's tag:
 `-X1.1`, `-X1.2` are terminals 1 and 2 of strip `-X1`. The terminal strip editor
 (`wiringcraft strip`) sets their order on the rail, spare terminals and terminal levels.
-
-**Terminal level.** The level of a terminal on a multi-level terminal block, 1 being the
-bottom. Set with `strip level`.
 
 **Title block.** The band at the bottom of every page with the project's and the page's
 fields (customer, revision, drawn by, ...). A page's own fields win over the project's on that
