@@ -360,12 +360,20 @@ pub fn replace_renaming(
             return Err(format!("{other} and {from} would both become {to}."));
         }
     }
+    // A tag that only a wire's cable core names is in use too.
+    let cables: std::collections::BTreeSet<DeviceTag> = p
+        .pages
+        .iter()
+        .flat_map(|pg| pg.wires.iter())
+        .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone()))
+        .collect();
     let taken: Vec<DeviceTag> = p
         .devices
         .keys()
         .cloned()
         .chain(p.tag_index().into_keys())
         .chain(p.meta.strips.iter().map(|l| l.strip.clone()))
+        .chain(cables.iter().cloned())
         .filter(|t| !renames.contains_key(t))
         .collect();
     if let Some(to) = renames.values().find(|to| taken.contains(to)) {
@@ -388,7 +396,8 @@ pub fn replace_renaming(
             if !p.devices.contains_key(&old) || renames.contains_key(&old) {
                 continue;
             }
-            let held = (p.devices.contains_key(&new) || drawn.contains_key(&new)) && !renames.contains_key(&new);
+            let held = (p.devices.contains_key(&new) || drawn.contains_key(&new) || cables.contains(&new))
+                && !renames.contains_key(&new);
             if held || targets.contains_key(&new) || !spare_targets.insert(new.clone()) {
                 return Err(format!("{new} is already used."));
             }
@@ -404,6 +413,7 @@ pub fn replace_renaming(
         .chain(p.tag_index().into_keys())
         .chain(p.meta.strips.iter().map(|l| l.strip.clone()))
         .chain(renames.values().cloned())
+        .chain(cables.iter().cloned())
         .collect();
     let mut next = 0usize;
     let mut placed: Vec<(DeviceTag, DeviceTag)> = Vec::new();
@@ -845,10 +855,41 @@ mod tests {
         );
         assert_eq!(p, before);
         p.pages[0].symbols.pop();
+        // A tag only a cable core names is taken too.
+        p.pages[0].wires.push(Wire {
+            id: "w1".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: Some(crate::project::CableCore {
+                cable: tag("-X2.S1"),
+                core: "1".into(),
+            }),
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        assert_eq!(
+            replace(&mut p, &hits, "X1", "X2", opts),
+            Err("-X2.S1 is already used.".into())
+        );
+        p.pages[0].wires[0].cable = Some(crate::project::CableCore {
+            cable: tag("-WCFIND0.S1"),
+            core: "1".into(),
+        });
         p.devices.insert(tag("-WCFIND0.S1"), Device::default());
         assert!(replace(&mut p, &hits, "X1", "X2", opts).is_ok());
         assert_eq!(p.devices.get(&tag("-X2.S1")), Some(&part));
         assert_eq!(p.devices.get(&tag("-WCFIND0.S1")), Some(&Device::default()));
+        assert_eq!(
+            p.pages[0].wires[0].cable.as_ref().map(|c| c.cable.clone()),
+            Some(tag("-WCFIND0.S1"))
+        );
     }
 
     #[test]
