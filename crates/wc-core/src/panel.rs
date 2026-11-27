@@ -522,7 +522,9 @@ fn leading_number(v: &str) -> Option<f64> {
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
         .collect();
     let run = run.trim_end_matches(['.', ',']);
-    let decimal = run.rfind(['.', ',']).filter(|&i| run.matches(&run[i..=i]).count() == 1);
+    let decimal = run
+        .rfind(['.', ','])
+        .filter(|&i| run.get(i..=i).is_some_and(|mark| run.matches(mark).count() == 1));
     let s: String = run
         .char_indices()
         .filter_map(|(i, c)| match c {
