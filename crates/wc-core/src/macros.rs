@@ -1115,7 +1115,7 @@ mod edge_tests {
         let blank = m.apply(Some("   "), &bridge)?;
         assert_eq!(blank, m.apply(None, &bridge)?);
         assert_eq!(blank.wires[0].spec.section.as_deref(), Some("2.5"));
-        assert_eq!(blank.wires[0].spec.colour.as_deref(), Some(" BU "));
+        assert_eq!(blank.wires[0].spec.colour.as_deref(), Some("BU"));
         // With sets, a blank choice still asks for one.
         let mut with_sets = m.clone();
         with_sets.value_sets.push(ValueSet {
