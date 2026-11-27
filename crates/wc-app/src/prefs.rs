@@ -56,10 +56,25 @@ impl Default for Prefs {
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("APPDATA").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// The settings folder from the values of `XDG_CONFIG_HOME`, `APPDATA` and `HOME`, taken in that
+/// order. An empty or relative value is skipped, as the XDG spec asks, so the settings never land
+/// in whatever folder the app was started from.
+fn config_dir_from(
+    xdg: Option<&std::ffi::OsStr>,
+    appdata: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let absolute = |v: Option<&std::ffi::OsStr>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = absolute(xdg)
+        .or_else(|| absolute(appdata))
+        .or_else(|| absolute(home).map(|h| h.join(".config")))?;
     Some(base.join("wiringcraft"))
 }
 
@@ -300,6 +315,39 @@ mod tests {
         assert_eq!(back.ribbon_tab, 2);
         let old: Prefs = toml::from_str("chrome = \"ribbon\"\n").unwrap();
         assert_eq!(old.ribbon_tab, 0);
+    }
+
+    #[test]
+    fn an_empty_or_relative_config_variable_is_skipped() {
+        use std::ffi::OsStr;
+        let abs = std::env::temp_dir();
+        let a = abs.join("xdg");
+        let b = abs.join("appdata");
+        let h = abs.join("home");
+        // A good XDG_CONFIG_HOME wins.
+        assert_eq!(
+            config_dir_from(Some(a.as_os_str()), Some(b.as_os_str()), Some(h.as_os_str())),
+            Some(a.join("wiringcraft"))
+        );
+        // Empty or relative XDG_CONFIG_HOME falls through to APPDATA, then to HOME/.config.
+        for bad in ["", "rel", "./cfg"] {
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), Some(b.as_os_str()), Some(h.as_os_str())),
+                Some(b.join("wiringcraft")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), Some(OsStr::new(bad)), Some(h.as_os_str())),
+                Some(h.join(".config").join("wiringcraft")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), None, Some(OsStr::new(bad))),
+                None,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(config_dir_from(None, None, None), None);
     }
 
     #[test]
