@@ -74,6 +74,8 @@ the part has a footprint drawing, the layout draws the maker's outline instead o
 
 The size is stored in the layout when the device is placed. Placing the device again with
 `panel device <id> <tag>` (no `--at`) keeps its place and takes the size its part has now.
+When the part gives no width and height, the device keeps the size stored in the layout (the
+18 x 90 mm default is only for a device that is not on the plate yet).
 
 For example, with the starter library's example parts on a 400 x 500 mm plate:
 
