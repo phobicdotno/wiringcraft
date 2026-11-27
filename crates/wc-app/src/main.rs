@@ -2816,7 +2816,8 @@ impl App {
                             keep = false;
                         }
                         // Escape is Cancel, as in the other dialogs: nothing is saved or dropped.
-                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        // It is used up here, so the symbol editor does not also drop its shape.
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
