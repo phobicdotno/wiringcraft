@@ -1091,12 +1091,13 @@ read l
         assert!(r.is_ok(), "stand-in adapter: {:?}", r.as_ref().err());
         let Ok((acp, log, polled)) = r else { unreachable!() };
         drop(acp);
-        let answers: Vec<Value> = std::fs::read_to_string(&seen)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
+        let seen_text = std::fs::read_to_string(&seen);
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen_text.is_ok(), "reading the answers: {:?}", seen_text.as_ref().err());
+        let Ok(seen_text) = seen_text else { unreachable!() };
+        let answers: Result<Vec<Value>, _> = seen_text.lines().map(serde_json::from_str::<Value>).collect();
+        assert!(answers.is_ok(), "parsing {seen_text:?}: {:?}", answers.as_ref().err());
+        let Ok(answers) = answers else { unreachable!() };
         assert!(polled.finished && !polled.unanswered, "{polled:?} {log:?}");
         assert_eq!(
             log,
