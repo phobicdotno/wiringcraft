@@ -93,7 +93,7 @@ the schematic behind it.
 - **Delete page**: delete this page (asks first).
 - ---
 - **Panel layout**: add a cabinet panel layout: a 600 x 800 mm mounting plate with wire ducts and DIN rails.
-- **Arrange devices**: put the devices that have a part and are not on the plate yet onto its DIN rails.
+- **Arrange devices**: put the devices that have a part and are not on the plate yet onto its DIN rails. Devices whose part is door- or front-mounted (push buttons, pilot lights) stay off the plate and are not listed as not fitting.
 - **Delete panel layout**: delete the panel layout shown.
 
 ### View
@@ -159,9 +159,13 @@ With symbols selected (after a separator when wires are selected too):
 
 - **Rotate**, **Mirror**, **Copy**, **Cut**, **Duplicate**, **Delete**: as in the Edit menu.
 
-With only free text or drawings selected:
+With free text or drawings selected and no symbols (after a separator when wires are selected
+too):
 
 - **Copy**, **Cut**, **Duplicate**, **Delete**: as in the Edit menu.
+
+When wires are selected together with symbols, texts or drawings, this Delete removes the whole
+selection, wires included.
 
 ### On a panel layout
 
