@@ -266,7 +266,8 @@ pub fn library_rule<'a>(sets: &'a [RuleSet], which: &str) -> Result<Option<(&'a 
 /// `off` (a project's [`ProjectMeta::rules_off`]) with the library rule `which` turned off
 /// (`turn_off`) or back on: `Ok(None)` when it is that way already. Turning a rule off adds
 /// `which` as written; turning it on drops every entry that turns it off, by number or by
-/// name. An entry naming no rule (a source since removed) can still be dropped.
+/// name. An entry naming no rule (a source since removed) can still be dropped, but a
+/// selector that names no rule and no entry is refused, as when turning it off.
 ///
 /// [`ProjectMeta::rules_off`]: crate::project::ProjectMeta::rules_off
 pub fn turn_rule(off: &[String], sets: &[RuleSet], which: &str, turn_off: bool) -> Result<Option<Vec<String>>, String> {
@@ -276,8 +277,9 @@ pub fn turn_rule(off: &[String], sets: &[RuleSet], which: &str, turn_off: bool) 
     let unreadable = which
         .split_once(':')
         .is_some_and(|(src, _)| sets.iter().any(|set| set.source == src.trim() && set.rules.is_err()));
+    let listed = off.iter().any(|o| o.trim() == which);
     let found = match library_rule(sets, which) {
-        Err(_) if !turn_off && unreadable => None,
+        Err(_) if !turn_off && unreadable && listed => None,
         found => found?,
     };
     let mut now = off.to_vec();
@@ -294,7 +296,12 @@ pub fn turn_rule(off: &[String], sets: &[RuleSet], which: &str, turn_off: bool) 
             now.push(which.to_owned());
         }
         (false, Some((src, n, r))) => now.retain(|o| !turned_off(std::slice::from_ref(o), src, n, r)),
-        (false, None) => now.retain(|o| o.trim() != which),
+        (false, None) if listed => now.retain(|o| o.trim() != which),
+        (false, None) => {
+            return Err(format!(
+                "No library check rule {which:?} and no rules_off entry {which:?}: write source:number or source:name."
+            ));
+        }
     }
     Ok(Some(now).filter(|now| now != off))
 }
@@ -683,6 +690,17 @@ severty = "error"
         assert_eq!(
             turn_rule(&off(&["gone:4"]), &sets, "gone:4", false).unwrap(),
             Some(vec![])
+        );
+        // On for a selector that names no rule and no entry is refused, not "on already" (#1041).
+        assert!(
+            turn_rule(&off(&["house:1"]), &sets, "house:motrs", false)
+                .unwrap_err()
+                .contains("No library check rule \"house:motrs\" and no rules_off entry")
+        );
+        assert!(
+            turn_rule(&[], &sets, "broken:1", false)
+                .unwrap_err()
+                .contains("bad toml")
         );
     }
 

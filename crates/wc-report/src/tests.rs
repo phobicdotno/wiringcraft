@@ -132,6 +132,40 @@ fn parts_list_groups_by_part_and_lists_gaps() {
 }
 
 #[test]
+fn parts_list_sorts_numbers_by_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.extend([
+        place("s10", "lamp", 200.0, Some("-P10")),
+        place("s11", "lamp", 210.0, Some("-P2")),
+        place("s12", "coil", 220.0, Some("-K10")),
+        place("s13", "coil", 230.0, Some("-K2")),
+    ]);
+    for tag in ["-K10", "-K2"] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                part: Some("acme.r24".into()),
+                ..Default::default()
+            },
+        );
+    }
+    let t = parts_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][5], "-K2, -K10, =A+C1-K1");
+    let lamps: Vec<&str> = t
+        .rows
+        .iter()
+        .filter(|r| r[4] == "no part assigned")
+        .map(|r| r[5].as_str())
+        .filter(|d| d.starts_with("-P"))
+        .collect();
+    assert_eq!(lamps, ["-P1", "-P2", "-P10"]);
+}
+
+#[test]
 fn parts_list_counts_accessories_with_their_quantity() {
     let (mut p, s, mut parts) = fixture();
     let marker = wc_core::Part {
@@ -196,6 +230,31 @@ fn interruption_points_are_not_devices() {
 }
 
 #[test]
+fn the_contents_does_not_count_interruption_points_as_devices() {
+    let (mut p, mut s, parts) = fixture();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let before = contents(&i).rows[0][2].clone();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    p.pages[0].symbols.push(place("s10", "lamp", 210.0, Some("-P9")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // The lamp adds a device, the tagged arrow does not.
+    let Ok(n) = before.parse::<usize>() else {
+        unreachable!("device count {before}")
+    };
+    assert_eq!(contents(&i).rows[0][2], (n + 1).to_string());
+}
+
+#[test]
 fn device_list_merges_symbols_of_one_device() {
     let (p, s, parts) = fixture();
     let t = device_list(&Inputs {
@@ -205,6 +264,27 @@ fn device_list_merges_symbols_of_one_device() {
     });
     let k1 = t.rows.iter().find(|r| r[0] == "=A+C1-K1").unwrap();
     assert_eq!(k1, &["=A+C1-K1", "Pump relay", "acme.r24", "coil, no", "2"]);
+}
+
+#[test]
+fn device_list_sorts_numbers_by_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.extend([
+        place("s10", "lamp", 200.0, Some("-P10")),
+        place("s11", "lamp", 210.0, Some("-P2")),
+    ]);
+    let t = device_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let lamps: Vec<&str> = t
+        .rows
+        .iter()
+        .map(|r| r[0].as_str())
+        .filter(|d| d.starts_with("-P"))
+        .collect();
+    assert_eq!(lamps, ["-P1", "-P2", "-P10"]);
 }
 
 #[test]
@@ -222,6 +302,37 @@ fn wire_list_names_both_ends_and_inherits_potentials() {
     assert_eq!(t.rows[1][4..6], ["=A+C1-K1:14", "-X1.1:1"]);
     // w4 carries 0V itself.
     assert_eq!(t.rows[3][2], "0V");
+}
+
+#[test]
+fn wire_list_names_the_potential_of_a_wire_between_two_junctions() {
+    let (mut p, s, parts) = fixture();
+    let at = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+    // w5 runs from w1's free end to another free point, w6 from that point on: neither touches
+    // a pin, but both are in the 24V net through w1. w7 touches nothing and is in no net.
+    p.pages[0].wires.extend([
+        wire("w5", at(50.0, 20.0), at(70.0, 20.0), None, None),
+        wire("w6", at(70.0, 20.0), at(70.0, 0.0), None, None),
+        wire("w7", at(200.0, 0.0), at(210.0, 0.0), None, None),
+    ]);
+    let t = wire_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let potential = |from: &str, to: &str| t.rows.iter().find(|r| r[4] == from && r[5] == to).map(|r| r[2].clone());
+    assert_eq!(
+        potential("junction 50.0,20.0", "junction 70.0,20.0").as_deref(),
+        Some("24V")
+    );
+    assert_eq!(
+        potential("junction 70.0,20.0", "junction 70.0,0.0").as_deref(),
+        Some("24V")
+    );
+    assert_eq!(
+        potential("junction 200.0,0.0", "junction 210.0,0.0").as_deref(),
+        Some("")
+    );
 }
 
 #[test]
@@ -324,6 +435,35 @@ fn natural_order() {
 }
 
 #[test]
+fn terminal_plan_sorts_strips_by_number_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s10", "term", 140.0, Some("-X10.1")));
+    let t = terminal_plan(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let mut strips: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    strips.dedup();
+    assert_eq!(strips, ["-X1", "-X2", "-X10"]);
+}
+
+#[test]
+fn cable_list_sorts_cables_by_number_value() {
+    let (mut p, s, parts) = fixture();
+    for tag in ["-W10", "-W2"] {
+        p.devices.insert(DeviceTag::parse(tag).unwrap(), Device::default());
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let cables: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(cables, ["-W2", "-W10"]);
+}
+
+#[test]
 fn cable_list_groups_cores_by_cable() {
     let (mut p, s, parts) = fixture();
     let w1 = DeviceTag::parse("-W1").unwrap();
@@ -352,6 +492,331 @@ fn cable_list_groups_cores_by_cable() {
     assert_eq!(t.rows[0], ["-W1", "", "Lamp cable", "1", "2", "=A+C1-K1:14", "-X1.1:1"]);
     assert_eq!(t.rows[1][..4], ["", "", "", "2"]);
     assert_eq!(wire_list(&i).rows[1][3], "-W1:1");
+}
+
+#[test]
+fn cable_list_names_a_part_missing_from_the_library_copy_by_its_id() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    p.devices.insert(
+        w1.clone(),
+        Device {
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    assert!(!parts.contains_key("LAPP.1119203"));
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][..2], ["-W1", "LAPP.1119203"]);
+}
+
+#[test]
+fn cable_list_lists_a_cable_of_the_devices_file_without_drawn_cores() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w5 = DeviceTag::parse("-W5").unwrap();
+    p.devices.insert(
+        w5.clone(),
+        Device {
+            description: "Pump cable".into(),
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    // A terminal named like a cable is no cable.
+    p.devices.insert(DeviceTag::parse("-X1.W1").unwrap(), Device::default());
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows.len(), 2);
+    assert_eq!(t.rows[0][..4], ["-W1", "", "", "1"]);
+    assert_eq!(t.rows[1], ["-W5", "LAPP.1119203", "Pump cable", "", "", "", ""]);
+    assert!(t.row_pages.get(1).is_none_or(String::is_empty));
+}
+
+#[test]
+fn cable_list_lists_a_hierarchical_cable_drawn_as_no_terminal() {
+    let (mut p, s, parts) = fixture();
+    // -A1.WD3 is drawn with a standalone symbol and has no cores yet; the marking list lists
+    // it as a cable, and so does the cable list. -X1.W1 is drawn as a terminal.
+    let wd3 = DeviceTag::parse("-A1.WD3").unwrap();
+    p.devices.insert(
+        wd3.clone(),
+        Device {
+            description: "Sensor cable".into(),
+            ..Default::default()
+        },
+    );
+    p.devices.insert(DeviceTag::parse("-X1.W1").unwrap(), Device::default());
+    p.pages[0].symbols.push(place("s9", "lamp", 200.0, Some("-A1.WD3")));
+    p.pages[0].symbols.push(place("t9", "term", 210.0, Some("-X1.W1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = cable_list(&i);
+    let cables: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).filter(|c| !c.is_empty()).collect();
+    assert_eq!(cables, ["-A1.WD3"]);
+    assert_eq!(t.rows[0], ["-A1.WD3", "", "Sensor cable", "", "", "", ""]);
+    let marked: Vec<String> = marking_list(&i, &[MarkerKind::Cables])
+        .rows
+        .iter()
+        .map(|r| r[2].clone())
+        .collect();
+    assert_eq!(marked, ["-A1.WD3"]);
+}
+
+#[test]
+fn check_names_a_cable_core_on_two_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    let set_core = |p: &mut Project, page: usize, id: &str, core: &str| {
+        if let Some(w) = p.pages[page].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: DeviceTag::parse("-W1").unwrap(),
+                core: core.into(),
+            });
+        }
+    };
+    // w2 (-K1:14 to -X1.1:1) and w4 (-K1:A2 to -X2:1) are two connections.
+    set_core(&mut p, 0, "w2", "1");
+    set_core(&mut p, 0, "w4", "2");
+    assert!(found(&p).is_empty());
+    // A core drawn in two pieces of one connection is one conductor.
+    p.pages[0].wires.push(wire(
+        "w5",
+        pin("s4", "1"),
+        Endpoint::Point {
+            at: Point::new(110.0, 60.0),
+        },
+        None,
+        None,
+    ));
+    set_core(&mut p, 0, "w5", "1");
+    assert!(found(&p).is_empty());
+    // A wire naming only the cable names no core.
+    set_core(&mut p, 0, "w3", "");
+    set_core(&mut p, 0, "w1", " ");
+    assert!(found(&p).is_empty());
+    // A repeat on an overview page does not count.
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.number = "1".into();
+    overview.overview = true;
+    if let Some(c) = overview
+        .wires
+        .iter_mut()
+        .find(|w| w.id == "w4")
+        .and_then(|w| w.cable.as_mut())
+    {
+        c.core = "1".into();
+    }
+    p.pages.insert(0, overview);
+    assert!(found(&p).is_empty());
+    // The same core on a second connection is named on the second one's wire.
+    set_core(&mut p, 1, "w4", "1");
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w4".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
+    // Wire ids need not be unique on a page (a replaced page can repeat them): the second
+    // connection's wire still counts when it shares the first one's id.
+    let w4 = p.pages[1].wires.iter_mut().find(|w| w.id == "w4");
+    let Some(w4) = w4 else {
+        unreachable!("the fixture has w4")
+    };
+    w4.id = "w2".into();
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w2".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    // w1 (24V, at -K1:A1) and w4 (0V, at -K1:A2) are two connections sharing core -W1:1.
+    for w in p.pages[0].wires.iter_mut().filter(|w| w.id == "w1" || w.id == "w4") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    let expected = [(
+        Some("p2".to_owned()),
+        Some("w4".to_owned()),
+        "cable core -W1:1 is on 2 connections".to_owned(),
+    )];
+    assert_eq!(found(&p), expected);
+    // An overview page whose wiring joins the 24V and 0V potentials into one net.
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    let mid = Point::new(20.0, 20.0);
+    overview.wires = vec![
+        wire(
+            "o1",
+            Endpoint::Point {
+                at: Point::new(10.0, 20.0),
+            },
+            Endpoint::Point { at: mid },
+            None,
+            Some("24V"),
+        ),
+        wire(
+            "o2",
+            Endpoint::Point { at: mid },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+            None,
+            Some("0V"),
+        ),
+    ];
+    p.pages.insert(0, overview);
+    assert_eq!(found(&p), expected);
+}
+
+#[test]
+fn wires_on_an_overview_page_are_not_listed_twice() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1,
+            core: "1".into(),
+        });
+    }
+    let lists = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        (wire_list(&i).rows, cable_list(&i).rows)
+    };
+    let schematic = p.pages[0].number.clone();
+    let (wires, cables) = lists(&p);
+    // The baseline lists the schematic's cable core, so the checks below compare real rows.
+    assert_eq!(cables.len(), 1);
+    assert_eq!(cables[0][0], "-W1");
+    assert_eq!(cables[0][3], "1");
+    assert_eq!(cables[0][4], schematic);
+    // The same schematic again, drawn on a line diagram.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    let (same_wires, same_cables) = lists(&p);
+    assert_eq!(same_wires.len(), wires.len(), "an overview page adds no wire rows");
+    assert_eq!(same_cables, cables, "an overview page adds no cable rows");
+    p.pages.last_mut().unwrap().overview = false;
+    let (more_wires, more_cables) = lists(&p);
+    assert!(more_wires.len() > wires.len(), "a normal page does");
+    assert_eq!(more_cables.len(), cables.len() + 1, "one more core row");
+    assert_eq!(more_cables[0], cables[0]);
+    assert_eq!(more_cables[1][..5], ["", "", "", "1", "9"], "the copied page's core");
+}
+
+#[test]
+fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
+    let (mut p, s, parts) = fixture();
+    let rows = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        wire_list(&i).rows
+    };
+    // The generated name of the net list row with these connections.
+    let net_name = |p: &Project, connections: &str| {
+        let t = net_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        });
+        let Some(row) = t.rows.iter().find(|r| r[2] == connections) else {
+            unreachable!("no net with {connections}")
+        };
+        row[0].clone()
+    };
+    let schematic_net = "-X1.1:1, =A+C1-K1:14";
+    let before = rows(&p);
+    let before_name = net_name(&p, schematic_net);
+    assert!(before_name.starts_with('N'), "{before_name} is a generated name");
+    assert!(
+        before.iter().any(|r| r[2].starts_with('N')),
+        "the fixture has a net with a generated name"
+    );
+    // The same schematic again, drawn on a line diagram placed before it.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p0".into();
+    overview.number = "0".into();
+    overview.overview = true;
+    // Untagged, so the net list tells the overview's own nets from the schematic's by their pins.
+    for sym in &mut overview.symbols {
+        sym.tag = None;
+    }
+    p.pages.insert(0, overview.clone());
+    assert_eq!(rows(&p), before, "an overview page before the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview before");
+    p.pages.remove(0);
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    p.pages.push(overview);
+    assert_eq!(rows(&p), before, "an overview page after the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview after");
 }
 
 #[test]
@@ -461,6 +926,124 @@ fn project_check_finds_the_usual_mistakes() {
 }
 
 #[test]
+fn project_check_warns_about_parts_missing_from_the_library_copy() {
+    let (mut p, s, parts) = fixture();
+    // -P1 names a part the library copy lacks, as its main part and twice as an accessory;
+    // -K1's part is there, its accessory is not.
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some("acme.gone".into()),
+            accessories: vec![wc_core::DevicePart {
+                part: "acme.gone".into(),
+                qty: 2,
+            }],
+            ..Default::default()
+        },
+    );
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    p.devices.get_mut(&k1).unwrap().accessories.push(wc_core::DevicePart {
+        part: "acme.socket".into(),
+        qty: 1,
+    });
+    // A jumper whose part is missing.
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).unwrap();
+    p.meta.jumpers[0].part = Some("acme.bridge".into());
+    let found = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let missing: Vec<&str> = found
+        .iter()
+        .filter(|f| f.message.contains("missing from the project's library copy"))
+        .inspect(|f| assert_eq!(f.severity, Severity::Warning))
+        .map(|f| f.message.as_str())
+        .collect();
+    assert_eq!(
+        missing,
+        [
+            "-P1: part acme.gone is missing from the project's library copy",
+            "=A+C1-K1: part acme.socket is missing from the project's library copy",
+            "jumper of -X1: part acme.bridge is missing from the project's library copy",
+        ]
+    );
+    // -P1 has a part now, even if it is missing, so no "has no part" note.
+    assert!(!found.iter().any(|f| f.message == "-P1 has no part"), "{found:?}");
+}
+
+#[test]
+fn project_check_warns_about_a_missing_part_of_a_device_drawn_only_as_interruption_points() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let Ok(l1) = DeviceTag::parse("-L1") else {
+        unreachable!()
+    };
+    p.devices.insert(
+        l1,
+        Device {
+            part: Some("acme.gone".into()),
+            ..Default::default()
+        },
+    );
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    assert!(
+        found.contains(&"-L1: part acme.gone is missing from the project's library copy".to_owned()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn project_check_names_an_unreadable_part_copy_with_its_reason() {
+    let (mut p, s, parts) = fixture();
+    let Ok(p1) = DeviceTag::parse("-P1") else {
+        unreachable!()
+    };
+    p.devices.insert(
+        p1,
+        Device {
+            part: Some("acme.broken".into()),
+            ..Default::default()
+        },
+    );
+    let unreadable = [("acme.broken".to_owned(), "expected value at line 1".to_owned())]
+        .into_iter()
+        .collect();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check_with_unreadable(&i, &[], &unreadable)
+        .into_iter()
+        .map(|f| f.message)
+        .collect();
+    assert!(
+        found.contains(
+            &"-P1: part acme.broken in the project's library copy cannot be read: expected value at line 1".to_owned()
+        ),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|m| m.contains("acme.broken is missing")), "{found:?}");
+    // Without the reason it is reported as missing.
+    assert!(
+        check(&i)
+            .iter()
+            .any(|f| f.message == "-P1: part acme.broken is missing from the project's library copy")
+    );
+}
+
+#[test]
 fn a_device_repeated_on_an_overview_page_is_not_drawn_twice() {
     let (mut p, s, parts) = fixture();
     // The coil -K1 again, on a line diagram.
@@ -499,6 +1082,52 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
 }
 
 #[test]
+fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    // The same point again, on a line diagram.
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.symbols.push(place("s20", "arrow", 100.0, Some("-L1")));
+    p.pages.push(overview);
+    let lonely = |p: &Project| -> Vec<Option<String>> {
+        check(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .into_iter()
+        .filter(|f| f.message == "interruption point -L1 has no partner")
+        .map(|f| f.page_id)
+        .collect()
+    };
+    assert!(lonely(&p).is_empty(), "on a normal page the two points are partners");
+    p.pages[1].overview = true;
+    assert_eq!(
+        lonely(&p),
+        vec![Some(p.pages[0].id.clone())],
+        "the schematic point has no partner; the overview copy still has the schematic one"
+    );
+}
+
+/// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
+fn caex_file_name(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"CAEXFile" => {
+                let attr = e.try_get_attribute("FileName").ok()??;
+                return Some(attr.unescape_value().ok()?.into_owned());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+#[test]
 fn automationml_has_devices_pins_and_one_link_per_join() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
@@ -519,7 +1148,7 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
         symbols: &s,
         parts: &parts,
     };
-    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z");
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml");
     // K1, -P1, -X1.1, -X1.2, -X2; not the interruption point.
     assert_eq!(counts.devices, 5, "{xml}");
     assert!(!xml.contains("-L1"));
@@ -530,12 +1159,31 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert!(xml.contains("<Value>R-24, DC</Value>") && xml.contains("<Value>Acme</Value>"));
     assert!(xml.contains("Name=\"Coil &lt;voltage&gt;\"") && xml.contains("<Value>24 V &amp; more</Value>"));
     assert!(xml.contains("LastWritingDateTime=\"2026-11-16T22:00:00Z\""));
+    // FileName names the file written, not the project.
+    assert!(xml.contains("<CAEXFile FileName=\"plant-v2.aml\""), "{xml}");
+    // Without a file name, the project name stands in.
+    let fallback = automationml(&i, "2026-11-16T22:00:00Z", "").0;
+    assert!(fallback.contains("<CAEXFile FileName=\"Test.aml\""), "{fallback}");
+    // A file name is kept exactly as given, spaces included.
+    let spaced = automationml(&i, "2026-11-16T22:00:00Z", " plant-v2.aml").0;
+    assert!(spaced.contains("<CAEXFile FileName=\" plant-v2.aml\""), "{spaced}");
+    // Tab, line feed and carriage return survive attribute normalisation as character
+    // references; U+0085 is allowed in XML 1.0 and kept, U+FFFE is not and is dropped.
+    let odd = automationml(&i, "2026-11-16T22:00:00Z", "a\tb\nc\rd\u{85}e\u{FFFE}f.aml").0;
+    assert!(
+        odd.contains("<CAEXFile FileName=\"a&#9;b&#10;c&#13;d\u{85}ef.aml\""),
+        "{odd}"
+    );
+    // An XML reader gets the file name back exactly, tab, line feed and carriage return included.
+    let name = "a\tb\nc\rd.aml";
+    let xml_name = automationml(&i, "2026-11-16T22:00:00Z", name).0;
+    assert_eq!(caex_file_name(&xml_name).as_deref(), Some(name), "{xml_name}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
-    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z").0, xml);
+    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
 #[test]
@@ -596,6 +1244,44 @@ fn plc_io_list_and_contents() {
 }
 
 #[test]
+fn plc_points_repeated_on_an_overview_page_are_listed_once() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    s.insert(input.id.clone(), input);
+    p.pages[0]
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    overview
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    p.pages.insert(0, overview);
+    p.devices.insert(
+        DeviceTag::parse("-A1.I1").unwrap(),
+        Device {
+            properties: [("Address".to_string(), "%I0.2".to_string())].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // Listed once, linked to the schematic page, and declared once.
+    let t = build(Kind::Plc, &i);
+    assert_eq!(t.rows.len(), 1);
+    assert_eq!(t.rows[0][2], "-A1.I1");
+    assert_eq!(t.rows[0][5], "2");
+    assert_eq!(t.row_pages, [p.pages[1].id.clone()]);
+    let v = plc_variables(&i);
+    assert_eq!(v.variables, 1);
+    assert!(!v.text.contains("A1_I1_2"));
+}
+
+#[test]
 fn the_location_list_counts_devices_and_names_unlisted_locations() {
     let mut p = Project::new("t");
     for t in ["+L1-K1", "+L1-K2", "+L2.A-K3", "-K4"] {
@@ -618,6 +1304,83 @@ fn the_location_list_counts_devices_and_names_unlisted_locations() {
             ["+L2.A", "", "1", "not in the project's locations"],
         ]
     );
+}
+
+#[test]
+fn the_location_list_sorts_unlisted_locations_with_numbers_by_value() {
+    let mut p = Project::new("t");
+    for t in ["+L10-K1", "+L2-K2", "+L3-K3"] {
+        p.devices.insert(DeviceTag::parse(t).unwrap(), Default::default());
+    }
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = build(Kind::Locations, &i);
+    let paths: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(paths, ["+L2", "+L3", "+L10"]);
+}
+
+#[test]
+fn the_location_list_reads_a_location_stored_with_its_plus() {
+    let mut p = Project::new("t");
+    p.devices
+        .insert(DeviceTag::parse("+L1-K1").unwrap(), Default::default());
+    p.meta.locations.push(wc_core::project::Location {
+        path: "+L1".into(),
+        description: "Main cabinet".into(),
+    });
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    assert_eq!(build(Kind::Locations, &i).rows, [["+L1", "Main cabinet", "1", ""]]);
+}
+
+#[test]
+fn the_location_list_shows_a_location_stored_twice_once() {
+    let mut p = Project::new("t");
+    p.devices
+        .insert(DeviceTag::parse("+L1-K1").unwrap(), Default::default());
+    for (path, description) in [("L1", ""), ("+L1", "Main cabinet"), (" +L1", "Other")] {
+        p.meta.locations.push(wc_core::project::Location {
+            path: path.into(),
+            description: description.into(),
+        });
+    }
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    assert_eq!(build(Kind::Locations, &i).rows, [["+L1", "Main cabinet", "1", ""]]);
+}
+
+#[test]
+fn the_location_list_says_why_a_stored_path_is_no_location() {
+    let mut p = Project::new("t");
+    p.meta.locations.push(wc_core::project::Location {
+        path: "+A-B".into(),
+        description: "Typo".into(),
+    });
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let rows = build(Kind::Locations, &i).rows;
+    let [row] = rows.as_slice() else {
+        unreachable!("one row: {rows:?}")
+    };
+    assert_eq!(row[..3], ["+A-B", "Typo", "0"]);
+    assert_eq!(row[3], wc_core::project::location_path("+A-B").unwrap_err());
+    assert!(row[3].contains("not a location"), "{}", row[3]);
 }
 
 #[test]
@@ -984,6 +1747,24 @@ fn marker_list_headers_and_types_follow_the_language_and_warnings_still_find_wir
     assert!(nb.rows.iter().any(|r| r[0] == "Komponent"));
     assert_eq!(Language::parse("NO"), Some(Language::Nb));
     assert_eq!(Language::parse("fr"), None);
+}
+
+#[test]
+fn a_numbered_wire_repeated_on_an_overview_gets_no_extra_markers() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].wires[0].number = Some("7".into());
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Wires]);
+    let rows: Vec<String> = t.rows.iter().map(|r| r.join("|")).collect();
+    assert!(rows.contains(&"Wire||7|2".to_owned()), "{rows:?}");
 }
 
 #[test]
@@ -2930,4 +3711,577 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
         parts: &parts,
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
+}
+
+#[test]
+fn project_check_flags_a_wire_on_one_pin_at_both_ends() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s2", "13"), pin("s2", "13"), Some("7"), None));
+    p.pages[0]
+        .wires
+        .push(wire("w6", pin("s2", "13"), pin("s2", "14"), Some("8"), None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("starts and ends on"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert_eq!(found[0].message, "wire 7 starts and ends on =A+C1-K1:13");
+    assert_eq!(found[0].item.as_deref(), Some("w5"));
+}
+
+#[test]
+fn project_check_warns_once_per_same_pin_wire_when_ids_repeat() {
+    let (mut p, s, parts) = fixture();
+    for _ in 0..2 {
+        p.pages[0]
+            .wires
+            .push(wire("w9", pin("s2", "13"), pin("s2", "13"), None, None));
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("starts and ends on"))
+        .map(|f| f.message)
+        .collect();
+    assert_eq!(
+        found,
+        [
+            "wire starts and ends on =A+C1-K1:13 (wire 1 of 2 with id w9 on this page)",
+            "wire starts and ends on =A+C1-K1:13 (wire 2 of 2 with id w9 on this page)",
+        ]
+    );
+}
+
+#[test]
+fn check_names_a_connection_with_two_wire_numbers_and_a_number_on_two_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    assert!(found(&p).is_empty(), "the fixture's numbers are fine");
+    // The lamp's X2 joins the connection of wire 3 through a wire numbered 10.
+    p.pages[0]
+        .wires
+        .push(wire("w8", pin("s6", "X1"), pin("s5", "2"), Some(" 10 "), None));
+    assert_eq!(
+        found(&p),
+        [("w3".to_owned(), "one connection has wire numbers 3 and 10".to_owned())]
+    );
+    // Number 2 again on the separate connection of wire 3: on two connections now.
+    p.pages[0].wires[2].number = Some("2".into());
+    p.pages[0].wires.pop();
+    assert_eq!(
+        found(&p),
+        [("w3".to_owned(), "wire number 2 is on 2 connections".to_owned())]
+    );
+    // A copy on an overview page repeats the connection on purpose.
+    p.pages[0].wires[2].number = Some("3".into());
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s20", "lamp", 100.0, Some("-P1")));
+    overview
+        .wires
+        .push(wire("w20", pin("s20", "X1"), pin("s20", "X2"), Some("2"), None));
+    p.pages.push(overview);
+    assert!(found(&p).is_empty());
+}
+
+#[test]
+fn wire_numbers_tell_apart_same_id_wires_of_separate_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    // Wire ids need not be unique on a page (a replaced page can repeat them): w3 takes w2's id
+    // and stays a separate connection.
+    p.pages[0].wires[2].id = "w2".into();
+    assert!(found(&p).is_empty(), "two connections with numbers 2 and 3");
+    // The same number on both is a number on two connections.
+    p.pages[0].wires[2].number = Some("2".into());
+    assert_eq!(
+        found(&p),
+        [("w2".to_owned(), "wire number 2 is on 2 connections".to_owned())]
+    );
+}
+
+#[test]
+fn wire_numbers_ignore_overview_wiring_that_joins_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    // w1 (24V, numbered 1) and w4 (0V) are two connections; w4 takes number 1 too.
+    p.pages[0].wires[3].number = Some("1".into());
+    let expected = [("w4".to_owned(), "wire number 1 is on 2 connections".to_owned())];
+    assert_eq!(found(&p), expected);
+    // An overview page whose wiring joins the 24V and 0V potentials into one net.
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    let mid = Point::new(20.0, 20.0);
+    overview.wires = vec![
+        wire(
+            "o1",
+            Endpoint::Point {
+                at: Point::new(10.0, 20.0),
+            },
+            Endpoint::Point { at: mid },
+            None,
+            Some("24V"),
+        ),
+        wire(
+            "o2",
+            Endpoint::Point { at: mid },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+            None,
+            Some("0V"),
+        ),
+    ];
+    p.pages.insert(0, overview);
+    assert_eq!(found(&p), expected);
+    // With w4 numbered 4 the two connections do not become one with numbers 1 and 4.
+    p.pages[1].wires[3].number = Some("4".into());
+    assert!(found(&p).is_empty());
+}
+
+#[test]
+fn a_repeated_wire_number_is_named_on_the_connection_drawn_second() {
+    let (mut p, s, parts) = fixture();
+    // Connection a is drawn first by an unnumbered wire; b's wire takes 7 before a's second does.
+    p.pages[0].wires = vec![
+        wire("a0", pin("s2", "14"), pin("s4", "1"), None, None),
+        wire("b0", pin("s4", "2"), pin("s6", "X1"), Some("7"), None),
+        wire("a1", pin("s4", "1"), pin("s2", "13"), Some("7"), None),
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("wire number"))
+        .map(|f| (f.item.unwrap_or_default(), f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [("b0".to_owned(), "wire number 7 is on 2 connections".to_owned())]
+    );
+}
+
+#[test]
+fn two_wire_numbers_on_one_connection_are_named_on_its_first_wire_even_unnumbered() {
+    let (mut p, s, parts) = fixture();
+    // One connection drawn first by an unnumbered wire, then by wires numbered 7 and 8.
+    p.pages[0].wires = vec![
+        wire("a0", pin("s2", "14"), pin("s4", "1"), None, None),
+        wire("a1", pin("s4", "1"), pin("s2", "13"), Some("7"), None),
+        wire("a2", pin("s2", "13"), pin("s4", "1"), Some("8"), None),
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("wire number"))
+        .map(|f| (f.item.unwrap_or_default(), f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [("a0".to_owned(), "one connection has wire numbers 7 and 8".to_owned())]
+    );
+}
+
+#[test]
+fn rows_of_the_wire_cable_terminal_and_plc_lists_link_to_their_page() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    s.insert(input.id.clone(), input);
+    // A second page, numbered 7 with the id p7, with a terminal, a PLC input and a cable core.
+    let mut second = Page::new("p7", "7", "Field");
+    second.symbols = vec![
+        place("t1", "term", 10.0, Some("-X1.3")),
+        place("in1", "wc.plc.input", 40.0, Some("-A1.I1")),
+    ];
+    let mut core = wire("w20", pin("t1", "2"), pin("in1", "I"), Some("20"), None);
+    core.cable = Some(wc_core::CableCore {
+        cable: DeviceTag::parse("-W1").unwrap(),
+        core: "2".into(),
+    });
+    second.wires.push(core);
+    p.pages.push(second);
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    p.meta.strips.push(wc_core::project::StripLayout {
+        strip: DeviceTag::parse("-X1").unwrap(),
+        spares: vec!["9".into()],
+        order: vec![],
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let id_of = |number: &str| p.pages.iter().find(|pg| pg.number == number).map(|pg| pg.id.clone());
+    for (kind, page_column) in [
+        (Kind::Wires, 0),
+        (Kind::Cables, 4),
+        (Kind::Terminals, 5),
+        (Kind::Plc, 5),
+    ] {
+        let t = build(kind, &i);
+        assert!(!t.rows.is_empty(), "{kind:?}");
+        for (n, row) in t.rows.iter().enumerate() {
+            let link = t.row_pages.get(n).cloned().unwrap_or_default();
+            let want = id_of(&row[page_column]).unwrap_or_default();
+            assert_eq!(link, want, "{kind:?} row {row:?}");
+        }
+        assert!(t.row_pages.iter().any(|l| l == "p7"), "{kind:?}");
+    }
+    // The spare terminal is on no page and links nowhere.
+    let t = build(Kind::Terminals, &i);
+    let spare = t.rows.iter().position(|r| r[5] == SPARE_PAGE).unwrap();
+    assert_eq!(t.row_pages.get(spare).map(String::as_str).unwrap_or(""), "");
+    // A sorted layout keeps each row's link with it.
+    let layout = ReportLayout {
+        sort: vec!["-Page".into()],
+        ..Default::default()
+    };
+    let sorted = build_with(Kind::Wires, &i, Some(&layout));
+    assert_eq!(sorted.rows[0][0], "7");
+    assert_eq!(sorted.row_pages[0], "p7");
+    assert_eq!(sorted.row_pages[1], "p2");
+}
+
+#[test]
+fn check_warns_about_panel_devices_that_overlap_stick_out_or_left_the_project() {
+    use wc_core::panel::Panel;
+    let (mut p, s, parts) = fixture();
+    let tag = |t: &str| {
+        let Ok(tag) = DeviceTag::parse(t) else { unreachable!() };
+        tag
+    };
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    let place = |plate: &mut Panel, t: &str, x: f64, y: f64, r: Rotation| {
+        let Ok(()) = plate.place_device(tag(t), Point::new(x, y), (40.0, 80.0), r) else {
+            unreachable!()
+        };
+    };
+    place(&mut plate, "=A+C1-K1", 100.0, 0.0, Rotation::R0);
+    // Turned, -X1.1 covers 80 x 40 from (60, 50): it overlaps -K1 (100..140 x 0..80).
+    place(&mut plate, "-X1.1", 60.0, 50.0, Rotation::R90);
+    // -P1 touches -K1's and -X1.1's right edges: a gap of 0 is no overlap.
+    place(&mut plate, "-P1", 140.0, 0.0, Rotation::R0);
+    // -X2 lies partly off the plate (as a hand-edited file can have it).
+    place(&mut plate, "-X2", 300.0, 200.0, Rotation::R0);
+    if let Some(wc_core::panel::PanelItem::Device { at, .. }) = plate.items.last_mut() {
+        *at = Point::new(380.0, 250.0);
+    }
+    // -K9 is drawn nowhere and has no device entry.
+    place(&mut plate, "-K9", 200.0, 100.0, Rotation::R0);
+    p.panels.push(plate);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.starts_with("panel "))
+        .map(|f| f.message)
+        .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(has("panel Main: =A+C1-K1 and -X1.1 overlap"), "{found:?}");
+    assert!(has("panel Main: -X2 sticks out of the plate"), "{found:?}");
+    assert!(
+        has("panel Main: -K9 is on the plate but no longer in the project"),
+        "{found:?}"
+    );
+    assert_eq!(found.len(), 3, "{found:?}");
+}
+
+#[test]
+fn check_warns_about_panel_rails_and_ducts_that_stick_out_of_the_plate() {
+    use wc_core::panel::{Panel, PanelItem};
+    let (mut p, s, parts) = fixture();
+    // As an imported cabinet layout or a hand-edited file can have them.
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    plate.items = vec![
+        // Flush with the plate's left and right edges: on the plate.
+        PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(400.0, 40.0),
+        },
+        PanelItem::Rail {
+            at: Point::new(0.0, 100.0),
+            length: 400.0,
+        },
+        // Runs 50 mm past the right edge.
+        PanelItem::Rail {
+            at: Point::new(50.0, 200.0),
+            length: 400.0,
+        },
+        // Reaches below the bottom edge.
+        PanelItem::Duct {
+            min: Point::new(0.0, 280.0),
+            max: Point::new(40.0, 320.0),
+        },
+        // A corner that is not a number, which sorting the corners would hide.
+        PanelItem::Duct {
+            min: Point::new(f64::NAN, 10.0),
+            max: Point::new(40.0, 50.0),
+        },
+        // Corners written the other way round are still on the plate.
+        PanelItem::Duct {
+            min: Point::new(80.0, 50.0),
+            max: Point::new(60.0, 10.0),
+        },
+    ];
+    let Ok(k1) = DeviceTag::parse("=A+C1-K1") else {
+        unreachable!()
+    };
+    // A device whose position is not a number is not on the plate either.
+    plate.items.push(PanelItem::Device {
+        tag: k1,
+        at: Point::new(f64::NAN, 10.0),
+        width: 40.0,
+        height: 80.0,
+        rotation: Rotation::R0,
+    });
+    p.panels.push(plate);
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .filter(|f| f.message.starts_with("panel "))
+    .map(|f| f.message)
+    .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(has("panel Main: rail at 50,200 sticks out of the plate"), "{found:?}");
+    assert!(
+        has("panel Main: duct 0,280 to 40,320 sticks out of the plate"),
+        "{found:?}"
+    );
+    assert!(
+        has("panel Main: duct NaN,10 to 40,50 sticks out of the plate"),
+        "{found:?}"
+    );
+    assert!(has("panel Main: =A+C1-K1 sticks out of the plate"), "{found:?}");
+    assert_eq!(found.len(), 4, "{found:?}");
+}
+
+#[test]
+fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
+    use wc_core::panel::Panel;
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let Ok(l1) = DeviceTag::parse("-L1") else {
+        unreachable!()
+    };
+    p.devices.entry(l1.clone()).or_default();
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    let Ok(()) = plate.place_device(l1, Point::new(10.0, 10.0), (40.0, 80.0), Rotation::R0) else {
+        unreachable!()
+    };
+    p.panels.push(plate);
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    assert!(!found.iter().any(|m| m.starts_with("panel ")), "{found:?}");
+    // The tag still only names a connection, so it gets no "has no part" note.
+    assert!(!found.iter().any(|m| m == "-L1 has no part"), "{found:?}");
+}
+
+#[test]
+fn markdown_cells_with_a_backslash_keep_their_columns() {
+    let mut t = Table::new("Paths", &["Path", "Text", "Next"]);
+    t.rows.push(vec!["C:\\".into(), "a\\|b".into(), "next".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Paths\n\n| Path | Text | Next |\n|---|---|---|\n| C:\\\\ | a\\\\\\|b | next |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_show_markdown_characters_as_typed() {
+    let mut t = Table::new("Notes", &["*Tag*", "Text"]);
+    t.rows
+        .push(vec!["*a*".into(), "b_c_d `x` <tag> [l](u) ~s~ & ![i](p)".into()]);
+    t.rows.push(vec!["#1".into(), "-K1 2.5 mm² plain".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Notes\n\n| \\*Tag\\* | Text |\n|---|---|\n\
+         | \\*a\\* | b\\_c\\_d \\`x\\` &lt;tag&gt; \\[l\\](u) \\~s\\~ \\& \\!\\[i\\](p) |\n\
+         | \\#1 | -K1 2.5 mm² plain |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["see https://example.com/a_b *x*".into()]);
+    t.rows.push(vec!["(www.x.no/a_b|c), mail a_b@x.no or a_b@c".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | see https://example.com/a_b \\*x\\* |\n\
+         | (www\\.x.no/a\\_b\\|c), mail a_b@x.no or a\\_b@c |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_words_that_only_look_like_links() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://*spare*/path".into()]);
+    t.rows.push(vec!["https://example.com/&copy;".into()]);
+    t.rows.push(vec!["https://example.com/a_b. www.a_b.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://\\*spare\\*/path |\n\
+         | https\\://example.com/\\&copy; |\n\
+         | https://example.com/a_b. www.a\\_b.no |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_backslashes_in_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://example.com/a\\b".into()]);
+    t.rows
+        .push(vec!["https://example.com/a\\|b https://example.com/c\\".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a\\b |\n\
+         | https\\://example.com/a\\\\\\|b https\\://example.com/c\\\\ |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_an_uppercase_www_word() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["WWW.example.com/*spare*/path HTTPS://example.com/a_b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | WWW.example.com/\\*spare\\*/path HTTPS://example.com/a_b |\n"
+    );
+}
+
+#[test]
+fn markdown_links_with_text_that_needs_a_backslash_are_written_as_text() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["https://example.com/a_b, https://example.com/a_b*".into()]);
+    t.rows
+        .push(vec!["a_b@x.no&amp; www.x.no/a_b&copy; www.x.no/a_b.".into()]);
+    t.rows
+        .push(vec!["https://example.com/a|b https://example.com/a\\".into()]);
+    t.rows.push(vec!["HTTP://example.com/a\\|b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a_b, https\\://example.com/a\\_b\\* |\n\
+         | <a_b@x.no>\\&amp; www\\.x.no/a\\_b\\&copy; www.x.no/a_b. |\n\
+         | https\\://example.com/a\\|b https\\://example.com/a\\\\ |\n\
+         | HTTP\\://example.com/a\\\\\\|b |\n"
+    );
+}
+
+#[test]
+fn markdown_email_with_text_after_it_is_bracketed_only_when_commonmark_takes_it() {
+    let mut t = Table::new("Mail", &["Text"]);
+    t.rows.push(vec!["a@x_y.no* a_b@x.no&amp; a@-x.no_ a@x.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Mail\n\n| Text |\n|---|\n\
+         | a\\@x\\_y.no\\* <a_b@x.no>\\&amp; a\\@-x.no\\_ a@x.no |\n"
+    );
+}
+
+#[test]
+fn an_overview_page_adds_no_net_list_rows() {
+    let (mut p, s, parts) = fixture();
+    let nets = |p: &Project| {
+        net_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .rows
+    };
+    let before = nets(&p);
+    assert!(
+        before.iter().any(|r| r[0] == "0V" && r[1] == "2"),
+        "the fixture has a 0V net with two pins: {before:?}"
+    );
+    // The same schematic again, tags kept, drawn on a line diagram.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    assert_eq!(nets(&p), before, "an overview page adds no net rows or pins");
+    // A normal page with the same drawing does add its pins.
+    p.pages.last_mut().unwrap().overview = false;
+    assert_ne!(nets(&p), before);
 }

@@ -162,7 +162,9 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
-                    SymbolRole::Auxiliary => x.auxes.entry(tag.clone()).or_default().push(a),
+                    // A contact repeated on an overview page (line diagram) is not listed
+                    // under its coil again: the schematic page draws it in detail (#1076).
+                    SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),
                     SymbolRole::Interruption => x.links.entry(tag.clone()).or_default().push(a),
                     _ => {}
                 }
@@ -541,13 +543,21 @@ pub fn cover_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> 
     if !page.cover {
         return None;
     }
-    Some(match logo.cover {
+    Some(match placed_cover_box(logo) {
         Some((a, b)) => (
             Point::new(a.x.min(b.x), a.y.min(b.y)),
             Point::new(a.x.max(b.x), a.y.max(b.y)),
         ),
         None => cover_logo_default(project, page),
     })
+}
+
+/// The cover box the user put the logo in, unless a corner is not a number (`nan` or `inf`
+/// typed into `project.toml`): such a box is drawn nowhere, so the logo takes its default place
+/// instead of writing `NaN` into the page (#1183).
+fn placed_cover_box(logo: &wc_core::Logo) -> Option<(Point, Point)> {
+    logo.cover
+        .filter(|(a, b)| [a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()))
 }
 
 /// Every box the project's logo is drawn in on `page`: the title block's, and on the cover
@@ -607,7 +617,11 @@ fn cover_name_y(rows: usize, logo: bool, y0: f64, y1: f64) -> f64 {
 /// Whether the cover shows the project's logo in its default place, above the name: only then
 /// does the name leave room for it.
 fn default_cover_logo(project: &Project) -> bool {
-    project.meta.logo.as_ref().is_some_and(|l| l.cover.is_none())
+    project
+        .meta
+        .logo
+        .as_ref()
+        .is_some_and(|l| placed_cover_box(l).is_none())
 }
 
 /// How many rows of the cover's field table fit on a cover whose drawing area runs from `y0`
@@ -883,14 +897,13 @@ pub fn draw_page(
         pen.circle((x, y), 0.6, true);
     }
 
-    // Symbols.
+    // Symbols. A symbol missing from the library copy is warned about once per page, with
+    // how many placements it has there, however often it is placed.
     pen.width(0.3);
+    let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
     for s in &page.symbols {
         let Some(sym) = symbols.get(&s.symbol) else {
-            warnings.push(format!(
-                "page {}: symbol {:?} is not in the project's library copy",
-                page.number, s.symbol
-            ));
+            *missing.entry(s.symbol.as_str()).or_insert(0) += 1;
             pen.colour(0.85, 0.1, 0.1);
             pen.rect((s.at.x - 4.0, s.at.y - 4.0), (s.at.x + 4.0, s.at.y + 4.0));
             pen.text((s.at.x, s.at.y + 1.0), 2.5, 1, "?");
@@ -915,6 +928,18 @@ pub fn draw_page(
         for (i, l) in lines.iter().enumerate() {
             pen.text((ta.x, top + 3.0 * i as f64), 2.5, 2, l);
         }
+    }
+
+    for (symbol, n) in missing {
+        let placements = if n > 1 {
+            format!(" ({n} placements)")
+        } else {
+            String::new()
+        };
+        warnings.push(format!(
+            "page {}: symbol {symbol:?} is not in the project's library copy{placements}",
+            page.number
+        ));
     }
 
     // Cross-references, as links to the page they point at.
@@ -1062,11 +1087,31 @@ pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
     if text_width_mm(s, height) <= width {
         return s.to_owned();
     }
-    let mut out: String = s.to_owned();
-    while !out.is_empty() && text_width_mm(&format!("{out}..."), height) > width {
-        out.pop();
+    // The longest start of `s` that still fits with "..." after it. A longer start is never
+    // narrower, so the cut point is found by halving: a few measures, not one per character.
+    let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).skip(1).collect();
+    let fits = |end: usize| {
+        s.get(..end)
+            .is_some_and(|start| text_width_mm(&format!("{start}..."), height) <= width)
+    };
+    let (mut lo, mut hi) = (0, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if ends.get(mid - 1).is_some_and(|&end| fits(end)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
     }
-    format!("{out}...")
+    let end = lo.checked_sub(1).and_then(|i| ends.get(i)).map_or(0, |&e| e);
+    format!("{}...", s.get(..end).unwrap_or_default())
+}
+
+/// A sheet heading drawn 4 mm high, at most `width` mm wide: `title` cut short with "..." when
+/// it is too long, followed by `counter` (such as " (2 / 3)"), which is always kept whole.
+pub(crate) fn fit_heading(title: &str, counter: &str, width: f64) -> String {
+    let room = width - text_width_mm(counter, 4.0);
+    format!("{}{counter}", fit_at(title, room, 4.0))
 }
 
 /// One line of a report page's table: a row of the table, by its index, or the heading of a
@@ -1143,12 +1188,12 @@ pub fn draw_table_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let mut y = MARGIN + HEADER + 10.0;
-    let heading = if part.1 > 1 {
-        format!("{} ({} / {})", table.title, part.0, part.1)
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
     } else {
-        table.title.clone()
+        String::new()
     };
-    pen.text((x0, y), 4.0, 0, &heading);
+    pen.text((x0, y), 4.0, 0, &fit_heading(&table.title, &counter, x1 - x0));
     y += 4.0;
     if !table.header.is_empty() {
         // The title-block values the layout asks for, as on the page's title block.
@@ -1355,10 +1400,12 @@ pub fn draw_card_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let top = MARGIN + HEADER + 10.0;
-    let mut heading = format!("PLC card {}", card.card);
-    if part.1 > 1 {
-        heading.push_str(&format!(" ({} / {})", part.0, part.1));
-    }
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
+    } else {
+        String::new()
+    };
+    let heading = fit_heading(&format!("PLC card {}", card.card), &counter, x1 - x0);
     pen.text((x0, top), 4.0, 0, &heading);
     let mut about = vec![];
     if !card.rack.is_empty() {

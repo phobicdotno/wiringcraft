@@ -36,6 +36,8 @@ pub enum Icon {
     PageProps,
     PageUp,
     PageDown,
+    PagePrev,
+    PageNext,
     PageDelete,
     ZoomIn,
     ZoomOut,
@@ -394,6 +396,16 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                 ],
                 false,
             );
+        }
+        Icon::PagePrev | Icon::PageNext => {
+            poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);
+            let (tip, back) = if icon == Icon::PagePrev {
+                (9.0, 14.0)
+            } else {
+                (15.0, 10.0)
+            };
+            aline((back, 9.0), (tip, 13.5));
+            aline((tip, 13.5), (back, 18.0));
         }
         Icon::PageDelete => {
             poly(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)], true);

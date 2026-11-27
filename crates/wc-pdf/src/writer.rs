@@ -143,6 +143,8 @@ pub struct Stroke {
 
 struct PageData {
     size_mm: (f64, f64),
+    /// The sheet's own page number (`R1`, `3`, `P1`...), shown in the reader's page box.
+    label: String,
     title: String,
     drawn: Drawn,
 }
@@ -153,19 +155,33 @@ pub struct Doc {
 }
 
 /// Encode text for the WinAnsi Helvetica font as a hex string. Latin-1 characters map directly
-/// (covers æ ø å ä ö ü é ...); anything else becomes '?'.
+/// (covers æ ø å ä ö ü é ...), the euro, curly quotes, ellipsis, dashes and the rest of WinAnsi
+/// to their codes; an arrow becomes '>' and anything else '?'.
 pub fn pdf_text(s: &str) -> String {
     let mut out = String::from("<");
     for c in s.chars() {
-        let b = match c as u32 {
-            0x20..=0x7e | 0xa0..=0xff => c as u32 as u8,
-            0x2013 => 0x96,
-            0x2014 => 0x97,
-            0x2022 => 0x95,
-            0x2192 => b'>',
-            _ => b'?',
+        let b = match c {
+            '\u{2192}' => b'>',
+            _ => wc_core::font::winansi_code(c).unwrap_or(b'?'),
         };
         let _ = write!(out, "{b:02X}");
+    }
+    out.push('>');
+    out
+}
+
+/// Encode a PDF text string (bookmark titles, the document title, layer names) as a hex
+/// string. Readers decode these as PDFDocEncoding or UTF-16, not as the page font's WinAnsi, so
+/// `pdf_text` would turn an en dash into "Œ" there. Printable ASCII is the same in every one of
+/// them and is written as is; anything else is written as UTF-16BE with a byte order mark, which
+/// holds any character (#726).
+pub fn pdf_text_string(s: &str) -> String {
+    if s.chars().all(|c| matches!(c, ' '..='~')) {
+        return pdf_text(s);
+    }
+    let mut out = String::from("<FEFF");
+    for unit in s.encode_utf16() {
+        let _ = write!(out, "{unit:04X}");
     }
     out.push('>');
     out
@@ -179,9 +195,11 @@ impl Doc {
         }
     }
 
-    pub fn add_page(&mut self, size_mm: (f64, f64), title: &str, drawn: Drawn) {
+    /// Add a sheet; `label` is its own page number, which the reader shows instead of 1, 2, 3.
+    pub fn add_page(&mut self, size_mm: (f64, f64), label: &str, title: &str, drawn: Drawn) {
         self.pages.push(PageData {
             size_mm,
+            label: label.to_owned(),
             title: title.to_owned(),
             drawn,
         });
@@ -242,14 +260,38 @@ impl Doc {
             let refs = ocg_refs.join(" ");
             format!(" /OCProperties << /OCGs [{refs}] /D << /Order [{refs}] /ON [{refs}] >> >>")
         };
+        // Page labels: the reader's page box shows each sheet's own number (#727). A sheet
+        // without a number counts on in decimal from its position.
+        let labels = if n == 0 {
+            String::new()
+        } else {
+            let nums: Vec<String> = self
+                .pages
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if p.label.is_empty() {
+                        format!("{i} << /S /D /St {} >>", i + 1)
+                    } else {
+                        format!("{i} << /P {} >>", page_label(&p.label))
+                    }
+                })
+                .collect();
+            format!(" /PageLabels << /Nums [{}] >>", nums.join(" "))
+        };
         objs.push((
             1,
-            format!("<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines{oc} >>").into_bytes(),
+            // DisplayDocTitle: readers show the project name (the Info /Title), not the file name.
+            format!(
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines \
+                 /ViewerPreferences << /DisplayDocTitle true >>{oc}{labels} >>"
+            )
+            .into_bytes(),
         ));
         for (k, l) in used.iter().enumerate() {
             objs.push((
                 ocg_obj(k),
-                format!("<< /Type /OCG /Name {} >>", pdf_text(l.title())).into_bytes(),
+                format!("<< /Type /OCG /Name {} >>", pdf_text_string(l.title())).into_bytes(),
             ));
         }
         let properties = if used.is_empty() {
@@ -285,7 +327,7 @@ impl Doc {
         }
         objs.push((
             5,
-            format!("<< /Title {} /Producer (WiringCraft) >>", pdf_text(&self.title)).into_bytes(),
+            format!("<< /Title {} /Producer (WiringCraft) >>", pdf_text_string(&self.title)).into_bytes(),
         ));
         for (i, p) in self.pages.iter().enumerate() {
             let (w, h) = (p.size_mm.0 * PT_PER_MM, p.size_mm.1 * PT_PER_MM);
@@ -357,7 +399,7 @@ impl Doc {
             objs.push((page_obj(i) + 1, content));
             let mut item = format!(
                 "<< /Title {} /Parent 4 0 R /Dest [{} 0 R /Fit]",
-                pdf_text(&p.title),
+                pdf_text_string(&p.title),
                 page_obj(i)
             );
             if i > 0 {
@@ -654,3 +696,25 @@ impl Pen {
 }
 
 pub use wc_core::font::text_width_mm;
+
+/// A page label prefix as a PDF text string: printable ASCII as a literal string with `(`, `)`
+/// and `\` escaped, anything else as UTF-16BE hex with a byte order mark.
+fn page_label(s: &str) -> String {
+    if s.chars().all(|c| matches!(c, ' '..='~')) {
+        let mut out = String::from("(");
+        for c in s.chars() {
+            if matches!(c, '(' | ')' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push(')');
+        return out;
+    }
+    let mut out = String::from("<FEFF");
+    for unit in s.encode_utf16() {
+        let _ = write!(out, "{unit:04X}");
+    }
+    out.push('>');
+    out
+}

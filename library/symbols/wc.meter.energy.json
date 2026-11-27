@@ -1,0 +1,160 @@
+{
+  "category": "measuring",
+  "description": "Single-phase energy meter (kWh meter) for a supply or sub-circuit: 1 is L in, 2 L out, 3 N in, 4 N out.",
+  "graphics": [
+    {
+      "kind": "rect",
+      "max": {
+        "x": 8.0,
+        "y": 15.0
+      },
+      "min": {
+        "x": -8.0,
+        "y": 5.0
+      }
+    },
+    {
+      "a": {
+        "x": -8.0,
+        "y": 8.0
+      },
+      "b": {
+        "x": 8.0,
+        "y": 8.0
+      },
+      "kind": "line"
+    },
+    {
+      "align": "center",
+      "at": {
+        "x": 0.0,
+        "y": 12.4
+      },
+      "height": 2.5,
+      "kind": "text",
+      "text": "kWh"
+    },
+    {
+      "a": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": -5.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -5.0,
+        "y": 15.0
+      },
+      "b": {
+        "x": -5.0,
+        "y": 20.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 15.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 20.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": -3.8,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    },
+    {
+      "at": {
+        "x": 6.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "3"
+    },
+    {
+      "at": {
+        "x": -3.8,
+        "y": 19.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2"
+    },
+    {
+      "at": {
+        "x": 6.2,
+        "y": 19.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "4"
+    }
+  ],
+  "id": "wc.meter.energy",
+  "letter_code": "P",
+  "name": "Energy meter (kWh)",
+  "pins": [
+    {
+      "at": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "3"
+    },
+    {
+      "at": {
+        "x": -5.0,
+        "y": 20.0
+      },
+      "dir": "down",
+      "name": "2"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 20.0
+      },
+      "dir": "down",
+      "name": "4"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -16.0,
+    "y": 10.0
+  }
+}

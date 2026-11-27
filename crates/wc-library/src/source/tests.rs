@@ -1,0 +1,169 @@
+use super::*;
+
+fn io(e: std::io::Error) -> Error {
+    Error::Core(wc_core::Error::io("tmp", e))
+}
+
+fn src(name: &str, kind: &str, location: &str, reference: Option<&str>) -> LibrarySource {
+    LibrarySource {
+        name: name.into(),
+        kind: kind.into(),
+        location: location.into(),
+        reference: reference.map(str::to_owned),
+    }
+}
+
+/// Runs git in `dir` with a fixed identity, so tests do not depend on the user's git config.
+fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
+    let mut all = vec![
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "tag.gpgsign=false",
+    ];
+    all.extend_from_slice(args);
+    git(&all, Some(dir), "test")
+}
+
+fn commit_file(repo: &Path, text: &str) -> Result<()> {
+    std::fs::write(repo.join("lib.txt"), text).map_err(io)?;
+    run_git(repo, &["add", "lib.txt"])?;
+    run_git(repo, &["commit", "-q", "-m", text])
+}
+
+fn read(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(io)
+}
+
+fn source_message(r: Result<impl std::fmt::Debug>) -> (String, String) {
+    match r {
+        Err(Error::Source { name, message }) => (name, message),
+        other => unreachable!("expected a source error, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_kind_is_an_error_naming_the_kind() {
+    let s = src("odd", "ftp", "somewhere", None);
+    let (name, message) = source_message(Source::resolve(Path::new("."), &s));
+    assert_eq!(name, "odd");
+    assert!(message.contains("\"ftp\""), "{message}");
+    let (name, message) = source_message(sync_one(Path::new("."), &s));
+    assert_eq!(name, "odd");
+    assert!(message.contains("\"ftp\""), "{message}");
+}
+
+#[test]
+fn missing_folder_is_reported_as_not_reachable() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let s = src("gone", "folder", "no-such-folder", None);
+    let msg = sync_one(tmp.path(), &s)?;
+    assert!(msg.starts_with("gone: folder "), "{msg}");
+    assert!(msg.ends_with(" is not reachable"), "{msg}");
+    assert!(msg.contains("no-such-folder"), "{msg}");
+
+    std::fs::create_dir(tmp.path().join("here")).map_err(io)?;
+    let msg = sync_one(tmp.path(), &src("here", "folder", "here", None))?;
+    assert!(!msg.contains("not reachable"), "{msg}");
+    Ok(())
+}
+
+#[test]
+fn git_source_with_an_invalid_name_is_rejected() {
+    for bad in ["../escape", ".hidden", "a/b", ""] {
+        let s = src(bad, "git", "/nowhere", None);
+        let (name, message) = source_message(Source::resolve(Path::new("."), &s));
+        assert_eq!(name, bad);
+        assert!(message.contains("must be"), "{message}");
+        let (_, message) = source_message(sync_one(Path::new("."), &s));
+        assert!(message.contains("must be"), "{message}");
+    }
+}
+
+#[test]
+fn cache_root_order() {
+    let os = |s: &str| Some(OsString::from(s));
+    assert_eq!(
+        cache_root_from(os("/c/wc"), os("/c/xdg"), os("/c/home")),
+        Some(PathBuf::from("/c/wc"))
+    );
+    assert_eq!(
+        cache_root_from(None, os("/c/xdg"), os("/c/home")),
+        Some(PathBuf::from("/c/xdg/wiringcraft"))
+    );
+    assert_eq!(
+        cache_root_from(None, None, os("/c/home")),
+        Some(PathBuf::from("/c/home/.cache/wiringcraft"))
+    );
+    assert_eq!(cache_root_from(None, None, None), None);
+}
+
+#[test]
+fn git_source_clones_then_updates() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let upstream = tmp.path().join("upstream");
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir(&upstream).map_err(io)?;
+
+    // main is one commit ahead of the v1 tag, so a pinned clone differs from a default one.
+    run_git(&upstream, &["init", "-q", "-b", "main"])?;
+    commit_file(&upstream, "v1")?;
+    run_git(&upstream, &["tag", "v1"])?;
+    commit_file(&upstream, "v2")?;
+
+    let loc = upstream.to_string_lossy().into_owned();
+    let latest = src("latest", "git", &loc, None);
+    let pinned = src("pinned", "git", &loc, Some("v1"));
+    let proj = tmp.path();
+    let sync = |s: &LibrarySource| sync_one_in(proj, s, Some(&cache));
+
+    // Resolving a git source points at its folder in the cache.
+    assert_eq!(
+        Source::resolve_in(proj, &latest, Some(&cache))?.root,
+        cache.join("git").join("latest")
+    );
+
+    // First sync clones: without a reference it takes the default branch, with one that tag.
+    assert_eq!(sync(&latest)?, format!("latest: cloned {loc}"));
+    assert_eq!(sync(&pinned)?, format!("pinned: cloned {loc}"));
+    assert_eq!(read(&cache.join("git/latest/lib.txt"))?, "v2");
+    assert_eq!(read(&cache.join("git/pinned/lib.txt"))?, "v1");
+
+    // A new upstream commit: the next sync fetches and resets; the pinned source stays on v1.
+    commit_file(&upstream, "v3")?;
+    assert_eq!(sync(&latest)?, format!("latest: updated from {loc}"));
+    assert_eq!(sync(&pinned)?, format!("pinned: updated from {loc}"));
+    assert_eq!(read(&cache.join("git/latest/lib.txt"))?, "v3");
+    assert_eq!(read(&cache.join("git/pinned/lib.txt"))?, "v1");
+    Ok(())
+}
+
+#[test]
+fn git_source_follows_a_changed_location() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let (old, new) = (tmp.path().join("old"), tmp.path().join("new"));
+    for (repo, text) in [(&old, "old"), (&new, "new")] {
+        std::fs::create_dir(repo).map_err(io)?;
+        run_git(repo, &["init", "-q", "-b", "main"])?;
+        commit_file(repo, text)?;
+    }
+    let sync = |loc: &Path| {
+        sync_one_in(
+            tmp.path(),
+            &src("lib", "git", &loc.to_string_lossy(), None),
+            Some(&cache),
+        )
+    };
+
+    sync(&old)?;
+    assert_eq!(read(&cache.join("git/lib/lib.txt"))?, "old");
+    // The user points the source at another repository: the next sync takes that one.
+    assert_eq!(sync(&new)?, format!("lib: updated from {}", new.display()));
+    assert_eq!(read(&cache.join("git/lib/lib.txt"))?, "new");
+    Ok(())
+}

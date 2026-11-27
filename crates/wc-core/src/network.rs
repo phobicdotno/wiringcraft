@@ -169,7 +169,7 @@ impl Network {
     }
 
     /// What is wrong with this network: a node or link end that is not a device tag, a device
-    /// listed twice, two nodes with one address, a link end on a device that is not a node of
+    /// listed twice, two nodes with one address or one station name, a link end on a device that is not a node of
     /// the network, a link from a port to itself, and a port used by two links.
     pub fn warnings(&self) -> Vec<String> {
         let name = &self.name;
@@ -179,6 +179,8 @@ impl Network {
         }
         let mut devices = BTreeSet::new();
         let mut addresses: BTreeMap<&str, &str> = BTreeMap::new();
+        // Station names are DNS-style on PROFINET, so `PLC` and `plc` are the same name.
+        let mut stations: BTreeMap<String, &str> = BTreeMap::new();
         for n in &self.nodes {
             match n.device.parse::<DeviceTag>() {
                 Ok(tag) => {
@@ -194,6 +196,15 @@ impl Network {
             {
                 out.push(format!(
                     "network {name}: {} and {} have the same address {a}",
+                    other, n.device
+                ));
+            }
+            let st = n.station.trim();
+            if !st.is_empty()
+                && let Some(other) = stations.insert(st.to_lowercase(), n.device.as_str())
+            {
+                out.push(format!(
+                    "network {name}: {} and {} have the same station {st}",
                     other, n.device
                 ));
             }
@@ -313,6 +324,7 @@ cable = "-W20"
         });
         n.nodes.push(Node {
             device: "-K10".into(),
+            station: " PLC ".into(),
             ..Default::default()
         });
         for (from, to) in [("-A1:X1P1", "-K11:P1"), ("-K11:P2", "-K99:P1"), ("-K11:P2", "-K11:P2")] {
@@ -327,6 +339,7 @@ cable = "-W20"
             [
                 "network PN1: -K10 and -K11 have the same address 192.168.0.10",
                 "network PN1: -K10 is listed twice",
+                "network PN1: -A1 and -K10 have the same station PLC",
                 "network PN1: link 3 is on -K99, which is not a node",
                 "network PN1: link 4 joins -K11:P2 to itself",
                 "network PN1: port -A1:X1P1 has 2 links",

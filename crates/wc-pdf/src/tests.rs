@@ -210,6 +210,51 @@ fn pages_export_as_svg_and_dxf() {
 }
 
 #[test]
+fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
+    // `%%c` would be read as a diameter sign and `\U+0041` as `A` (#832).
+    assert_eq!(vector::dxf_text("50%%c"), "50\\U+0025\\U+0025c");
+    assert_eq!(vector::dxf_text("a%%%b"), "a\\U+0025\\U+0025\\U+0025b");
+    assert_eq!(vector::dxf_text("a\\U+0041"), "a\\U+005CU+0041");
+    // A lone percent sign starts no code and stays readable.
+    assert_eq!(vector::dxf_text("100 % on"), "100 % on");
+    assert_eq!(vector::dxf_text("%\t%d"), "\\U+0025\\U+0025d");
+    // Beyond U+FFFF there is no four-digit code; a five-digit one would be misread.
+    assert_eq!(vector::dxf_text("ok \u{1F600}"), "ok ?");
+    assert_eq!(vector::dxf_text("Ålesund\n"), "\\U+00C5lesund");
+}
+
+#[test]
+fn page_files_are_named_after_the_page_number() {
+    let page = |number: &str| PageDrawing {
+        id: "p-7".into(),
+        number: number.into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: Vec::new(),
+        pictures: Vec::new(),
+        panel: false,
+    };
+    // The app and the command line name page files the same way: `1.2` keeps its dot.
+    assert_eq!(crate::page_file_stem(&page("1.2")), "1.2");
+    assert_eq!(crate::page_file_stem(&page(" A/1 ")), "A_1");
+    // Without a number, the page's id names the file.
+    assert_eq!(crate::page_file_stem(&page("  ")), "p-7");
+    // Leading dots are left out, and a name of only dots falls back to `page`.
+    assert_eq!(crate::page_file_stem(&page(".hidden")), "hidden");
+    assert_eq!(crate::page_file_stem(&page("..")), "page");
+    // A name Windows keeps for a device, in any case and also before a dot, gets a `_` in front.
+    assert_eq!(crate::page_file_stem(&page(".NUL")), "_NUL");
+    assert_eq!(crate::page_file_stem(&page("con")), "_con");
+    assert_eq!(crate::page_file_stem(&page("com1")), "_com1");
+    assert_eq!(crate::page_file_stem(&page("Aux.2")), "_Aux.2");
+    assert_eq!(crate::page_file_stem(&page("LPT9")), "_LPT9");
+    // Names that only start like a device stay as they are.
+    assert_eq!(crate::page_file_stem(&page("CONSOLE")), "CONSOLE");
+    assert_eq!(crate::page_file_stem(&page("COM10")), "COM10");
+    assert_eq!(crate::page_file_stem(&page("COM0")), "COM0");
+}
+
+#[test]
 fn arcs_keep_their_side_in_svg_and_dxf() {
     // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
     // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.
@@ -222,9 +267,154 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
         size_mm: (100.0, 100.0),
         prims: pen.prims,
         pictures: Vec::new(),
+        panel: false,
     };
     assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
     assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
+}
+
+#[test]
+fn svg_texts_keep_their_spaces() {
+    // Viewers squeeze leading and repeated spaces unless the text says to keep them.
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.text((10.0, 10.0), 3.0, 0, "  L1  L2");
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let s = svg(&page);
+    let Some(text) = s.lines().find(|l| l.starts_with("<text")) else {
+        unreachable!("no text in {s}");
+    };
+    assert!(text.starts_with("<text xml:space=\"preserve\" "), "{text}");
+    assert!(text.ends_with(">  L1  L2</text>"), "{text}");
+}
+
+#[test]
+fn svg_leaves_out_characters_xml_does_not_allow() {
+    // U+FFFE and U+FFFF are not allowed anywhere in XML: one of them makes viewers refuse the
+    // whole file, so they are left out like control characters.
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.text((10.0, 10.0), 3.0, 0, "K1\u{FFFE} \u{FFFF}24V\u{7}");
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1\u{FFFF}".into(),
+        title: "Main\u{FFFE}".into(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let s = svg(&page);
+    assert!(!s.contains(['\u{FFFE}', '\u{FFFF}']), "{s}");
+    assert!(s.contains("<title>1 Main</title>"), "{s}");
+    assert!(s.contains(">K1 24V</text>"), "{s}");
+}
+
+#[test]
+fn dxf_fills_junction_dots_and_filled_shapes() {
+    let wire = |id: &str, a: (f64, f64), b: (f64, f64)| Wire {
+        id: id.into(),
+        from: Endpoint::Point {
+            at: Point::new(a.0, a.1),
+        },
+        to: Endpoint::Point {
+            at: Point::new(b.0, b.1),
+        },
+        via: vec![],
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    };
+    let mut project = Project::new("Fills");
+    let mut p1 = Page::new("p1", "1", "Control");
+    // A T: the second wire ends in the middle of the first, a junction at (100, 50).
+    p1.wires.push(wire("w1", (50.0, 50.0), (150.0, 50.0)));
+    p1.wires.push(wire("w2", (100.0, 50.0), (100.0, 100.0)));
+    p1.graphics.push(Shape::Polyline {
+        points: vec![
+            Point::new(200.0, 100.0),
+            Point::new(210.0, 100.0),
+            Point::new(205.0, 90.0),
+        ],
+        closed: true,
+        filled: true,
+    });
+    project.pages = vec![p1];
+    let (pages, _) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    let h = pages[0].size_mm.1;
+    let d = dxf(&pages[0]);
+    assert!(!d.contains("0\nCIRCLE\n"), "no hollow circle for the dot: {d}");
+    // The dot: a closed polyline 0.6 wide of two half circles through 99.7 and 100.3.
+    let dot = format!(
+        "66\n1\n70\n1\n40\n0.6\n41\n0.6\n0\nVERTEX\n8\n0\n10\n99.7\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n\
+         0\nVERTEX\n8\n0\n10\n100.3\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n0\nSEQEND\n",
+        y = h - 50.0
+    );
+    assert!(d.contains(&dot), "{d}");
+    // The triangle: one SOLID with its last corner repeated.
+    let solid = format!(
+        "0\nSOLID\n8\nDRAWINGS\n62\n7\n10\n200\n20\n{a}\n11\n210\n21\n{a}\n12\n205\n22\n{b}\n13\n205\n23\n{b}\n",
+        a = h - 100.0,
+        b = h - 90.0
+    );
+    assert!(d.contains(&solid), "{d}");
+}
+
+#[test]
+fn filled_outlines_become_dxf_solids_when_convex() {
+    let Some(quad) = crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (0.0, 0.0)])
+    else {
+        unreachable!("a rectangle is convex")
+    };
+    assert_eq!(quad, vec![[(0.0, 0.0), (4.0, 0.0), (0.0, 3.0), (4.0, 3.0)]]);
+    let Some(fan) = crate::vector::solid_triangles(&[(0.0, 0.0), (2.0, 0.0), (3.0, 1.0), (2.0, 2.0), (0.0, 2.0)])
+    else {
+        unreachable!("a pentagon is convex")
+    };
+    assert_eq!(fan.len(), 3);
+    // An arrow with a notch is not convex: it stays an outline.
+    assert!(crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)]).is_none());
+    // A rectangle with a segment drawn back over itself turns half a turn each way at the
+    // reversals: a fan would paint outside it, so it stays an outline.
+    assert!(
+        crate::vector::solid_triangles(&[(4.0, 4.0), (0.0, 4.0), (0.0, 0.0), (8.0, 0.0), (0.0, 0.0), (4.0, 0.0)])
+            .is_none()
+    );
+}
+
+#[test]
+fn dxf_keeps_a_filled_path_that_is_not_convex_as_a_closed_outline() {
+    // An open, filled notched arrow: PDF and SVG fill it as if closed, so the DXF outline is
+    // closed too (group 70 is 1), and there is no SOLID.
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: vec![crate::writer::Prim::Path {
+            points: vec![(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)],
+            closed: false,
+            filled: true,
+            ink: crate::writer::Stroke {
+                rgb: (0.0, 0.0, 0.0),
+                width: 0.25,
+            },
+            layer: None,
+        }],
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let d = dxf(&page);
+    assert!(!d.contains("0\nSOLID\n"), "{d}");
+    assert!(d.contains("0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n1\n"), "{d}");
 }
 
 #[test]
@@ -271,6 +461,24 @@ fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     assert!(d.contains("0\nTEXT\n8\nWIRE-NUMBERS\n"));
     assert!(d.contains("0\nLINE\n8\nDRAWINGS\n"));
 
+    // In SVG the wire number sits in its own group that Inkscape shows as a layer.
+    let s = svg(&pages[0]);
+    assert!(s.contains("xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\""));
+    let open = "id=\"wire-numbers\" inkscape:groupmode=\"layer\" inkscape:label=\"Wire numbers\">";
+    let Some(at) = s.find(open) else {
+        unreachable!("no wire-numbers group: {s}")
+    };
+    let group = &s[at..at + s[at..].find("</g>").unwrap_or(0)];
+    assert!(group.contains(">101</text>"), "{group}");
+    assert!(s.contains("id=\"drawings\" inkscape:groupmode=\"layer\""));
+    // Symbol labels have no layer and stay outside the layer groups.
+    let Some(k1) = s.find(">-K1</text>") else {
+        unreachable!("no -K1 label")
+    };
+    let last_open = s[..k1].rfind("<g ").unwrap_or(0);
+    assert!(!s[last_open..k1].contains("inkscape:groupmode"));
+    assert_well_formed(&s);
+
     // A page with nothing optional declares no layers.
     project.pages[0].wires.clear();
     project.pages[0].graphics.clear();
@@ -314,7 +522,187 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
     // The contents rows jump to the schematic pages, which are now the 2nd and 3rd page objects.
     assert!(text.contains("/Dest [9 0 R /Fit]"), "row 1 -> page 1");
     assert!(text.contains("/Dest [12 0 R /Fit]"), "row 2 -> page 2");
+    // The third row is the parts list (#693).
+    assert_eq!(text.matches("/Subtype /Link").count(), 3);
+}
+
+#[test]
+fn table_of_contents_lists_the_sheets_after_the_schematic_pages() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
+    // One row short of a full page, so the rows of the later sheets run onto a second page.
+    let mut rows = vec![vec!["1".to_owned(), "Mains".to_owned()]];
+    rows.resize(per_page - 1, vec![String::new(), "Note".to_owned()]);
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows,
+        row_pages: vec!["p1".into()],
+        front: true,
+        ..Default::default()
+    };
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        networks: vec![wc_core::network::Network {
+            name: "PN1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    // Two contents pages, the schematic page, the panel, the parts list and the network.
+    assert_eq!(report.pages, 6);
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("R2 Table of contents (2/2)") < usize::MAX);
+    // The parts list is the third report page, after the two contents pages.
+    assert!(at("R3 Parts list") < usize::MAX);
+    let shows = |s: &str| text.contains(&format!("{} Tj", writer::pdf_text(s)));
+    for cell in ["P1", "Cabinet", "R3", "Parts list", "N1", "Network PN1"] {
+        assert!(shows(cell), "{cell}");
+    }
+    // The schematic page and the three later sheets are linked from the contents.
+    assert_eq!(text.matches("/Subtype /Link").count(), 4);
+}
+
+/// A contents table as `wc_report::contents` builds it, with `rows` of (page, title).
+fn contents_table(rows: &[(&str, &str)], row_pages: &[&str]) -> wc_report::Table {
+    wc_report::Table {
+        title: "Table of contents".into(),
+        columns: ["Page", "Title", "Devices", "Wires"].map(String::from).to_vec(),
+        rows: rows
+            .iter()
+            .map(|(p, t)| vec![(*p).to_owned(), (*t).to_owned(), String::new(), String::new()])
+            .collect(),
+        row_pages: row_pages.iter().map(|p| (*p).to_owned()).collect(),
+        front: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn later_sheets_fill_the_columns_of_a_contents_layout() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    // The project's layout shows the title first and the page renamed, without the counts.
+    let layout = ReportLayout {
+        columns: vec![
+            ReportColumn {
+                from: "Title".into(),
+                heading: None,
+            },
+            ReportColumn {
+                from: "Page".into(),
+                heading: Some("Sheet".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    let contents = contents_table(&[("1", "Mains")], &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    let at = |s: &str| text.find(&format!("{} Tj", writer::pdf_text(s)));
+    // The row reads "Parts list | R2", like "Mains | 1" above it.
+    let (Some(mains), Some(sheet), Some(title), Some(number)) = (at("Mains"), at("Sheet"), at("Parts list"), at("R2"))
+    else {
+        unreachable!("the contents shows both rows")
+    };
+    assert!(sheet < mains && mains < title && title < number);
+    // Both on the contents page, not "R2" from the parts list's own sheet.
+    assert!(!text[title..number].contains("endstream"));
     assert_eq!(text.matches("/Subtype /Link").count(), 2);
+}
+
+#[test]
+fn the_reader_page_box_shows_each_sheet_own_number() {
+    // Page labels: typing a sheet's number into the reader's page box opens that sheet (#727).
+    let mut project = Project::new("x");
+    project.pages = vec![
+        Page::new("p1", "3", "Mains"),
+        Page::new("p2", "=A1/5 (b)", "Control"),
+        Page::new("p3", "", "Unnumbered"),
+        Page::new("p4", "Å1", "Nordic"),
+    ];
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        front: true,
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 6);
+    let labels = "/PageLabels << /Nums [0 << /P (R1) >> 1 << /P (3) >> 2 << /P (=A1/5 \\(b\\)) >> \
+                  3 << /S /D /St 4 >> 4 << /P <FEFF00C50031> >> 5 << /P (P1) >>] >>";
+    let found = text.find("/PageLabels").map_or("", |at| &text[at..]);
+    assert!(text.contains(labels), "{}", found.lines().next().unwrap_or(""));
+}
+
+#[test]
+fn a_contents_grouped_by_page_counts_a_heading_per_later_sheet() {
+    use wc_core::report_layout::ReportLayout;
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 2), band);
+    // Page 1 as a heading with its rows takes all but three lines. The panel and the parts
+    // list then each take a heading and a row: four lines, so the parts list row runs onto
+    // a second contents page and the parts list itself is R3.
+    let mut rows = vec![("1", "Mains")];
+    rows.resize(per_page - 4, ("1", "Note"));
+    let layout = ReportLayout {
+        group: Some("Page".into()),
+        ..Default::default()
+    };
+    let contents = contents_table(&rows, &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 5);
+    let has = |title: &str| text.contains(&format!("/Title {}", writer::pdf_text(title)));
+    assert!(has("R2 Table of contents (2/2)"));
+    assert!(has("R3 Parts list"));
+    // The parts list's row in the contents is headed R3: the last text before its title.
+    let Some(title) = text.find(&format!("{} Tj", writer::pdf_text("Parts list"))) else {
+        unreachable!("the contents lists the parts list")
+    };
+    let row = text[..title].rsplit("Tj").nth(1).unwrap_or_default();
+    assert!(row.contains(&writer::pdf_text("Page: R3")), "{row}");
 }
 
 #[test]
@@ -560,6 +948,53 @@ fn the_logo_shows_in_every_title_block_and_on_the_cover_stored_once() {
 }
 
 #[test]
+fn a_logo_cover_box_that_is_not_a_number_takes_the_default_place() {
+    let mut png = Vec::new();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, image::Rgb([200, 30, 30])));
+    assert!(
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
+    let mut project = Project::new("x");
+    let mut cover = Page::new("p0", "0", "Cover");
+    cover.cover = true;
+    project.pages = vec![cover.clone()];
+    let mut underlays = BTreeMap::new();
+    underlays.insert("pictures/logo.png".to_string(), png);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    project.meta.logo = Some(wc_core::Logo {
+        file: "pictures/logo.png".into(),
+        cover: None,
+    });
+    let (default_pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let default_box = cover_logo_box(&project, &cover);
+    let cover_svg = |project: &Project| {
+        let (pages, _) = page_drawings(project, &BTreeMap::new(), &opts);
+        let Some(page) = pages.first() else {
+            unreachable!("the cover page is drawn")
+        };
+        svg(page)
+    };
+    let default_svg = cover_svg(&project);
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/logo.png".into(),
+            cover: Some((Point::new(bad, 40.0), Point::new(140.0, 60.0))),
+        });
+        assert_eq!(cover_logo_box(&project, &cover), default_box, "{bad}");
+        let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // Drawn as if no box were set, instead of `NaN` in the page.
+        assert!(pdf == default_pdf, "{bad}: the PDF differs from the default place");
+        assert_eq!(cover_svg(&project), default_svg, "{bad}");
+    }
+}
+
+#[test]
 fn a_missing_logo_is_a_warning_and_the_export_still_works() {
     let mut project = Project::new("x");
     project.pages = vec![Page::new("p1", "1", "Mains")];
@@ -648,6 +1083,58 @@ fn a_jpeg_cut_short_after_its_header_is_a_warning_for_the_logo_and_an_underlay()
     assert!(!String::from_utf8_lossy(&pdf).contains("/Subtype /Image"));
     assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
     assert!(report.warnings.iter().all(|w| w.contains("damaged")));
+}
+
+/// A minimal JPEG: SOI, an optional APP14 `Adobe` segment, a baseline frame header 300 wide
+/// and 200 high with `channels` components, a scan header, one scan byte and EOI.
+fn tiny_jpeg(channels: u8, adobe: bool) -> Vec<u8> {
+    let mut b = vec![0xFF, 0xD8];
+    if adobe {
+        // APP14: "Adobe", version 100, flags0, flags1, transform 0 (no colour transform).
+        b.extend([0xFF, 0xEE, 0x00, 0x0E]);
+        b.extend(b"Adobe");
+        b.extend([0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+    // SOF0: precision 8, height 200, width 300, then one 3-byte entry per component.
+    let sof_len = 8 + 3 * u16::from(channels);
+    b.extend([0xFF, 0xC0]);
+    b.extend(sof_len.to_be_bytes());
+    b.extend([0x08, 0x00, 0xC8, 0x01, 0x2C, channels]);
+    for c in 1..=channels {
+        b.extend([c, 0x11, 0x00]);
+    }
+    // SOS with one component, then a scan byte and EOI.
+    b.extend([
+        0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x00, 0xFF, 0xD9,
+    ]);
+    b
+}
+
+#[test]
+fn jpeg_pictures_get_the_colour_space_of_their_channel_count() {
+    for (channels, adobe, space, extra) in [
+        (1, false, "DeviceGray", ""),
+        (3, false, "DeviceRGB", ""),
+        (4, false, "DeviceCMYK", ""),
+        (4, true, "DeviceCMYK", " /Decode [1 0 1 0 1 0 1 0]"),
+        // The Adobe segment only inverts CMYK.
+        (3, true, "DeviceRGB", ""),
+    ] {
+        let bytes = tiny_jpeg(channels, adobe);
+        let Ok(img) = picture::decode(&bytes) else {
+            unreachable!("{channels} channels, adobe {adobe}: not decoded");
+        };
+        assert_eq!((img.width, img.height), (300, 200), "{channels} channels");
+        assert_eq!(img.colour_space, space, "{channels} channels, adobe {adobe}");
+        assert_eq!(img.extra, extra, "{channels} channels, adobe {adobe}");
+        assert_eq!(img.filter, "DCTDecode");
+        assert_eq!(img.data, bytes, "a JPEG is embedded as it is");
+        assert!(img.alpha.is_none());
+    }
+    let Err(why) = picture::decode(&tiny_jpeg(2, false)) else {
+        unreachable!("a 2-channel JPEG was accepted");
+    };
+    assert!(why.contains("2 colour channels"), "{why}");
 }
 
 #[test]
@@ -741,6 +1228,63 @@ fn panel_layouts_print_after_the_schematic_pages() {
     assert!(text.contains(&writer::pdf_text(
         "Cabinet CAB1  ·  plate 600 x 800 mm  ·  scale 1:5  ·  1 device(s)"
     )));
+}
+
+#[test]
+fn a_panel_layout_is_drawn_for_svg_and_dxf_with_its_plate_outline() {
+    use wc_core::panel::Panel;
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let opts = Options {
+        panels: vec![Panel::with_rails("main", "Cabinet CAB1", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &opts);
+    assert_eq!(report.pages, 2);
+    let [page, panel] = pages.as_slice() else {
+        unreachable!("the page and the panel: {}", pages.len())
+    };
+    assert!(!page.panel && panel.panel);
+    assert_eq!((panel.id.as_str(), panel.number.as_str()), ("panel-main", "P1"));
+    assert_eq!(panel.title, "Cabinet CAB1");
+    // The 600 x 800 mm plate at 1:5 is a closed 120 x 160 mm outline.
+    let plate = panel.prims.iter().find_map(|p| match p {
+        Prim::Path {
+            points,
+            closed: true,
+            filled: false,
+            ..
+        } => {
+            let xs = points.iter().map(|p| p.0);
+            let ys = points.iter().map(|p| p.1);
+            let (x0, x1) = (xs.clone().fold(f64::MAX, f64::min), xs.fold(f64::MIN, f64::max));
+            let (y0, y1) = (ys.clone().fold(f64::MAX, f64::min), ys.fold(f64::MIN, f64::max));
+            ((x1 - x0 - 120.0).abs() < 1e-6 && (y1 - y0 - 160.0).abs() < 1e-6).then_some((x0, y1))
+        }
+        _ => None,
+    });
+    let Some((x0, y1)) = plate else {
+        unreachable!("no plate outline")
+    };
+    // In the DXF (y up) the plate's bottom left corner is a polyline vertex.
+    let dxf = crate::dxf(panel);
+    let corner = format!(
+        "VERTEX\n8\n0\n10\n{}\n20\n{}\n",
+        crate::vector::num(x0),
+        crate::vector::num(panel.size_mm.1 - y1)
+    );
+    assert!(dxf.contains(&corner), "{corner:?} not in the DXF");
+    assert!(crate::svg(panel).contains("<title>P1 Cabinet CAB1</title>"));
+    // Its file is named after the panel, the same in the app and on the command line.
+    assert_eq!(crate::panel_file_stem(panel), "panel-Cabinet_CAB1");
+    let mut named = panel.clone();
+    named.title = "Main.v1".into();
+    assert_eq!(crate::panel_file_stem(&named), "panel-Main_v1");
+    named.title = " ".into();
+    assert_eq!(crate::panel_file_stem(&named), "panel-main");
+    // Without panels in the options, only the page is drawn.
+    let (pages, _) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(pages.len(), 1);
 }
 
 #[test]
@@ -943,6 +1487,40 @@ fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
         .unwrap_or(&[]);
     let pages: Vec<&str> = mains.iter().map(|a| a.page_id.as_str()).collect();
     assert_eq!(pages, ["p2", "p1"], "the schematic first, the overview still listed");
+}
+
+#[test]
+fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p1", "1", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "no", 50.0, "-K1"));
+    let mut schematic = Page::new("p2", "2", "Control");
+    schematic.symbols.push(place("s2", "coil", 50.0, "-K1"));
+    schematic.symbols.push(place("s3", "no", 150.0, "-K1"));
+    project.pages = vec![overview, schematic];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let listed: Vec<&str> = marks
+        .iter()
+        .filter(|m| m.text.starts_with("13-14"))
+        .map(|m| m.target_page_id.as_str())
+        .collect();
+    assert_eq!(listed, ["p2"], "the contact is listed once, on its schematic page");
+    // The repeat on the overview still points back to its coil.
+    let Some(overview) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let back = layout::xref_marks(overview, &symbols, &x, &mut warnings);
+    assert!(back.iter().any(|m| m.target_page_id == "p2"), "{back:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 #[test]
@@ -1558,6 +2136,23 @@ fn svg_images(s: &str) -> Vec<(f64, f64, f64, f64, String)> {
         .collect()
 }
 
+/// Fails unless `s` parses as XML with every element closed.
+fn assert_well_formed(s: &str) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(s);
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => unreachable!("not XML at {}: {e}\n{s}", reader.buffer_position()),
+        }
+    }
+    assert_eq!(depth, 0, "unclosed elements:\n{s}");
+}
+
 #[test]
 fn svg_drawings_show_the_logo_and_the_underlay() {
     let mut png = Vec::new();
@@ -1615,7 +2210,11 @@ fn svg_drawings_show_the_logo_and_the_underlay() {
         (images[0].0, images[0].1, images[0].2, images[0].3),
         (0.0, 0.0, 420.0, 297.0)
     );
-    assert!(page.find("<image").unwrap_or(usize::MAX) < page.find("<g ").unwrap_or(0));
+    // The underlay sits in its own "scans" layer, before the drawing's group.
+    let scans = "<g id=\"scans\" inkscape:groupmode=\"layer\" inkscape:label=\"Scanned sheets\">\n<image";
+    assert!(page.contains(scans), "{page}");
+    assert!(page.find(scans).unwrap_or(usize::MAX) < page.find("<g fill").unwrap_or(0));
+    assert_well_formed(&page);
     assert!(page.rfind("<image").unwrap_or(0) > page.find("</g>").unwrap_or(usize::MAX));
     // DXF has no pictures and stays as it was.
     assert!(!dxf(&pages[1]).contains("base64"));
@@ -1659,7 +2258,7 @@ fn svg_drawings_leave_out_a_missing_or_damaged_picture() {
 }
 
 #[test]
-fn page_lines_leave_out_pictures_without_warning() {
+fn page_lines_say_which_pictures_they_leave_out() {
     let mut project = Project::new("Lines");
     let mut p1 = Page::new("p1", "1", "One");
     p1.underlay = Some(wc_core::Underlay {
@@ -1672,13 +2271,66 @@ fn page_lines_leave_out_pictures_without_warning() {
         file: "pictures/logo.png".into(),
         cover: None,
     });
-    // No picture bytes are given: a DXF export does not read them, so none may be missed.
+    // No picture bytes are given: a DXF export does not read them, so none is called missing,
+    // but the user is told the DXF has neither the underlay nor the logo.
     let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(pages.len(), 1);
     assert!(pages[0].pictures.is_empty());
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: the underlay underlays/p1.png is left out: DXF has no pictures (the SVG export shows it)"
+                .to_string(),
+            "the logo pictures/logo.png is left out: DXF has no pictures (the SVG export shows it)".to_string(),
+        ]
+    );
+    // Without a logo or an underlay, nothing is said.
+    let mut plain = project.clone();
+    plain.meta.logo = None;
+    plain.pages[0].underlay = None;
+    let (_, quiet) = crate::page_lines(&plain, &BTreeMap::new(), &Options::default());
+    assert!(quiet.warnings.is_empty(), "{:?}", quiet.warnings);
     let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(svg_report.warnings.len(), 2, "{:?}", svg_report.warnings);
+}
+
+#[test]
+fn page_lines_say_which_texts_lose_a_character_beyond_u_ffff() {
+    let mut project = Project::new("Wide");
+    let mut p1 = Page::new("p1", "1", "One");
+    for text in ["Pump \u{1F600}", "Pump \u{1F600}", "Ålesund"] {
+        p1.graphics.push(Shape::Text {
+            at: Point::new(50.0, 50.0),
+            text: text.into(),
+            height: 3.0,
+            align: Default::default(),
+            angle: 0.0,
+        });
+    }
+    project.pages = vec![p1];
+    let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert!(dxf(&pages[0]).contains("\nPump ?\n"));
+    // Named once, however often the text is on the page; Å has a code and is not named.
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: the text \"Pump \u{1F600}\" is written as \"Pump ?\" in the DXF: a DXF has no code for \
+             characters beyond U+FFFF, such as emoji (the SVG export keeps them)"
+                .to_string()
+        ]
+    );
+    // For a log, the same warning without the text.
+    assert_eq!(
+        dxf_warnings(&pages[0], false),
+        vec![
+            "page 1: a text is written with \"?\" in the DXF: a DXF has no code for characters beyond \
+             U+FFFF, such as emoji (the SVG export keeps them)"
+                .to_string()
+        ]
+    );
+    // The SVG export keeps the character, so it says nothing.
+    let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    assert!(svg_report.warnings.is_empty(), "{:?}", svg_report.warnings);
 }
 
 #[test]
@@ -2295,6 +2947,30 @@ fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
 }
 
 #[test]
+fn a_very_long_heading_is_cut_quickly_and_keeps_its_counter() {
+    let title = "Cable list for the north basin pump station ".repeat(2_300);
+    let title = format!("{}\u{e9}", &title[..99_999]);
+    assert_eq!(title.chars().count(), 100_000);
+    let counter = " (2 / 3)";
+    let heading = layout::fit_heading(&title, counter, 180.0);
+    assert!(heading.ends_with(&format!("...{counter}")), "{heading:?}");
+    assert!(writer::text_width_mm(&heading, 4.0) <= 180.0, "{heading:?}");
+    // The cut is the longest start that fits: one more character would not.
+    let Some(kept) = heading.strip_suffix(&format!("...{counter}")) else {
+        unreachable!("the heading ends with the counter")
+    };
+    let Some(next) = title[kept.len()..].chars().next() else {
+        unreachable!("the title was cut")
+    };
+    let longer = format!("{kept}{next}...{counter}");
+    assert!(writer::text_width_mm(&longer, 4.0) > 180.0, "{longer:?}");
+    // A short heading is left as it is.
+    assert_eq!(layout::fit_heading("Cables", counter, 180.0), "Cables (2 / 3)");
+    // No room at all for the title leaves only "..." before the counter.
+    assert_eq!(layout::fit_heading(&title, counter, 1.0), format!("...{counter}"));
+}
+
+#[test]
 fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
     let mut project = Project::new("x");
     let mut page = Page::new("p1", "1", "Cabinet");
@@ -2432,5 +3108,291 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
             .any(|w| w.starts_with("network PN3: node 4 is not a device tag")),
         "{:?}",
         report.warnings
+    );
+}
+
+#[test]
+fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
+    // One page, so there is a sheet to print (#833).
+    let mut project = Project::new("Pump station");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
+        unreachable!("no catalog in {text}");
+    };
+    assert!(
+        catalog.contains("/ViewerPreferences << /DisplayDocTitle true >>"),
+        "{catalog}"
+    );
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("Pump station"))));
+
+    // The file still opens: the trailer points at the xref table, and every object it lists
+    // starts where the table says, so the added catalog entry did not shift any offset.
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).rposition(|w| w == needle);
+    let Some(sx) = find(&pdf, b"startxref\n") else {
+        unreachable!("no startxref");
+    };
+    let start: usize = std::str::from_utf8(&pdf[sx + 10..])
+        .ok()
+        .and_then(|s| s.lines().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    assert!(pdf.get(start..).is_some_and(|t| t.starts_with(b"xref")));
+    let table = std::str::from_utf8(&pdf[start..]).unwrap_or("");
+    let mut lines = table.lines().skip(1);
+    let count: usize = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(count > 1, "{table}");
+    for (n, line) in lines.take(count).enumerate().skip(1) {
+        let offset: usize = line.split(' ').next().and_then(|o| o.parse().ok()).unwrap_or(0);
+        let head = format!("{n} 0 obj");
+        assert!(
+            pdf.get(offset..).is_some_and(|o| o.starts_with(head.as_bytes())),
+            "object {n} is not at {offset}"
+        );
+    }
+}
+
+#[test]
+fn a_project_with_nothing_to_print_says_so() {
+    // No pages and no report tables: no sheet, so the caller is told instead of being handed a
+    // PDF no reader opens (#833).
+    let (_, report) = export(&Project::new("x"), &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 0);
+    assert_eq!(report.warnings, vec![NOTHING_TO_EXPORT.to_string()]);
+
+    // One page: no such warning.
+    let mut project = Project::new("x");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 1);
+    assert!(
+        !report.warnings.iter().any(|w| w == NOTHING_TO_EXPORT),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn page_text_writes_the_rest_of_winansi() {
+    // Euro, curly quotes and ellipsis have WinAnsi codes in the built-in font: no '?'.
+    assert_eq!(writer::pdf_text("€ “x” …"), "<80209378942085>");
+    assert_eq!(writer::pdf_text("„Œœ Šš™’"), "<848C9C208A9A9992>");
+    // An arrow still becomes '>', and a glyph the font lacks '?'.
+    assert_eq!(writer::pdf_text("→Д"), "<3E3F>");
+}
+
+#[test]
+fn bookmarks_and_the_document_title_are_text_strings_not_font_codes() {
+    // A reader decodes bookmark titles as PDFDocEncoding or UTF-16: the page font's WinAnsi
+    // en dash (0x96) would show as "Œ" there, and Ω could not be written at all (#726).
+    let mut project = Project::new("Pumpe – Ålesund");
+    project.pages = vec![Page::new("p1", "1", "Motor – pump Ω"), Page::new("p2", "2", "Control")];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let utf16 = |s: &str| -> String {
+        let units: String = s.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        format!("<FEFF{units}>")
+    };
+    assert_eq!(writer::pdf_text_string("1 Motor – pump Ω"), utf16("1 Motor – pump Ω"));
+    assert!(text.contains(&format!("/Title {}", utf16("1 Motor – pump Ω"))));
+    assert!(text.contains(&format!("/Title {} /Producer", utf16("Pumpe – Ålesund"))));
+    // Plain ASCII titles stay as they were, the same bytes in every encoding.
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("2 Control"))));
+    // The page itself still draws the title with the font's own codes.
+    assert!(text.contains(&format!("{} Tj", writer::pdf_text("Motor – pump Ω"))));
+}
+
+/// Decode a hex PDF text string written by `pdf_text_string`: UTF-16BE after a byte order mark,
+/// otherwise one byte per character (printable ASCII only).
+fn decode_text_string(hex: &str) -> Option<String> {
+    let hex = hex.strip_prefix('<')?.strip_suffix('>')?;
+    if let Some(units) = hex.strip_prefix("FEFF") {
+        let units: Option<Vec<u16>> = (0..units.len())
+            .step_by(4)
+            .map(|i| units.get(i..i + 4).and_then(|u| u16::from_str_radix(u, 16).ok()))
+            .collect();
+        return String::from_utf16(&units?).ok();
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+        .map(|b| b.filter(u8::is_ascii).map(char::from))
+        .collect()
+}
+
+#[test]
+fn a_title_with_euro_quotes_and_other_scripts_round_trips_as_a_text_string() {
+    // WinAnsi puts € at 0x80 and the curly quotes at 0x93/0x94, which PDFDocEncoding reads as
+    // other characters; the document title must come out as typed (#803).
+    for title in ["Pumpe 1 200 € „Nord“ “A”", "Ω → 日本"] {
+        let project = Project::new(title);
+        let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+        let text = String::from_utf8_lossy(&pdf);
+        let Some(at) = text.find("/Producer (WiringCraft)") else {
+            unreachable!("the info dictionary is written")
+        };
+        let Some(start) = text[..at].rfind("/Title ") else {
+            unreachable!("the info dictionary has a title")
+        };
+        let written = text[start + "/Title ".len()..at].trim();
+        assert_eq!(written, writer::pdf_text_string(title));
+        assert!(written.starts_with("<FEFF"), "{written}");
+        assert_ne!(written, writer::pdf_text(title), "not the page font's codes");
+        assert_eq!(decode_text_string(written).as_deref(), Some(title));
+    }
+    // Plain ASCII stays a simple one-byte string.
+    assert_eq!(writer::pdf_text_string("Plant 7"), writer::pdf_text("Plant 7"));
+    assert_eq!(
+        decode_text_string(&writer::pdf_text_string("Plant 7")).as_deref(),
+        Some("Plant 7")
+    );
+}
+
+#[test]
+fn layer_names_are_text_strings() {
+    // Layer names are read as PDF text strings, like the title: each declared layer's /Name is
+    // `pdf_text_string` of its title, and a non-ASCII name would come out as UTF-16 (#803).
+    let mut p1 = Page::new("p1", "1", "Main");
+    p1.graphics.push(Shape::Line {
+        a: Point::new(20.0, 20.0),
+        b: Point::new(60.0, 20.0),
+    });
+    let mut project = Project::new("Layers");
+    project.pages = vec![p1];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let names: Vec<&str> = text
+        .match_indices("/Type /OCG /Name ")
+        .filter_map(|(i, m)| {
+            let rest = &text[i + m.len()..];
+            rest.find(" >>").map(|end| &rest[..end])
+        })
+        .collect();
+    assert!(!names.is_empty(), "the drawing layer is declared");
+    for name in &names {
+        let Some(title) = decode_text_string(name) else {
+            unreachable!("{name} is a text string")
+        };
+        assert!(writer::Layer::ALL.iter().any(|l| l.title() == title), "{title}");
+        assert_eq!(*name, writer::pdf_text_string(&title));
+    }
+    let Some(name) = decode_text_string(&writer::pdf_text_string("Leitungen → Ω 日本")) else {
+        unreachable!("non-ASCII names are written as UTF-16")
+    };
+    assert_eq!(name, "Leitungen → Ω 日本");
+}
+
+#[test]
+fn a_missing_symbol_is_warned_about_once_per_page_with_its_placements() {
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "A");
+    for (k, x) in [40.0, 80.0, 120.0].into_iter().enumerate() {
+        p1.symbols.push(place(&format!("r{k}"), "relay", x, &format!("-K{k}")));
+    }
+    p1.symbols.push(place("t1", "lamp", 160.0, "-P1"));
+    let mut p2 = Page::new("p2", "2", "B");
+    p2.symbols.push(place("r9", "relay", 40.0, "-K9"));
+    project.pages = vec![p1, p2];
+    let (pdf, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: symbol \"lamp\" is not in the project's library copy".to_string(),
+            "page 1: symbol \"relay\" is not in the project's library copy (3 placements)".to_string(),
+            "page 2: symbol \"relay\" is not in the project's library copy".to_string(),
+        ]
+    );
+    // Every placement is still drawn as a box with a question mark.
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(text.matches(&format!("{} Tj", writer::pdf_text("?"))).count(), 5);
+    // The SVG and DXF exports warn the same way.
+    let (_, lines) = page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(lines.warnings, report.warnings);
+}
+
+#[test]
+fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
+    // Helvetica's WinAnsi has no Ω or Cyrillic: they print as '?', so say so (Latin-1, the
+    // euro and dashes print, and an arrow prints as '>' on purpose).
+    let mut project = Project::new("Demo");
+    project.pages = vec![
+        Page::new("p1", "1", "Motor 10 kΩ Ω Жар"),
+        Page::new("p2", "2", "Pumpe – Ålesund 200 € → B"),
+    ];
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec!["page 1: the PDF cannot print Ω Ж а р in its text; they show as ?".to_string()]
+    );
+}
+
+#[test]
+fn a_long_report_or_plc_card_heading_is_cut_to_the_frame_and_keeps_its_counter() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let long = "Device list for the north basin pumping station, the second pump hall and its \
+                cabinets, with every spare and every terminal named on the drawings, listed \
+                again for the south basin, its pump hall, its cabinets and every spare there";
+    let table = wc_report::Table {
+        title: long.into(),
+        columns: vec!["Tag".into()],
+        ..Default::default()
+    };
+    let card = wc_report::PlcCardSheet {
+        card: long.into(),
+        ..Default::default()
+    };
+    let page = Page::new("r", "R1", "Report");
+    let (w, _) = page.size.mm();
+    let right = w - layout::MARGIN - 6.0;
+    let headings = |drawn: &writer::Drawn| -> Vec<(f64, String)> {
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { at, height, text, .. } if (*height - 4.0).abs() < 1e-9 => {
+                    Some((at.0 + writer::text_width_mm(text, 4.0), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let report = layout::draw_table_page(&project, &page, 0, 3, &table, &[], (2, 3), "");
+    let card_sheet = layout::draw_card_page(&project, &page, 0, 3, &card, 0, (2, 3), "");
+    for (what, drawn, start) in [
+        ("report", &report, "Device list"),
+        ("card", &card_sheet, "PLC card Device"),
+    ] {
+        let found: Vec<(f64, String)> = headings(drawn)
+            .into_iter()
+            .filter(|(_, t)| t.starts_with(start))
+            .collect();
+        let [(end, text)] = found.as_slice() else {
+            unreachable!("one {what} heading, got {found:?}")
+        };
+        assert!(
+            *end <= right + 1e-6,
+            "{what} heading {text:?} ends at {end} mm, past {right} mm"
+        );
+        assert!(
+            text.ends_with("... (2 / 3)"),
+            "{what} heading {text:?} is cut and keeps its counter"
+        );
+    }
+    // A short title is drawn whole.
+    let short = wc_report::Table {
+        title: "Devices".into(),
+        ..table
+    };
+    let drawn = layout::draw_table_page(&project, &page, 0, 1, &short, &[], (1, 1), "");
+    assert!(
+        headings(&drawn).iter().any(|(_, t)| t == "Devices"),
+        "{:?}",
+        headings(&drawn)
     );
 }
