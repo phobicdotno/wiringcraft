@@ -149,10 +149,16 @@ pub fn panel_step(project: &Project, panel: &Panel, parts: &BTreeMap<String, Par
         "(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{unc})) GLOBAL_UNIT_ASSIGNED_CONTEXT((#{len},#{ang},#{sol})) REPRESENTATION_CONTEXT('',''))"
     ));
     let origin = w.placement([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
-    let rep = w.add(&format!(
-        "ADVANCED_BREP_SHAPE_REPRESENTATION('',(#{origin},{}),#{gctx})",
-        refs.join(",")
-    ));
+    // AP214 rule WR2 wants at least one solid in an ADVANCED_BREP_SHAPE_REPRESENTATION, so a
+    // panel with nothing to draw gets a plain SHAPE_REPRESENTATION holding only the origin.
+    let rep = if refs.is_empty() {
+        w.add(&format!("SHAPE_REPRESENTATION('',(#{origin}),#{gctx})"))
+    } else {
+        w.add(&format!(
+            "ADVANCED_BREP_SHAPE_REPRESENTATION('',(#{origin},{}),#{gctx})",
+            refs.join(",")
+        ))
+    };
     w.add(&format!("SHAPE_DEFINITION_REPRESENTATION(#{pds},#{rep})"));
 
     let mut out = String::new();
@@ -172,7 +178,8 @@ pub fn panel_step(project: &Project, panel: &Panel, parts: &BTreeMap<String, Par
     }
 }
 
-/// A STEP string: quotes doubled, non-ASCII as `\X2\` hex, which every reader takes.
+/// A STEP string (ISO 10303-21): quotes and backslashes doubled, control characters as `\X\hh`,
+/// other non-ASCII as `\X2\` (4-digit) or, outside the BMP, `\X4\` (8-digit) code points.
 fn step_text(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -180,13 +187,14 @@ fn step_text(s: &str) -> String {
             '\'' => out.push_str("''"),
             '\\' => out.push_str("\\\\"),
             ' '..='~' => out.push(c),
+            '\u{0}'..='\u{1F}' | '\u{7F}' => {
+                let _ = write!(out, "\\X\\{:02X}", u32::from(c));
+            }
+            '\u{80}'..='\u{FFFF}' => {
+                let _ = write!(out, "\\X2\\{:04X}\\X0\\", u32::from(c));
+            }
             _ => {
-                let mut buf = [0u16; 2];
-                out.push_str("\\X2\\");
-                for unit in c.encode_utf16(&mut buf) {
-                    let _ = write!(out, "{unit:04X}");
-                }
-                out.push_str("\\X0\\");
+                let _ = write!(out, "\\X4\\{:08X}\\X0\\", u32::from(c));
             }
         }
     }
@@ -351,6 +359,31 @@ mod tests {
         assert!(!done.text.contains("'-K7'"), "{}", done.text);
         assert!(done.default_depth.is_empty(), "{:?}", done.default_depth);
         Ok(())
+    }
+
+    #[test]
+    fn text_escapes_follow_part_21() {
+        assert_eq!(step_text("it's a\\b"), "'it''s a\\\\b'");
+        assert_eq!(step_text("\u{C5}"), "'\\X2\\00C5\\X0\\'");
+        assert_eq!(step_text("\u{1F600}"), "'\\X4\\0001F600\\X0\\'");
+        assert_eq!(step_text("a\nb"), "'a\\X\\0Ab'");
+        assert_eq!(step_text("\u{0}\u{7F}"), "'\\X\\00\\X\\7F'");
+        assert_eq!(step_text("\u{FFFF}\u{10000}"), "'\\X2\\FFFF\\X0\\\\X4\\00010000\\X0\\'");
+    }
+
+    #[test]
+    fn an_empty_panel_has_no_advanced_brep() {
+        let project = Project::new("Empty");
+        for panel in [
+            Panel::new("main", "Empty", 0.0, 0.0),
+            Panel::new("nan", "Not a number", f64::NAN, 100.0),
+        ] {
+            let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-27T14:00:00").text;
+            assert!(!step.contains("MANIFOLD_SOLID_BREP("), "{step}");
+            assert!(!step.contains("ADVANCED_BREP_SHAPE_REPRESENTATION("), "{step}");
+            assert!(step.contains("=SHAPE_REPRESENTATION('',(#"), "{step}");
+            assert!(step.contains("SHAPE_DEFINITION_REPRESENTATION("), "{step}");
+        }
     }
 
     #[test]
