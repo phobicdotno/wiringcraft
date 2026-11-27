@@ -970,3 +970,13 @@ fn the_starter_battery_has_plus_and_minus_pins() -> Result<()> {
     assert_eq!(names, ["+", "-"]);
     Ok(())
 }
+
+#[test]
+fn the_starter_changeover_contact_has_its_pins_on_the_5_mm_grid() -> Result<()> {
+    // #1148: pins 12 and 14 sat 4 mm to the sides, so a wire drawn on the grid missed them.
+    let (_tmp, lib) = starter_library()?;
+    let (s, _) = lib.symbol("wc.contact.co")?;
+    let pins: Vec<_> = s.pins.iter().map(|p| (p.name.as_str(), p.at.x, p.at.y)).collect();
+    assert_eq!(pins, [("11", 0.0, 0.0), ("12", -5.0, 15.0), ("14", 5.0, 15.0)]);
+    Ok(())
+}
