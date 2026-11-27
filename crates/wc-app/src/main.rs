@@ -6926,30 +6926,33 @@ fn welcome(
                 if !recent.is_empty() {
                     ui.add_space(18.0);
                     panels::section(ui, "Recent projects", None);
-                    for d in recent {
-                        let name = d
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| d.display().to_string());
-                        let (dot, text, hover) = match recent_problem(d) {
-                            None => (t.accent, RichText::new(name), d.display().to_string()),
-                            Some(why) => (
-                                t.muted,
-                                RichText::new(name).color(t.muted),
-                                format!("{} ({why})", d.display()),
-                            ),
-                        };
-                        let r = panels::row(ui, false, panels::Lead::Dot(dot), text, false).on_hover_text(hover);
-                        if r.clicked() {
-                            *open_recent = Some(d.clone());
-                        }
-                        r.context_menu(|ui| {
-                            if ui.button("Remove from recent projects").clicked() {
-                                *forget = Some(d.clone());
-                                ui.close_menu();
+                    // Every entry stays reachable in a short window.
+                    egui::ScrollArea::vertical().id_salt("recent").show(ui, |ui| {
+                        for d in recent {
+                            let name = d
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| d.display().to_string());
+                            let (dot, text, hover) = match recent_problem(d) {
+                                None => (t.accent, RichText::new(name), d.display().to_string()),
+                                Some(why) => (
+                                    t.muted,
+                                    RichText::new(name).color(t.muted),
+                                    format!("{} ({why})", d.display()),
+                                ),
+                            };
+                            let r = panels::row(ui, false, panels::Lead::Dot(dot), text, false).on_hover_text(hover);
+                            if r.clicked() {
+                                *open_recent = Some(d.clone());
                             }
-                        });
-                    }
+                            r.context_menu(|ui| {
+                                if ui.button("Remove from recent projects").clicked() {
+                                    *forget = Some(d.clone());
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                    });
                 }
             });
     });

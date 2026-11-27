@@ -2524,6 +2524,32 @@ mod tests {
         assert_eq!(ed.selection, vec![Selection::Symbol("s2".into())]);
     }
 
+    /// The colour of the text a `row` paints for `text`: the section colour of its galley.
+    fn row_text_color(text: RichText) -> Option<egui::Color32> {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row(ui, false, Lead::Dot(egui::Color32::GRAY), text.clone(), false);
+            });
+        });
+        out.shapes.into_iter().find_map(|clipped| match clipped.shape {
+            egui::Shape::Text(t) if t.galley.text() == "entry" => t.galley.job.sections.first().map(|s| s.format.color),
+            _ => None,
+        })
+    }
+
+    /// Text given a colour keeps it in a row, so a recent project that is gone stays muted
+    /// (#1329); text without one does not take that colour.
+    #[test]
+    fn a_row_keeps_the_colour_its_text_was_given() {
+        let red = egui::Color32::from_rgb(200, 10, 10);
+        assert_eq!(row_text_color(RichText::new("entry").color(red)), Some(red));
+        let plain = row_text_color(RichText::new("entry"));
+        assert!(plain.is_some(), "the row draws its text");
+        assert_ne!(plain, Some(red));
+    }
+
     /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.
     fn jumper_texts(o: &mut Open, page: usize, ids: &[String]) -> Vec<String> {
         let ctx = egui::Context::default();
