@@ -6308,7 +6308,7 @@ fn vendored_parts_warning_unreadable(
             }
             // The part id and the reason come from the project: escaped, so they cannot steer
             // the terminal.
-            Err(err) => eprintln!("warning: {}", escape_field(&format!("cannot read part {id}: {err}"))),
+            Err(err) => warn([format!("cannot read part {id}: {err}")]),
         }
     }
     parts
