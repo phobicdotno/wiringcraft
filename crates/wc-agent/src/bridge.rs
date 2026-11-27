@@ -808,12 +808,12 @@ mod tests {
 
     #[test]
     fn a_token_line_ending_in_crlf_is_accepted_and_the_next_line_kept() {
-        let Ok(bridge) = Bridge::start(Vec::new(), String::new(), Arc::new(|| {})) else {
-            return;
-        };
-        let Ok(mut s) = TcpStream::connect(("127.0.0.1", bridge.port)) else {
-            return;
-        };
+        let started = Bridge::start(Vec::new(), String::new(), Arc::new(|| {}));
+        assert!(started.is_ok(), "starting the bridge: {:?}", started.as_ref().err());
+        let Ok(bridge) = started else { unreachable!() };
+        let connected = TcpStream::connect(("127.0.0.1", bridge.port));
+        assert!(connected.is_ok(), "connecting: {:?}", connected.as_ref().err());
+        let Ok(mut s) = connected else { unreachable!() };
         // Token and first message in one write: the message must not be swallowed with the token.
         let _ = s.write_all(
             format!(
