@@ -411,9 +411,17 @@ fn convex(pts: &[Pos2]) -> bool {
     true
 }
 
+/// How many corner tests [`triangulate`] may spend on one outline. Ear clipping costs about the
+/// square of the point count, so a fill of tens of thousands of points (one long SVG path, a
+/// solid DXF hatch) would freeze the editor on its first paint; past this budget the shape is
+/// drawn as its outline instead. About a few tens of milliseconds in a release build, and enough
+/// for fills of a few thousand points.
+const TRIANGULATE_BUDGET: usize = 20_000_000;
+
 /// Triangles (vertex indexes) covering a simple polygon, by ear clipping. A polygon with a hole
-/// cut in along a bridge (its two sides on top of each other) comes out right too.
-fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
+/// cut in along a bridge (its two sides on top of each other) comes out right too. `None` when
+/// cutting it up would take more than [`TRIANGULATE_BUDGET`] corner tests.
+fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
     let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
     // Summed in f64 (each f32 product is exact there), so the winding does not cancel out.
     let area: f64 = pts
@@ -425,14 +433,23 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     let mut idx: Vec<usize> = (0..pts.len()).collect();
     let mut out = Vec::new();
     let mut guard = 0;
-    while idx.len() > 3 && guard < pts.len() * pts.len() {
+    let mut work = 0usize;
+    while idx.len() > 3 && guard < pts.len().saturating_mul(pts.len()) {
         guard += 1;
         let n = idx.len();
+        let mut over = false;
         let ear = (0..n).find(|&i| {
+            // Every candidate counts at least once, so a run of reflex corners is bounded too.
+            work += 1;
+            if work > TRIANGULATE_BUDGET {
+                over = true;
+                return true;
+            }
             let (a, b, c) = (pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
             if cross(a, b, c) * turn <= 0.0 {
                 return false;
             }
+            work += n;
             // No other corner strictly inside the triangle.
             idx.iter().all(|&k| {
                 let q = pts[k];
@@ -442,6 +459,9 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
                 }
             })
         });
+        if over {
+            return None;
+        }
         match ear {
             Some(i) => {
                 out.push([idx[(i + n - 1) % n] as u32, idx[i] as u32, idx[(i + 1) % n] as u32]);
@@ -462,7 +482,7 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     if let [a, b, c] = idx[..] {
         out.push([a as u32, b as u32, c as u32]);
     }
-    out
+    Some(out)
 }
 
 /// The outline of a filled polyline in drawing millimetres, as the key of [`TriCache`]: the same
@@ -482,8 +502,11 @@ impl std::hash::Hash for FillKey<'_> {
 #[derive(Default)]
 struct Triangulator;
 
-impl egui::util::cache::ComputerMut<FillKey<'_>, std::sync::Arc<[[u32; 3]]>> for Triangulator {
-    fn compute(&mut self, key: FillKey<'_>) -> std::sync::Arc<[[u32; 3]]> {
+/// The triangles of one fill, or `None` when it is too large to cut up (drawn as its outline).
+type FillTriangles = Option<std::sync::Arc<[[u32; 3]]>>;
+
+impl egui::util::cache::ComputerMut<FillKey<'_>, FillTriangles> for Triangulator {
+    fn compute(&mut self, key: FillKey<'_>) -> FillTriangles {
         #[cfg(test)]
         TRIANGULATIONS.with(|n| n.set(n.get() + 1));
         // In millimetres, not screen pixels, so panning and zooming keep the cached triangles.
@@ -495,13 +518,13 @@ impl egui::util::cache::ComputerMut<FillKey<'_>, std::sync::Arc<[[u32; 3]]>> for
             .iter()
             .map(|q| Pos2::new((q.x - o.x) as f32, (q.y - o.y) as f32))
             .collect();
-        triangulate(&pts).into()
+        triangulate(&pts).map(Into::into)
     }
 }
 
 /// Triangles of the filled polylines painted last frame, so a large fill is not cut up again on
-/// every frame. Shapes not painted in a frame drop out.
-type TriCache = egui::util::cache::FrameCache<std::sync::Arc<[[u32; 3]]>, Triangulator>;
+/// every frame (nor a too large one tried again). Shapes not painted in a frame drop out.
+type TriCache = egui::util::cache::FrameCache<FillTriangles, Triangulator>;
 
 #[cfg(test)]
 thread_local! {
@@ -527,17 +550,22 @@ pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke)
                 p.add(EShape::convex_polygon(pts, stroke.color, Stroke::NONE));
             } else if *filled {
                 // egui fills only convex paths itself, so cut the outline into triangles.
-                let mut mesh = egui::Mesh::default();
-                for p in &pts {
-                    mesh.colored_vertex(*p, stroke.color);
-                }
                 let tris = p
                     .ctx()
                     .memory_mut(|m| m.caches.cache::<TriCache>().get(FillKey(points)));
-                for &[a, b, c] in tris.iter() {
-                    mesh.add_triangle(a, b, c);
+                if let Some(tris) = tris {
+                    let mut mesh = egui::Mesh::default();
+                    for p in &pts {
+                        mesh.colored_vertex(*p, stroke.color);
+                    }
+                    for &[a, b, c] in tris.iter() {
+                        mesh.add_triangle(a, b, c);
+                    }
+                    p.add(EShape::mesh(mesh));
+                } else {
+                    // Too many points to cut up without stalling the editor: its outline at least.
+                    p.add(EShape::closed_line(pts, stroke));
                 }
-                p.add(EShape::mesh(mesh));
             } else if *closed {
                 p.add(EShape::closed_line(pts, stroke));
             } else {
@@ -4171,7 +4199,9 @@ mod tests {
             let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
             (d1 > 0.0 && d2 > 0.0 && d3 > 0.0) || (d1 < 0.0 && d2 < 0.0 && d3 < 0.0)
         };
-        let tris = triangulate(&pts);
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("a small outline is cut up")
+        };
         assert!(
             !tris.iter().any(|t| inside(Pos2::new(30.0, 40.0), *t)),
             "the notch is not filled"
@@ -4206,6 +4236,7 @@ mod tests {
         .map(|(x, y)| Pos2::new(*x, *y))
         .collect();
         let area: f32 = triangulate(&pts)
+            .unwrap_or_default()
             .iter()
             .map(|[a, b, c]| {
                 let (a, b, c) = (pts[*a as usize], pts[*b as usize], pts[*c as usize]);
@@ -4222,7 +4253,9 @@ mod tests {
             .iter()
             .map(|(x, y)| Pos2::new(*x, *y))
             .collect();
-        let tris = triangulate(&pts);
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("a small outline is cut up")
+        };
         assert_eq!(tris.len(), 4);
         let area: f32 = tris
             .iter()
@@ -4267,6 +4300,57 @@ mod tests {
         assert_eq!(runs() - start, 2);
     }
 
+    /// A closed zigzag round a circle: every other corner pointing in, so it is not convex.
+    fn star(n: usize) -> Vec<Point> {
+        (0..n)
+            .map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / n as f64;
+                let r = if i % 2 == 0 { 100.0 } else { 99.0 };
+                Point::new(r * t.cos(), r * t.sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fill_of_a_few_thousand_points_is_still_cut_into_triangles() {
+        let pts: Vec<Pos2> = star(2_000).iter().map(|q| Pos2::new(q.x as f32, q.y as f32)).collect();
+        let Some(tris) = triangulate(&pts) else {
+            unreachable!("2000 points fit in the budget")
+        };
+        assert_eq!(tris.len(), pts.len() - 2);
+    }
+
+    #[test]
+    fn a_fill_of_a_hundred_thousand_points_is_drawn_as_its_outline_without_stalling() {
+        let shape = Shape::Polyline {
+            points: star(100_000),
+            closed: true,
+            filled: true,
+        };
+        let ctx = egui::Context::default();
+        let xf = Xf {
+            origin: Pos2::new(200.0, 200.0),
+            zoom: 1.0,
+        };
+        let started = std::time::Instant::now();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            let p = ctx.layer_painter(egui::LayerId::background());
+            paint_shape(&p, &xf, &shape, Stroke::new(1.0_f32, Color32::BLACK));
+        });
+        // Unbounded ear clipping takes minutes here; the budget keeps it to a fraction of that
+        // even in a debug build.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let drawn = out
+            .shapes
+            .iter()
+            .any(|c| matches!(&c.shape, EShape::Path(path) if path.closed && path.points.len() == 100_000));
+        assert!(drawn, "the outline is painted");
+    }
+
     #[test]
     fn a_clockwise_outline_far_from_the_origin_fills_the_outline_not_its_notch() {
         // A clockwise L near (10000, 10000) mm: the notch is the square 10001..10002 on both axes.
@@ -4281,7 +4365,9 @@ mod tests {
         .iter()
         .map(|(x, y)| Point::new(*x, *y))
         .collect();
-        let tris = egui::util::cache::ComputerMut::compute(&mut Triangulator, FillKey(&pts));
+        let Some(tris) = egui::util::cache::ComputerMut::compute(&mut Triangulator, FillKey(&pts)) else {
+            unreachable!("a small outline is cut up")
+        };
         let at = |i: u32| {
             let q = pts[i as usize];
             (q.x - 10000.0, q.y - 10000.0)
