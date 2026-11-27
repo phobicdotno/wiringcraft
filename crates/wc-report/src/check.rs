@@ -400,7 +400,9 @@ pub fn check_with_unreadable(
             })
             .collect();
         for w in &page.wires {
-            if w.potential.is_some() {
+            // A blank name is no potential (connectivity joins nothing by it), so it does not
+            // excuse a free end.
+            if w.potential.as_deref().is_some_and(|n| !n.trim().is_empty()) {
                 continue;
             }
             for e in [&w.from, &w.to] {
