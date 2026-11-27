@@ -1772,21 +1772,41 @@ const PROJECT_DATA: [&str; 9] = [
 ];
 
 /// The project file or folder of the project in `dir` that the output file `path` would land
-/// on, as the file system resolves both (a link to one included), if it would (#1252).
+/// on, as the file system resolves both (a link to one included), if it would (#1252). Every
+/// name along a chain of links counts, not only where the chain ends: a link inside a project
+/// folder that leads out of it, and a link whose target does not exist yet, are both judged by
+/// each place the write passes through.
 fn project_data_at(dir: &Path, path: &Path) -> Option<&'static str> {
-    // Nothing there yet: where its folder really is, and its name in that folder.
-    let target = std::fs::canonicalize(path).ok().or_else(|| {
-        let name = path.file_name()?;
-        let parent = path
+    // Where a name really is: its folder resolved, the name itself not followed.
+    let placed = |p: &Path| -> Option<PathBuf> {
+        let name = p.file_name()?;
+        let parent = p
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         Some(std::fs::canonicalize(parent).ok()?.join(name))
-    })?;
+    };
+    let mut places: Vec<PathBuf> = std::fs::canonicalize(path).ok().into_iter().collect();
+    let mut hop = path.to_path_buf();
+    // A bounded walk, as the file system bounds a chain of links.
+    for _ in 0..40 {
+        let Some(at) = placed(&hop) else { break };
+        places.push(at.clone());
+        let is_link = std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink());
+        let Some(next) = is_link.then(|| std::fs::read_link(&at).ok()).flatten() else {
+            break;
+        };
+        hop = match at.parent() {
+            Some(folder) if next.is_relative() => folder.join(next),
+            _ => next,
+        };
+    }
     let root = std::fs::canonicalize(dir).ok()?;
     PROJECT_DATA.into_iter().find(|name| {
         let at = std::fs::canonicalize(root.join(name)).unwrap_or_else(|_| root.join(name));
-        target.starts_with(at)
+        places
+            .iter()
+            .any(|p| p.starts_with(&at) || p.starts_with(root.join(name)))
     })
 }
 

@@ -66,6 +66,36 @@ fn an_export_through_a_link_to_a_project_file_is_refused() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn an_export_through_a_link_to_a_missing_project_file_is_refused() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    project(tmp.path())?;
+    let target = tmp.path().join("p/pages/new.page.json");
+    std::os::unix::fs::symlink(&target, tmp.path().join("out.pdf"))?;
+    let out = wiringcraft(tmp.path(), &["-C", "p", "pdf", "out.pdf"])?;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("it is the project's"));
+    assert!(!target.exists(), "an export was written into the pages folder");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn an_export_onto_a_project_file_that_links_out_of_its_folder_is_refused() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let before = project(tmp.path())?;
+    let page = tmp.path().join("p/pages/p0001.page.json");
+    let outside = tmp.path().join("page-elsewhere.json");
+    std::fs::rename(&page, &outside)?;
+    std::os::unix::fs::symlink(&outside, &page)?;
+    let out = wiringcraft(&tmp.path().join("p"), &["aml", "pages/p0001.page.json"])?;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("it is the project's"));
+    assert_eq!(std::fs::read(&outside)?, before[2].1);
+    Ok(())
+}
+
 #[test]
 fn an_export_beside_the_project_files_is_written() -> TestResult {
     let tmp = tempfile::tempdir()?;
