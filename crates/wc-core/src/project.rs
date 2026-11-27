@@ -1900,7 +1900,8 @@ impl Project {
             .into_iter()
             .map(|(_, label)| label)
             .collect();
-        out.sort();
+        // Page 2 before page 10, -K2 before -K10, pin 2 before pin 13 (#1359).
+        out.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
         out.dedup();
         out
     }
@@ -2133,6 +2134,44 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dangling_pins_sort_pages_tags_and_pins_by_number() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        for (n, tags) in [("10", ["-K1", "-K2"]), ("2", ["-K10", "-K2"])] {
+            let mut page = Page::new(format!("p{n}"), n, "");
+            for (i, tag) in tags.iter().enumerate() {
+                page.symbols.push(PlacedSymbol {
+                    id: format!("s{i}"),
+                    symbol: "k".into(),
+                    at: Point::default(),
+                    rotation: Rotation::default(),
+                    mirror: false,
+                    tag: Some(DeviceTag::parse(tag)?),
+                });
+            }
+            page.wires = serde_json::from_str(
+                r#"[{"id":"w1","from":{"item":"s0","pin":"13"},"to":{"item":"s0","pin":"2"}},
+                    {"id":"w2","from":{"item":"s1","pin":"13"},"to":{"item":"s1","pin":"2"}}]"#,
+            )?;
+            p.pages.push(page);
+        }
+        let symbol: crate::Symbol = serde_json::from_str(r#"{"id":"k","name":"K","graphics":[],"pins":[]}"#)?;
+        assert_eq!(
+            p.dangling_pins("k", &symbol),
+            [
+                "page 2 -K2:2",
+                "page 2 -K2:13",
+                "page 2 -K10:2",
+                "page 2 -K10:13",
+                "page 10 -K1:2",
+                "page 10 -K1:13",
+                "page 10 -K2:2",
+                "page 10 -K2:13",
+            ]
+        );
+        Ok(())
+    }
 
     #[test]
     fn removing_symbols_takes_the_wires_on_their_pins_too() -> std::result::Result<(), Box<dyn std::error::Error>> {
