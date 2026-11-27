@@ -64,8 +64,9 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
-/// Every tag the project uses: on its pages, in its device data and as the cable of a wire
-/// core (a cable with cores but no symbol drawn and no device entry is still taken).
+/// Every tag the project uses: on its pages, in its device data, as the cable of a wire
+/// core (a cable with cores but no symbol drawn and no device entry is still taken) and on a
+/// fieldbus network (its nodes, link ends and link cables).
 pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
     let mut used: BTreeSet<DeviceTag> = project.tag_index().into_keys().collect();
     used.extend(project.devices.keys().cloned());
@@ -76,6 +77,12 @@ pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
             .flat_map(|p| &p.wires)
             .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone())),
     );
+    for n in &project.meta.networks {
+        let nodes = n.nodes.iter().map(|x| x.device.parse::<DeviceTag>().ok());
+        let cables = n.links.iter().map(|l| l.cable.parse::<DeviceTag>().ok());
+        let ends = n.ports().into_iter().flat_map(|(a, b, _)| [a.device, b.device]);
+        used.extend(nodes.chain(cables).flatten().chain(ends));
+    }
     used
 }
 
@@ -257,6 +264,31 @@ mod tests {
                 "{data:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_tag_only_a_network_names_is_taken() {
+        let mut p = project();
+        p.meta.networks.push(crate::network::Network {
+            name: "PN1".into(),
+            nodes: vec![crate::network::Node {
+                device: "-K2".into(),
+                ..Default::default()
+            }],
+            links: vec![crate::network::Link {
+                from: "-K2:X1P1".into(),
+                to: "-K3:X1P1".into(),
+                cable: "-W1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let used = used_tags(&p);
+        for t in ["-K2", "-K3", "-W1"] {
+            assert!(used.contains(&tag(t)), "{t}");
+        }
+        assert_eq!(free_tag_like(&used, &tag("-W1")), Some(tag("-W2")));
+        assert_eq!(free_tag_like(&used, &tag("-K1")), Some(tag("-K4")));
     }
 
     #[test]
