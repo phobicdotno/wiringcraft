@@ -394,7 +394,10 @@ impl Panel {
                     outside(min, max).then(|| format!("rail at {},{}", at.x, at.y))
                 }
                 PanelItem::Duct { min, max } => {
-                    outside(*min, *max).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
+                    // Corners may be given either way round; check the rectangle they span.
+                    let lo = Point::new(min.x.min(max.x), min.y.min(max.y));
+                    let hi = Point::new(min.x.max(max.x), min.y.max(max.y));
+                    outside(lo, hi).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
                 }
                 PanelItem::Device { tag, .. } => {
                     let (min, max) = item.device_bounds()?;

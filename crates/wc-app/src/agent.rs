@@ -11343,10 +11343,12 @@ mod tests {
         let long_rail = json!({"kind": "rail", "at": {"x": 550.0, "y": 100.0}, "length": 100.0});
         let back_rail = json!({"kind": "rail", "at": {"x": 50.0, "y": 100.0}, "length": -100.0});
         let duct = json!({"kind": "duct", "min": {"x": 10.0, "y": 700.0}, "max": {"x": 590.0, "y": 840.0}});
+        let back_duct = json!({"kind": "duct", "min": {"x": 650.0, "y": 100.0}, "max": {"x": 590.0, "y": 140.0}});
         for (item, name) in [
             (long_rail, "rail at 550,100"),
             (back_rail, "rail at 50,100"),
             (duct, "duct 10,700"),
+            (back_duct, "duct 650,100"),
         ] {
             let content = json!({"name": "P", "width": 600.0, "height": 800.0, "items": [item]});
             let r = call(&mut a, "panels", json!({"action": "replace", "content": content}));
