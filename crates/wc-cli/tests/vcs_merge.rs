@@ -48,8 +48,9 @@ fn a_conflicted_merge_can_be_aborted() -> TestResult {
 
     let out = wiringcraft(&dir, &["vcs", "merge", "--abort"])?;
     assert!(out.contains("merge aborted"), "{out}");
+    // Git on Windows may check the file out with CRLF line ends (core.autocrlf).
     assert_eq!(
-        std::fs::read_to_string(&notes)?,
+        std::fs::read_to_string(&notes)?.replace("\r\n", "\n"),
         "main\n",
         "the file is as before the merge"
     );
