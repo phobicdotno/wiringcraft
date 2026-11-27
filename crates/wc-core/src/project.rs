@@ -1563,16 +1563,17 @@ impl WireSpec {
             "BK", "BN", "RD", "OG", "YE", "GN", "BU", "VT", "GY", "WH", "PK", "GD", "TQ", "SR",
         ];
         let Some(c) = &self.colour else { return true };
-        let letters: Vec<char> = c
-            .to_uppercase()
-            .chars()
-            .filter(|ch| !matches!(ch, '/' | '-' | '+' | ' '))
-            .collect();
-        !letters.is_empty()
-            && letters.len().is_multiple_of(2)
-            && letters
-                .chunks(2)
-                .all(|p| CODES.contains(&p.iter().collect::<String>().as_str()))
+        // Each part between separators is whole codes, so `B/K` is not read as `BK`.
+        let upper = c.to_uppercase();
+        let mut parts = upper.split(['/', '-', '+', ' ']).filter(|p| !p.is_empty()).peekable();
+        parts.peek().is_some()
+            && parts.all(|p| {
+                let letters: Vec<char> = p.chars().collect();
+                letters.len().is_multiple_of(2)
+                    && letters
+                        .chunks(2)
+                        .all(|l| CODES.contains(&l.iter().collect::<String>().as_str()))
+            })
     }
 }
 
@@ -2725,7 +2726,7 @@ mod tests {
         for good in ["", "BU", "bu", "GNYE", "gn/ye", "GN-YE", "WH BK"] {
             assert!(spec("", good).colour_is_iec(), "{good}");
         }
-        for bad in ["XX", "BLUE", "B", "GNY", "sw", "1"] {
+        for bad in ["XX", "BLUE", "B", "GNY", "sw", "1", "B/K", "G/N/YE", "/"] {
             assert!(!spec("", bad).colour_is_iec(), "{bad}");
         }
     }
