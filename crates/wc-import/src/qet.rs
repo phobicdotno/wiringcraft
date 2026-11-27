@@ -232,10 +232,13 @@ fn letter_code(label: &str) -> String {
     let l = label.trim();
     let l = l.strip_prefix('-').unwrap_or(l);
     let letters = l.chars().take_while(|c| c.is_ascii_alphabetic()).count();
-    if (1..=3).contains(&letters) && l[letters..].chars().all(|c| c.is_ascii_digit()) {
-        l[..letters].to_ascii_uppercase()
-    } else {
-        String::new()
+    match (l.get(..letters), l.get(letters..)) {
+        (Some(code), Some(number))
+            if (1..=3).contains(&letters) && !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            code.to_ascii_uppercase()
+        }
+        _ => String::new(),
     }
 }
 
@@ -762,7 +765,8 @@ mod tests {
         for (label, code) in [
             ("-K1", "K"),
             (" -PG1 ", "PG"),
-            ("A", "A"),
+            ("A", ""),
+            ("-PG", ""),
             ("q12", "Q"),
             ("<![CDATA[-F]]>3", "F"),
             ("SICK UM 30", ""),
