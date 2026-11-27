@@ -500,6 +500,12 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[u32; 3]>> {
             let mut clear = true;
             'cells: for cy in c0y..=c1y {
                 for cx in c0x..=c1x {
+                    // Empty cells count too: an ear with a box over most of the grid costs
+                    // its cells even with no corner in them.
+                    work += 1;
+                    if work > TRIANGULATE_BUDGET {
+                        return None;
+                    }
                     for &k in grid.get(cy * side + cx)? {
                         work += 1;
                         if !alive.get(k).copied()? || k == ia || k == ear || k == ic {
