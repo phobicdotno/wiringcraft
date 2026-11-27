@@ -81,8 +81,57 @@ pub fn check_with_unreadable(
     library: &[wc_core::check_rule::RuleSet],
     unreadable: &BTreeMap<String, String>,
 ) -> Vec<Finding> {
-    let p = i.project;
     let mut out = Vec::new();
+    // A graphic page is for drawings only: a symbol or wire on it is not meant to be there.
+    for page in i.project.pages.iter().filter(|pg| pg.graphic) {
+        for s in &page.symbols {
+            let name = s
+                .tag
+                .as_ref()
+                .map_or_else(|| format!("symbol {}", s.id), |t| t.to_string());
+            out.push(at(
+                page,
+                &s.id,
+                Severity::Warning,
+                format!("{name} is on a graphic page, which is for drawings only; move it to a schematic page"),
+            ));
+        }
+        for w in &page.wires {
+            out.push(at(
+                page,
+                &w.id,
+                Severity::Warning,
+                "a wire is on a graphic page, which is for drawings only; move it to a schematic page".to_owned(),
+            ));
+        }
+    }
+
+    // A graphic page is not evaluated electrically: every other check runs without its symbols
+    // and wires, so one left there counts nowhere else (not as a drawing of its device either).
+    let without_graphic;
+    let stripped;
+    let i = if i
+        .project
+        .pages
+        .iter()
+        .any(|pg| pg.graphic && !(pg.symbols.is_empty() && pg.wires.is_empty()))
+    {
+        let mut q = i.project.clone();
+        for pg in q.pages.iter_mut().filter(|pg| pg.graphic) {
+            pg.symbols.clear();
+            pg.wires.clear();
+        }
+        without_graphic = q;
+        stripped = Inputs {
+            project: &without_graphic,
+            symbols: i.symbols,
+            parts: i.parts,
+        };
+        &stripped
+    } else {
+        i
+    };
+    let p = i.project;
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
     // Connections outside overview pages, by wire place; cable cores and wire numbers share them.
     let wire_net = wire_nets_off_overview(i);
@@ -114,30 +163,6 @@ pub fn check_with_unreadable(
                 "revision {letter} has characters the PDF cannot print apart from others; give it plain Latin-1 letters"
             ),
         });
-    }
-
-    // A graphic page is for drawings only: a symbol or wire on it is not meant to be there.
-    for page in p.pages.iter().filter(|pg| pg.graphic) {
-        for s in &page.symbols {
-            let name = s
-                .tag
-                .as_ref()
-                .map_or_else(|| format!("symbol {}", s.id), |t| t.to_string());
-            out.push(at(
-                page,
-                &s.id,
-                Severity::Warning,
-                format!("{name} is on a graphic page, which is for drawings only; move it to a schematic page"),
-            ));
-        }
-        for w in &page.wires {
-            out.push(at(
-                page,
-                &w.id,
-                Severity::Warning,
-                "a wire is on a graphic page, which is for drawings only; move it to a schematic page".to_owned(),
-            ));
-        }
     }
 
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
@@ -1206,7 +1231,12 @@ mod tests {
         assert!(run(&p).iter().all(|f| !f.message.contains("graphic page")));
         let mut sketch = Page::new("g1", "2", "Sketch");
         sketch.graphic = true;
-        sketch.symbols = vec![place("s9", "lamp", "-P9"), place("s8", "lamp", "")];
+        // -P1 is drawn on the schematic page too: the copy on the graphic page does not count.
+        sketch.symbols = vec![
+            place("s9", "lamp", "-P9"),
+            place("s8", "lamp", ""),
+            place("s7", "lamp", "-P1"),
+        ];
         sketch.wires = vec![wc_core::Wire {
             id: "w1".into(),
             from: Endpoint::Pin {
@@ -1228,7 +1258,16 @@ mod tests {
             .into_iter()
             .filter(|f| f.message.contains("graphic page"))
             .collect();
-        assert_eq!(on_graphic.len(), 3, "{on_graphic:?}");
+        let all = run(&p);
+        assert!(all.iter().all(|f| !f.message.contains("drawn 2 times")), "{all:?}");
+        // Nothing else is said about what is on the graphic page: its open pins and its
+        // wire's free end are not evaluated.
+        assert!(
+            all.iter()
+                .all(|f| f.page_id.as_deref() != Some("g1") || f.message.contains("graphic page")),
+            "{all:?}"
+        );
+        assert_eq!(on_graphic.len(), 4, "{on_graphic:?}");
         assert!(
             on_graphic
                 .iter()

@@ -689,8 +689,16 @@ fn onto_page(
     for w in &imported.warnings {
         err!(log, "warning: {}", escape_field(w));
     }
-    // The page must be there before anything is taken (a retry would skip the copies).
-    page_mut(&mut p, page)?;
+    // The page must be there before anything is taken (a retry would skip the copies). A
+    // graphic page takes the drawings but no symbol.
+    let target = page_mut(&mut p, page)?;
+    if target.graphic && !imported.symbols.is_empty() {
+        return Err(format!(
+            "page {:?} is a graphic page, which holds drawings only, and the drawing has {} symbol(s); import it onto a schematic page",
+            target.id,
+            imported.symbols.len()
+        ));
+    }
     let needed: std::collections::BTreeSet<&str> = imported
         .symbols
         .iter()

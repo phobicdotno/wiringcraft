@@ -68,6 +68,22 @@ fn a_macro_is_placed_with_the_chosen_value_set() -> TestResult {
     );
     assert!(list.contains("project\tbroken\t") && list.contains("voltage"), "{list}");
 
+    // A graphic page takes no macro with symbols or wires.
+    wiringcraft(&dir, &["page", "add", "g1", "--number", "90", "--graphic"])?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "place", "g1", "starter", "--at", "50,60", "--set", "3 kW"],
+    ) else {
+        return Err("a macro with symbols was placed on a graphic page".into());
+    };
+    assert!(
+        err.contains("graphic page") && err.contains("a macro with symbols or wires"),
+        "{err}"
+    );
+    assert!(
+        !dir.join("vendor/symbols/wc.coil.json").exists(),
+        "nothing was taken for it"
+    );
     let Err(err) = wiringcraft(&dir, &["macro", "place", "p1", "starter", "--at", "50,60"]) else {
         return Err("placed without a value set".into());
     };

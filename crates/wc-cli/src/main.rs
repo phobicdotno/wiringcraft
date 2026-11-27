@@ -3553,6 +3553,10 @@ fn run(mut cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
+                    // A graphic page takes a macro of drawings only; checked before anything is taken.
+                    if !m.symbols.is_empty() || !m.wires.is_empty() {
+                        refuse_graphic(page_mut(&mut p, &page)?, "a macro with symbols or wires")?;
+                    }
                     // A pinned symbol or part keeps its pinned version: a missing copy is put
                     // back from a library that still has that version, never from a newer one.
                     // One without a pin is taken from the library and pinned, also when a copy
@@ -8850,6 +8854,13 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("no-such-page"), "{err}");
         assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
+
+        // A graphic page takes no symbol, and nothing is copied for one.
+        cli(&dir, &["page", "graphic", page.as_str()]).unwrap();
+        let err = cli(&dir, &args).unwrap_err();
+        assert!(err.contains("graphic page") && err.contains("2 symbol(s)"), "{err}");
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err());
+        cli(&dir, &["page", "graphic", page.as_str(), "--off"]).unwrap();
 
         // A copy that cannot be written after `aa.good` was copied takes that copy away again.
         let blocked = store::vendor_path(&dir, ItemKind::Symbol, "zz.bad").unwrap();
