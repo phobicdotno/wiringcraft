@@ -1758,11 +1758,80 @@ fn check_pages(p: &Project, pages: &[String]) -> Res<()> {
     }
 }
 
-/// Write an output file the user named. Under [`output_guard`] the file is written so that it
+/// The project's own files and folders in its folder: an output file must never replace one.
+const PROJECT_DATA: [&str; 9] = [
+    store::PROJECT_FILE,
+    store::DEVICES_FILE,
+    store::LOCK_FILE,
+    wc_core::translate::TRANSLATIONS_FILE,
+    store::PAGES_DIR,
+    store::PANELS_DIR,
+    store::COMMENTS_DIR,
+    store::VENDOR_DIR,
+    wc_core::macros::MACROS_DIR,
+];
+
+/// The project file or folder of the project in `dir` that the output file `path` would land
+/// on, as the file system resolves both (a link to one included), if it would (#1252). Every
+/// name along a chain of links counts, not only where the chain ends: a link inside a project
+/// folder that leads out of it, and a link whose target does not exist yet, are both judged by
+/// each place the write passes through.
+fn project_data_at(dir: &Path, path: &Path) -> Option<&'static str> {
+    // Where a name really is: its folder resolved, the name itself not followed.
+    let placed = |p: &Path| -> Option<PathBuf> {
+        let name = p.file_name()?;
+        let parent = p
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Some(std::fs::canonicalize(parent).ok()?.join(name))
+    };
+    let mut places: Vec<PathBuf> = std::fs::canonicalize(path).ok().into_iter().collect();
+    let mut hop = path.to_path_buf();
+    // A bounded walk, as the file system bounds a chain of links.
+    for _ in 0..40 {
+        let Some(at) = placed(&hop) else { break };
+        places.push(at.clone());
+        let is_link = std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink());
+        let Some(next) = is_link.then(|| std::fs::read_link(&at).ok()).flatten() else {
+            break;
+        };
+        hop = match at.parent() {
+            Some(folder) if next.is_relative() => folder.join(next),
+            _ => next,
+        };
+    }
+    // Where the walk stopped, the last link followed included.
+    if let Some(at) = placed(&hop) {
+        places.push(at);
+    }
+    let root = std::fs::canonicalize(dir).ok()?;
+    PROJECT_DATA.into_iter().find(|name| {
+        let at = std::fs::canonicalize(root.join(name)).unwrap_or_else(|_| root.join(name));
+        places
+            .iter()
+            .any(|p| p.starts_with(&at) || p.starts_with(root.join(name)))
+    })
+}
+
+/// Write an output file the user named, into the project in `dir`'s folder too but never onto
+/// one of the project's own files (#1252). Under [`output_guard`] the file is written so that it
 /// cannot land on a project file, a link swapped in after the app's own look included (#458).
 /// A failure names the file: the guarded write does that itself, a plain one is given it here.
-fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+fn write_out(dir: &Path, path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     let path = path.as_ref();
+    // The guard refuses these itself, with the shared session as the reason.
+    if output_guard().is_none()
+        && let Some(name) = project_data_at(dir, path)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "will not write {}: it is the project's {name}; name another file",
+                escape_field(&path.display().to_string())
+            ),
+        ));
+    }
     match output_guard() {
         Some(g) => wc_core::guard::write_output(Some(g), path, bytes),
         None => std::fs::write(path, bytes).map_err(|err| {
@@ -2596,7 +2665,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     };
                     let parts = vendored_parts(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
-                    write_out(&out, &step.text).map_err(e)?;
+                    write_out(dir, &out, &step.text).map_err(e)?;
                     println!(
                         "wrote {} ({} solids)",
                         out.display(),
@@ -3875,7 +3944,7 @@ fn run(mut cli: Cli) -> Res<()> {
             if report.pages == 0 {
                 return Err(wc_pdf::NOTHING_TO_EXPORT.into());
             }
-            write_out(&out, bytes).map_err(e)?;
+            write_out(dir, &out, bytes).map_err(e)?;
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
             }
@@ -3974,7 +4043,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 while !used.insert(stem.to_lowercase()) {
                     stem.push('_');
                 }
-                write_out(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
+                write_out(dir, out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
             }
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -4085,7 +4154,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 let tables: Vec<wc_report::Table> = kinds.iter().map(|k| wc_report::build(*k, &inputs)).collect();
                 let refs: Vec<&wc_report::Table> = tables.iter().collect();
                 let bytes = wc_report::xlsx::workbook(&refs).map_err(e)?;
-                write_out(&path, bytes).map_err(e)?;
+                write_out(dir, &path, bytes).map_err(e)?;
                 return Ok(());
             }
             // Several tables in one CSV file is not a CSV any reader takes: `--out` names a
@@ -4097,7 +4166,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 make_out_dir(folder)?;
                 for k in &kinds {
                     let t = wc_report::build(*k, &inputs);
-                    write_out(folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
+                    write_out(dir, folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
                 }
                 println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
                 return Ok(());
@@ -4117,7 +4186,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 text.push('\n');
             }
             match out {
-                Some(path) => write_out(&path, text).map_err(e)?,
+                Some(path) => write_out(dir, &path, text).map_err(e)?,
                 None => print!("{text}"),
             }
         }
@@ -4149,7 +4218,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let (text, counts) = wc_report::automationml(&inputs, &utc_now(), &file_name);
-            write_out(&out, text).map_err(e)?;
+            write_out(dir, &out, text).map_err(e)?;
             if counts.untagged_pins > 0 {
                 eprintln!(
                     "warning: {} connected pin(s) on symbols without a tag were left out",
@@ -4173,7 +4242,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 parts: &parts,
             };
             let v = wc_report::plc_variables(&inputs);
-            write_out(&out, &v.text).map_err(e)?;
+            write_out(dir, &out, &v.text).map_err(e)?;
             if v.unlocated > 0 {
                 eprintln!(
                     "warning: {} point(s) have no PLC address and are declared at %I* or %Q*",
@@ -4992,7 +5061,7 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
             let rows = wc_vcs::history(&git, limit).map_err(e)?;
             match svg {
                 Some(path) => {
-                    write_out(&path, wc_vcs::subway_svg(&rows)).map_err(e)?;
+                    write_out(dir, &path, wc_vcs::subway_svg(&rows)).map_err(e)?;
                     println!("wrote {}", path.display());
                 }
                 None => print!("{}", wc_vcs::subway_text(&rows)),
@@ -5938,7 +6007,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
             .unwrap_or_else(|| wc_report::LEVEL_SEPARATOR.to_owned()),
     };
     let t = wc_report::marking_list_with(&inputs, &options);
-    write_out(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    write_out(dir, out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::formula_warnings(&t));
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
@@ -5989,7 +6058,7 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
     if t.rows.is_empty() {
         warnings.push("the project has no numbered terminals on its schematic pages".into());
     }
-    write_out(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    write_out(dir, out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
         markers: t.rows.len(),
