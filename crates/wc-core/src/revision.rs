@@ -871,3 +871,154 @@ mod tests {
         assert_eq!(p.unprintable_revisions().len(), 2);
     }
 }
+
+#[cfg(test)]
+mod revision_edge_tests {
+    #![allow(clippy::unwrap_used, clippy::panic, clippy::unreachable)]
+    use super::*;
+    use crate::project::Page;
+
+    fn project() -> Project {
+        let mut p = Project::new("Demo");
+        p.pages.push(Page::new("p1", "1", "Power"));
+        p
+    }
+
+    fn texts(shapes: &[Shape]) -> Vec<&str> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fields_are_cut_by_characters_and_lose_control_characters() {
+        let mut p = project();
+        let long = "é".repeat(MAX_FIELD + 50);
+        p.add_revision("A", " 2026-11-01\n", "Motor\tadded\r\n", &long).unwrap();
+        let r = p.revision("A").unwrap();
+        assert_eq!(r.date, "2026-11-01");
+        assert_eq!(r.text, "Motoradded");
+        assert_eq!(r.author.chars().count(), MAX_FIELD, "cut by characters, not bytes");
+        assert!(r.author.chars().all(|c| c == 'é'));
+        // A letter longer than MAX_LETTER is cut to it.
+        p.add_revision("0123456789", "", "", "").unwrap();
+        assert_eq!(p.latest_revision().unwrap().letter, "01234567");
+    }
+
+    #[test]
+    fn an_edit_that_only_differs_by_what_is_dropped_changes_nothing() {
+        let mut p = project();
+        p.add_revision("A", "2026-11-01", "First issue", "OP").unwrap();
+        assert!(
+            !p.edit_revision(" A ", " 2026-11-01 ", "First\u{7} issue", "OP\n")
+                .unwrap()
+        );
+        // An edit keeps the letter as it was and only clears what it is given empty.
+        assert!(p.edit_revision("A", "", "", "").unwrap());
+        assert_eq!(
+            p.meta.revisions,
+            [Revision {
+                letter: "A".into(),
+                date: String::new(),
+                text: String::new(),
+                author: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn removing_an_unknown_revision_is_refused_and_a_blocking_cloud_names_its_page() {
+        let mut p = project();
+        assert!(p.remove_revision("A").is_err());
+        p.add_revision("A", "", "", "").unwrap();
+        p.pages.push(Page::new("p2", "7", "Control"));
+        p.add_cloud("p2", Point::new(0.0, 0.0), Point::new(10.0, 10.0), None)
+            .unwrap();
+        let Err(Error::Invalid(msg)) = p.remove_revision("A") else {
+            panic!("a cloud on page 7 carries A")
+        };
+        assert!(msg.contains("page 7"), "{msg}");
+        assert_eq!(p.meta.revisions.len(), 1, "nothing removed");
+    }
+
+    #[test]
+    fn a_tiny_cloud_gets_one_scallop_a_side_and_a_huge_one_is_capped() {
+        let tiny = RevisionCloud::new(Point::new(0.0, 0.0), Point::new(0.5, 0.25), "A");
+        assert!(tiny.is_valid());
+        assert_eq!(tiny.scallops().len(), 4);
+        let huge = RevisionCloud::new(Point::new(0.0, 0.0), Point::new(1e7, 1e7), "A");
+        assert_eq!(huge.scallops().len(), 4 * 500);
+        // The capped scallops still cover each side end to end.
+        let Some(Shape::Arc { radius, .. }) = huge.scallops().first().cloned() else {
+            unreachable!()
+        };
+        assert!((radius * 2.0 * 500.0 - 1e7).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_table_without_revisions_is_just_its_heading() {
+        let shapes = table_shapes(&[], Point::new(0.0, 0.0));
+        assert_eq!(texts(&shapes), ["Rev", "Date", "Description", "By"]);
+        let lines = shapes.iter().filter(|s| matches!(s, Shape::Line { .. })).count();
+        assert_eq!(lines, TABLE_COLUMNS.len() - 1, "only the column separators");
+        let (w, h) = table_size(0);
+        assert_eq!((w, h), (140.0, TABLE_ROW));
+        assert!(matches!(shapes[0], Shape::Rect { max, .. } if max == Point::new(w, h)));
+        // A table at a non-finite place draws nothing.
+        assert!(table_shapes(&[], Point::new(f64::NAN, 0.0)).is_empty());
+        assert!(table_shapes(&[], Point::new(0.0, f64::NEG_INFINITY)).is_empty());
+    }
+
+    #[test]
+    fn empty_table_cells_draw_no_text() {
+        let mut p = project();
+        p.add_revision("A", "", "Only a description", "").unwrap();
+        let shapes = table_shapes(&p.meta.revisions, Point::new(0.0, 0.0));
+        assert_eq!(&texts(&shapes)[4..], ["A", "Only a description"]);
+        // A text that fits is kept whole.
+        assert_eq!(fit("OP", TABLE_COLUMNS[3].1), "OP");
+    }
+
+    #[test]
+    fn a_letter_saved_by_hand_is_found_as_saved() {
+        let mut p = project();
+        // Typed input would drop the control character, but the saved letter stays reachable.
+        p.meta.revisions.push(Revision {
+            letter: "A\u{1}".into(),
+            date: String::new(),
+            text: String::new(),
+            author: String::new(),
+        });
+        assert!(p.revision("A\u{1}").is_some());
+        assert!(p.revision("A").is_none());
+        assert!(p.edit_revision("A\u{1}", "2026-11-27", "", "").unwrap());
+        p.remove_revision("A\u{1}").unwrap();
+        assert!(p.meta.revisions.is_empty());
+    }
+
+    #[test]
+    fn clouds_without_a_listed_revision_are_reported_page_by_page() {
+        let mut p = project();
+        p.pages.push(Page::new("p2", "2", "Control"));
+        p.add_revision("A", "", "", "").unwrap();
+        for page in ["p1", "p2"] {
+            p.add_cloud(page, Point::new(0.0, 0.0), Point::new(10.0, 10.0), None)
+                .unwrap();
+        }
+        p.pages[0]
+            .clouds
+            .push(RevisionCloud::new(Point::new(0.0, 0.0), Point::new(5.0, 5.0), "Z"));
+        p.pages[1].clouds[0].revision = "Y".into();
+        assert_eq!(
+            p.clouds_without_revision(),
+            [("1".to_owned(), "Z".to_owned()), ("2".to_owned(), "Y".to_owned())]
+        );
+        // The tag is matched trimmed, the stored letter exactly.
+        assert!(p.cloud_revision(" A\t").is_some());
+        assert!(p.cloud_revision("a").is_none());
+    }
+}
