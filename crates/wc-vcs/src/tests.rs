@@ -300,6 +300,42 @@ fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
 }
 
 #[test]
+fn a_merge_conflict_left_with_markers_is_not_committed() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(|e| wc_core::Error::io("notes", e));
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    let before = git.head();
+    assert_eq!(git.merge("other")?, MergeOutcome::Conflicts(vec!["notes.txt".into()]));
+    // Not edited yet: git left its markers in the file.
+    let result = git.commit("Merge other");
+    assert!(result.is_err(), "committed {result:?} with conflict markers");
+    let err = result.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("conflict markers") && err.contains("notes.txt"), "{err}");
+    assert_eq!(git.head(), before);
+    assert!(dir.join(".git").join("MERGE_HEAD").exists());
+    // Still conflicted, so the merge can be resolved or aborted as before.
+    assert_eq!(
+        git.run(&["diff", "--name-only", "--diff-filter=U"])?.trim(),
+        "notes.txt"
+    );
+    assert!(git.commit_paths_as("Merge other", "A <a@b>", &["notes.txt"]).is_err());
+    write("both\n")?;
+    assert!(git.commit("Merge other")?.is_some());
+    assert!(!dir.join(".git").join("MERGE_HEAD").exists());
+    Ok(())
+}
+
+#[test]
 fn a_merge_while_another_is_unfinished_is_refused() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let dir = tmp.path();
