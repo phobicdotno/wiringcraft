@@ -1293,4 +1293,16 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn an_orientation_with_spaces_around_it_is_still_read() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<terminal x="0" y="0" orientation=" n " name="1"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.x", 1.0)?;
+        let dirs: Vec<PinDir> = imp.symbol.pins.iter().map(|p| p.dir).collect();
+        assert_eq!(dirs, vec![PinDir::Up]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Ok(())
+    }
 }
