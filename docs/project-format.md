@@ -23,10 +23,13 @@ my-project/
 ```
 
 Only `project.toml` is needed. A missing `devices.json` or `library.lock` reads as empty, and a
-missing folder as one with nothing in it. A new project has `project.toml`, `devices.json`,
+missing folder as one with nothing in it. A new project made without `--template` has `project.toml`, `devices.json`,
 `library.lock` and the cover page `pages/p0001.page.json`, plus the two git files when
 `wiringcraft new` sets up git (not with `--no-git`; a later plain `git init` does not add them). The other files
-and folders appear when something is first put in them.
+and folders appear when something is first put in them. A project made with `--template` instead
+starts with a copy of everything in the base project except its `.git` and `comments/` folders:
+its pages rather than `p0001`, and its own `.gitignore` and `.gitattributes` if it has them, even
+with `--no-git`. `wiringcraft new` then adds either git file only where the copy has none.
 
 ## project.toml
 
@@ -229,8 +232,10 @@ such as `pictures/logo.png`. A different picture of the same name gets a new nam
 - `.wiringcraft.lock`: locked while a `wiringcraft` command works on the project, so commands
   take turns. The lock is best effort: when it cannot be opened or taken, the command prints a
   warning and runs without it, so do not run another command on the project until it is done.
-  It is never committed: the new project's `.gitignore` lists it, and in a repository
-  whose `.gitignore` does not, it goes in git's local exclude list.
+  The new project's `.gitignore` lists it, and in a repository whose `.gitignore` does not, the
+  next command puts it in git's local exclude list (a warning says when that fails). A project
+  made with `--no-git` has neither, so after a plain `git init`, `git add .` stages the lock file
+  unless a command has run in between; add `/.wiringcraft.lock` to `.gitignore` to be sure.
 - `translations.toml.lock.tmp`: locked while `translations.toml` is read and changed.
 - `*.tmp`: staging files of a write in progress.
 - `export/`: listed in `.gitignore` as generated output.
