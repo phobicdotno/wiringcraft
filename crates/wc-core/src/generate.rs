@@ -132,6 +132,9 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
             match symbol(&s.symbol) {
                 Some(def) => {
                     pts.push(s.at);
+                    if let Some(tag) = &s.tag {
+                        tag_points(s, &def, tag, &mut pts);
+                    }
                     for g in &def.graphics {
                         drawn_points(&g.placed(s.at, s.rotation, s.mirror), &mut pts);
                     }
@@ -159,6 +162,32 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
         pts.extend(copies.first().map(|m| m.anchor));
     }
     bounds_of(&pts)
+}
+
+/// The height the PDF and the canvas draw a device tag's lines at.
+const TAG_HEIGHT: f64 = 2.5;
+
+/// Points round a placed symbol's device tag as `wc_pdf::layout::tag_lines` draws it: one line
+/// per `=function`, `+location` and `-product`, centred on the tag position, right-aligned (left
+/// where the placement turns that side round). The product line is measured three digits longer,
+/// as placing a copy can give it a higher number than the macro's own.
+fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::DeviceTag, pts: &mut Vec<Point>) {
+    let ta = def.tag_at.transform(s.rotation, s.mirror) + s.at;
+    let reversed = Point::new(1.0, 0.0).transform(s.rotation, s.mirror).x < -0.5;
+    let align = if reversed { Align::Left } else { Align::Right };
+    let mut lines = Vec::new();
+    if !tag.function.is_empty() {
+        lines.push(format!("={}", tag.function.join(".")));
+    }
+    if !tag.location.is_empty() {
+        lines.push(format!("+{}", tag.location.join(".")));
+    }
+    lines.push(format!("-{}999", tag.product.join(".")));
+    let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
+    for (i, line) in lines.iter().enumerate() {
+        let at = Point::new(ta.x, top + 3.0 * i as f64);
+        pts.extend(text_corners(at, line, TAG_HEIGHT, align, 0.0));
+    }
 }
 
 /// Points round what a shape draws: a text as wide as it is drawn ([`text_corners`]), and a
@@ -588,6 +617,30 @@ mod tests {
             xs.len() == 3 && xs.windows(2).all(|w| w[1] - w[0] >= width + GAP - 1e-9),
             "{xs:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_symbol_s_device_tag_counts_as_drawn() -> Result<()> {
+        let one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let s = one.symbols.first().ok_or(Error::Invalid("no symbol".into()))?;
+        let tag = s.tag.clone().ok_or(Error::Invalid("no tag".into()))?;
+        // The tag sits 30 mm left of the symbol, right-aligned: it grows further left.
+        let def = Symbol {
+            id: "wc.coil".into(),
+            pins: Vec::new(),
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: Default::default(),
+            graphics: Vec::new(),
+            tag_at: Point::new(-30.0, 0.0),
+            description: String::new(),
+            source: String::new(),
+        };
+        let (min, _) = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
+        let width = crate::font::text_width_mm(&format!("-{}999", tag.product.join(".")), TAG_HEIGHT);
+        assert!(min.x <= s.at.x - 30.0 - width + 1e-9, "{min:?}");
         Ok(())
     }
 

@@ -824,7 +824,13 @@ mod tests {
         undeclared.value_sets.iter_mut().for_each(|v| {
             v.values.remove("current");
         });
-        assert!(err_of(undeclared.check()).contains("{{current}} is used"));
+        let err = err_of(undeclared.check());
+        // The name is quoted (escaped), so odd characters in it cannot reach a terminal raw.
+        assert!(
+            err.contains("{{current}} is used") && err.contains(&format!("macro {:?}:", undeclared.name)),
+            "{err}"
+        );
+        assert!(err.contains("macro \""), "{err}");
 
         let mut twice = starter()?;
         twice.placeholders.push(Placeholder {
@@ -881,7 +887,12 @@ mod tests {
         assert!(m.value_sets.iter().all(|v| !v.values.keys().any(|k| key(k) == "kw")));
         m.check()?;
         assert!(err_of(m.rename_declared("power", "Part")).contains("there already"));
-        assert!(err_of(m.rename_declared("volts", "v")).contains("no placeholder volts"));
+        let err = err_of(m.rename_declared("volts", "v"));
+        assert!(
+            err.contains("no placeholder volts") && err.contains(&format!("macro {:?}:", m.name)),
+            "{err}"
+        );
+        assert!(err.contains("macro \""), "{err}");
 
         // A set giving the placeholder under two spellings keeps the value placing used.
         let mut twice = starter()?;
