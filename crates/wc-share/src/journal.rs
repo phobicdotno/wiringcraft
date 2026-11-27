@@ -631,4 +631,173 @@ mod tests {
         assert_eq!(std::fs::read(&path)?, b"mine");
         Ok(())
     }
+
+    #[test]
+    fn replace_file_writes_over_the_file_and_over_a_staging_file_left_behind() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("project.json");
+        std::fs::write(&path, b"old")?;
+        // A staging file from an earlier failure is replaced, not appended to or in the way.
+        std::fs::write(tmp.path().join("project.json.restore"), b"stale and longer")?;
+        replace_file(&path, b"new")?;
+        assert_eq!(std::fs::read(&path)?, b"new");
+        assert!(
+            !tmp.path().join("project.json.restore").exists(),
+            "the staging file became the file"
+        );
+        // A file that is not there yet is made.
+        let fresh = tmp.path().join("devices.json");
+        replace_file(&fresh, b"made")?;
+        assert_eq!(std::fs::read(&fresh)?, b"made");
+        Ok(())
+    }
+
+    #[test]
+    fn replace_file_into_a_missing_folder_fails_and_leaves_nothing() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("gone").join("project.json");
+        assert!(replace_file(&path, b"x").is_err());
+        assert!(!tmp.path().join("gone").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_put_back_is_kept_and_finished_before_the_next_change() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let mut journal = GitJournal::open(tmp.path())?;
+        assert!(journal.git().is_repo(), "open makes the folder a repository");
+        assert_eq!(journal.dir(), tmp.path());
+        let added = tmp.path().join("added.json");
+        std::fs::write(&added, b"added by the change")?;
+        let blocked = tmp.path().join("later").join("was.json");
+        let failed = journal.put_back(vec![
+            (added.clone(), None),
+            // Removing a file that is not there is nothing to do.
+            (tmp.path().join("never.json"), None),
+            (blocked.clone(), Some(b"was".to_vec())),
+        ]);
+        assert!(
+            matches!(&failed, Some(wc_core::Error::Io { path, .. }) if *path == blocked),
+            "{failed:?}"
+        );
+        assert!(!added.exists(), "a file the change added is removed");
+        assert_eq!(journal.rollback_left, [(blocked.clone(), Some(b"was".to_vec()))]);
+        // Still failing: refused again, and kept for the next try.
+        assert!(journal.finish_rollback().is_err());
+        assert_eq!(journal.rollback_left.len(), 1);
+        std::fs::create_dir(tmp.path().join("later"))?;
+        journal.finish_rollback()?;
+        assert_eq!(std::fs::read(&blocked)?, b"was");
+        assert!(journal.rollback_left.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_memory_journal_keeps_changes_vendored_ids_and_pictures_in_order() -> TestResult {
+        let mut journal = MemoryJournal::default();
+        let project = Project::new("demo");
+        let change = |message: &str| Change {
+            by: 7,
+            author: "Ann <ann@example.com>".into(),
+            page: Some("1".into()),
+            message: message.into(),
+        };
+        journal.record(&project, &change("first"))?;
+        journal.record(&project, &change("second"))?;
+        let symbol = Symbol {
+            source: String::new(),
+            id: "coil".into(),
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: Default::default(),
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let part = Part {
+            id: "relay-24v".into(),
+            ..Default::default()
+        };
+        journal.vendor(&[symbol], &[part])?;
+        journal.picture(&Picture {
+            file: "pictures/logo.png".into(),
+            data: b"png".to_vec(),
+        })?;
+        journal.restore(&project)?;
+        assert_eq!(journal.changes, [change("first"), change("second")]);
+        assert_eq!(journal.vendored, ["coil", "relay-24v"], "symbols first, then parts");
+        assert_eq!(journal.pictures, ["pictures/logo.png"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_picture_outside_the_picture_folders_or_empty_is_refused_and_writes_nothing() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        for (file, data) in [
+            ("pages/logo.png", &b"png"[..]),
+            ("pictures/../project.json", b"png"),
+            ("/tmp/logo.png", b"png"),
+            ("pictures/logo.png", b""),
+        ] {
+            let picture = Picture {
+                file: file.into(),
+                data: data.to_vec(),
+            };
+            let r = write_picture(tmp.path(), &picture);
+            assert!(
+                matches!(&r, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "{file}: {r:?}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(tmp.path())?.count(), 0, "no folder or file made");
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_picture_that_is_not_there_is_a_storage_failure() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let picture = Picture {
+            file: "underlays/plan.png".into(),
+            data: b"theirs".to_vec(),
+        };
+        let r = replace_picture(tmp.path(), &picture, b"mine");
+        assert!(
+            matches!(&r, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
+            "{r:?}"
+        );
+        let names: Vec<_> = std::fs::read_dir(tmp.path().join("underlays"))?.collect();
+        assert!(names.is_empty(), "no picture and no aside file: {names:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_that_finds_the_name_taken_is_not_worked_around() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let (part, path) = (tmp.path().join(".logo.png.part"), tmp.path().join("logo.png"));
+        std::fs::write(&part, b"new")?;
+        let taken = |_: &std::path::Path, _: &std::path::Path| -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "taken"))
+        };
+        let r = publish_with(&part, &path, taken);
+        assert!(r.is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists));
+        assert!(!path.exists(), "no rename over the name");
+        assert_eq!(std::fs::read(&part)?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn free_part_names_are_new_and_differ() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let a = free_part_name(tmp.path(), "aside")?;
+        let b = free_part_name(tmp.path(), "aside")?;
+        assert_ne!(a, b);
+        for name in [&a, &b] {
+            assert_eq!(name.parent(), Some(tmp.path()));
+            assert!(name.extension().is_some_and(|e| e == "aside"), "{name:?}");
+            assert!(!name.exists());
+        }
+        Ok(())
+    }
 }
