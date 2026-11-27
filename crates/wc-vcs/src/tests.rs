@@ -1211,3 +1211,33 @@ fn the_exclude_scratch_file_sits_beside_the_list() {
         Some(format!("exclude.{}.new", std::process::id()).as_str())
     );
 }
+
+#[test]
+fn a_subject_with_git_log_separators_keeps_its_commit() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let mut p = store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    if let Some(page) = p.page_mut("p0001") {
+        page.title = "Cover sheet".into();
+    }
+    store::save(dir, &p)?;
+    let subject = "Rename \u{1e}cover\u{1f} sheet";
+    git.commit(subject)?;
+
+    let rows = history(&git, 50)?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows.first().map(|r| r.commit.subject.as_str()), Some(subject));
+    assert!(rows.first().is_some_and(|r| r.commit.head), "{rows:?}");
+    // The map stays well-formed XML: the separators are left out of its text.
+    let svg = subway_svg(&rows);
+    assert!(svg.contains("Rename cover sheet"), "{svg}");
+    assert!(!svg.contains(['\u{1e}', '\u{1f}']), "{svg}");
+
+    let h = page_history(&git, "p0001", 10)?;
+    let subjects: Vec<&str> = h.iter().map(|v| v.subject.as_str()).collect();
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert_eq!(subjects.first(), Some(&subject));
+    Ok(())
+}
