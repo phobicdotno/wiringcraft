@@ -345,33 +345,86 @@ fn arc_numbers(s: &str) -> (Vec<f64>, Option<String>) {
     (out, error)
 }
 
+/// The most points in the filled outlines of one `<path>` with several closed sub-paths; a
+/// bigger fill would take too long to cut into triangles for the canvas, so it stays outlines.
+const MAX_HOLE_FILL_POINTS: usize = 20_000;
+
+/// Whether `pt` lies on an edge of the loop (within a hair).
+fn on_edge(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+    lp.iter().zip(lp.iter().cycle().skip(1)).any(|(&a, &b)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((pt.0 - a.0) * dx + (pt.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (cx, cy) = (a.0 + t * dx - pt.0, a.1 + t * dy - pt.1);
+        cx * cx + cy * cy <= 1e-18_f64.max(len2 * 1e-20)
+    })
+}
+
 /// The closed sub-paths of one filled `<path>` as filled outlines with their holes cut in (see
-/// [`crate::dxf::with_holes_kept`]), so a ring or a letter O keeps its hole open. With the
-/// `nonzero` rule a sub-path inside another one that runs the same way adds to it rather than
-/// cutting a hole, so only the outlines where the fill starts or stops are kept; with `evenodd`
-/// every nested outline switches it. Nesting is read from each sub-path's first point, so
-/// sub-paths that cross each other are taken as nested or apart, not as overlapping. `None`
-/// when the sub-paths are too many or too big to work out.
-fn solid_parts(rings: &[Vec<Point>], even_odd: bool) -> Option<Vec<Vec<Point>>> {
+/// [`crate::dxf::with_holes_kept`]), so a ring or a letter O keeps its hole open, and the
+/// indices of the sub-paths that are not an edge of the fill (too few points, or inside one
+/// that runs the same way under `nonzero`), to be drawn as outlines. With `nonzero` a sub-path
+/// inside another one that runs the same way adds to it rather than cutting a hole, so only the
+/// outlines where the fill starts or stops are kept; with `evenodd` every nested outline
+/// switches it. Nesting is read from a point of each sub-path that is on no other one (a hole
+/// may touch the outline around it), so sub-paths that cross each other are taken as nested or
+/// apart, not as overlapping. `None` when the sub-paths are too many or too big to work out.
+fn solid_parts(rings: &[Vec<Point>], even_odd: bool) -> Option<(Vec<Vec<Point>>, Vec<usize>)> {
     use crate::dxf::{Loop, NESTING_BUDGET, area2, inside, with_holes_kept};
-    let mut loops: Vec<Loop> = rings
-        .iter()
-        .map(|r| r.iter().map(|p| (p.x, p.y)).collect::<Loop>())
-        .filter(|l| l.len() >= 3)
-        .collect();
+    let mut left_out: Vec<usize> = Vec::new();
+    let mut loops: Vec<(usize, Loop)> = Vec::new();
+    for (i, r) in rings.iter().enumerate() {
+        let l: Loop = r.iter().map(|p| (p.x, p.y)).collect();
+        if l.len() >= 3 {
+            loops.push((i, l));
+        } else {
+            left_out.push(i);
+        }
+    }
+    // Start each loop at a point on no other loop, so the nesting tests (here and in
+    // `with_holes_kept`, which read the first point) are not thrown by a touching edge.
+    let mut work = 0usize;
+    let all: Vec<Loop> = loops.iter().map(|(_, l)| l.clone()).collect();
+    for (n, (_, lp)) in loops.iter_mut().enumerate() {
+        let mut start = None;
+        for (v, &pt) in lp.iter().enumerate() {
+            let mut clear = true;
+            for (k, other) in all.iter().enumerate() {
+                if k == n {
+                    continue;
+                }
+                work = work.saturating_add(other.len());
+                if work > NESTING_BUDGET {
+                    return None;
+                }
+                if on_edge(pt, other) {
+                    clear = false;
+                    break;
+                }
+            }
+            if clear {
+                start = Some(v);
+                break;
+            }
+        }
+        lp.rotate_left(start?);
+    }
     if !even_odd {
         // Biggest first, so the loop around another comes before it.
-        loops.sort_by(|a, b| area2(b).abs().total_cmp(&area2(a).abs()));
+        loops.sort_by(|a, b| area2(&b.1).abs().total_cmp(&area2(&a.1).abs()));
         // The winding number inside each loop (but outside the loops in it): its own turn plus
         // those of every loop around it.
         let mut winding: Vec<i64> = Vec::with_capacity(loops.len());
         let mut keep: Vec<bool> = Vec::with_capacity(loops.len());
-        let mut work = 0usize;
-        for (i, lp) in loops.iter().enumerate() {
+        for (i, (_, lp)) in loops.iter().enumerate() {
             let pt = *lp.first()?;
             let mut around = None;
             for k in (0..i).rev() {
-                let other = loops.get(k)?;
+                let other = &loops.get(k)?.1;
                 work = work.saturating_add(other.len());
                 if work > NESTING_BUDGET {
                     return None;
@@ -389,15 +442,27 @@ fn solid_parts(rings: &[Vec<Point>], even_odd: bool) -> Option<Vec<Vec<Point>>> 
             winding.push(w);
         }
         let mut kept = keep.into_iter();
-        loops.retain(|_| kept.next().unwrap_or(false));
+        loops.retain(|(i, _)| {
+            let k = kept.next().unwrap_or(false);
+            if !k {
+                left_out.push(*i);
+            }
+            k
+        });
     }
-    let (solid, _) = with_holes_kept(&loops, 0)?;
-    Some(
+    let only: Vec<Loop> = loops.iter().map(|(_, l)| l.clone()).collect();
+    let (solid, _) = with_holes_kept(&only, 0)?;
+    if solid.iter().map(Vec::len).sum::<usize>() > MAX_HOLE_FILL_POINTS {
+        return None;
+    }
+    left_out.sort_unstable();
+    Some((
         solid
             .into_iter()
             .map(|l| l.into_iter().map(|(x, y)| Point::new(x, y)).collect())
             .collect(),
-    )
+        left_out,
+    ))
 }
 
 /// A point of path data, before its transform.
@@ -925,7 +990,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                     let solid = solid_parts(&closed, even_odd);
                     if solid.is_none() {
                         warnings.push(format!(
-                            "path {path_count} is drawn as outlines: its holes are too many or too big to cut"
+                            "path {path_count} is drawn as outlines: its holes are too many or too big to fill"
                         ));
                     }
                     solid
@@ -933,9 +998,17 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                     None
                 };
                 if pin_name.is_none() {
+                    let mut ring = 0usize;
                     for (pts, closed) in parts {
-                        if closed && solid.is_some() {
-                            continue;
+                        if closed {
+                            ring += 1;
+                            // A closed sub-path in the fill is drawn by it; the others (too few
+                            // points, or not an edge of the fill) keep their outline.
+                            if let Some((_, left_out)) = &solid
+                                && left_out.binary_search(&(ring - 1)).is_err()
+                            {
+                                continue;
+                            }
                         }
                         shapes.push(Shape::Polyline {
                             points: pts,
@@ -943,7 +1016,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                             filled: filled && closed && rings <= 1,
                         });
                     }
-                    for pts in solid.unwrap_or_default() {
+                    for pts in solid.map(|(fill, _)| fill).unwrap_or_default() {
                         shapes.push(Shape::Polyline {
                             points: pts,
                             closed: true,
@@ -1538,6 +1611,59 @@ mod tests {
         assert!(painted(&o, (5.0, 5.0)), "the island in it");
         assert!(painted(&o, (22.0, 2.0)), "the square apart");
         assert!(!painted(&o, (15.0, 2.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_hole_that_touches_the_outline_around_it_stays_open() -> Result<()> {
+        // The triangle starts on the square's right edge.
+        for rule in ["nonzero", "evenodd"] {
+            for d in ["M0 0H10V10H0Z M10 5L7 3L7 7Z", "M0 0H10V10H0Z M10 5L7 7L7 3Z"] {
+                let svg = format!(
+                    r##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="black" fill-rule="{rule}" d="{d}"/></svg>"##
+                );
+                let o = solid_outlines(&svg)?;
+                assert!(painted(&o, (2.0, 5.0)), "{rule} {d}");
+                if rule == "evenodd" || d.ends_with("L7 3L7 7Z") {
+                    // A hole: evenodd always, nonzero when it runs the other way.
+                    assert!(!painted(&o, (8.0, 5.0)), "{rule} {d}");
+                } else {
+                    assert!(painted(&o, (8.0, 5.0)), "nonzero, same way: no hole ({d})");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sub_paths_left_out_of_the_fill_keep_their_outline() -> Result<()> {
+        // A closed two-point line, and (nonzero) a square inside one that runs the same way:
+        // neither is an edge of the fill, so both stay outlines beside the one filled shape.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <path fill="black" d="M0 0H10V10H0Z M20 0L30 0Z M3 3H7V7H3Z"/>
+        </svg>"##;
+        let mut fills = fills_of(svg)?;
+        fills.sort_unstable();
+        assert_eq!(fills, vec![false, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_huge_fill_with_holes_stays_outlines_and_warns() -> Result<()> {
+        let mut d = String::from("M0 0");
+        for i in 1..=MAX_HOLE_FILL_POINTS {
+            d.push_str(&format!(" L{} {}", i as f64 * 0.01, if i % 2 == 0 { 0.0 } else { 0.5 }));
+        }
+        d.push_str(" V-100 H0 Z M1 -50 H2 V-49 H1 Z");
+        let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="black" d="{d}"/></svg>"##);
+        let (s, warnings) = symbol_with_warnings(&svg, "svg.huge", "Huge")?;
+        assert!(
+            s.graphics
+                .iter()
+                .all(|g| !matches!(g, Shape::Polyline { filled: true, .. })),
+            "no fill"
+        );
+        assert!(warnings.iter().any(|w| w.contains("drawn as outlines")), "{warnings:?}");
         Ok(())
     }
 
