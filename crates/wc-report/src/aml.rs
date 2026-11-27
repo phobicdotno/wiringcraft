@@ -217,7 +217,7 @@ pub fn automationml(i: &Inputs<'_>, written: &str, file_name: &str) -> (String, 
                 } else {
                     format!("{base}#{count}")
                 };
-                if written.insert(link.clone()) {
+                if written.insert(esc(&link)) {
                     break link;
                 }
             };
