@@ -340,13 +340,10 @@ pub fn page_history(git: &Git, page: &str, limit: usize) -> Result<Vec<PageVersi
     wc_core::store::check_id(page)?;
     let path = format!("pages/{page}.page.json");
     let n = format!("-n{}", limit.max(1));
-    let text = git.run(&["log", &n, "--format=%H%x1f%an%x1f%at%x1f%s%x1e", "--", &path])?;
+    let text = git.run(&["log", &n, "--format=%H%x00%an%x00%at%x00%s%x00", "--", &path])?;
     let mut out = Vec::new();
-    for record in text.split('\u{1e}') {
-        let fields: Vec<&str> = record.trim().split('\u{1f}').collect();
-        let [commit, author, time, subject] = fields.as_slice() else {
-            continue;
-        };
+    // NUL-ended fields, so a subject holding any other character keeps its record whole.
+    for [commit, author, time, subject] in crate::log_records(&text) {
         let old_text = git.show(&format!("{commit}^"), &path);
         let new_text = git.show(commit, &path);
         let (had, has) = (old_text.is_some(), new_text.is_some());
@@ -365,10 +362,10 @@ pub fn page_history(git: &Git, page: &str, limit: usize) -> Result<Vec<PageVersi
             }],
         };
         out.push(PageVersion {
-            commit: (*commit).to_owned(),
-            author: (*author).to_owned(),
-            time: time.parse().unwrap_or(0),
-            subject: (*subject).to_owned(),
+            commit: commit.to_owned(),
+            author: author.to_owned(),
+            time: time.trim().parse().unwrap_or(0),
+            subject: subject.to_owned(),
             changes,
         });
     }
