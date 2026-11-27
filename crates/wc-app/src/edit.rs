@@ -855,13 +855,15 @@ impl Open {
             .cloned()
             .collect();
         let mut out_wires = Vec::new();
-        for w in carried_wires(p, &syms, &wires) {
+        // A wire whose end on a symbol left out has no position (the symbol or pin is missing)
+        // is left out too: it would still end on that symbol, and it is not drawn anyway.
+        'wires: for w in carried_wires(p, &syms, &wires) {
             let mut w = w.clone();
             for e in [&mut w.from, &mut w.to] {
                 if pin_item(e).is_some_and(|i| !syms.contains(i)) {
                     match self.end_pos(p, e) {
                         Some(at) => *e = Endpoint::Point { at },
-                        None => continue,
+                        None => continue 'wires,
                     }
                 }
             }
@@ -1845,6 +1847,23 @@ mod tests {
         assert!(o.project.pages[page].symbols.is_empty() && o.project.pages[page].wires.is_empty());
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn a_copied_wire_whose_end_pin_is_not_found_is_left_out() {
+        let (_tmp, mut o, page, _a, b) = setup();
+        // The end on `b` names a pin its symbol does not have, so it has no position.
+        o.project.pages[page].wires[0].to = Endpoint::Pin {
+            item: b.clone(),
+            pin: "gone".into(),
+        };
+        let w = o.project.pages[page].wires[0].id.clone();
+        let clip = o.copy(page, &[Selection::Wire(w)]);
+        assert!(
+            clip.wires.is_empty(),
+            "the wire would still end on the symbol it was copied without: {:?}",
+            clip.wires
+        );
     }
 
     #[test]
