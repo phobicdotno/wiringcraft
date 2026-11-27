@@ -171,8 +171,10 @@ enum Dialog {
     },
     /// The recorded versions of one page, newest first.
     PageHistory(String, Vec<wc_vcs::PageVersion>),
-    Commit(String),
-    NewBranch(String),
+    /// The version message, and whether its field has had the keyboard yet.
+    Commit(String, bool),
+    /// The branch name, and whether its field has had the keyboard yet.
+    NewBranch(String, bool),
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
@@ -2305,8 +2307,8 @@ impl App {
                     Err(e) => self.dialog = Some(Dialog::Message(format!("The library could not be opened:\n{e}"))),
                 }
             }
-            Action::Commit => self.dialog = Some(Dialog::Commit(String::new())),
-            Action::NewBranch => self.dialog = Some(Dialog::NewBranch(String::new())),
+            Action::Commit => self.dialog = Some(Dialog::Commit(String::new(), false)),
+            Action::NewBranch => self.dialog = Some(Dialog::NewBranch(String::new(), false)),
             Action::History => match wc_vcs::subway::history(&wc_vcs::Git::new(&open.dir), 200) {
                 Ok(rows) => self.dialog = Some(Dialog::History(rows)),
                 Err(e) => self.dialog = Some(Dialog::Message(format!("No history yet:\n{e}"))),
@@ -2515,8 +2517,8 @@ impl App {
             Dialog::Translations(_) => "Translations",
             Dialog::PdfLanguage { .. } => "Export PDF",
             Dialog::Rules { .. } => "Check rules",
-            Dialog::Commit(_) => "Record a version",
-            Dialog::NewBranch(_) => "New branch",
+            Dialog::Commit(..) => "Record a version",
+            Dialog::NewBranch(..) => "New branch",
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
@@ -3995,20 +3997,28 @@ impl App {
                         }
                     });
                 }
-                Dialog::Commit(msg) => {
+                Dialog::Commit(msg, focused) => {
                     ui.label("What changed?");
-                    ui.add(egui::TextEdit::multiline(msg).desired_rows(3).desired_width(380.0));
+                    let r = ui.add(egui::TextEdit::multiline(msg).desired_rows(3).desired_width(380.0));
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
                     ui.horizontal(|ui| {
-                        if ui
+                        // Enter starts a new line in the message; Ctrl+Enter records it.
+                        let enter = r.has_focus() && ui.input(|i| pressed_with(i, Key::Enter, |m| m.command_only()));
+                        if (ui
                             .add_enabled(!msg.trim().is_empty(), egui::Button::new("Commit"))
                             .on_disabled_hover_text("Describe what changed first.")
                             .clicked()
+                            || enter)
+                            && !msg.trim().is_empty()
                         {
                             let m = msg.trim().to_owned();
                             then = Some(Box::new(move |app: &mut App| app.commit(&m)));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -4311,20 +4321,31 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewBranch(name) => {
+                Dialog::NewBranch(name, focused) => {
                     ui.label("Branch name (for example customer-changes):");
-                    ui.text_edit_singleline(name);
+                    let r = ui.text_edit_singleline(name);
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
                     ui.horizontal(|ui| {
-                        if ui
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if (ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Create and switch"))
                             .on_disabled_hover_text("Name the branch first.")
                             .clicked()
+                            || enter)
+                            && !name.trim().is_empty()
                         {
                             let n = name.trim().to_owned();
                             then = Some(Box::new(move |app: &mut App| app.branch(&n)));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        else if enter {
+                            // Enter on a blank name took the keyboard from the field: give it back.
+                            r.request_focus();
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -8192,6 +8213,46 @@ mod nudge_tests {
             sent.extend(app_frame(app, ctx, events, false));
         }
         sent
+    }
+
+    fn key(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// The version and branch dialogs give their field the keyboard when they open, so typing
+    /// goes straight in; Enter (Ctrl+Enter in the multi-line message) does nothing while the
+    /// field is blank, and Escape cancels them.
+    #[test]
+    fn version_and_branch_dialogs_take_typing_at_once_and_close_on_escape() {
+        for commit in [true, false] {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            app.dialog = Some(if commit {
+                Dialog::Commit(String::new(), false)
+            } else {
+                Dialog::NewBranch(String::new(), false)
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            let confirm = key(Key::Enter, if commit { Modifiers::COMMAND } else { Modifiers::NONE });
+            app_frame(&mut app, &ctx, vec![confirm], false);
+            assert!(app.dialog.is_some(), "commit {commit}: nothing to confirm yet");
+            app_frame(&mut app, &ctx, vec![egui::Event::Text("fix".into())], false);
+            match &app.dialog {
+                Some(Dialog::Commit(text, _) | Dialog::NewBranch(text, _)) => {
+                    assert_eq!(text, "fix", "commit {commit}: typed into the field")
+                }
+                _ => unreachable!("commit {commit}: the dialog stays open"),
+            }
+            app_frame(&mut app, &ctx, vec![key(Key::Escape, Modifiers::NONE)], false);
+            assert!(app.dialog.is_none(), "commit {commit}: Escape cancels");
+        }
     }
 
     /// An app with its coil moved one step: the project has unsaved changes.
