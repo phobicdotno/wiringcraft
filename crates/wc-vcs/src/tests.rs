@@ -369,6 +369,53 @@ fn a_merge_with_unrecorded_changes_is_refused() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_merge_conflict_names_a_file_with_an_accent_as_it_is() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    std::fs::create_dir_all(dir.join("pages")).map_err(|e| wc_core::Error::io("pages", e))?;
+    let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).map_err(|e| wc_core::Error::io(name, e));
+    write("pages/øvre.page.json", "base\n")?;
+    write("two words.txt", "base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("pages/øvre.page.json", "other\n")?;
+    write("two words.txt", "other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("pages/øvre.page.json", "main\n")?;
+    write("two words.txt", "main\n")?;
+    git.commit("main")?;
+    assert_eq!(
+        git.merge("other")?,
+        MergeOutcome::Conflicts(vec!["pages/øvre.page.json".into(), "two words.txt".into()])
+    );
+    Ok(())
+}
+
+#[test]
+fn a_version_that_starts_with_a_dash_is_not_a_git_option() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    // As an option, `--output=<file>` makes git write that file and report no error.
+    assert!(changes(&git, "--output=x", None).is_err());
+    assert!(!dir.join("x").exists());
+    assert!(changes(&git, &base, Some("--output=y")).is_err());
+    assert!(!dir.join("y").exists());
+    assert!(changes(&git, "--output=x", Some("--output=y")).is_err());
+    assert!(!dir.join("x").exists() && !dir.join("y").exists());
+    // A real version is still read.
+    assert!(changes(&git, &base, None)?.is_empty());
+    assert!(changes(&git, &base, Some(&base))?.is_empty());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {

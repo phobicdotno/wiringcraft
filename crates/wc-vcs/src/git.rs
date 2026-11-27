@@ -551,10 +551,12 @@ impl Git {
                 MergeOutcome::Merged
             }),
             Err(e) => {
+                // `-z`: paths as they are (no quoting of accents, tabs or quotes), NUL-ended.
                 let conflicts: Vec<String> = self
-                    .run(&["diff", "--name-only", "--diff-filter=U"])
+                    .run(&["diff", "--name-only", "--diff-filter=U", "-z"])
                     .unwrap_or_default()
-                    .lines()
+                    .split('\0')
+                    .filter(|p| !p.is_empty())
                     .map(str::to_owned)
                     .collect();
                 if conflicts.is_empty() {
