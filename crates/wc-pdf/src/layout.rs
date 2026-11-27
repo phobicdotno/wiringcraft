@@ -64,6 +64,9 @@ impl Appearance {
 pub struct CrossRefs {
     pub mains: BTreeMap<DeviceTag, Vec<Appearance>>,
     pub auxes: BTreeMap<DeviceTag, Vec<Appearance>>,
+    /// Standalone devices by tag, such as a breaker or motor protection breaker: a contact
+    /// with no coil of its tag points to one of these instead (#1467).
+    pub standalones: BTreeMap<DeviceTag, Vec<Appearance>>,
     /// Interruption points on schematic pages, by tag.
     pub links: BTreeMap<DeviceTag, Vec<Appearance>>,
     /// Interruption points repeated on overview pages (line diagrams), by tag. They link
@@ -143,7 +146,12 @@ pub fn xref_marks(
                     });
                 }
             }
-            SymbolRole::Auxiliary => match xref.mains.get(tag).and_then(|m| m.first()) {
+            SymbolRole::Auxiliary => match xref
+                .mains
+                .get(tag)
+                .or_else(|| xref.standalones.get(tag))
+                .and_then(|m| m.first())
+            {
                 Some(main) => out.push(XrefMark {
                     at: tag_at.last().map_or(s.at, |(at, _)| *at + Point::new(0.0, 3.0)),
                     align: tag_align,
@@ -200,6 +208,7 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
+                    SymbolRole::Standalone => x.standalones.entry(tag.clone()).or_default().push(a),
                     // A contact repeated on an overview page (line diagram) is not listed
                     // under its coil again: the schematic page draws it in detail (#1076).
                     SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),

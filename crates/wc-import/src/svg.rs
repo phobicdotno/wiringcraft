@@ -1,6 +1,7 @@
 //! SVG symbol import. Pins are marked by `id="pin:NAME"`, `data-pin="NAME"` or
 //! `class="pin"` (named by order). One SVG user unit is one millimetre unless the root element
-//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox.
+//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox, or a height
+//! in one when the width is missing or a percentage.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -917,13 +918,22 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
         if tag == "svg" && !seen_root {
             seen_root = true;
-            // width="40mm" with viewBox="0 0 80 160" means 0.5 mm per unit.
-            if let (Some(w), Some(vb)) = (attr(&e, "width"), attr(&e, "viewBox")) {
+            // width="40mm" with viewBox="0 0 80 160" means 0.5 mm per unit. With no width, or a
+            // percentage or `auto` one, a browser sizes the width from the height instead.
+            if let Some(vb) = attr(&e, "viewBox") {
                 let vbn = numbers(&vb);
-                if let (Some(wmm), 4) = (length_mm(&w), vbn.len())
-                    && vbn[2] > 0.0
+                let w = attr(&e, "width");
+                let w = w.as_deref().map(str::trim);
+                let by_height = w.is_none_or(|w| w.ends_with('%') || w.eq_ignore_ascii_case("auto"));
+                let size = if by_height {
+                    attr(&e, "height").and_then(|h| length_mm(&h)).map(|h| (h, 3))
+                } else {
+                    w.and_then(length_mm).map(|w| (w, 2))
+                };
+                if let (Some((mm, i)), 4) = (size, vbn.len())
+                    && vbn[i] > 0.0
                 {
-                    let s = wmm / vbn[2];
+                    let s = mm / vbn[i];
                     m = m.mul(&M([s, 0.0, 0.0, s, -vbn[0] * s, -vbn[1] * s]));
                 }
             }
@@ -1255,6 +1265,31 @@ mod tests {
             let s = symbol(&svg, "svg.u", "U")?;
             assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 80.0).abs() < 1e-3, "{w}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn viewbox_height_sizes_the_symbol_when_the_width_is_missing_or_a_percentage() -> Result<()> {
+        // 10 mm over a viewBox 20 high: 0.5 mm per unit, so 40 units come in as 20 mm.
+        for w in ["", r#"width="100%""#, r#"width="auto""#] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" {w} height="10mm" viewBox="0 0 40 20">
+                    <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="40" cy="20" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            let (a, b) = (pin_at(&s, "1"), pin_at(&s, "2"));
+            assert!(
+                ((b.x - a.x) - 20.0).abs() < 1e-3 && ((b.y - a.y) - 10.0).abs() < 1e-3,
+                "{w}: {a:?} {b:?}"
+            );
+        }
+        // An absolute width still wins over the height.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="80mm" height="10mm" viewBox="0 0 40 20">
+            <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="40" cy="0" r="1"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.u", "U")?;
+        assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 80.0).abs() < 1e-3);
         Ok(())
     }
 
