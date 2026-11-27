@@ -200,6 +200,7 @@ pub fn relative_file_is_safe(f: &str) -> bool {
 
 /// Terminals of one strip bridged together by a jumper: they form one potential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredJumper")]
 pub struct Jumper {
     /// The strip, e.g. `-X1`.
     pub strip: DeviceTag,
@@ -209,6 +210,43 @@ pub struct Jumper {
     /// list and written in the WAGO configurator export.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+}
+
+/// A [`Jumper`] as read from `project.toml`, before its terminals are checked.
+#[derive(Deserialize)]
+struct StoredJumper {
+    strip: DeviceTag,
+    terminals: Vec<String>,
+    #[serde(default)]
+    part: Option<String>,
+}
+
+impl TryFrom<StoredJumper> for Jumper {
+    type Error = String;
+
+    /// Refuses a jumper naming a number that cannot be a terminal of its strip, or with fewer
+    /// than two different terminals (a hand edit or another tool), as
+    /// [`ProjectMeta::add_jumper`] does.
+    fn try_from(j: StoredJumper) -> Result<Self, String> {
+        let mut distinct: Vec<&String> = Vec::new();
+        for t in &j.terminals {
+            check_terminal_number(&j.strip, t)?;
+            if !distinct.contains(&t) {
+                distinct.push(t);
+            }
+        }
+        if distinct.len() < 2 {
+            return Err(format!(
+                "the jumper on {} needs at least two different terminals of the strip",
+                j.strip
+            ));
+        }
+        Ok(Jumper {
+            strip: j.strip,
+            terminals: j.terminals,
+            part: j.part,
+        })
+    }
 }
 
 /// How a terminal strip is arranged on its rail: the order of its terminals and the spare
@@ -836,6 +874,7 @@ impl ProjectMeta {
     /// Take `terminal` of `strip` out of its jumper; a jumper left with one terminal goes.
     /// Returns whether anything changed.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let terminal = terminal.trim();
         let mut changed = false;
         for j in self.jumpers.iter_mut().filter(|j| &j.strip == strip) {
             let before = j.terminals.len();
@@ -927,6 +966,7 @@ impl ProjectMeta {
     /// Give the jumper that holds `terminal` of `strip` a part, or none. Returns whether that
     /// changed anything; `Err` when the terminal is in no jumper.
     pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<bool, String> {
+        let terminal = terminal.trim();
         let j = self
             .jumpers
             .iter_mut()
@@ -2540,6 +2580,20 @@ mod tests {
     }
 
     #[test]
+    fn jumper_edits_trim_the_terminal_number_like_adding_does() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&[" 1 ", "2", "3"]))?;
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert!(m.set_jumper_part(&x1, " 2 ", Some("wago.2002-403"))?);
+        assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-403"));
+        assert!(m.remove_from_jumper(&x1, " 3 "));
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2"]));
+        Ok(())
+    }
+
+    #[test]
     fn a_jumper_keeps_its_part_through_merges_renames_and_saving() -> Result<(), Box<dyn std::error::Error>> {
         let x1 = DeviceTag::parse("-X1")?;
         let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
@@ -2805,6 +2859,24 @@ mod tests {
         assert_eq!(m, once, "the same terminals in another order change nothing");
         assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
         Ok(())
+    }
+
+    #[test]
+    fn a_hand_edited_jumper_is_checked_on_load() {
+        let load = |terminals: &str| {
+            let text = format!("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = {terminals}\n");
+            toml::from_str::<ProjectMeta>(&text).map_err(|e| e.to_string())
+        };
+        for bad in [r#"["1.2", "3"]"#, r#"["", "3"]"#, r#"["a b", "3"]"#] {
+            let err = load(bad).err().unwrap_or_default();
+            assert!(err.contains("cannot be a terminal of -X1"), "{bad}: {err}");
+        }
+        for single in [r#"["3"]"#, r#"["3", "3"]"#, "[]"] {
+            let err = load(single).err().unwrap_or_default();
+            assert!(err.contains("at least two different terminals"), "{single}: {err}");
+        }
+        let ok = load(r#"["3", "4"]"#).map(|m| m.jumpers.len());
+        assert_eq!(ok, Ok(1));
     }
 
     #[test]

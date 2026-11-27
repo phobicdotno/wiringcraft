@@ -2661,11 +2661,13 @@ fn run(mut cli: Cli) -> Res<()> {
                     );
                 }
                 PanelCmd::Arrange { id, location } => {
-                    let parts = vendored_parts(dir, &p);
                     let mut panels = std::mem::take(&mut p.panels);
                     let Some(panel) = panels.iter_mut().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
                     };
+                    // A device whose part copy cannot be read is left off the plate, so the
+                    // part is named in a warning rather than left out without a word.
+                    let parts = vendored_parts_warning_unreadable(dir, &p);
                     let done = wc_core::panel::arrange(panel, &p, &parts, location.as_deref());
                     p.panels = panels;
                     println!("placed {} device(s): {}", done.placed.len(), done.placed.join(", "));
@@ -2683,7 +2685,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     let Some(panel) = p.panels.iter().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
                     };
-                    let parts = vendored_parts(dir, &p);
+                    // Warned about, so a part that cannot be read is not taken for one
+                    // without a depth.
+                    let parts = vendored_parts_warning_unreadable(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
                     write_out(dir, &out, &step.text).map_err(e)?;
                     println!(
@@ -4196,7 +4200,12 @@ fn run(mut cli: Cli) -> Res<()> {
             if format == "csv" && sep == ';' && out.is_some() {
                 text.push('\u{feff}');
             }
-            for k in kinds {
+            for (i, k) in kinds.into_iter().enumerate() {
+                // CSV tables end with their own line end: a blank line only goes between two of
+                // them, so a file of one table has no empty record at its end.
+                if format == "csv" && i > 0 {
+                    text.push('\n');
+                }
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
                     "csv" => t.to_csv_with(sep),
@@ -4204,7 +4213,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     "text" => plain_table(&t),
                     other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
                 });
-                text.push('\n');
+                if format != "csv" {
+                    text.push('\n');
+                }
             }
             match out {
                 Some(path) => write_out(dir, &path, text).map_err(e)?,
@@ -4227,7 +4238,14 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::Aml { out } => {
             let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            // The export is built without such a symbol (its connection points are left out),
+            // so it is warned about as `pdf` does.
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            warn(
+                missing
+                    .iter()
+                    .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
+            );
             let parts = vendored_parts(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
@@ -4255,7 +4273,14 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::PlcVars { out } => {
             let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            // The list is built without such a symbol (its points are left out), so it is
+            // warned about as `pdf` does.
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            warn(
+                missing
+                    .iter()
+                    .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
+            );
             let parts = vendored_parts(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
@@ -4274,7 +4299,14 @@ fn run(mut cli: Cli) -> Res<()> {
         }
         Cmd::Nets => {
             let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            // The nets are linked without such a symbol's role, so it is warned about as `pdf`
+            // does.
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            warn(
+                missing
+                    .iter()
+                    .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
+            );
             let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id).map(|s| s.role));
             for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
@@ -6340,7 +6372,7 @@ fn vendored_parts_warning_unreadable(
             }
             // The part id and the reason come from the project: escaped, so they cannot steer
             // the terminal.
-            Err(err) => eprintln!("warning: {}", escape_field(&format!("cannot read part {id}: {err}"))),
+            Err(err) => warn([format!("cannot read part {id}: {err}")]),
         }
     }
     parts
@@ -10687,7 +10719,8 @@ mod tests {
         )
         .unwrap();
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
-        assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
+        assert_eq!(wires, std::fs::read_to_string(&one).unwrap());
+        assert!(wires.ends_with("\r\n") && !wires.ends_with("\r\n\n"), "{wires:?}");
     }
 
     #[test]
@@ -10746,7 +10779,7 @@ mod tests {
             assert!(csv.starts_with('\u{feff}'), "{}: {csv}", k.name());
         }
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
-        assert_eq!(format!("{wires}\n"), semi);
+        assert_eq!(wires, semi);
         // Only `,` and `;`, and only for CSV.
         assert!(cli(&dir, &["report", "wires", "--format", "csv", "--sep", "|"]).is_err());
         assert!(cli(&dir, &["report", "wires", "--format", "md", "--sep", ";"]).is_err());
