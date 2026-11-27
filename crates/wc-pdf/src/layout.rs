@@ -43,10 +43,12 @@ pub struct Appearance {
 }
 
 impl Appearance {
+    /// `page/column.row`, such as `3/2.B`. Blanks around a stored page number are left out, as
+    /// wire numbering leaves them out.
     pub fn location(&self) -> String {
         format!(
             "{}/{}.{}",
-            self.page_number,
+            self.page_number.trim(),
             self.column,
             wc_core::project::row_letter(self.row)
         )
@@ -57,6 +59,9 @@ impl Appearance {
 pub struct CrossRefs {
     pub mains: BTreeMap<DeviceTag, Vec<Appearance>>,
     pub auxes: BTreeMap<DeviceTag, Vec<Appearance>>,
+    /// Standalone devices by tag, such as a breaker or motor protection breaker: a contact
+    /// with no coil of its tag points to one of these instead (#1467).
+    pub standalones: BTreeMap<DeviceTag, Vec<Appearance>>,
     /// Interruption points on schematic pages, by tag.
     pub links: BTreeMap<DeviceTag, Vec<Appearance>>,
     /// Interruption points repeated on overview pages (line diagrams), by tag. They link
@@ -128,15 +133,27 @@ pub fn xref_marks(
         match sym.role {
             SymbolRole::Main => {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
+                    // Only named pins are listed; a contact without any shows its location alone.
+                    let pins: Vec<&str> = a.pins.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+                    let text = if pins.is_empty() {
+                        a.location()
+                    } else {
+                        format!("{} {}", pins.join("-"), a.location())
+                    };
                     out.push(XrefMark {
                         at: Point::new(s.at.x + 5.0, below + 3.5 + line_h * i as f64),
                         align: Align::Left,
-                        text: format!("{} {}", a.pins.join("-"), a.location()),
+                        text,
                         target_page_id: a.page_id.clone(),
                     });
                 }
             }
-            SymbolRole::Auxiliary => match xref.mains.get(tag).and_then(|m| m.first()) {
+            SymbolRole::Auxiliary => match xref
+                .mains
+                .get(tag)
+                .or_else(|| xref.standalones.get(tag))
+                .and_then(|m| m.first())
+            {
                 Some(main) => out.push(XrefMark {
                     at: tag_at.last().map_or(s.at, |(at, _)| *at + Point::new(0.0, 3.0)),
                     align: tag_align,
@@ -191,6 +208,7 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
+                    SymbolRole::Standalone => x.standalones.entry(tag.clone()).or_default().push(a),
                     // A contact repeated on an overview page (line diagram) is not listed
                     // under its coil again: the schematic page draws it in detail (#1076).
                     SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),

@@ -10,6 +10,9 @@ use crate::agent::{AppTools, SYSTEM};
 use crate::screenshot::{self, MAX_WAITING, Shot};
 use crate::theme::Theme;
 
+/// Why "Connect with" is greyed out: the connection is not switched under an answer.
+const SWITCH_WHILE_BUSY: &str = "Wait for the assistant to finish answering before switching how it connects";
+
 impl App {
     fn uses_login(&self) -> bool {
         self.prefs.assistant.backend == Backend::ClaudeLogin
@@ -499,10 +502,12 @@ impl App {
                 changed |= ui
                     .radio_value(&mut self.prefs.assistant.backend, Backend::ClaudeLogin, "My Claude login")
                     .on_hover_text("Claude Code on this computer, signed in with your Claude account (Pro, Max, Team). No key needed.")
+                    .on_disabled_hover_text(SWITCH_WHILE_BUSY)
                     .changed();
                 changed |= ui
                     .radio_value(&mut self.prefs.assistant.backend, Backend::ApiKey, "API key")
                     .on_hover_text("An Anthropic API key, billed per use")
+                    .on_disabled_hover_text(SWITCH_WHILE_BUSY)
                     .changed();
             });
         });
