@@ -300,6 +300,15 @@ pub fn check_with_unreadable(
             }
         }
     }
+    // A breaker or motor protection breaker is one standalone symbol; its auxiliary contacts
+    // carry its tag and belong to it as their main function, as in Eplan (#1467).
+    let owners: BTreeSet<&DeviceTag> = p
+        .pages
+        .iter()
+        .flat_map(|pg| &pg.symbols)
+        .filter(|s| role(&s.symbol) == Some(SymbolRole::Standalone))
+        .filter_map(|s| s.tag.as_ref())
+        .collect();
     let partnered = |page: &Page, tag: &DeviceTag| {
         let schematic = links.get(tag).copied().unwrap_or(0);
         if page.overview {
@@ -311,7 +320,7 @@ pub fn check_with_unreadable(
     for page in &p.pages {
         for s in &page.symbols {
             match (role(&s.symbol), &s.tag) {
-                (Some(SymbolRole::Auxiliary), Some(tag)) if !mains.contains(tag) => {
+                (Some(SymbolRole::Auxiliary), Some(tag)) if !mains.contains(tag) && !owners.contains(tag) => {
                     out.push(at(page, &s.id, Severity::Warning, format!("contact {tag} has no coil")))
                 }
                 (Some(SymbolRole::Interruption), Some(tag)) if !partnered(page, tag) => {

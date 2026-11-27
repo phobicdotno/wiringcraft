@@ -1203,6 +1203,23 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
 }
 
 #[test]
+fn an_auxiliary_contact_of_a_standalone_breaker_has_no_missing_coil() {
+    // A breaker or MPCB is one standalone symbol; its aux contact belongs to it (#1467).
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s11", "no", 320.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s12", "lamp", 360.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s13", "no", 400.0, Some("-Q8")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let findings = check(&i);
+    assert!(!findings.iter().any(|f| f.message.contains("contact -Q9 has no coil")));
+    assert!(findings.iter().any(|f| f.message.contains("contact -Q8 has no coil")));
+}
+
+#[test]
 fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
