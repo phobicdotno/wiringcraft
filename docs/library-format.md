@@ -147,9 +147,11 @@ A part is an orderable article. It is read into `wc_core::Part`
 
 `import footprint-dxf` and `import model-step` fill `footprint` and `model`. On a panel layout
 a part's width and height come from its `Width` and `Height` properties first, then its
-footprint, then its model; its depth from `Depth`, then the model. The property names are
-matched without regard to case (German and Norwegian names such as `Breite` and `Høyde` work
-too), and the leading number of the value is used, so `"45 mm"` and `"45"` are both 45.
+footprint, then its model; its depth from `Depth`, then the model. German and Norwegian names
+work too: `Breite` and `Bredde`, `Höhe`, `Hoehe`, `Høyde` and `Hoyde`, `Tiefe` and `Dybde`
+(`Width mm`, `Height mm` and `Depth mm` also work). Width and height names are matched without regard to the case
+of the letters A to Z only, so write `ö` and `ø` in lower case (`HÖHE` is not found, `HöHE` is).
+The leading number of the value is used, so `"45 mm"` and `"45"` are both 45.
 
 `library/parts/example.ex-ct-9-24dc.json`:
 
@@ -180,7 +182,8 @@ The example parts are made-up data from a maker called `Example`.
 
 A project never draws from a library source directly. When it first uses a symbol or part, the
 item is copied to the project's `vendor/symbols/` or `vendor/parts/` and pinned in
-`library.lock` with the source it came from and its content hash:
+`library.lock` with the source it came from and its content hash (for the parts a placed macro
+names, see [Macros](#macros)):
 
 ```toml
 [symbols."wc.coil"]
@@ -286,4 +289,6 @@ without regard to case. A small example:
 
 Placing a macro gives its symbols fresh ids and the next free tags. Macros themselves have no
 hash and are not pinned: they are read from the source when placed. The symbols a placed macro
-uses are copied and pinned like any other symbol.
+uses are copied and pinned like any other symbol. The parts named in its `devices` are not
+copied or pinned yet (#1418): until `wiringcraft lib lock` is run, `lib status` shows them as not
+pinned and `check` warns that they are missing from the project's library copy.
