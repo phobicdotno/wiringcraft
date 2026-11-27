@@ -590,8 +590,11 @@ fn text_shapes(t: &str, at: &Sexp, effects: Option<&Sexp>, pt: &impl Fn(f64, f64
 /// usually Value. Hidden ones (KiCad 6/7 `(effects ... hide)`, KiCad 8+ `(hide yes)`) and
 /// KiCad's own `ki_` keys are left out.
 fn visible_fields(sym: &Sexp, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Vec<Shape> {
-    let hidden = |s: &Sexp| {
-        s.items().iter().any(|i| i.atom() == Some("hide")) || s.first("hide").and_then(|h| h.arg(1)) == Some("yes")
+    // A bare `hide` flag is read from item `from` on: a property's key and value come first,
+    // and a field whose key or text is "hide" is not hidden by it.
+    let hidden = |s: &Sexp, from: usize| {
+        s.items().iter().skip(from).any(|i| i.atom() == Some("hide"))
+            || s.first("hide").and_then(|h| h.arg(1)) == Some("yes")
     };
     let mut out = Vec::new();
     for p in sym.all("property") {
@@ -603,8 +606,8 @@ fn visible_fields(sym: &Sexp, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Ve
             || key.starts_with("ki_")
             || value.trim().is_empty()
             || value == "~"
-            || hidden(p)
-            || effects.is_some_and(hidden)
+            || hidden(p, 3)
+            || effects.is_some_and(|e| hidden(e, 1))
         {
             continue;
         }
@@ -1153,6 +1156,7 @@ mod tests {
     (property "ki_keywords" "light" (at 0 0 0) (effects (font (size 1.27 1.27))))
     (property "Voltage" "24 V" (at 4 1 0) (effects (font (size 1 1))))
     (property "Spare" "~" (at 0 0 0))
+    (property "Note" "hide" (at 6 0 0) (effects (font (size 1 1))))
     (symbol "Lamp_1_1" (pin passive line (at 0 0 270) (length 0) (name "1") (number "1"))))
 )"#;
         let (syms, warnings) = symbols(lib, "k", 1.0)?;
@@ -1176,7 +1180,8 @@ mod tests {
             .collect();
         let names: Vec<&str> = texts.iter().map(|t| t.0).collect();
         // Reference, Description, KiCad's own keys, hidden fields and empty ones are not drawn.
-        assert_eq!(names, vec!["Lamp", "24 V"], "{texts:?}");
+        // A field whose text is "hide" is still shown.
+        assert_eq!(names, vec!["Lamp", "24 V", "hide"], "{texts:?}");
         // Placed like a text item: the Value reads bottom to top, its baseline half its
         // height to the right of `at` (0, 3 on the page).
         let (_, at, height, angle, align) = texts[0];
