@@ -2512,9 +2512,9 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
     let mut tag_warnings = Vec::new();
-    // Per symbol: how many were placed at an angle that is not a right angle, and the first
-    // such angle as the file gives it (none when out of range).
-    let mut odd_angles: BTreeMap<String, (usize, Option<f64>)> = BTreeMap::new();
+    // Per symbol: how many were placed at an angle that is not a right angle, the first such
+    // angle as the file gives it, and how many at an angle out of range (placed unturned).
+    let mut odd_angles: BTreeMap<String, (usize, Option<f64>, usize)> = BTreeMap::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -2594,10 +2594,13 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                     }
                     budget -= 1;
                     if odd {
-                        let entry = odd_angles
-                            .entry((*id).clone())
-                            .or_insert((0, in_range.then_some(angle)));
-                        entry.0 += 1;
+                        let entry = odd_angles.entry((*id).clone()).or_default();
+                        if in_range {
+                            entry.0 += 1;
+                            entry.1.get_or_insert(angle);
+                        } else {
+                            entry.2 += 1;
+                        }
                     }
                     let (x, y) = cells.at(cell, (ix, iy));
                     out.symbols.push(PlacedSymbol {
@@ -2618,16 +2621,22 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         }
         i = j;
     }
-    for (id, (count, first)) in odd_angles {
-        let angle = first.map_or_else(|| "an angle out of range".to_owned(), |a| format!("{a} degrees"));
-        let what = if count == 1 {
-            "1 placed".to_owned()
-        } else {
-            format!("{count} placed, the first")
-        };
-        tag_warnings.push(format!(
-            "{id}: {what} at {angle}, turned to the nearest right angle (symbols only turn in right angles)"
-        ));
+    for (id, (count, first, out_of_range)) in odd_angles {
+        let mut said = Vec::new();
+        if let Some(first) = first {
+            let what = if count == 1 {
+                "1 placed".to_owned()
+            } else {
+                format!("{count} placed, the first")
+            };
+            said.push(format!(
+                "{what} at {first} degrees, turned to the nearest right angle (symbols only turn in right angles)"
+            ));
+        }
+        if out_of_range > 0 {
+            said.push(format!("{out_of_range} placed at an angle out of range, left unturned"));
+        }
+        tag_warnings.push(format!("{id}: {}", said.join("; ")));
     }
     shapes(
         d,
@@ -3203,6 +3212,27 @@ mod tests {
                 p.warnings
             );
         }
+        Ok(())
+    }
+
+    /// An angle out of range is said as left unturned, apart from the rounded ones, whichever
+    /// comes first.
+    #[test]
+    fn an_angle_out_of_range_is_said_as_left_unturned() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let at = |angle: &str| format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+        let said = |ents: &str| -> Result<Vec<String>> {
+            let p = page(&dxf(ents, ""), 1.0, &known)?;
+            Ok(p.warnings.into_iter().filter(|w| w.starts_with("wc.coil:")).collect())
+        };
+        assert_eq!(
+            said(&at("1e9"))?,
+            ["wc.coil: 1 placed at an angle out of range, left unturned"]
+        );
+        let both = "wc.coil: 1 placed at 45 degrees, turned to the nearest right angle (symbols only turn in \
+                    right angles); 1 placed at an angle out of range, left unturned";
+        assert_eq!(said(&format!("{}{}", at("45"), at("1e9")))?, [both]);
+        assert_eq!(said(&format!("{}{}", at("1e9"), at("45")))?, [both]);
         Ok(())
     }
 
