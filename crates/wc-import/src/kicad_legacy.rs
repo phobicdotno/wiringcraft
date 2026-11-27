@@ -747,6 +747,12 @@ ENDDEF
             .count();
         assert_eq!(hidden_pins, 2, "{sym}");
         assert!(sym.contains("edge_clock_high") && sym.contains("output_low"), "{sym}");
+        // The shared importer draws those as plain pins and says so.
+        let (_, more) = crate::kicad::symbols(&sym, "kicad.x", 1.0)?;
+        assert!(
+            more.iter().any(|w| w.contains("pin mark (edge_clock_high)")),
+            "{more:?}"
+        );
         // A quoted text keeps `~` and reads `''` as a double quote.
         assert!(sym.contains(r#""a~b \"c\"""#), "{sym}");
         // Unit 3 has nothing drawn but is still declared.

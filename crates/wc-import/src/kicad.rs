@@ -443,6 +443,14 @@ fn convert(
                     if length > 0.0 {
                         graphics.extend(pin_shapes(g, tip, inward, length, scale));
                     }
+                    // A mark other than inverted or clock is drawn as a plain pin: said, not lost
+                    // silently (the connection point stays).
+                    if let Some(mark) = g
+                        .arg(2)
+                        .filter(|m| !matches!(*m, "line" | "inverted" | "clock" | "inverted_clock"))
+                    {
+                        *skipped.entry(format!("pin mark ({mark})")).or_default() += 1;
+                    }
                     pins.push(Pin {
                         name: pin_name,
                         at: tip,
