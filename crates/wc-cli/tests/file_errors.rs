@@ -28,6 +28,21 @@ fn a_pdf_into_a_missing_folder_names_the_file() -> TestResult {
 }
 
 #[test]
+fn a_drawing_folder_that_is_a_file_names_it() -> TestResult {
+    // `drawing` makes its output folder; a file in the way is named in the error (#1200).
+    let tmp = tempfile::tempdir()?;
+    let made = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .current_dir(tmp.path())
+        .args(["new", "p", "--no-git"])
+        .output()?;
+    assert!(made.status.success());
+    std::fs::write(tmp.path().join("out.svg"), "x")?;
+    let err = wiringcraft(tmp.path(), &["-C", "p", "drawing", "out.svg"])?;
+    assert!(err.contains("cannot make folder out.svg: "), "{err}");
+    Ok(())
+}
+
+#[test]
 fn inspecting_a_missing_file_names_it() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let err = wiringcraft(tmp.path(), &["inspect", "nofile.zip"])?;

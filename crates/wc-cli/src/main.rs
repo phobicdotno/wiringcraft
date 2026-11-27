@@ -1782,7 +1782,7 @@ fn read_text(path: impl AsRef<Path>) -> Res<String> {
 }
 
 /// Make the output folder `out`; under [`output_guard`] a folder in the project is refused
-/// before any folder is made.
+/// before any folder is made. A failure names the folder.
 fn make_out_dir(out: &Path) -> Res<()> {
     if let Some(g) = output_guard() {
         match g.holds(out) {
@@ -1801,7 +1801,8 @@ fn make_out_dir(out: &Path) -> Res<()> {
             }
         }
     }
-    std::fs::create_dir_all(out).map_err(e)
+    std::fs::create_dir_all(out)
+        .map_err(|err| format!("cannot make folder {}: {err}", escape_field(&out.display().to_string())))
 }
 
 fn e<E: std::fmt::Display>(err: E) -> String {
