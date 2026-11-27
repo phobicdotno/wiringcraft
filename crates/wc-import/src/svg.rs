@@ -1,6 +1,6 @@
 //! SVG symbol import. Pins are marked by `id="pin:NAME"`, `data-pin="NAME"` or
 //! `class="pin"` (named by order). One SVG user unit is one millimetre unless the root element
-//! gives a width in mm together with a viewBox.
+//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -252,6 +252,24 @@ fn is_white_rgb(f: &str) -> bool {
     };
     let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
     parts.len() == 3 && parts.iter().all(|p| matches!(*p, "255" | "100%"))
+}
+
+/// A length in an absolute unit (`mm`, `cm`, `Q`, `in`, `pt`, `pc`) in millimetres. A bare
+/// number, `px` and relative units give `None`: the user unit then stays one millimetre.
+fn length_mm(v: &str) -> Option<f64> {
+    let v = v.trim();
+    let (n, per) = [
+        ("mm", 1.0),
+        ("cm", 10.0),
+        ("Q", 0.25),
+        ("in", 25.4),
+        ("pt", 25.4 / 72.0),
+        ("pc", 25.4 / 6.0),
+    ]
+    .into_iter()
+    .find_map(|(unit, per)| v.strip_suffix(unit).map(|n| (n, per)))?;
+    let mm = n.trim().parse::<f64>().ok()? * per;
+    mm.is_finite().then_some(mm)
 }
 
 fn num(e: &BytesStart, name: &str) -> f64 {
@@ -719,8 +737,9 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             // width="40mm" with viewBox="0 0 80 160" means 0.5 mm per unit.
             if let (Some(w), Some(vb)) = (attr(&e, "width"), attr(&e, "viewBox")) {
                 let vbn = numbers(&vb);
-                if w.trim_end().ends_with("mm") && vbn.len() == 4 && vbn[2] > 0.0 {
-                    let wmm = numbers(&w).first().copied().unwrap_or(vbn[2]);
+                if let (Some(wmm), 4) = (length_mm(&w), vbn.len())
+                    && vbn[2] > 0.0
+                {
                     let s = wmm / vbn[2];
                     m = m.mul(&M([s, 0.0, 0.0, s, -vbn[0] * s, -vbn[1] * s]));
                 }
@@ -957,6 +976,48 @@ mod tests {
                 .any(|g| matches!(g, Shape::Text { text, .. } if text == "K"))
         );
         assert!(s.graphics.len() >= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn viewbox_width_in_other_absolute_units_is_converted_to_mm() -> Result<()> {
+        // Each width is 40 mm over a viewBox 80 wide: 0.5 mm per unit.
+        for w in [
+            "40mm",
+            "4cm",
+            "40mm ",
+            "160Q",
+            "113.38582677165354pt",
+            "9.448818897637796pc",
+        ] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" viewBox="10 0 80 160">
+                    <circle id="pin:1" cx="10" cy="0" r="1"/><circle id="pin:2" cx="90" cy="160" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            let (a, b) = (pin_at(&s, "1"), pin_at(&s, "2"));
+            assert!(
+                ((b.x - a.x) - 40.0).abs() < 1e-3 && ((b.y - a.y) - 80.0).abs() < 1e-3,
+                "{w}: {a:?} {b:?}"
+            );
+        }
+        // One inch over 100 units: 0.254 mm per unit.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1in" viewBox="0 0 100 100">
+            <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="100" cy="0" r="1"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.u", "U")?;
+        assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 25.4).abs() < 1e-3);
+        // No unit, or px, keeps one unit per millimetre.
+        for w in ["40", "40px"] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" viewBox="0 0 80 160">
+                    <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="80" cy="0" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 80.0).abs() < 1e-3, "{w}");
+        }
         Ok(())
     }
 
