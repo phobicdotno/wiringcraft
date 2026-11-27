@@ -8464,8 +8464,15 @@ mod nudge_tests {
         );
         let again = titles(app_frame(&mut app, &ctx, Vec::new(), false));
         assert!(again.is_empty(), "nothing changed: not sent again, got {again:?}");
-        app.open.as_mut().unwrap().dirty = true;
-        let dirty = titles(app_frame(&mut app, &ctx, Vec::new(), false));
+        // A real edit (the selected coil nudged left) makes the project unsaved.
+        let mut dirty = titles(app_frame(
+            &mut app,
+            &ctx,
+            vec![key(Key::ArrowLeft, Modifiers::NONE)],
+            false,
+        ));
+        assert!(app.open.as_ref().unwrap().dirty, "the nudge is not saved yet");
+        dirty.extend(titles(app_frame(&mut app, &ctx, Vec::new(), false)));
         assert_eq!(
             dirty,
             vec![format!("• {name} – WiringCraft")],
