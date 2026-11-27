@@ -1744,6 +1744,10 @@ pub struct Page {
     /// [`ProjectMeta`]), so editing them once updates the cover and every title block.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cover: bool,
+    /// A graphic page: free drawings only (sketches, notes, pictures), with no symbols or wires
+    /// and nothing on it evaluated electrically. `check` warns about a symbol or wire on one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub graphic: bool,
     /// Title-block fields of this page alone (its revision, date, checked by, ...). On this
     /// page's title block they win over the project's fields of the same name
     /// ([`ProjectMeta::title_block`]); fields the page does not set come from the project.
@@ -1792,6 +1796,7 @@ impl Page {
             underlay: None,
             overview: false,
             cover: false,
+            graphic: false,
             title_block: BTreeMap::new(),
             clouds: Vec::new(),
             revision_table: None,

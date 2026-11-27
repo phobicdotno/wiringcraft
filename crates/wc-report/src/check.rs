@@ -116,6 +116,30 @@ pub fn check_with_unreadable(
         });
     }
 
+    // A graphic page is for drawings only: a symbol or wire on it is not meant to be there.
+    for page in p.pages.iter().filter(|pg| pg.graphic) {
+        for s in &page.symbols {
+            let name = s
+                .tag
+                .as_ref()
+                .map_or_else(|| format!("symbol {}", s.id), |t| t.to_string());
+            out.push(at(
+                page,
+                &s.id,
+                Severity::Warning,
+                format!("{name} is on a graphic page, which is for drawings only; move it to a schematic page"),
+            ));
+        }
+        for w in &page.wires {
+            out.push(at(
+                page,
+                &w.id,
+                Severity::Warning,
+                "a wire is on a graphic page, which is for drawings only; move it to a schematic page".to_owned(),
+            ));
+        }
+    }
+
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
     // A symbol with two pins of one name is told once, where it is first drawn: a wire names a
     // pin only by its name, so the second pin can never be reached.
@@ -1174,6 +1198,57 @@ mod tests {
         ] {
             assert_eq!(cloud_index(item), None, "{item:?}");
         }
+    }
+
+    #[test]
+    fn a_symbol_or_wire_on_a_graphic_page_is_warned_about() {
+        let mut p = project();
+        assert!(run(&p).iter().all(|f| !f.message.contains("graphic page")));
+        let mut sketch = Page::new("g1", "2", "Sketch");
+        sketch.graphic = true;
+        sketch.symbols = vec![place("s9", "lamp", "-P9"), place("s8", "lamp", "")];
+        sketch.wires = vec![wc_core::Wire {
+            id: "w1".into(),
+            from: Endpoint::Pin {
+                item: "s9".into(),
+                pin: "X1".into(),
+            },
+            to: Endpoint::Point {
+                at: Point::new(40.0, 10.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        }];
+        p.pages.push(sketch);
+        let on_graphic: Vec<_> = run(&p)
+            .into_iter()
+            .filter(|f| f.message.contains("graphic page"))
+            .collect();
+        assert_eq!(on_graphic.len(), 3, "{on_graphic:?}");
+        assert!(
+            on_graphic
+                .iter()
+                .all(|f| f.severity == Severity::Warning && f.page_id.as_deref() == Some("g1"))
+        );
+        assert!(
+            on_graphic
+                .iter()
+                .any(|f| f.item.as_deref() == Some("s9") && f.message.starts_with("-P9 is on"))
+        );
+        assert!(
+            on_graphic
+                .iter()
+                .any(|f| f.item.as_deref() == Some("s8") && f.message.starts_with("symbol s8 is on"))
+        );
+        assert!(
+            on_graphic
+                .iter()
+                .any(|f| f.item.as_deref() == Some("w1") && f.message.starts_with("a wire is on"))
+        );
     }
 
     #[test]

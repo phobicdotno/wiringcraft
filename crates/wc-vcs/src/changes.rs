@@ -243,6 +243,7 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
                 ("underlay", o.underlay != n.underlay),
                 ("overview setting", o.overview != n.overview),
                 ("cover setting", o.cover != n.cover),
+                ("graphic setting", o.graphic != n.graphic),
             ];
             for (what, changed) in settings {
                 if changed {
