@@ -2003,6 +2003,7 @@ impl App {
                 self.ed.page = open.add_page();
                 self.ed.panel = None;
                 self.ed.panel_pick = None;
+                self.ed.panel_drag = None;
                 self.ed.selection.clear();
                 self.ed.view.fit = true;
             }
@@ -2011,6 +2012,7 @@ impl App {
                     self.ed.page = i;
                     self.ed.panel = None;
                     self.ed.panel_pick = None;
+                    self.ed.panel_drag = None;
                     self.ed.selection.clear();
                     self.ed.view.fit = true;
                 }
@@ -9539,6 +9541,15 @@ mod menu_action_tests {
         for action in [Action::AddPage, Action::DuplicatePage] {
             a.ed.panel = Some(0);
             a.ed.panel_pick = Some(0);
+            // A device drag still held in the panel view ends with it.
+            a.ed.panel_drag = Some((
+                wc_core::geom::Point::new(0.0, 0.0),
+                None,
+                wc_core::panel::PanelItem::Rail {
+                    at: wc_core::geom::Point::new(0.0, 0.0),
+                    length: 10.0,
+                },
+            ));
             let pages = a.open.as_ref().unwrap().project.pages.len();
             a.ed.menu_action = Some(action);
             a.run_menu_action();
@@ -9552,6 +9563,7 @@ mod menu_action_tests {
                 (None, None),
                 "{action:?} closes the panel view"
             );
+            assert!(a.ed.panel_drag.is_none(), "{action:?} ends a panel drag");
             assert_eq!(
                 a.open.as_ref().unwrap().project.pages[a.ed.page].number,
                 (pages + 1).to_string()
