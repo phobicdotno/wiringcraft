@@ -92,7 +92,8 @@ pub fn classify(name: &str, head: &[u8]) -> Kind {
     }
     let text = String::from_utf8_lossy(&head[..head.len().min(512)]);
     // Before the AutomationML test: a KiCad description may quote anything.
-    if ext == "kicad_sym" || text.trim_start().starts_with("(kicad_symbol_lib") {
+    if ext == "kicad_sym" || text.trim_start().starts_with("(kicad_symbol_lib") || crate::kicad_legacy::is_legacy(&text)
+    {
         return Kind::KicadSymbols;
     }
     if text.contains("<CAEXFile") || ext == "aml" {
@@ -228,6 +229,7 @@ mod tests {
             ("readme.bin", b"\x00\x01"),
             ("lib/Relays.kicad_sym", b"(kicad_symbol_lib (version 20231120))"),
             ("lib/unnamed", b"  (kicad_symbol_lib)"),
+            ("lib/old_relays.lib", b"EESchema-LIBRARY Version 2.4\n#encoding utf-8\n"),
             (
                 "lib/quoting",
                 b"(kicad_symbol_lib (symbol \"x\" (property \"Description\" \"reads <CAEXFile>\")))",
@@ -245,6 +247,7 @@ mod tests {
         assert_eq!(kind("cache.db"), Some(Kind::SqliteDb));
         assert_eq!(kind("Relays.kicad_sym"), Some(Kind::KicadSymbols));
         assert_eq!(kind("unnamed"), Some(Kind::KicadSymbols));
+        assert_eq!(kind("old_relays.lib"), Some(Kind::KicadSymbols));
         assert_eq!(kind("quoting"), Some(Kind::KicadSymbols));
         assert!(Kind::KicadSymbols.importable());
         assert_eq!(kind("parts.xlsx"), Some(Kind::Spreadsheet));

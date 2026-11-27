@@ -138,7 +138,7 @@ gives the details.
 |---|---|
 | `symbol-dxf` | a symbol from a DXF drawing (pins: POINT entities, or entities on a layer named PIN) |
 | `symbol-svg` | a symbol from an SVG drawing (pins: elements with `id="pin:NAME"` or `data-pin="NAME"`) |
-| `symbol-kicad` | every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later) |
+| `symbol-kicad` | every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later, or an old `.lib`) |
 | `symbol-qet` | QElectroTech elements (`.elmt`), one symbol per file |
 | `footprint-dxf` | a maker's outline drawing (DXF, front view, mm at 1:1) as a part's footprint on cabinet layouts |
 | `model-step` | a maker's 3D model (STEP) of a part: its bounding box gives the part's size for layouts and 3D export |

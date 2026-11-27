@@ -116,7 +116,7 @@ the schematic behind it.
 - ---
 - **New symbol**: draw a new symbol and save it into a library folder.
 - **Edit symbol**: change a library symbol (the selected one, or pick one).
-- **Import symbols**: import DXF, SVG, KiCad (`.kicad_sym`) and QElectroTech (`.elmt`) files into a library folder.
+- **Import symbols**: import DXF, SVG, KiCad (`.kicad_sym`, and old `.lib` libraries) and QElectroTech (`.elmt`) files into a library folder.
 
 ### Versions
 

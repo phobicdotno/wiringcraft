@@ -80,7 +80,7 @@ wiringcraft import symbol-kicad [OPTIONS] --lib <LIB> <FILE>
 
 | Option | Meaning |
 |---|---|
-| `<FILE>` | The `.kicad_sym` file (KiCad 6 or later) |
+| `<FILE>` | The `.kicad_sym` file (KiCad 6 or later), or an old `.lib` library (KiCad 5 and before, `EESchema-LIBRARY`), told apart by its first line |
 | `--lib <LIB>` | The library folder to write into |
 | `--prefix <PREFIX>` | Id prefix (default `kicad.<file name>`) |
 | `--scale <SCALE>` | Multiply coordinates, e.g. 2 to put KiCad's 2.54 mm pin grid near a 5 mm grid (default 1) |
@@ -446,7 +446,7 @@ Imports the open-format entries of another tool's project archive, each as its o
 
 - PDF entries as trace pages (`pdf`), DXF entries each on a new page `dxf-<number>` (`page-dxf`),
   AutomationML entries as overview pages (`aml`), numbered on from `--first-page`;
-- `.kicad_sym` entries into `--lib` with the prefix `kicad.<entry name>` (`symbol-kicad`);
+- `.kicad_sym` entries (and old KiCad `.lib` libraries) into `--lib` with the prefix `kicad.<entry name>` (`symbol-kicad`);
 - CSV and Excel (`.xlsx`) lists last, told apart by their header: a device and an address column
   make a PLC address list (`plc-csv`), an order or part number column a parts list for `--lib`
   (`parts-csv`).

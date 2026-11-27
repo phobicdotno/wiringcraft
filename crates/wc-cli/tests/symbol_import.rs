@@ -407,3 +407,20 @@ fn symbol_qet_writes_the_good_files_and_fails_naming_the_missing_or_broken_ones(
     symbol(&tmp.path().join("lib"), "qet.good")?;
     Ok(())
 }
+
+#[test]
+fn symbol_kicad_reads_an_old_lib_library() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let lib = "EESchema-LIBRARY Version 2.4\n#encoding utf-8\n#\n# LAMP\n#\nDEF LAMP H 0 40 N N 1 F N\nF0 \"H\" 100 0 50 H V L CNN\nF1 \"LAMP\" 100 -100 50 H V L CNN\nDRAW\nC 0 0 70 0 1 10 N\nP 2 0 1 0 -50 50 50 -50 N\nX X1 X1 0 200 130 D 50 50 1 1 P\nX X2 X2 0 -200 130 U 50 50 1 1 P\nENDDRAW\nENDDEF\n#\n#End Library\n";
+    std::fs::write(tmp.path().join("old-lamps.lib"), lib)?;
+    let (out, _) = run_ok(tmp.path(), &["import", "symbol-kicad", "old-lamps.lib", "--lib", "lib"])?;
+    let s = symbol(&tmp.path().join("lib"), "kicad.old-lamps.lamp")?;
+    assert_eq!(s.letter_code, "H");
+    assert_eq!(pin_names(&s), ["X1", "X2"]);
+    // 400 mil between the pins: 10.16 mm, the second one below the first.
+    let ys: Vec<f64> = s.pins.iter().map(|p| p.at.y).collect();
+    assert_eq!(ys, [0.0, 10.16]);
+    assert!(s.graphics.iter().any(|g| matches!(g, wc_core::Shape::Circle { .. })));
+    assert!(out.contains("kicad.old-lamps.lamp.json"), "{out}");
+    Ok(())
+}
