@@ -1684,6 +1684,30 @@ fn a_coil_lists_its_contacts_by_column_not_by_drawing_order() {
 }
 
 #[test]
+fn an_overview_interruption_point_lists_its_partners_in_page_order() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Line diagram");
+    p1.overview = true;
+    p1.symbols.push(place("s1", "arrow", 50.0, "-L1"));
+    let mut p2 = Page::new("p2", "2", "Power");
+    p2.symbols.push(place("s2", "arrow", 50.0, "-L1"));
+    let mut p3 = Page::new("p3", "3", "Line diagram");
+    p3.overview = true;
+    p3.symbols.push(place("s3", "arrow", 50.0, "-L1"));
+    project.pages = vec![p1, p2, p3];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(last) = project.pages.get(2) else {
+        unreachable!("three pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(last, &symbols, &x, &mut warnings);
+    assert_eq!(marks.first().map(|m| m.text.as_str()), Some("1/2.B 2/2.B"), "{marks:?}");
+    assert_eq!(marks.first().map(|m| m.target_page_id.as_str()), Some("p1"));
+}
+
+#[test]
 fn cross_references_give_page_column_and_row() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
