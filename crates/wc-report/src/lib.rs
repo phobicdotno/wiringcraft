@@ -853,10 +853,22 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
 }
 
 /// Device list: every tag with its description, part and the pages it appears on, with
-/// numbers sorted by value (`-K2` before `-K10`).
+/// numbers sorted by value (`-K2` before `-K10`). A cable's pages are also those its cores are
+/// drawn on, as in the cable list (overview pages, `Page::overview`, do not count for cores).
 pub fn device_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Device list", &["Device", "Description", "Part", "Symbols", "Pages"]);
     let index = i.project.tag_index();
+    let mut core_pages: BTreeMap<&DeviceTag, Vec<(String, String)>> = BTreeMap::new();
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
+        for w in &page.wires {
+            if let Some(c) = &w.cable {
+                core_pages
+                    .entry(&c.cable)
+                    .or_default()
+                    .push((page.id.clone(), w.id.clone()));
+            }
+        }
+    }
     let mut tags: Vec<DeviceTag> = all_tags(i).into_iter().collect();
     tags.sort_by_cached_key(|t| natural_key(&t.to_string()));
     for tag in tags {
@@ -877,7 +889,10 @@ pub fn device_list(i: &Inputs<'_>) -> Table {
             dev.map(|d| d.description.clone()).unwrap_or_default(),
             dev.and_then(|d| d.part.clone()).unwrap_or_default(),
             symbols.into_iter().collect::<Vec<_>>().join(", "),
-            pages_of(i.project, uses),
+            match core_pages.get(&tag) {
+                Some(cores) => pages_of(i.project, &[uses, cores.as_slice()].concat()),
+                None => pages_of(i.project, uses),
+            },
         ]);
     }
     t
