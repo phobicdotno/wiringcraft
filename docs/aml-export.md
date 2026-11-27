@@ -19,8 +19,11 @@ The file path is taken from the current folder, not from the `-C` project folder
 goes in must exist. The command will not write over one of the project's own files (for example
 `devices.json`).
 
-In the app, File > AutomationML (also in the Project group of the Start ribbon tab) asks where to save, starting at
-`export/<project name>.aml` in the project folder, and creates the `export` folder when needed.
+In the app, File > AutomationML (also in the Project group of the Start ribbon tab) asks where
+to save, with `<project name>.aml` filled in (characters other than letters, digits and `-`
+become `_`). The dialog opens in the project's `export` folder when it exists, else in the
+project folder, so accepting the name there saves it in the project folder. The folder of the
+chosen path is created when it does not exist yet.
 
 ## File structure
 
