@@ -326,6 +326,12 @@ fn a_merge_while_another_is_unfinished_is_refused() -> Result<()> {
     // The first merge is untouched and can still be aborted.
     git.abort_merge()?;
     assert!(git.run(&["status", "--porcelain"])?.trim().is_empty());
+    // Nothing left to abort: said plainly, not as git's fatal text.
+    let r = git.abort_merge();
+    let Err(Error::Git { message, .. }) = &r else {
+        unreachable!("{r:?}")
+    };
+    assert_eq!(message, "no merge in progress");
     Ok(())
 }
 
