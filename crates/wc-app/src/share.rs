@@ -359,7 +359,8 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
         .iter()
         .flat_map(|w| [&w.from, &w.to])
         .any(|end| matches!(end, wc_core::Endpoint::Pin { item, .. } if !symbols.contains(item.as_str())));
-    (!dangling).then_some(page)
+    // A page cannot be both an overview and a graphic page: each side marking it one way is a clash.
+    (!dangling && !(page.graphic && page.overview)).then_some(page)
 }
 
 /// One thing in a three-way merge: the side that changed it, or `None` when both changed it

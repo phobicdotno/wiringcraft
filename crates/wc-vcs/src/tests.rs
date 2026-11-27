@@ -180,6 +180,10 @@ fn page_setting_changes_are_reported() -> std::result::Result<(), wc_core::Error
     b.overview = true;
     assert_eq!(shown(&b), ["page 3: overview setting changed"]);
 
+    let mut b = a.clone();
+    b.graphic = true;
+    assert_eq!(shown(&b), ["page 3: graphic setting changed"]);
+
     // A difference no check names (here the stored id) is still reported.
     let mut b = a.clone();
     b.id = "q".into();
