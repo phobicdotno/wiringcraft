@@ -51,7 +51,9 @@ Some things do not connect:
   dot is drawn there. End both wires at the same point instead (see issue #1655).
 - A free end placed where a pin is drawn is not joined to the pin. Draw the end on the pin
   (`item:pin`).
-- Wires on two different pins of one symbol are not joined, except through a jumper.
+- A symbol does not join its own pins. Wires on two different pins of one symbol are one net
+  only when the rules above join them: through shared free ends, the same potential name,
+  interruption points with the same tag, or a jumper.
 
 ## Listing the nets
 
@@ -78,7 +80,9 @@ A connection starts on the first page it is drawn on, at its leftmost point (the
 counting wire ends and bend points.
 
 A connection that already has a number on any of its wires keeps it, and its other wires take
-it. `--overwrite` renumbers those too. A new number never repeats one in use. Wires that touch
+it. When its wires carry different numbers, the first one found (page by page, in the order the
+wires are stored) is kept and the others are replaced without a warning, which also clears the
+`check` warning about several numbers. `--overwrite` gives every connection a new number. A new number never repeats one in use. Wires that touch
 no pin get no number, and neither do wires on overview pages.
 
 A number typed with `--number` is not checked when the wire is drawn. `check` warns when one
@@ -117,4 +121,6 @@ The PDF prints a wire's number, potential name and cable core next to its first 
 ## Free ends and `check`
 
 A free end that meets no other wire and whose wire has no potential name is "in the air":
-`check` warns about it. A free end with a potential name is a potential arrow and is fine.
+`check` warns about it. A wire whose `potential` field is there but blank (`"potential": ""`,
+which an import can write) is an exception: it joins nothing by name, yet `check` gives no air
+warning for it. A free end with a potential name is a potential arrow and is fine.
