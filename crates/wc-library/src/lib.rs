@@ -810,3 +810,6 @@ pub fn library_rules(project_dir: &Path, project: &Project) -> Vec<wc_core::chec
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod core_tests;
