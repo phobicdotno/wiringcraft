@@ -4745,6 +4745,11 @@ fn title_block_of(fields: &[(String, String)]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The status line after a Save that wrote `n` files, counted in words that agree.
+pub fn saved_message(n: usize) -> String {
+    format!("Saved ({n} {} changed).", if n == 1 { "file" } else { "files" })
+}
+
 pub fn author_name() -> String {
     std::env::var("WIRINGCRAFT_USER")
         .ok()
@@ -5261,6 +5266,14 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The Save status line counts one file as one file (#1629).
+    #[test]
+    fn the_saved_message_counts_files_in_words_that_agree() {
+        assert_eq!(saved_message(0), "Saved (0 files changed).");
+        assert_eq!(saved_message(1), "Saved (1 file changed).");
+        assert_eq!(saved_message(3), "Saved (3 files changed).");
+    }
 
     /// A part copy that cannot be looked for (say, in a folder that may not be entered) is
     /// reported as unreadable with the reason, not as missing (#1035). The failing lookup is

@@ -3724,7 +3724,7 @@ impl App {
         match action {
             "save" => {
                 let n = open.save()?;
-                Ok(format!("Saved ({n} files changed)."))
+                Ok(crate::state::saved_message(n))
             }
             "commit" => {
                 let msg = need_s(v, "message")?;

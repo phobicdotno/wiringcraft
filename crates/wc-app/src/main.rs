@@ -1829,8 +1829,8 @@ impl App {
             Action::Save => match open.save() {
                 Ok(n) => {
                     self.ed.message = match &refused {
-                        Some(r) => format!("Saved ({n} files changed). {r}"),
-                        None => format!("Saved ({n} files changed)."),
+                        Some(r) => format!("{} {r}", state::saved_message(n)),
+                        None => state::saved_message(n),
                     }
                 }
                 // A file changed outside that Save would write over asks first (#662).
