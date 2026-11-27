@@ -2230,7 +2230,7 @@ impl App {
                 });
                 let mut ed = match (a, selected, lib.as_ref()) {
                     (Action::EditSymbol, Some(id), Some(lib)) => match lib.symbol(&id) {
-                        Ok((s, source)) => symbol_editor::SymbolEditor::edit(s, &source, targets),
+                        Ok((s, source)) => symbol_editor::SymbolEditor::edit(&id, s, &source, targets),
                         Err(err) => {
                             let mut e = symbol_editor::SymbolEditor::new(targets);
                             e.message = format!("Symbol {id} could not be opened from the library: {err}");
