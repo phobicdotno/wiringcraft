@@ -573,6 +573,21 @@ mod tests {
         let ext = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
         let width = crate::font::text_width_mm(words, 5.0);
         assert!(ext.1.x >= at.x + width - 1e-9, "{ext:?} {at:?}");
+        // Copies placed with it keep their texts apart.
+        let copies = [one.clone(), one.clone(), one];
+        let mut project = Project::new("x");
+        generate(&mut project, &copies, ext, PageSize::A3, "Stops")?;
+        let mut xs: Vec<f64> = project
+            .pages
+            .iter()
+            .flat_map(|p| p.symbols.iter().filter(|s| s.symbol == "wc.coil").map(|s| s.at.x))
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        xs.dedup();
+        assert!(
+            xs.len() == 3 && xs.windows(2).all(|w| w[1] - w[0] >= width + GAP - 1e-9),
+            "{xs:?}"
+        );
         Ok(())
     }
 
@@ -597,6 +612,23 @@ mod tests {
         let (lmin, lmax) = bounds_of(&label);
         assert!(lmax.x > 201.0 && lmin.x < 200.0, "{lmin:?} {lmax:?}");
         assert!(min.x <= lmin.x && min.y <= lmin.y && max.x >= lmax.x && max.y >= lmax.y);
+        // Copies placed with it keep their labels apart.
+        let mut project = Project::new("x");
+        generate(&mut project, &[c.clone(), c], (min, max), PageSize::A3, "Dims")?;
+        let mut boxes = Vec::new();
+        for g in project.pages.iter().flat_map(|p| &p.graphics) {
+            for part in g.dimension_parts().unwrap_or_default() {
+                if matches!(part, Shape::Text { .. }) {
+                    let mut pts = Vec::new();
+                    drawn_points(&part, &mut pts);
+                    boxes.push(bounds_of(&pts));
+                }
+            }
+        }
+        assert_eq!(boxes.len(), 2);
+        let [(a0, a1), (b0, b1)] = [boxes[0], boxes[1]];
+        let apart = a1.x <= b0.x || b1.x <= a0.x || a1.y <= b0.y || b1.y <= a0.y;
+        assert!(apart, "{boxes:?}");
         Ok(())
     }
 
