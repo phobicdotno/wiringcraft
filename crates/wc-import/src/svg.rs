@@ -43,6 +43,12 @@ impl M {
         let [a, b, ..] = self.0;
         (a * a + b * b).sqrt()
     }
+    /// How long a unit up the page comes out: a text's height, which follows the y axis when x
+    /// and y are scaled apart (`preserveAspectRatio="none"`, `scale(2, 1)`).
+    fn y_scale(&self) -> f64 {
+        let [_, _, c, d, ..] = self.0;
+        (c * c + d * d).sqrt()
+    }
     /// Whether a circle stays a circle: x and y are scaled alike and stay at right angles
     /// (turns, mirrors and moves are fine; a `scale(2, 1)` or a skew is not).
     fn keeps_circles(&self) -> bool {
@@ -304,7 +310,8 @@ fn viewbox_fit(w: f64, h: Option<f64>, vb: [f64; 4], par: &str) -> M {
         None => (sx, sx),
         Some(sy) => {
             let par = par.to_ascii_lowercase();
-            let mut words = par.split_whitespace();
+            // `defer` matters only for an image, and is passed over here.
+            let mut words = par.split_whitespace().skip_while(|w| *w == "defer");
             match (words.next(), words.next()) {
                 (Some("none"), _) => (sx, sy),
                 (_, Some("slice")) => (sx.max(sy), sx.max(sy)),
@@ -897,7 +904,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                         pending_text = None;
                         label = Some((shapes.len(), space_after));
                         let f = fonts.last().copied().unwrap_or_default();
-                        let sc = stack.last().copied().unwrap_or(M::ID).scale();
+                        let sc = stack.last().copied().unwrap_or(M::ID).y_scale();
                         shapes.push(Shape::Text {
                             at,
                             text: s,
@@ -948,7 +955,14 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 {
                     let hmm = attr(&e, "height").and_then(|h| length_mm(&h));
                     let par = attr(&e, "preserveAspectRatio").unwrap_or_default();
-                    m = m.mul(&viewbox_fit(wmm, hmm, [vbn[0], vbn[1], vbn[2], vbn[3]], &par));
+                    let fit = viewbox_fit(wmm, hmm, [vbn[0], vbn[1], vbn[2], vbn[3]], &par);
+                    if fit.0.iter().any(|v| !v.is_finite()) {
+                        let h = attr(&e, "height").unwrap_or_default();
+                        return Err(Error::Format(format!(
+                            "SVG: width=\"{w}\" height=\"{h}\" viewBox=\"{vb}\" give a size that cannot be drawn"
+                        )));
+                    }
+                    m = m.mul(&fit);
                 }
             }
         }
@@ -1310,6 +1324,26 @@ mod tests {
         assert!(close(size(got), (40.0, 80.0)), "{got:?}");
         let got = fit(r#"preserveAspectRatio="none""#)?;
         assert!(close(size(got), (40.0, 40.0)), "{got:?}");
+        // `defer` in front is passed over.
+        let got = fit(r#"preserveAspectRatio="defer xMidYMid slice""#)?;
+        assert!(close(size(got), (40.0, 80.0)), "{got:?}");
+        // A viewBox so thin that its scale runs to infinity is an error, not a symbol of NaN.
+        let thin = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-308" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/></svg>"#;
+        assert!(symbol(thin, "svg.u", "U").is_err());
+        // With none, a text is as high as the y axis makes it: 10 units at 0.25 mm.
+        let text = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 160" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="160"/><text x="0" y="20" font-size="10">K</text></svg>"#;
+        let s = symbol(text, "svg.u", "U")?;
+        let heights: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { height, .. } => Some(*height),
+                _ => None,
+            })
+            .collect();
+        assert!(heights.len() == 1 && (heights[0] - 1.8).abs() < 1e-9, "{heights:?}");
         Ok(())
     }
 
