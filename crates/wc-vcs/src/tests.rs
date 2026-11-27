@@ -370,6 +370,34 @@ fn markers_are_found_in_a_project_inside_a_parent_repository() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn markers_are_found_in_a_repository_whose_folder_ends_in_a_space_or_is_not_utf8() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut names: Vec<&[u8]> = vec![b"repo "];
+    // macOS refuses a file name that is not UTF-8.
+    if cfg!(target_os = "linux") {
+        names.push(b"repo\xff");
+    }
+    for name in names {
+        let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+        let dir = tmp.path().join(std::ffi::OsStr::from_bytes(name));
+        std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("repo", e))?;
+        let git = Git::new(&dir);
+        git.init()?;
+        let before = conflicted_merge(&git, &dir)?;
+        let result = git.commit("Merge other");
+        let err = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            err.contains("conflict markers") && err.contains("notes.txt"),
+            "{:?}: {err}",
+            dir
+        );
+        assert_eq!(git.head(), before);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn a_conflicted_file_that_cannot_be_read_is_an_error_naming_it() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let dir = tmp.path();

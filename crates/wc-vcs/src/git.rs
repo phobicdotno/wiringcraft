@@ -516,7 +516,10 @@ impl Git {
         if !self.git_path("MERGE_HEAD")?.exists() {
             return Ok(());
         }
-        let root = self.dir.join(self.run(&["rev-parse", "--show-toplevel"])?.trim());
+        // As bytes, without only git's line end: a root can end in a space or not be UTF-8.
+        let top = self.run_bytes(&["rev-parse", "--show-toplevel"])?;
+        let top = top.strip_suffix(b"\n").unwrap_or(&top);
+        let root = self.dir.join(os_path(top.strip_suffix(b"\r").unwrap_or(top)));
         let out = self.run_bytes(&["diff", "--no-relative", "--name-only", "--diff-filter=U", "-z"])?;
         let mut left = Vec::new();
         for path in out.split(|&b| b == 0).filter(|p| !p.is_empty()) {
