@@ -370,8 +370,13 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
             Event::CData(t) if name_lang.is_some() => name_text.push_str(&String::from_utf8_lossy(&t)),
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                if name_lang.is_some() {
-                    name_text.push_str(&t.unescape().unwrap_or_default());
+                if let Some(lang) = &name_lang {
+                    match t.unescape() {
+                        Ok(v) => name_text.push_str(&v),
+                        Err(e) => warnings.push(format!(
+                            "the element's name ({lang}) has text that cannot be read ({e}); it is left out"
+                        )),
+                    }
                 } else if path.last().map(String::as_str) == Some("info_name")
                     && v == "label"
                     && let Some(at) = dynamic_at
@@ -1216,6 +1221,17 @@ mod tests {
             let (imp, _) = element(&el(name), "q.k", DEFAULT_SCALE)?;
             assert_eq!(imp.qet_name, "NO contact", "{name}");
         }
+        // Name text that cannot be decoded is left out with a warning that says why.
+        let (imp, warnings) = element(
+            &el(r#"<name lang="en"><![CDATA[NO]]> &bogus; contact</name>"#),
+            "q.k",
+            DEFAULT_SCALE,
+        )?;
+        assert_eq!(imp.qet_name, "NO");
+        assert!(
+            warnings.iter().any(|w| w.contains("name (en)") && w.contains("bogus")),
+            "{warnings:?}"
+        );
         Ok(())
     }
 
