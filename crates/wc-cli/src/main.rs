@@ -4137,7 +4137,15 @@ fn run(mut cli: Cli) -> Res<()> {
                 format!("{bom}{}", t.to_csv_with(sep))
             };
             let p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            // The reports are built without such a symbol (the PLC I/O list leaves its points
+            // out), so it is warned about as `pdf` does.
+            let (symbols, missing) = store::vendored_symbols(dir, &p);
+            for m in missing {
+                eprintln!(
+                    "warning: symbol {} has no vendored copy (run `wiringcraft lib lock`)",
+                    escape_field(&m)
+                );
+            }
             let parts = vendored_parts(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
