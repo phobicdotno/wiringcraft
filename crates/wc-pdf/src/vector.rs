@@ -643,6 +643,12 @@ pub(crate) fn solid_triangles(points: &[(f64, f64)]) -> Option<Vec<[(f64, f64); 
     })
 }
 
+/// Whether a stroke is drawn wider than the default 0.25 mm pen, so its DXF polyline carries
+/// the width. Thinner strokes stay plain lines, as a CAD tool draws them at its default weight.
+fn wide(ink: &Stroke) -> bool {
+    ink.width.is_finite() && ink.width > 0.25 + 1e-9
+}
+
 /// A DXF (R12, ASCII) drawing of one page in millimetres, y up with the origin at the page's
 /// bottom left corner, as CAD tools expect.
 pub fn dxf(page: &PageDrawing) -> String {
@@ -691,7 +697,7 @@ pub fn dxf(page: &PageDrawing) -> String {
                             pair(20 + i as u16, &num(y(*py)));
                         }
                     }
-                } else if points.len() == 2 && !closed {
+                } else if points.len() == 2 && !closed && !wide(ink) {
                     pair(0, "LINE");
                     pair(8, layer);
                     pair(62, &colour);
@@ -706,11 +712,22 @@ pub fn dxf(page: &PageDrawing) -> String {
                     pair(66, "1");
                     // A filled path that is not convex stays an outline, closed as its fill is.
                     pair(70, if *closed || *filled { "1" } else { "0" });
+                    // R12 has no line weight: a wide stroke keeps its width as the polyline's
+                    // start and end width, on the polyline and on each vertex.
+                    let w = wide(ink).then(|| num(ink.width));
+                    if let Some(w) = &w {
+                        pair(40, w);
+                        pair(41, w);
+                    }
                     for (px, py) in points {
                         pair(0, "VERTEX");
                         pair(8, layer);
                         pair(10, &num(*px));
                         pair(20, &num(y(*py)));
+                        if let Some(w) = &w {
+                            pair(40, w);
+                            pair(41, w);
+                        }
                     }
                     pair(0, "SEQEND");
                     pair(8, layer);
