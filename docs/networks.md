@@ -70,7 +70,7 @@ Address, Station, Port, Connected to, Cable and Pages.
 
 | Warning | When |
 |---|---|
-| `a network has no name` | `name` is empty |
+| `a network has no name` | `name` is empty or only spaces |
 | `network PN1: a second network has this name` | two networks share a name (spaces around it do not count) |
 | `network PN1: node "...": ...` | a node's `device` is not a device tag |
 | `network PN1: -K10 is listed twice` | two nodes name one device |
@@ -103,8 +103,8 @@ with the title `Network <name>`. Its headline is the name, the bus type in brack
 description: `Network PN1 (PROFINET): Line 1 field devices`.
 
 Every device is a box with up to four lines: its tag, its description in the project, its
-address and its station. The nodes get a box each, and so does a device that only a link
-names. A node with an empty `device` is drawn as `(node 2)`, with its number among the nodes.
+address and its station. Every node gets a box, two nodes of one device share it, and a device that only a link
+names gets one too. A node with an empty `device` is drawn as `(node 2)`, with its number among the nodes.
 A box opens a page in the file where the device is drawn.
 
 The boxes are placed from the links:
