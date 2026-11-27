@@ -5779,7 +5779,8 @@ impl eframe::App for App {
         // the panels enter its value before the close asks about unsaved changes.
         let close_waited = self.closing == Closing::WaitsForTyped;
         // An assistant's open waited for a typed value the same way (#1091).
-        if close_waited || std::mem::take(&mut self.assistant.enter_typed) {
+        let assistant_waited = std::mem::take(&mut self.assistant.enter_typed);
+        if close_waited || assistant_waited {
             enter_typed_value(ctx);
         }
         self.hold_close_while_importing(ctx);
@@ -5843,9 +5844,12 @@ impl eframe::App for App {
         }
         self.poll_import(ctx);
         self.log_messages();
-        self.assistant.typed_field = ctx
-            .memory(egui::Memory::focused)
-            .is_some_and(|f| Some(f) != self.assistant.input_id);
+        // In the frame the field gives up the keyboard its value is entered only by the panels,
+        // after the assistant's tools ran: an open asked again in this frame still waits.
+        self.assistant.typed_field = assistant_waited
+            || ctx
+                .memory(egui::Memory::focused)
+                .is_some_and(|f| Some(f) != self.assistant.input_id);
         self.assistant_poll(ctx);
         self.ask_pending();
         if self.applied_theme != self.prefs.theme {
@@ -8178,8 +8182,16 @@ mod nudge_tests {
         );
         assert_eq!(app.open.as_ref().unwrap().dir, first, "not replaced");
         app_frame(&mut app, &ctx, Vec::new(), false);
+        // The frame the field gives up the keyboard: the tools run before the panels enter the
+        // value, so an open asked again in it (through the assistant's poll) is refused too.
+        assert!(
+            app.assistant.typed_field,
+            "an open in the frame the value is entered still waits"
+        );
         assert_eq!(tag(&app).as_ref(), Some(&typed), "entered");
         assert!(app.open.as_ref().unwrap().dirty, "an unsaved change now");
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(!app.assistant.typed_field, "no field has the keyboard now");
         let r = app.agent_tool("open_project", &path);
         assert!(matches!(&r, Ok(m) if m.contains("unsaved changes")), "{r:?}");
         assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Open(_)))));
