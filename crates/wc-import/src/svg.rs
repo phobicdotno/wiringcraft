@@ -1,7 +1,8 @@
 //! SVG symbol import. Pins are marked by `id="pin:NAME"`, `data-pin="NAME"` or
 //! `class="pin"` (named by order). One SVG user unit is one millimetre unless the root element
-//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox. An absolute
-//! height as well fits the viewBox into both by `preserveAspectRatio`, as a browser does.
+//! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox, or a height
+//! in one when the width is missing or a percentage. An absolute width and height together fit
+//! the viewBox into both by `preserveAspectRatio`, as a browser does.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -962,18 +963,29 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
         if tag == "svg" && !seen_root {
             seen_root = true;
-            // width="40mm" with viewBox="0 0 80 160" means 0.5 mm per unit.
-            if let (Some(w), Some(vb)) = (attr(&e, "width"), attr(&e, "viewBox")) {
+            // width="40mm" with viewBox="0 0 80 160" means 0.5 mm per unit. With no width, or a
+            // percentage or `auto` one, a browser sizes the width from the height instead.
+            if let Some(vb) = attr(&e, "viewBox") {
                 let vbn = numbers(&vb);
-                if let (Some(wmm), 4) = (length_mm(&w), vbn.len())
-                    && vbn[2] > 0.0
-                {
-                    let hmm = attr(&e, "height").and_then(|h| length_mm(&h));
-                    let par = attr(&e, "preserveAspectRatio").unwrap_or_default();
-                    let fit = viewbox_fit(wmm, hmm, [vbn[0], vbn[1], vbn[2], vbn[3]], &par);
+                let w = attr(&e, "width");
+                let w = w.as_deref().map(str::trim);
+                let by_height = w.is_none_or(|w| w.ends_with('%') || w.eq_ignore_ascii_case("auto"));
+                let hmm = attr(&e, "height").and_then(|h| length_mm(&h));
+                let fit = match vbn[..] {
+                    [x, y, _, vh] if by_height && vh > 0.0 => hmm.map(|h| {
+                        let s = h / vh;
+                        M([s, 0.0, 0.0, s, -x * s, -y * s])
+                    }),
+                    [x, y, vw, vh] if !by_height && vw > 0.0 => w.and_then(length_mm).map(|wmm| {
+                        let par = attr(&e, "preserveAspectRatio").unwrap_or_default();
+                        viewbox_fit(wmm, hmm, [x, y, vw, vh], &par)
+                    }),
+                    _ => None,
+                };
+                if let Some(fit) = fit {
                     if fit.0.iter().any(|v| !v.is_finite()) {
                         let h = printable(&attr(&e, "height").unwrap_or_default());
-                        let (w, vb) = (printable(&w), printable(&vb));
+                        let (w, vb) = (printable(w.unwrap_or_default()), printable(&vb));
                         return Err(Error::Format(format!(
                             "SVG: width=\"{w}\" height=\"{h}\" viewBox=\"{vb}\" give a size that cannot be drawn"
                         )));
@@ -1369,6 +1381,31 @@ mod tests {
             })
             .collect();
         assert!(heights.len() == 1 && (heights[0] - 2.88).abs() < 1e-9, "{heights:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn viewbox_height_sizes_the_symbol_when_the_width_is_missing_or_a_percentage() -> Result<()> {
+        // 10 mm over a viewBox 20 high: 0.5 mm per unit, so 40 units come in as 20 mm.
+        for w in ["", r#"width="100%""#, r#"width="auto""#] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" {w} height="10mm" viewBox="0 0 40 20">
+                    <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="40" cy="20" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            let (a, b) = (pin_at(&s, "1"), pin_at(&s, "2"));
+            assert!(
+                ((b.x - a.x) - 20.0).abs() < 1e-3 && ((b.y - a.y) - 10.0).abs() < 1e-3,
+                "{w}: {a:?} {b:?}"
+            );
+        }
+        // An absolute width still sets the x scale; with `none` the height does not shrink it.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="80mm" height="10mm" viewBox="0 0 40 20" preserveAspectRatio="none">
+            <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="40" cy="0" r="1"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.u", "U")?;
+        assert!(((pin_at(&s, "2").x - pin_at(&s, "1").x) - 80.0).abs() < 1e-3);
         Ok(())
     }
 

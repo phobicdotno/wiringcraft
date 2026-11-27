@@ -190,7 +190,7 @@ enum Cmd {
     Place {
         /// The page's id.
         page: String,
-        /// The library symbol's id, e.g. `iec.contactor.coil`.
+        /// The library symbol's id, e.g. `wc.coil`.
         symbol: String,
         /// Position in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
@@ -392,7 +392,7 @@ enum Cmd {
     /// translation into a language (exits with an error when any is missing, so it can guard a
     /// release), or set or remove one text's translation.
     Translations {
-        /// The language, such as `nb`.
+        /// The language, such as `nb`. Needed.
         #[arg(long, global = true)]
         lang: Option<String>,
         #[command(subcommand)]
@@ -448,7 +448,8 @@ enum Cmd {
         /// The AutomationML (`.aml`) file to write.
         out: PathBuf,
     },
-    /// Export data for other tools: marker lists for printing marking strips.
+    /// Export data for other tools: marker lists for printing marking strips, and terminal
+    /// strip lists for the WAGO configurator.
     #[command(subcommand)]
     Export(ExportCmd),
     /// Write the PLC inputs and outputs as an IEC 61131-3 global variable list (structured
@@ -559,7 +560,8 @@ struct MarkingArgs {
     /// Language of the header row and the type column: en, de, nb.
     #[arg(long, default_value = "en")]
     lang: String,
-    /// Only the terminals of this strip (as the terminal plan names it, e.g. -X1).
+    /// Only the terminals of this strip, by its full name as the terminal plan shows it, e.g.
+    /// `-X1` or `=PUMP+CAB1-X1`.
     #[arg(long, allow_hyphen_values = true)]
     strip: Option<String>,
     /// Written between the numbers of a multi-level terminal's levels on its one marker
@@ -620,7 +622,8 @@ enum CommentCmd {
 
 #[derive(Subcommand)]
 enum PanelCmd {
-    /// A new mounting plate with ducts around the edge and a DIN rail in every 125 mm row.
+    /// A new mounting plate with ducts around the edge and between rows, and a DIN rail in the
+    /// middle of each row: as many rows at least 125 mm high as fit, sharing the height evenly.
     New {
         /// The new layout's id, e.g. `plate1`.
         id: String,
@@ -899,7 +902,8 @@ enum RevisionCmd {
         /// The revision's letter, e.g. `A`.
         letter: String,
     },
-    /// Draw a cloud on a page around the rectangle from (x1, y1) to (x2, y2), in mm.
+    /// Draw a cloud on a page around the rectangle from (x1, y1) to (x2, y2), in mm. Prints its
+    /// index, as `revision list` shows it.
     Cloud {
         /// The page's id.
         page: String,
@@ -911,7 +915,7 @@ enum RevisionCmd {
         x2: f64,
         /// The opposite corner's y in mm.
         y2: f64,
-        /// The revision in its tag; the latest when left out.
+        /// The revision letter shown in the cloud's tag; the latest when left out.
         #[arg(long)]
         rev: Option<String>,
     },
@@ -997,9 +1001,11 @@ enum JumperCmd {
         /// Terminal numbers.
         terminals: Vec<String>,
     },
-    /// Give the jumper holding a terminal a part (article), e.g.
-    /// `jumper part -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
-    /// does not have yet is taken from its libraries.
+    /// Give the jumper holding a terminal a part (article), e.g. `jumper part -X1 3 <part id>`
+    /// with the id of a jumper part; leave the part out to clear it. Any part is accepted and
+    /// becomes the jumper's article in reports, so pick a jumper, not a terminal. A part the
+    /// project does not have yet is taken from its libraries (the bundled library has no jumper
+    /// parts).
     Part {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -1419,6 +1425,7 @@ enum ImportCmd {
     },
     /// Parts from a BMEcat catalogue (XML, version 1.2 or 2005): order number, maker,
     /// description, the maker's part number, GTIN, and ECLASS class and features as properties.
+    /// Fails when no part could be imported.
     PartsBmecat {
         /// The BMEcat XML file.
         file: PathBuf,
@@ -1467,7 +1474,8 @@ enum ImportCmd {
         letter_code: String,
     },
     /// Parts from a CSV or semicolon-separated export, or straight from an Excel workbook
-    /// (`.xlsx`, its first visible sheet), with the same column names either way.
+    /// (`.xlsx`, its first visible sheet), with the same column names either way. Fails when no
+    /// part could be imported.
     PartsCsv {
         /// The CSV or `.xlsx` file.
         file: PathBuf,
@@ -3884,7 +3892,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 d.part = (!part.is_empty()).then_some(part);
             }
             if let Some(desc) = description {
-                d.description = desc;
+                d.set_description(&desc);
             }
             save(dir, &p)?;
         }
@@ -4200,7 +4208,12 @@ fn run(mut cli: Cli) -> Res<()> {
             if format == "csv" && sep == ';' && out.is_some() {
                 text.push('\u{feff}');
             }
-            for k in kinds {
+            for (i, k) in kinds.into_iter().enumerate() {
+                // CSV tables end with their own line end: a blank line only goes between two of
+                // them, so a file of one table has no empty record at its end.
+                if format == "csv" && i > 0 {
+                    text.push('\n');
+                }
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
                     "csv" => t.to_csv_with(sep),
@@ -4208,7 +4221,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     "text" => plain_table(&t),
                     other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
                 });
-                text.push('\n');
+                if format != "csv" {
+                    text.push('\n');
+                }
             }
             match out {
                 Some(path) => write_out(dir, &path, text).map_err(e)?,
@@ -5122,13 +5137,19 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
             }
         }
         VcsCmd::Log { svg, limit } => {
-            let rows = wc_vcs::history(&git, limit).map_err(e)?;
+            let mut rows = wc_vcs::history(&git, limit).map_err(e)?;
             match svg {
                 Some(path) => {
                     write_out(dir, &path, wc_vcs::subway_svg(&rows)).map_err(e)?;
                     println!("wrote {}", path.display());
                 }
-                None => print!("{}", wc_vcs::subway_text(&rows)),
+                None => {
+                    // A commit subject from git can hold ESC or other control characters.
+                    for r in &mut rows {
+                        r.commit.subject = escape_field(&r.commit.subject);
+                    }
+                    print!("{}", wc_vcs::subway_text(&rows));
+                }
             }
         }
         VcsCmd::Changes { from, to } => {
@@ -5153,8 +5174,9 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
                     "{}  {}  {}  {}",
                     &v.commit[..v.commit.len().min(10)],
                     &utc_date(v.time)[..10],
-                    v.author,
-                    v.subject
+                    // Both come from git and can hold ESC or other control characters.
+                    escape_field(&v.author),
+                    escape_field(&v.subject)
                 );
                 for c in &v.changes {
                     println!("    {}", change_line(c));
@@ -5887,20 +5909,25 @@ fn keep_lock_out_of_git(dir: &Path) {
     }
 }
 
-/// Parse report names; `all` means every report.
+/// The reports `names` asks for, in order. A report named twice (or named besides `all`) is
+/// kept once, where it is first asked for, so it does not print twice.
 fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
     let mut out = Vec::new();
     for n in names {
-        if n == "all" {
-            out.extend(wc_report::Kind::ALL);
-            continue;
+        let kinds = if n == "all" {
+            wc_report::Kind::ALL.to_vec()
+        } else {
+            vec![wc_report::Kind::parse(n).ok_or_else(|| {
+                format!(
+                    "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, all)"
+                )
+            })?]
+        };
+        for k in kinds {
+            if !out.contains(&k) {
+                out.push(k);
+            }
         }
-        let k = wc_report::Kind::parse(n).ok_or_else(|| {
-            format!(
-                "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, all)"
-            )
-        })?;
-        out.push(k);
     }
     Ok(out)
 }
@@ -7315,6 +7342,14 @@ mod tests {
         cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
+
+        // The spaces around a description go, and a blank one clears it.
+        cli(&dir, &["device", "-K9", "--description", "  Spare pump "]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare pump");
+        cli(&dir, &["device", "-K9", "--description", "   "]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "");
     }
 
     #[test]
@@ -10712,7 +10747,8 @@ mod tests {
         )
         .unwrap();
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
-        assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
+        assert_eq!(wires, std::fs::read_to_string(&one).unwrap());
+        assert!(wires.ends_with("\r\n") && !wires.ends_with("\r\n\n"), "{wires:?}");
     }
 
     #[test]
@@ -10771,7 +10807,7 @@ mod tests {
             assert!(csv.starts_with('\u{feff}'), "{}: {csv}", k.name());
         }
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
-        assert_eq!(format!("{wires}\n"), semi);
+        assert_eq!(wires, semi);
         // Only `,` and `;`, and only for CSV.
         assert!(cli(&dir, &["report", "wires", "--format", "csv", "--sep", "|"]).is_err());
         assert!(cli(&dir, &["report", "wires", "--format", "md", "--sep", ";"]).is_err());

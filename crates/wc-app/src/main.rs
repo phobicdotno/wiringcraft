@@ -857,6 +857,7 @@ impl App {
         if let Some(d) = dir {
             app.open_dir(&d, &mut prefs);
         }
+        app.chrome = chrome::ChromeState::with_ribbon_tab(prefs.ribbon_tab);
         app.prefs = prefs;
         app
     }
@@ -3545,7 +3546,8 @@ impl App {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.edit_rules()));
                         }
-                        if ui.button("Close").clicked() {
+                        // Escape closes the list, as it does the other read-only dialogs.
+                        if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -5883,6 +5885,11 @@ impl eframe::App for App {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
+        // A ribbon tab the user opened is the one the ribbon opens on next time.
+        if self.chrome.ribbon_tab != self.prefs.ribbon_tab {
+            self.prefs.ribbon_tab = self.chrome.ribbon_tab;
+            self.prefs.save();
+        }
         if self.importing.is_none() {
             actions = self.route_menu_to_symbol_editor(actions);
         }

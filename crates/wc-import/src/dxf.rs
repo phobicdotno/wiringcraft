@@ -125,7 +125,8 @@ pub(crate) fn draw_mapped(
 }
 
 fn pairs(text: &str) -> Result<Vec<(i32, String)>> {
-    let mut lines = text.lines();
+    // Some editors (Notepad, for one) save a byte order mark before the first group code.
+    let mut lines = text.strip_prefix('\u{feff}').unwrap_or(text).lines();
     let mut out = Vec::new();
     while let Some(code) = lines.next() {
         let code = code.trim();
@@ -2727,6 +2728,16 @@ mod tests {
             "y flipped: the lower pin is further down"
         );
         assert_eq!(s.graphics.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_saved_with_a_utf8_bom_is_read() -> Result<()> {
+        // Some editors (Notepad, for one) put a byte order mark before the first group code.
+        let text = format!("\u{feff}{}", dxf("0\nLINE\n8\n0\n10\n0\n20\n0\n11\n5\n21\n0\n", ""));
+        let d = parse(&text)?;
+        assert_eq!(d.entities.len(), 1, "{d:?}");
+        assert_eq!(d.entities[0].kind, "LINE");
         Ok(())
     }
 
