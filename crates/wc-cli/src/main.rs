@@ -4978,7 +4978,8 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
                 wc_vcs::MergeOutcome::Conflicts(files) => {
                     println!("conflicts in:");
                     for f in files {
-                        println!("  {f}");
+                        // A file name from git can hold ESC or other control characters.
+                        println!("  {}", escape_field(&f));
                     }
                     return Err(
                     "resolve the files, then `wiringcraft vcs commit`, or undo the merge with `wiringcraft vcs merge --abort`"
@@ -4999,7 +5000,7 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
         }
         VcsCmd::Changes { from, to } => {
             for c in wc_vcs::changes(&git, &from, to.as_deref()).map_err(e)? {
-                println!("{c}");
+                println!("{}", change_line(&c));
             }
         }
         VcsCmd::PageLog { page, limit } => {
@@ -5023,12 +5024,21 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
                     v.subject
                 );
                 for c in &v.changes {
-                    println!("    {c}");
+                    println!("    {}", change_line(c));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// One recorded change as a line of text, with a file name from git escaped by [`escape_field`]
+/// so a control character in it cannot steer the terminal.
+fn change_line(c: &wc_vcs::Change) -> String {
+    match c {
+        wc_vcs::Change::File { path, status } => format!("{} {status}", escape_field(path)),
+        c => c.to_string(),
+    }
 }
 
 /// Who is writing a comment: the --author option, WIRINGCRAFT_USER, git's user.name, the login.

@@ -67,3 +67,50 @@ fn a_conflicted_merge_can_be_aborted() -> TestResult {
     assert!(err.contains("<NAME>"), "{err}");
     Ok(())
 }
+
+// Windows does not allow ESC in a file name.
+#[cfg(unix)]
+#[test]
+fn file_names_from_git_are_printed_escaped() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .status()?;
+    assert!(status.success());
+    let notes = dir.join("a\u{1b}[31mb.txt");
+    std::fs::write(&notes, "base\n")?;
+    wiringcraft(&dir, &["vcs", "commit", "-m", "base"])?;
+    wiringcraft(&dir, &["vcs", "branch", "other"])?;
+    std::fs::write(&notes, "other\n")?;
+    wiringcraft(&dir, &["vcs", "commit", "-m", "other"])?;
+    wiringcraft(&dir, &["vcs", "switch", "main"])?;
+    std::fs::write(&notes, "main\n")?;
+    wiringcraft(&dir, &["vcs", "commit", "-m", "main"])?;
+
+    let changes = wiringcraft(&dir, &["vcs", "changes", "other", "main"])?;
+    assert!(
+        changes.contains("a\\u{1b}[31mb.txt"),
+        "the name is listed escaped: {changes}"
+    );
+    assert!(!changes.contains('\u{1b}'), "no ESC reaches the terminal: {changes}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["vcs", "merge", "other"])
+        .env("GIT_AUTHOR_NAME", "Tester")
+        .env("GIT_AUTHOR_EMAIL", "tester@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Tester")
+        .env("GIT_COMMITTER_EMAIL", "tester@example.invalid")
+        .output()?;
+    assert!(!out.status.success(), "the merge stops on the conflict");
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        shown.contains("a\\u{1b}[31mb.txt"),
+        "the conflict is listed escaped: {shown}"
+    );
+    assert!(!shown.contains('\u{1b}'), "no ESC reaches the terminal: {shown}");
+    Ok(())
+}
