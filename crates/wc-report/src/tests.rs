@@ -819,6 +819,22 @@ fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
         "cable core -W1:1 is on 2 connections".to_owned(),
     )];
     assert_eq!(found(&p), expected);
+    // Core names match ignoring case and surrounding spaces: "bn" and " BN " are one core.
+    for w in p.pages[0].wires.iter_mut() {
+        let core = if w.id == "w1" { "bn" } else { " BN " };
+        if let Some(c) = w.cable.as_mut() {
+            c.core = core.into();
+        }
+    }
+    let bn = [(
+        Some("p2".to_owned()),
+        Some("w4".to_owned()),
+        "cable core -W1:bn is on 2 connections".to_owned(),
+    )];
+    assert_eq!(found(&p), bn);
+    for c in p.pages[0].wires.iter_mut().filter_map(|w| w.cable.as_mut()) {
+        c.core = "1".into();
+    }
     // An overview page whose wiring joins the 24V and 0V potentials into one net.
     let mut overview = Page::new("ov", "1", "Overview");
     overview.overview = true;
