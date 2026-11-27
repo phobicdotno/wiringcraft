@@ -5231,10 +5231,15 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
                     &utc_date(c.time)[..10],
                     if c.resolved { "  (resolved)" } else { "" }
                 );
+                // A CR is dropped only as part of a CRLF line break; one at the very end of
+                // the text is not a line break and is printed escaped.
                 let lines = |t: &str| -> Vec<String> {
-                    t.split('\n')
-                        .map(|l| escape_field(l.strip_suffix('\r').unwrap_or(l)))
-                        .collect()
+                    let mut parts: Vec<&str> = t.split('\n').collect();
+                    let last = parts.len() - 1;
+                    for part in &mut parts[..last] {
+                        *part = part.strip_suffix('\r').unwrap_or(part);
+                    }
+                    parts.into_iter().map(escape_field).collect()
                 };
                 println!("    {}", lines(&c.text).join("\n    "));
                 for r in &c.replies {
