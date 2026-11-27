@@ -925,13 +925,6 @@ impl Open {
         // those copied from another project are taken from the library when possible.
         let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
         self.ensure_symbols(ids)?;
-        let group = wc_core::placement::Group {
-            symbols: &clip.symbols,
-            wires: &clip.wires,
-            graphics: &clip.graphics,
-            devices: &clip.devices,
-            anchor: clip.anchor,
-        };
         use wc_core::placement::{DeviceData, OutOfTags};
         // The copied data first for a macro or a copy from another project; within one project
         // the project's own, which may have changed since the copy.
@@ -940,10 +933,30 @@ impl Open {
         } else {
             DeviceData::ProjectFirst
         };
-        self.checkpoint();
+        // The parts the copied devices name come along then, all or none, as `macro place`
+        // takes them (#1855); Undo takes their pins back.
+        let parts = match data {
+            DeviceData::GroupFirst => self.parts_to_take(clip.devices.values()),
+            DeviceData::ProjectFirst | DeviceData::GroupOnly => Vec::new(),
+        };
+        let lock = self.project.lock.clone();
+        let (taken, r) = self.take_parts(parts.iter().map(String::as_str));
+        if r.is_err() {
+            return self.give_back(taken, lock, r.map(|()| Vec::new()));
+        }
+        let group = wc_core::placement::Group {
+            symbols: &clip.symbols,
+            wires: &clip.wires,
+            graphics: &clip.graphics,
+            devices: &clip.devices,
+            anchor: clip.anchor,
+        };
+        self.checkpoint_with_lock(lock.clone());
         // A device for which no tag is left is pasted without one.
-        let placed = wc_core::placement::place(&mut self.project, page, group, at, data, OutOfTags::Untagged)
-            .map_err(|e| e.to_string())?;
+        let placed = match wc_core::placement::place(&mut self.project, page, group, at, data, OutOfTags::Untagged) {
+            Ok(placed) => placed,
+            Err(e) => return self.give_back(taken, lock, Err(e.to_string())),
+        };
         let out = (placed.symbols.into_iter().map(Selection::Symbol))
             .chain(placed.wires.into_iter().map(Selection::Wire))
             .chain(placed.graphics.into_iter().map(Selection::Graphic))
@@ -1494,6 +1507,126 @@ mod tests {
         assert!(o.project.lock.symbols.contains_key("wc.coil.valve"));
         assert!(o.undo());
         assert_eq!(o.project, before, "undo takes the new pin back too");
+    }
+
+    /// A macro of the two coils whose first device names `part` and, as an accessory,
+    /// `accessory`: saved in the project, its path returned.
+    fn macro_with_parts(o: &mut Open, page: usize, part: &str, accessory: &str) -> std::path::PathBuf {
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        let path = o.save_macro(&clip, "Two coils", "").unwrap();
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        let tag = m.symbols[0].tag.clone().unwrap();
+        let d = m.devices.entry(tag).or_default();
+        d.part = Some(part.into());
+        d.accessories = vec![wc_core::DevicePart {
+            part: accessory.into(),
+            qty: 1,
+        }];
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        path
+    }
+
+    const MAIN: &str = "example.ex-ct-9-24dc";
+    const ACCESSORY: &str = "example.ex-tb-2-5";
+
+    fn copy_of(o: &Open, id: &str) -> std::path::PathBuf {
+        wc_core::store::vendor_path(&o.dir, wc_core::lock::ItemKind::Part, id).unwrap()
+    }
+
+    #[test]
+    fn an_inserted_macro_takes_its_parts_and_undo_takes_their_pins_back() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        // A part no library has stays a name on the device.
+        let path = macro_with_parts(&mut o, page, MAIN, "NO-SUCH");
+        let lock = o.project.lock.clone();
+        assert!(!lock.parts.contains_key(MAIN));
+        o.insert_macro(page, &path, None).unwrap();
+        assert!(o.project.lock.parts.contains_key(MAIN), "taken and pinned");
+        assert!(o.parts.contains_key(MAIN), "and loaded");
+        assert!(copy_of(&o, MAIN).exists());
+        assert!(!o.project.lock.parts.contains_key("NO-SUCH"));
+        assert!(
+            o.project
+                .devices
+                .values()
+                .any(|d| d.accessories.iter().any(|a| a.part == "NO-SUCH")),
+            "the unknown part is kept on the device"
+        );
+        assert!(o.undo());
+        assert_eq!(o.project.lock, lock, "undo takes the pin back with the macro");
+        assert!(o.redo());
+        assert!(o.project.lock.parts.contains_key(MAIN));
+    }
+
+    #[test]
+    fn a_macro_whose_part_cannot_be_used_inserts_nothing_and_leaves_no_part_copy() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        // A pin whose copy is missing and whose version no library has.
+        o.project.lock.parts.insert(
+            ACCESSORY.into(),
+            wc_core::LockEntry {
+                source: "example".into(),
+                hash: "0000".into(),
+            },
+        );
+        // Sorted first, the main part is taken before the accessory is refused.
+        let path = macro_with_parts(&mut o, page, MAIN, ACCESSORY);
+        let before = o.project.clone();
+        let mark = o.undo_mark();
+        let err = o.insert_macro(page, &path, None).unwrap_err();
+        assert!(err.contains(ACCESSORY), "{err}");
+        assert_eq!(o.project, before, "nothing placed, no pin");
+        assert_eq!(o.undo_mark(), mark, "no undo step");
+        assert!(!o.parts.contains_key(MAIN));
+        assert!(!copy_of(&o, MAIN).exists(), "the copy taken on the way is removed");
+    }
+
+    #[test]
+    fn a_paste_from_another_project_takes_the_parts_of_its_devices() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let tag = o.project.pages[page].symbols[0].tag.clone().unwrap();
+        o.project.devices.entry(tag).or_default().part = Some(MAIN.into());
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        // Within the project its own data is used: nothing is taken.
+        o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert!(!o.project.lock.parts.contains_key(MAIN));
+        let (_tmp2, mut other, page2, _, _) = setup();
+        other.paste(page2, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert!(other.project.lock.parts.contains_key(MAIN));
+        assert!(other.parts.contains_key(MAIN));
+    }
+
+    #[test]
+    fn a_table_generation_takes_the_parts_and_gives_them_back_when_it_fails() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let path = macro_with_parts(&mut o, page, MAIN, "NO-SUCH");
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        m.placeholders.push(wc_core::macros::Placeholder {
+            name: "n".into(),
+            ..Default::default()
+        });
+        let at = m.symbols[1].at;
+        m.symbols[1].at = Point::new(at.x + 3000.0, at.y);
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        let table = o.dir.join("rows.csv");
+        std::fs::write(&table, "n\n1\n").unwrap();
+        let before = o.project.clone();
+        // Too wide for any page: the part taken on the way goes back.
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.contains("does not fit"), "{err}");
+        assert_eq!(o.project, before);
+        assert!(!o.parts.contains_key(MAIN));
+        assert!(!copy_of(&o, MAIN).exists());
+
+        m.symbols[1].at = at;
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        o.generate_from_table(page, &path, &table, None).unwrap();
+        assert!(o.project.lock.parts.contains_key(MAIN));
+        assert!(o.parts.contains_key(MAIN));
+        assert!(o.undo());
+        assert_eq!(o.project, before, "undo takes the pin back too");
     }
 
     #[test]

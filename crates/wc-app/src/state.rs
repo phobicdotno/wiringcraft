@@ -563,7 +563,7 @@ impl LibraryEntry {
 
 /// What [`Open::take_parts`] took into the project: parts loaded and part copies written.
 #[derive(Default)]
-struct TakenParts {
+pub(crate) struct TakenParts {
     loaded: Vec<String>,
     copies: Vec<PathBuf>,
 }
@@ -1261,7 +1261,10 @@ impl Open {
 
     /// [`Open::ensure_part`] for each part until one cannot be used, with what this call added:
     /// the parts loaded here and the copies written that were not there.
-    fn take_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> (TakenParts, Result<(), String>) {
+    pub(crate) fn take_parts<'a>(
+        &mut self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> (TakenParts, Result<(), String>) {
         let mut taken = TakenParts::default();
         let mut r = Ok(());
         for id in ids {
@@ -1283,7 +1286,12 @@ impl Open {
 
     /// Take back what [`Open::take_parts`] added and put `lock` back, for a change refused with
     /// `r`; a copy that cannot be removed is named in the error.
-    fn give_back<R>(&mut self, taken: TakenParts, lock: wc_core::Lockfile, r: Result<R, String>) -> Result<R, String> {
+    pub(crate) fn give_back<R>(
+        &mut self,
+        taken: TakenParts,
+        lock: wc_core::Lockfile,
+        r: Result<R, String>,
+    ) -> Result<R, String> {
         for id in taken.loaded {
             self.parts.remove(&id);
         }
@@ -1309,6 +1317,32 @@ impl Open {
                 )
             })
         }
+    }
+
+    /// The parts `devices` name (their main parts and accessories) that a macro or a copy from
+    /// another project takes into the project when it is placed (#1855), as the CLI's `macro
+    /// place` does: those the project pins, and those a library has. A part no library has
+    /// stays a name on the device; `check` reports it.
+    pub(crate) fn parts_to_take<'a>(&self, devices: impl IntoIterator<Item = &'a wc_core::Device>) -> Vec<String> {
+        let ids: std::collections::BTreeSet<&str> = devices
+            .into_iter()
+            .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect();
+        // The library is opened only when a part is not pinned.
+        let mut lib: Option<Option<wc_library::Library>> = None;
+        let mut out = Vec::new();
+        for id in ids {
+            if !self.project.lock.parts.contains_key(id) {
+                let lib = lib.get_or_insert_with(|| wc_library::Library::open(&self.dir, &self.project).ok());
+                if lib.as_ref().is_none_or(|lib| lib.locate(ItemKind::Part, id).is_none()) {
+                    continue;
+                }
+            }
+            out.push(id.to_owned());
+        }
+        out
     }
 
     /// Replace a device's accessories (its parts after the main part). New parts are taken from
@@ -1399,7 +1433,7 @@ impl Open {
     /// Take a snapshot before a change, so it can be undone.
     /// [`Open::checkpoint`] for a change that pinned library items before it: the undo step
     /// keeps the lock as it was (`lock`), so Undo takes those pins back and Redo brings them.
-    fn checkpoint_with_lock(&mut self, lock: wc_core::Lockfile) {
+    pub(crate) fn checkpoint_with_lock(&mut self, lock: wc_core::Lockfile) {
         let now = std::mem::replace(&mut self.project.lock, lock);
         self.checkpoint();
         self.project.lock = now;
@@ -4116,6 +4150,20 @@ impl Open {
             self.terminals_before.clone(),
         );
         self.ensure_symbols(ids)?;
+        // The parts the copies' devices name are taken too, all or none (#1855); the undo step
+        // below goes back to the lock before them.
+        let parts = self.parts_to_take(copies.iter().flat_map(|c| c.devices.values()));
+        let lock = self.project.lock.clone();
+        let (taken, r) = self.take_parts(parts.iter().map(String::as_str));
+        if let Err(e) = r {
+            let r = self.give_back(taken, lock, Err(e));
+            self.project = before;
+            self.symbols = symbols;
+            self.library = library;
+            self.terminals_before = terminals;
+            self.touch();
+            return r;
+        }
         // A symbol loaded here can renumber terminals already placed (a strip-only tag): that
         // is settled in the live project before the copy is made, so the copy keeps it.
         self.follow_terminals();
@@ -4136,12 +4184,13 @@ impl Open {
                 Ok(done)
             }
             Err(e) => {
+                let r = self.give_back(taken, lock, Err(e.to_string()));
                 self.project = before;
                 self.symbols = symbols;
                 self.library = library;
                 self.terminals_before = terminals;
                 self.touch();
-                Err(e.to_string())
+                r
             }
         }
     }
