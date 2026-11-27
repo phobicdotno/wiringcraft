@@ -125,10 +125,58 @@ pub fn records(text: &str, delim: char) -> Rows {
     out
 }
 
-fn guess_delimiter(header: &str) -> char {
-    [';', '\t', ',', '|']
+/// The separators a CSV text may use, in the order the guess tries them (of equals the last wins).
+const SEPARATORS: [char; 4] = [';', '\t', ',', '|'];
+
+/// How often `delim` stands outside double-quoted text in the header: the first record that is
+/// not blank, found as [`records`] finds it (same line endings, blank records and records of
+/// only `delim` left out, a quoted line break does not end it). The one difference: which
+/// separator the text uses is not known yet, so a quote opens quoted text after any of
+/// [`SEPARATORS`], not only after `delim`. Read with the wrong separator, a quoted cell would
+/// otherwise be plain text and the separators inside it would count.
+fn header_separators(text: &str, delim: char) -> usize {
+    let mut count = 0;
+    let mut blank = true;
+    // Inside quoted text, and at the start of a cell (where a quote opens quoted text).
+    let (mut quoted, mut cell_start) = (false, true);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c != '"' {
+                blank &= c.is_whitespace();
+            } else if chars.peek() == Some(&'"') {
+                chars.next();
+                blank = false;
+            } else {
+                quoted = false;
+            }
+        } else if c == '"' && cell_start {
+            quoted = true;
+            cell_start = false;
+        } else if c == '\n' || c == '\r' {
+            if !blank {
+                return count;
+            }
+            count = 0;
+            cell_start = true;
+        } else {
+            if c == delim {
+                count += 1;
+            } else {
+                blank &= c.is_whitespace();
+            }
+            cell_start = SEPARATORS.contains(&c);
+        }
+    }
+    if blank { 0 } else { count }
+}
+
+/// The separator a CSV text uses: the one found most often in the header outside double-quoted
+/// text (see [`header_separators`]), also when blank lines come before the header.
+fn guess_delimiter(text: &str) -> char {
+    SEPARATORS
         .into_iter()
-        .max_by_key(|d| header.matches(*d).count())
+        .max_by_key(|d| header_separators(text, *d))
         .unwrap_or(',')
 }
 
@@ -205,8 +253,7 @@ pub enum CsvKind {
 pub fn kind(text: &str) -> Option<CsvKind> {
     // The same header the readers take: the first record that is not blank, quoted line
     // breaks and all.
-    let first_line = text.lines().next().unwrap_or("");
-    kind_of_rows(&records(text, guess_delimiter(first_line)))
+    kind_of_rows(&records(text, guess_delimiter(text)))
 }
 
 /// [`kind`] for rows already split into cells, such as an Excel worksheet's.
@@ -234,15 +281,13 @@ pub fn file_rows(bytes: &[u8]) -> Result<Rows> {
         ));
     }
     let text = decode(bytes);
-    let first_line = text.lines().next().unwrap_or("");
-    Ok(records(&text, guess_delimiter(first_line)))
+    Ok(records(&text, guess_delimiter(&text)))
 }
 
 /// Parse a parts list. The first row is the header; columns are matched by name (several
 /// languages), anything unrecognised becomes a part property. Returns parts and warnings.
 pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
-    let first_line = text.lines().next().unwrap_or("");
-    parts_from_rows(&records(text, guess_delimiter(first_line)))
+    parts_from_rows(&records(text, guess_delimiter(text)))
 }
 
 /// The most contacts of one kind a part may have.
@@ -424,8 +469,7 @@ fn classify_plc(h: &str) -> PlcCol {
 /// in several languages; a description column is optional). The `plc` report written as CSV
 /// reads back unchanged. Returns the rows and warnings for rows that were skipped.
 pub fn plc_addresses(text: &str) -> Result<(Vec<PlcAddress>, Vec<String>)> {
-    let first_line = text.lines().next().unwrap_or("");
-    plc_addresses_from_rows(&records(text, guess_delimiter(first_line)))
+    plc_addresses_from_rows(&records(text, guess_delimiter(text)))
 }
 
 /// [`plc_addresses`] for rows already split into cells: an Excel worksheet's, or [`file_rows`]'.
@@ -590,6 +634,41 @@ mod tests {
     }
 
     #[test]
+    fn separators_inside_quotes_or_after_a_literal_quote_do_not_count() {
+        assert_eq!(guess_delimiter("Order number;\"Description\n,,,,\"\nA1;example\n"), ';');
+        assert_eq!(guess_delimiter("Order number;Size (\")\nA1;,,,,\n"), ';');
+    }
+
+    #[test]
+    fn a_line_break_inside_a_quoted_header_does_not_end_it() {
+        assert_eq!(guess_delimiter("\"Order\rnumber\";Description\r\nA1;example\r\n"), ';');
+        assert_eq!(guess_delimiter("\"Order\nnumber\";Description\nA1;example\n"), ';');
+    }
+
+    #[test]
+    fn a_header_ended_by_a_lone_carriage_return_sets_the_separator() {
+        // Old Mac line endings: the header is only the text up to the first `\r`.
+        assert_eq!(guess_delimiter("\nManufacturer;Order number\rABB;1SBL,,,\r"), ';');
+    }
+
+    #[test]
+    fn blank_lines_before_the_header_do_not_change_the_separator() -> Result<()> {
+        let list = "Manufacturer;Order number;Description\r\nABB;1SBL;Contactor, 3 pole\r\n";
+        for lead in ["\r\n", "\n\n", "  \t\n"] {
+            let text = format!("{lead}{list}");
+            assert_eq!(kind(&text), Some(CsvKind::Parts), "{lead:?}");
+            assert_eq!(parts(&text)?, parts(list)?, "{lead:?}");
+            let Ok(rows) = file_rows(text.as_bytes()) else {
+                unreachable!("{lead:?} reads");
+            };
+            assert_eq!(rows[0], ["Manufacturer", "Order number", "Description"]);
+        }
+        let (rows, _) = plc_addresses("\nDevice;Address\n-K1;%I0.0\n")?;
+        assert_eq!(rows.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn a_leading_apostrophe_is_a_guard_only_before_formula_characters() {
         // Any CSV: `'-K1` is taken as a guarded `-K1`, as a spreadsheet shows it.
         let rows = records(
@@ -618,6 +697,97 @@ mod tests {
         );
         // A byte Windows-1252 has no character for keeps its value; Latin-1 letters stay as they are.
         assert_eq!(decode(b"\x81\xe6\xf8\xe5"), "\u{81}\u{e6}\u{f8}\u{e5}");
+        Ok(())
+    }
+
+    #[test]
+    fn separators_inside_quoted_header_text_do_not_set_the_separator() -> Result<()> {
+        let text = "Manufacturer,Order number,\"Notes; one; two; three\"\r\nABB,1SBL,\"a; b\"\r\n";
+        assert_eq!(
+            guess_delimiter("Manufacturer,Order number,\"Notes; one; two; three\""),
+            ','
+        );
+        assert_eq!(kind(text), Some(CsvKind::Parts));
+        let (parts, warnings) = parts(text)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let [p] = parts.as_slice() else {
+            unreachable!("one part: {parts:?}");
+        };
+        assert_eq!(p.manufacturer, "ABB");
+        assert_eq!(p.order_number, "1SBL");
+        assert_eq!(
+            p.properties.get("Notes; one; two; three").map(String::as_str),
+            Some("a; b")
+        );
+        let Ok(rows) = file_rows(text.as_bytes()) else {
+            unreachable!("the list reads");
+        };
+        assert_eq!(rows[0], ["Manufacturer", "Order number", "Notes; one; two; three"]);
+        // A PLC address list the same way.
+        let (rows, warnings) = plc_addresses("Device,Address,\"Comment; a; b; c\"\n-K1,%I0.0,\"x; y\"\n")?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(rows.len(), 1);
+        // A semicolon list with commas in a quoted header stays a semicolon list.
+        assert_eq!(
+            guess_delimiter("Manufacturer;Order number;\"Notes, one, two, three\""),
+            ';'
+        );
+        // A doubled quote inside quoted text keeps the text quoted.
+        assert_eq!(guess_delimiter("a,\"b \"\"c; d\"\" ; e\",f"), ',');
+        // The header ends past a quoted line break, not at it.
+        assert_eq!(guess_delimiter("\"a\nb\";c;d\ne,f,g,h"), ';');
+        // So does a quoted header with a line break and the other separator in it.
+        assert_eq!(guess_delimiter("a,\"b;\r\nc;d;\",e\r\n1;2;3;4,5,6\r\n"), ',');
+        // The readers take the whole header, past its quoted line break.
+        let (parts, warnings) =
+            super::parts("Manufacturer;\"Notes,\nmore, and more, text\";Order number\nABB;x;1SBL\n")?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].order_number, "1SBL");
+        // A quote inside a cell is a plain character: the `;` after it still count.
+        let (parts, _) = parts_from_rows(&records(
+            "Size, 1\";Manufacturer;Order number\nM, 2\";ABB;1SBL\n",
+            guess_delimiter("Size, 1\";Manufacturer;Order number\nM, 2\";ABB;1SBL\n"),
+        ))?;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].order_number, "1SBL");
+        Ok(())
+    }
+
+    #[test]
+    fn blank_and_separator_only_lines_before_a_quoted_header_are_passed() -> Result<()> {
+        let list = "Manufacturer,Order number,\"Notes; one; two; three\"\r\nABB,1SBL,\"a; b\"\r\n";
+        for lead in ["\r\n", "\n \t\n", ",,\r\n", "\n,,\n\"\",\" \"\n\n"] {
+            let text = format!("{lead}{list}");
+            assert_eq!(guess_delimiter(&text), ',', "{lead:?}");
+            assert_eq!(kind(&text), Some(CsvKind::Parts), "{lead:?}");
+            assert_eq!(parts(&text)?, parts(list)?, "{lead:?}");
+        }
+        // The same with semicolons, and commas in the quoted header.
+        let text = "\n;;\nDevice;Address;\"Comment, a, b, c\"\n-K1;%I0.0;\"x, y\"\n";
+        assert_eq!(guess_delimiter(text), ';');
+        let (rows, warnings) = plc_addresses(text)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(rows.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_one_column_file_reads_as_one_column() -> Result<()> {
+        for text in [
+            "Order number\nA1\nB2\n",
+            "\n\"Order number\"\nA1\nB2\n",
+            "\"Order, number; or part number\"\nA1\nB2\n",
+        ] {
+            let Ok(rows) = file_rows(text.as_bytes()) else {
+                unreachable!("{text:?} reads");
+            };
+            assert_eq!(rows.len(), 3, "{text:?}");
+            assert!(rows.iter().all(|r| r.len() == 1), "{text:?}: {:?}", rows.cells);
+        }
+        let (parts, warnings) = parts("Order number\nA1\nB2\n")?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(parts.len(), 2);
         Ok(())
     }
 

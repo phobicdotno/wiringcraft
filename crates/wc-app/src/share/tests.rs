@@ -5724,19 +5724,19 @@ fn a_tag_a_waiting_rename_left_on_undo_is_another_devices_at_once() -> TestResul
 
 #[test]
 fn devices_renamed_onto_each_other_at_once_wait_together() -> TestResult {
-    renamed_onto_each_other("-K111")
+    renamed_onto_each_other("-K1.1.1")
 }
 
 #[test]
 fn devices_renamed_onto_each_other_at_once_wait_together_when_the_first_ones_part_waits() -> TestResult {
-    renamed_onto_each_other("-K11")
+    renamed_onto_each_other("-K1.1")
 }
 
-/// One replace renames -K1 (drawn on page 1) to -K11 and -K11 to -K111; device `waits`
+/// One replace renames -K1 (drawn on page 1) to -K1.1 and -K1.1 to -K1.1.1; device `waits`
 /// waits for its part.
 fn renamed_onto_each_other(waits: &str) -> TestResult {
     let tag = |t: &str| wc_core::DeviceTag::parse(t);
-    let (k1, k11) = (tag("-K1")?, tag("-K11")?);
+    let (k1, k11) = (tag("-K1")?, tag("-K1.1")?);
     let mut base = Project::new("Test");
     base.devices.insert(
         k1.clone(),
@@ -5761,19 +5761,19 @@ fn renamed_onto_each_other(waits: &str) -> TestResult {
     let opts = wc_core::find::FindOptions::default();
     let mut local = base.clone();
     let hits = wc_core::find::find(&local, "K1", opts);
-    let (_, made) = wc_core::find::replace_renaming(&mut local, &hits, "K1", "K11", opts)?;
+    let (_, made) = wc_core::find::replace_renaming(&mut local, &hits, "K1", "K1.1", opts)?;
     assert_eq!(made.len(), 2, "{made:?}");
     assert_eq!(local.pages[0].symbols[0].tag.as_ref(), Some(&k11));
     local.devices.get_mut(&tag(waits)?).ok_or("no device")?.part = Some("acme.relay".into());
     let mut renames = BTreeMap::new();
     note_renames(&mut renames, vec![made], &base, &local);
     assert_eq!(renames.len(), 2, "two renames, not one chain: {renames:?}");
-    // Still two at the next sync: the session has -K11, but as the old side of the second.
+    // Still two at the next sync: the session has -K1.1, but as the old side of the second.
     note_renames(&mut renames, Vec::new(), &base, &local);
     assert_eq!(renames.len(), 2, "{renames:?}");
     let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
     let held = Held::find_renamed(&local, &base, &parts, &renames_now(&renames, &local));
-    // What goes out meanwhile: both devices, and the page retagged to -K11, as the session
+    // What goes out meanwhile: both devices, and the page retagged to -K1.1, as the session
     // has them.
     let mut sendable = local.clone();
     held.drop_from(&mut sendable);
