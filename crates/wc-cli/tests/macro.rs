@@ -829,6 +829,27 @@ fn a_generation_refuses_a_pages_folder_that_is_a_link() -> TestResult {
         std::fs::symlink_metadata(&pages)?.file_type().is_symlink(),
         "the link stays"
     );
+    assert!(
+        !wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Symbol, "wc.coil")?.exists(),
+        "no symbol copy was taken before the refusal"
+    );
+    // An empty pages folder that is a link is refused all the same.
+    for f in std::fs::read_dir(&kept)? {
+        std::fs::remove_file(f?.path())?;
+    }
+    let err = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )
+    .err()
+    .ok_or("an empty linked pages folder is refused")?
+    .to_string();
+    assert!(err.contains("does not write through a linked folder"), "{err}");
+    assert_eq!(
+        std::fs::read_dir(&kept)?.count(),
+        0,
+        "nothing is written through the link"
+    );
     Ok(())
 }
 

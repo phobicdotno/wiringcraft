@@ -3762,6 +3762,10 @@ fn run(mut cli: Cli) -> Res<()> {
                         .collect::<Res<_>>()?;
                     // A link would become a plain file on the rollback, or be removed (#614).
                     refuse_linked_files(dir, &vendored, "macro generate")?;
+                    // The project's files and the pages folder the new pages go to are checked
+                    // the same way before any copy is taken, so a linked folder there refuses
+                    // before anything is written (#1858). The page id only names that folder.
+                    refuse_linked_files(dir, &snapshot_project(dir, &["new"], &[])?, "macro generate")?;
                     let undo_vendored = |err: String| -> String {
                         let failed = put_files_back(&vendored);
                         if failed.is_empty() {
