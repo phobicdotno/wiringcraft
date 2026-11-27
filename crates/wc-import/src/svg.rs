@@ -808,8 +808,10 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
             Event::End(e) => {
-                // A `<text>` with no words in it must not hand its place to later text.
-                if e.local_name().as_ref() == b"text" {
+                // A `<text>` with no words in it must not hand its place to later text. A
+                // `<text>` that is not drawn (one in another namespace inside `<metadata>`, say)
+                // never took the state, so its end leaves the open `<text>`'s state alone.
+                if e.local_name().as_ref() == b"text" && shows.last().is_none_or(|s| s.0) {
                     pending_text = None;
                     text_xy = None;
                     label = None;
@@ -2072,6 +2074,27 @@ mod tests {
         let words: Vec<&str> = texts.iter().map(|t| t.0).collect();
         assert_eq!(words, vec!["A", "B", "CD", "E"]);
         assert!(near(texts[1].1, Point::new(0.0, 10.0)), "the hidden tspan's y places B");
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_inside_metadata_does_not_end_the_open_text() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="5"><metadata><text xmlns="urn:notes">note</text></metadata>Relay</text>
+        </svg>"#;
+        let s = symbol(svg, "svg.meta", "Meta")?;
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts[0].0, "Relay");
+        assert!(near(texts[0].1, Point::new(0.0, 5.0)));
         Ok(())
     }
 
