@@ -22,7 +22,11 @@ const MAX_SYMBOLS: usize = 20_000;
 
 /// Whether `text` is an old KiCad symbol library.
 pub fn is_legacy(text: &str) -> bool {
-    text.trim_start_matches('\u{feff}').trim_start().starts_with(HEADER)
+    // The whole word: `EESchema-LIBRARY-notes` is something else.
+    text.trim_start_matches('\u{feff}')
+        .trim_start()
+        .strip_prefix(HEADER)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 /// A string as an S-expression atom: quoted, with `\` and `"` escaped.
@@ -51,7 +55,13 @@ fn mm(v: f64) -> String {
 }
 
 /// Split a line into words; a word in double quotes keeps its spaces (and `\"` its quote).
+#[cfg(test)]
 fn words(line: &str) -> Vec<String> {
+    words_quoted(line).into_iter().map(|(w, _)| w).collect()
+}
+
+/// [`words`], each with whether it was in double quotes.
+fn words_quoted(line: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -60,7 +70,8 @@ fn words(line: &str) -> Vec<String> {
             continue;
         }
         let mut word = String::new();
-        if c == '"' {
+        let quoted = c == '"';
+        if quoted {
             chars.next();
             while let Some(c) = chars.next() {
                 match c {
@@ -82,7 +93,7 @@ fn words(line: &str) -> Vec<String> {
                 chars.next();
             }
         }
-        out.push(word);
+        out.push((word, quoted));
     }
     out
 }
@@ -125,6 +136,8 @@ struct Def {
     units: i64,
     /// `F` lines as `(property ...)` items.
     properties: Vec<String>,
+    /// The value field's text as written in its `(property "Value" ...)`, for the aliases.
+    value: Option<String>,
     aliases: Vec<String>,
     /// Drawing items by (unit, style).
     items: std::collections::BTreeMap<(i64, i64), Vec<String>>,
@@ -189,7 +202,7 @@ fn justify(h: Option<&str>, v: Option<&str>) -> String {
 
 /// The `.kicad_sym` item of one drawing line, with its unit and body style; `None` for a line
 /// that is not read (its letter is returned as the warning's word).
-fn draw_item(w: &[String]) -> std::result::Result<(i64, i64, String), String> {
+fn draw_item(w: &[String], quoted: &[bool]) -> std::result::Result<(i64, i64, String), String> {
     let kind = w.first().map(String::as_str).unwrap_or("");
     let bad = || format!("{kind} line");
     let stroke = |i: usize| format!("(stroke (width {}) (type default))", mm(num(w, i).unwrap_or(0.0)));
@@ -310,7 +323,13 @@ fn draw_item(w: &[String]) -> std::result::Result<(i64, i64, String), String> {
             );
             let hidden = int(w, 5).unwrap_or(0) != 0;
             let (unit, style) = (int(w, 6).ok_or_else(bad)?, int(w, 7).ok_or_else(bad)?);
-            let t = text(w.get(8).ok_or_else(bad)?, false);
+            // A quoted text keeps its `~` and writes `"` as `''`; an unquoted one has `~` for a space.
+            let raw = w.get(8).ok_or_else(bad)?;
+            let t = if quoted.get(8).copied().unwrap_or(false) {
+                raw.replace("''", "\"")
+            } else {
+                text(raw, false)
+            };
             let justify = justify(w.get(11).map(String::as_str), w.get(12).map(String::as_str));
             Ok((
                 unit,
@@ -357,13 +376,28 @@ fn draw_item(w: &[String]) -> std::result::Result<(i64, i64, String), String> {
                 _ => "passive",
             };
             let shape_word = w.get(12).map(String::as_str).unwrap_or("");
-            let hidden = shape_word.starts_with('N');
-            let marks = shape_word.trim_start_matches('N');
-            let shape = match (marks.contains('I'), marks.contains('C')) {
-                (true, true) => "inverted_clock",
-                (true, false) => "inverted",
-                (false, true) => "clock",
-                _ => "line",
+            // `N` anywhere hides the pin (`N`, `NI`, `IN`); the other letters are its marks, named
+            // as KiCad 6 names them.
+            let hidden = shape_word.contains('N');
+            let has = |c: char| shape_word.contains(c);
+            let shape = if has('I') && has('C') {
+                "inverted_clock"
+            } else if has('I') {
+                "inverted"
+            } else if has('C') && has('L') {
+                "clock_low"
+            } else if has('C') {
+                "clock"
+            } else if has('F') {
+                "edge_clock_high"
+            } else if has('L') {
+                "input_low"
+            } else if has('V') {
+                "output_low"
+            } else if has('X') {
+                "non_logic"
+            } else {
+                "line"
             };
             Ok((
                 unit,
@@ -405,14 +439,19 @@ pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let w = words(line);
+        let wq = words_quoted(line);
+        let quoted: Vec<bool> = wq.iter().map(|(_, q)| *q).collect();
+        let w: Vec<String> = wq.into_iter().map(|(w, _)| w).collect();
         let Some(head) = w.first().map(String::as_str) else {
             continue;
         };
-        if in_fplist {
+        // A `DEF` ends a footprint filter list left open, and is then refused below as a symbol
+        // inside another.
+        if in_fplist && head != "DEF" {
             in_fplist = head != "$ENDFPLIST";
             continue;
         }
+        in_fplist = false;
         match (head, def.as_mut()) {
             ("DEF", None) => {
                 let name = text(w.get(1).map(String::as_str).unwrap_or(""), true);
@@ -466,7 +505,13 @@ pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
                     continue;
                 }
                 match field(k, &w, d) {
-                    Some(p) => d.properties.push(p),
+                    Some(p) => {
+                        if k == 1 {
+                            let v = text(w.get(1).map(String::as_str).unwrap_or(""), true);
+                            d.value = Some(if v.is_empty() { d.name.clone() } else { v });
+                        }
+                        d.properties.push(p)
+                    }
                     None => *skipped.entry(format!("{f} field")).or_default() += 1,
                 }
             }
@@ -478,11 +523,13 @@ pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
                 if d.name.is_empty() {
                     continue;
                 }
-                match draw_item(&w) {
+                match draw_item(&w, &quoted) {
                     Ok((unit, style, item)) => d.items.entry((unit.max(0), style.max(0))).or_default().push(item),
                     Err(kind) => *skipped.entry(kind).or_default() += 1,
                 }
             }
+            // A record not read, before `DRAW` as inside it, is counted for the warning.
+            (other, Some(d)) if !d.name.is_empty() => *skipped.entry(format!("{other} line")).or_default() += 1,
             _ => {}
         }
     }
@@ -506,10 +553,18 @@ fn write_symbol(out: &mut String, d: &Def) {
     for p in &d.properties {
         let _ = writeln!(out, "    {p}");
     }
+    let mut blocks: std::collections::BTreeMap<(i64, i64), Vec<&String>> = std::collections::BTreeMap::new();
     for ((unit, style), items) in &d.items {
         // Style 0 draws in both styles: KiCad 6 calls the normal style 1.
         let style = (*style).max(1);
         let unit = if d.units > 1 { *unit } else { (*unit).min(1) };
+        blocks.entry((unit, style)).or_default().extend(items);
+    }
+    // Every unit the `DEF` line declares, also one drawn only by the common items.
+    for unit in 1..=d.units {
+        blocks.entry((unit, 1)).or_default();
+    }
+    for ((unit, style), items) in &blocks {
         let _ = writeln!(out, "    (symbol {}", q(&format!("{}_{unit}_{style}", d.name)));
         for item in items {
             let _ = writeln!(out, "      {item}");
@@ -517,15 +572,24 @@ fn write_symbol(out: &mut String, d: &Def) {
         out.push_str("    )\n");
     }
     out.push_str("  )\n");
+    // An alias draws like its symbol and takes its fields, with its own name as the value.
+    let value_head = d.value.as_ref().map(|v| format!("(property \"Value\" {} ", q(v)));
     for alias in d.aliases.iter().filter(|a| !a.is_empty() && **a != d.name) {
-        let _ = writeln!(
-            out,
-            "  (symbol {} (extends {}) (property \"Reference\" {} (at 0 0 0)) (property \"Value\" {} (at 0 0 0) (effects hide)))",
-            q(alias),
-            q(&d.name),
-            q(&d.reference),
-            q(alias)
-        );
+        let _ = write!(out, "  (symbol {} (extends {})", q(alias), q(&d.name));
+        if !has_reference {
+            let _ = write!(out, " (property \"Reference\" {} (at 0 0 0))", q(&d.reference));
+        }
+        for p in &d.properties {
+            match value_head.as_deref().and_then(|head| p.strip_prefix(head)) {
+                Some(rest) => {
+                    let _ = write!(out, " (property \"Value\" {} {rest}", q(alias));
+                }
+                None => {
+                    let _ = write!(out, " {p}");
+                }
+            }
+        }
+        out.push_str(")\n");
     }
 }
 
@@ -655,5 +719,38 @@ ENDDEF
         let (symbols, _) = crate::kicad::symbols(&sym, "kicad.x", 1.0)?;
         assert_eq!(symbols.first().map(|i| i.kicad_name.as_str()), Some("Say\"Hi\\"));
         Ok(())
+    }
+
+    #[test]
+    fn review_cases_hidden_marks_quoted_text_units_fields_and_aliases() -> Result<()> {
+        let lib = "EESchema-LIBRARY Version 2.4\nDEF LAMP H 0 40 Y Y 3 L N\nF0 \"H\" 0 100 50 H V C CNN\nF1 \"LAMP\" 0 -100 50 H V C CNN\nF4 \"x\" 0 0 50 H I C CNN\nALIAS LAMP_24V\nQ 1 2 3\nDRAW\nT 0 0 0 50 0 1 1 \"a~b ''c''\" Normal 0 C C\nX A A 0 0 100 R 50 50 1 1 P IN\nX B B 0 100 100 R 50 50 1 1 P NI\nX C C 0 200 100 R 50 50 1 1 I F\nX D D 0 300 100 R 50 50 2 1 O V\nENDDRAW\nENDDEF\n";
+        let (sym, warnings) = to_kicad_sym(lib)?;
+        // Records not read before DRAW count too.
+        assert!(warnings.iter().any(|w| w.contains("Q line")), "{warnings:?}");
+        // Both `IN` and `NI` hide the pin; `F` and `V` are named marks.
+        let hidden_pins = sym
+            .lines()
+            .filter(|l| l.contains("(pin ") && l.contains(" hide"))
+            .count();
+        assert_eq!(hidden_pins, 2, "{sym}");
+        assert!(sym.contains("edge_clock_high") && sym.contains("output_low"), "{sym}");
+        // A quoted text keeps `~` and reads `''` as a double quote.
+        assert!(sym.contains(r#""a~b \"c\"""#), "{sym}");
+        // Unit 3 has nothing drawn but is still declared.
+        assert!(sym.contains("\"LAMP_3_1\""), "{sym}");
+        // The alias keeps the base fields with its own value.
+        let alias = sym.split("(extends").nth(1).unwrap_or_default();
+        assert!(
+            alias.contains("\"LAMP_24V\"") && alias.contains("\"Reference\" \"H\""),
+            "{sym}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_def_inside_an_open_footprint_list_is_refused() {
+        let lib = "EESchema-LIBRARY Version 2.4\nDEF A U 0 40 Y Y 1 L N\n$FPLIST\nDEF B U 0 40 Y Y 1 L N\nENDDEF\n";
+        assert!(to_kicad_sym(lib).is_err_and(|e| e.to_string().contains("before the one from line 2")));
+        assert!(!is_legacy("EESchema-LIBRARYX Version 2.4"));
     }
 }

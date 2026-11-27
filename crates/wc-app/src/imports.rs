@@ -1204,9 +1204,15 @@ INSERT INTO tew_componentterminal VALUES (50, 0, 'A1'), (50, 1, 'A2');
   (symbol "K" (property "Reference" "K" (at 0 0 0))
     (symbol "K_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "A1")))))"#;
         let parts = b"order number;manufacturer;description\nX-1;Acme;Relay\n";
+        // An old KiCad library (before KiCad 6) in the same archive.
+        let old = b"EESchema-LIBRARY Version 2.4\nDEF LAMP H 0 40 Y Y 1 L N\nF0 \"H\" 0 100 50 H V C CNN\nDRAW\nX 1 1 0 0 100 R 50 50 1 1 P\nENDDRAW\nENDDEF\n";
         assert!(write_zip(
             &archive,
-            &[("symbols/My Relays.kicad_sym", kicad), ("lists/parts.csv", parts)]
+            &[
+                ("symbols/My Relays.kicad_sym", kicad),
+                ("symbols/old.lib", old),
+                ("lists/parts.csv", parts)
+            ]
         ));
         let files = |dir: PathBuf| std::fs::read_dir(dir).map_or(0, |d| d.flatten().count());
 
@@ -1242,6 +1248,7 @@ INSERT INTO tew_componentterminal VALUES (50, 0, 'A1'), (50, 1, 'A2');
         assert!(!msg.contains("not imported"), "{msg}");
         assert!(msg.contains("imported 1 part(s)"), "{msg}");
         assert!(own.join("symbols").join("kicad.my_relays.k.json").exists(), "{msg}");
+        assert!(own.join("symbols").join("kicad.old.lamp.json").exists(), "{msg}");
         assert_eq!(files(own.join("parts")), 1, "{msg}");
 
         // Another folder: it must be given, and is the one written to.
