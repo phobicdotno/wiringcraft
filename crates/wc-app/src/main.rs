@@ -1842,10 +1842,17 @@ impl App {
             Action::SaveAs => self.pending = Some(Pending::SaveAs),
             Action::Undo | Action::Redo => {
                 let before = panel_pick_before(&self.ed, &open.project);
+                let shown = open.project.pages.get(page).map(|p| p.id.clone());
                 // As in a shared session: a panel device drag going on ends here.
                 self.ed.panel_drag = None;
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
+                    // The step may have moved the shown page in the list (a page moved up or
+                    // renumbered): keep showing it, or a page that is there when it went.
+                    let pages = &open.project.pages;
+                    self.ed.page = shown
+                        .and_then(|id| pages.iter().position(|p| p.id == id))
+                        .unwrap_or_else(|| page.min(pages.len().saturating_sub(1)));
                     self.ed.selection.clear();
                     // A wire being drawn may start on a pin the undo took away.
                     self.ed.wire = None;
@@ -9604,6 +9611,32 @@ mod menu_action_tests {
             a.open.as_ref().unwrap().project.panels[1].items,
             vec![device("-B1", 30.0)]
         );
+    }
+
+    #[test]
+    fn undo_and_redo_keep_showing_the_same_page() {
+        let (_tmp, mut a, _) = app();
+        let id = |a: &App| a.open.as_ref().unwrap().project.pages[a.ed.page].id.clone();
+        // Page 2 moves up to first place, and stays shown.
+        a.ed.page = 1;
+        let moved = id(&a);
+        a.ed.menu_action = Some(Action::PageUp);
+        a.run_menu_action();
+        assert_eq!((a.ed.page, id(&a)), (0, moved.clone()));
+        // Undo puts it back in second place: it is still the page shown.
+        a.ed.menu_action = Some(Action::Undo);
+        a.run_menu_action();
+        assert_eq!((a.ed.page, id(&a)), (1, moved.clone()));
+        a.ed.menu_action = Some(Action::Redo);
+        a.run_menu_action();
+        assert_eq!((a.ed.page, id(&a)), (0, moved));
+        // A page the undo takes away is no longer shown: a page that is there is.
+        a.ed.menu_action = Some(Action::AddPage);
+        a.run_menu_action();
+        assert_eq!(a.ed.page, 2);
+        a.ed.menu_action = Some(Action::Undo);
+        a.run_menu_action();
+        assert_eq!(a.ed.page, 1);
     }
 
     #[test]
