@@ -453,7 +453,14 @@ fn shapes(
         }
         polyline(pts, closed, false)
     };
+    // Set after an invisible INSERT: the attributes that follow it in the list belong to it and
+    // are left out with it, as on a page.
+    let mut in_invisible_insert = false;
     for (i, e) in ents.iter().enumerate() {
+        if e.kind == "ATTRIB" && in_invisible_insert {
+            continue;
+        }
+        in_invisible_insert = e.kind == "INSERT" && e.f(60) as i64 == 1;
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
             let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
@@ -3164,6 +3171,25 @@ mod tests {
         assert_eq!(p.symbols.len(), 1, "{:?}", p.symbols);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K2"));
         assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        // Inside a visible block, an invisible INSERT's attributes are left out with it, while
+        // a visible INSERT's attribute is still drawn.
+        let blocks = "0\nBLOCK\n2\nINNER\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nOUTER\n\
+                      0\nINSERT\n2\nINNER\n60\n1\n10\n0\n20\n0\n66\n1\n\
+                      0\nATTRIB\n2\nNOTE\n1\nHidden\n10\n0\n20\n5\n70\n0\n\
+                      0\nINSERT\n2\nINNER\n10\n0\n20\n20\n66\n1\n\
+                      0\nATTRIB\n2\nNOTE\n1\nShown\n10\n0\n20\n25\n70\n0\n\
+                      0\nENDBLK\n";
+        let (shapes, skipped) = drawn("0\nINSERT\n2\nOUTER\n10\n0\n20\n0\n", blocks)?;
+        let texts: Vec<&str> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Shown"], "{shapes:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
         Ok(())
     }
 
