@@ -1167,8 +1167,42 @@ impl Open {
     /// any of them, so a change can be refused before anything else of it is applied.
     pub fn check_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         let lock = self.project.lock.clone();
-        let r = ids.into_iter().try_for_each(|id| self.ensure_part(id));
+        let r = self.ensure_parts(ids);
         self.project.lock = lock;
+        r
+    }
+
+    /// [`Open::ensure_part`] for every part, all or none: when one cannot be used, the copies
+    /// and loaded parts the earlier ones got here are taken back (those there before are kept),
+    /// and so is the lock.
+    fn ensure_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let lock = self.project.lock.clone();
+        // What this call added: the parts loaded here and the copies written that were not there.
+        let (mut loaded, mut copies) = (Vec::new(), Vec::new());
+        let mut r = Ok(());
+        for id in ids {
+            let was_loaded = self.parts.contains_key(id);
+            let missing = store::vendor_path(&self.dir, ItemKind::Part, id)
+                .ok()
+                .filter(|path| !path.try_exists().unwrap_or(true));
+            r = self.ensure_part(id);
+            if !was_loaded && self.parts.contains_key(id) {
+                loaded.push(id.to_owned());
+            }
+            copies.extend(missing.filter(|path| path.exists()));
+            if r.is_err() {
+                break;
+            }
+        }
+        if r.is_err() {
+            for id in loaded {
+                self.parts.remove(&id);
+            }
+            for path in copies {
+                let _ = std::fs::remove_file(path);
+            }
+            self.project.lock = lock;
+        }
         r
     }
 
@@ -1183,13 +1217,8 @@ impl Open {
             return Ok(());
         }
         let lock = self.project.lock.clone();
-        for a in &accessories {
-            if let Err(e) = self.ensure_part(&a.part) {
-                // Parts taken before this one are not pinned without a change that uses them.
-                self.project.lock = lock;
-                return Err(e);
-            }
-        }
+        // Parts taken before one that cannot be used are taken back, copy and pin.
+        self.ensure_parts(accessories.iter().map(|a| a.part.as_str()))?;
         self.checkpoint_with_lock(lock);
         self.project.devices.entry(tag.clone()).or_default().accessories = accessories;
         Ok(())
@@ -9840,6 +9869,48 @@ pub(crate) mod tests {
         );
         assert!(o.undo());
         assert!(o.project.devices.get(&tag).is_none_or(|d| d.accessories.is_empty()));
+    }
+
+    #[test]
+    fn a_refused_accessory_list_takes_no_part_into_the_project() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let a = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        let id = o
+            .part_library
+            .iter()
+            .map(|(id, _)| id.clone())
+            .find(|id| !o.parts.contains_key(id))
+            .unwrap();
+        let copy = store::vendor_path(&o.dir, ItemKind::Part, &id).unwrap();
+        assert!(!copy.exists());
+        let list = vec![
+            DevicePart {
+                part: id.clone(),
+                qty: 1,
+            },
+            DevicePart {
+                part: "no.such.part".into(),
+                qty: 1,
+            },
+        ];
+        assert!(o.check_parts(list.iter().map(|a| a.part.as_str())).is_err());
+        assert!(!copy.exists(), "no copy left by a refused check");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused check");
+        assert!(o.set_device_accessories(&tag, list).is_err());
+        assert!(!copy.exists(), "no copy left by a refused change");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused change");
+        assert!(!o.project.lock.parts.contains_key(&id));
+        let good = vec![DevicePart {
+            part: id.clone(),
+            qty: 1,
+        }];
+        o.check_parts(good.iter().map(|a| a.part.as_str())).unwrap();
+        o.set_device_accessories(&tag, good).unwrap();
+        assert!(copy.exists());
+        assert!(o.parts.contains_key(&id));
+        assert!(o.project.lock.parts.contains_key(&id));
     }
 
     #[test]

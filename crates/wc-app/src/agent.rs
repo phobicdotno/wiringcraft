@@ -5491,6 +5491,16 @@ mod tests {
         assert_eq!(listed[0]["accessories"][0]["qty"], json!(3), "{listed}");
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1, "one undo step");
 
+        // A null qty on a device that has accessories is refused and keeps the list it has.
+        let r = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "accessories": [{"part": "example.ex-tb-2-5", "qty": null}]}),
+        );
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(got(&a), want);
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1, "no new step");
+
         // An empty list removes them, and undo brings them back.
         let said = call(&mut a, "set_device", json!({"tag": "-K1", "accessories": []})).unwrap();
         assert!(said.contains("accessories removed"), "{said}");
