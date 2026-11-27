@@ -1003,6 +1003,39 @@ fn a_cable_named_only_on_wires_is_a_device_without_a_part() {
 }
 
 #[test]
+fn a_blank_potential_name_does_not_hide_a_wire_end_in_the_air() {
+    let (mut p, s, parts) = fixture();
+    let air = |id: &str, y: f64, potential: Option<&str>| {
+        wire(
+            id,
+            pin("s6", "X2"),
+            Endpoint::Point {
+                at: Point::new(400.0, y),
+            },
+            None,
+            potential,
+        )
+    };
+    p.pages[0].wires.push(air("w20", 400.0, Some("  ")));
+    p.pages[0].wires.push(air("w21", 500.0, Some("")));
+    p.pages[0].wires.push(air("w22", 600.0, Some("24V")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    let air_at = |y: &str| {
+        found
+            .iter()
+            .any(|f| f.message == format!("wire ends in the air at 400.0, {y}"))
+    };
+    assert!(air_at("400.0"), "a blank name is no potential: {found:?}");
+    assert!(air_at("500.0"), "an empty name is no potential: {found:?}");
+    assert!(!air_at("600.0"), "a named potential joins across pages");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
