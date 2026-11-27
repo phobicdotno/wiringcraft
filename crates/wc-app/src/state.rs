@@ -1161,7 +1161,12 @@ impl Open {
     /// Make sure a part is in the project (taken from the library when needed) and loaded.
     fn ensure_part(&mut self, id: &str) -> Result<(), String> {
         let pin = self.project.lock.parts.get(id).cloned();
-        if pin.is_some() && self.parts.contains_key(id) {
+        // A loaded part is used as it is only when it is the version the pin names; one loaded
+        // from a copy changed since is checked against the pin below.
+        if let (Some(pin), Some(loaded)) = (&pin, self.parts.get(id))
+            && loaded.id == id
+            && loaded.hash() == pin.hash
+        {
             return Ok(());
         }
         let vendored = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
@@ -1317,6 +1322,23 @@ impl Open {
                 )
             })
         }
+    }
+
+    /// The devices placing a group (`symbols`, `wires` and the group's own `devices`) with its own
+    /// data first gives the tags it places, as [`wc_core::placement::place`] picks them: the
+    /// group's device for a tag, else the project's. The tags are those of the symbols and the
+    /// cables of the wires.
+    pub(crate) fn group_devices<'a>(
+        &'a self,
+        symbols: &'a [PlacedSymbol],
+        wires: &'a [Wire],
+        devices: &'a BTreeMap<DeviceTag, wc_core::Device>,
+    ) -> impl Iterator<Item = &'a wc_core::Device> + 'a {
+        let tags = symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref())
+            .chain(wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)));
+        tags.filter_map(|t| devices.get(t).or_else(|| self.project.devices.get(t)))
     }
 
     /// The parts `devices` name (their main parts and accessories) that a macro or a copy from
@@ -4162,7 +4184,11 @@ impl Open {
         self.ensure_symbols(ids)?;
         // The parts the copies' devices name are taken too, all or none (#1855); the undo step
         // below goes back to the lock before them.
-        let parts = self.parts_to_take(copies.iter().flat_map(|c| c.devices.values()));
+        let parts = self.parts_to_take(
+            copies
+                .iter()
+                .flat_map(|c| self.group_devices(&c.symbols, &c.wires, &c.devices)),
+        );
         let lock = self.project.lock.clone();
         let (taken, r) = match parts {
             Ok(parts) => self.take_parts(parts.iter().map(String::as_str)),

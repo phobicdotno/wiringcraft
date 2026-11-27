@@ -944,7 +944,7 @@ impl Open {
         // The parts the copied devices name come along then, all or none, as `macro place`
         // takes them (#1855); Undo takes their pins back.
         let parts = match data {
-            DeviceData::GroupFirst => self.parts_to_take(clip.devices.values()),
+            DeviceData::GroupFirst => self.parts_to_take(self.group_devices(&clip.symbols, &clip.wires, &clip.devices)),
             DeviceData::ProjectFirst | DeviceData::GroupOnly => Ok(Vec::new()),
         };
         let lock = self.project.lock.clone();
@@ -1610,6 +1610,22 @@ mod tests {
         assert_eq!(o.project, before, "no symbol pin either");
         assert!(!o.symbols.contains_key("wc.coil.valve"), "nor a loaded symbol");
         assert_eq!(o.undo_mark(), mark);
+    }
+
+    #[test]
+    fn a_macro_part_whose_loaded_copy_is_not_the_pinned_version_is_refused() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let path = macro_with_parts(&mut o, page, MAIN, "NO-SUCH");
+        o.insert_macro(page, &path, None).unwrap();
+        // The copy changes outside the app and is loaded as it is now; the pin stays.
+        let mut changed = o.parts[MAIN].clone();
+        changed.description = "changed outside".into();
+        wc_core::store::write_vendored_part(&o.dir, &changed).unwrap();
+        o.parts.insert(MAIN.into(), changed);
+        let before = o.project.clone();
+        let err = o.insert_macro(page, &path, None).unwrap_err();
+        assert!(err.contains("not the version the project pins"), "{err}");
+        assert_eq!(o.project, before);
     }
 
     #[test]
