@@ -64,8 +64,9 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
-/// `old` under the new tag of its parent (its tag one product level up), when the group's
-/// parent was renamed to a different tag: `-X1.3` of a strip `-X1` placed as `-X2` is `-X2.3`.
+/// `old` under the new tag of its parent (its tag one product level up), when the group holds
+/// that parent: `-X1.3` of a strip `-X1` placed as `-X2` is `-X2.3`, and placed as `-X1` it
+/// stays `-X1.3`.
 fn under_renamed_parent(renamed: &BTreeMap<&DeviceTag, Option<DeviceTag>>, old: &DeviceTag) -> Option<DeviceTag> {
     let (last, rest) = old.product.split_last()?;
     if rest.is_empty() {
@@ -76,9 +77,6 @@ fn under_renamed_parent(renamed: &BTreeMap<&DeviceTag, Option<DeviceTag>>, old: 
         ..old.clone()
     };
     let new_parent = renamed.get(&parent)?.as_ref()?;
-    if *new_parent == parent {
-        return None;
-    }
     let mut t = new_parent.clone();
     t.product.push(last.clone());
     Some(t)
@@ -138,9 +136,14 @@ pub fn place(
             continue;
         }
         // A terminal (or other sub-tag) of a strip the group holds follows the strip to its
-        // new tag, keeping its own number when that is free there.
-        let followed = under_renamed_parent(&renamed, old).filter(|t| !used.contains(t));
-        let new = match followed.or_else(|| free_tag_like(&used, old)) {
+        // new tag, keeping its own number when that is free there, else taking the next free
+        // number on that strip.
+        let followed = under_renamed_parent(&renamed, old);
+        let new = match followed
+            .clone()
+            .filter(|t| !used.contains(t))
+            .or_else(|| free_tag_like(&used, followed.as_ref().unwrap_or(old)))
+        {
             Some(t) => t,
             None if out_of_tags == OutOfTags::Fail => {
                 return Err(Error::Invalid(format!("no free tag like {old}")));
