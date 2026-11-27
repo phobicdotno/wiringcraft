@@ -785,6 +785,55 @@ fn a_generation_refuses_project_files_that_are_links() -> TestResult {
 
 #[cfg(unix)]
 #[test]
+fn a_generation_refuses_a_pages_folder_that_is_a_link() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    // The pages are kept in a folder outside the project, reached through a link (#1858): a
+    // save or a rollback would write there.
+    let pages = dir.join("pages");
+    let kept = tmp.path().join("kept-pages");
+    std::fs::rename(&pages, &kept)?;
+    std::os::unix::fs::symlink(&kept, &pages)?;
+    let before: Vec<_> = std::fs::read_dir(&kept)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "set\n3 kW\n")?;
+    let err = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )
+    .err()
+    .ok_or("a linked pages folder is refused")?
+    .to_string();
+    assert!(err.contains("does not write through a linked folder"), "{err}");
+    assert!(err.contains("pages"), "{err}");
+    let after: Vec<_> = std::fs::read_dir(&kept)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(after.len(), before.len(), "nothing is written through the link");
+    assert!(
+        std::fs::symlink_metadata(&pages)?.file_type().is_symlink(),
+        "the link stays"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn a_generation_refuses_a_symbol_copy_that_is_a_dangling_link() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path().join("p");
