@@ -74,6 +74,31 @@ pub struct XrefMark {
 
 pub const XREF_HEIGHT: f64 = 1.8;
 
+/// A placed symbol's device tag as drawn: how its lines align, and each line (`=function`,
+/// `+location`, `-product`) with its baseline anchor in page mm, centred on the tag position.
+/// The lines are right-aligned there, so they grow away from a drawing to their right; where
+/// the placement turns that side round (a mirror, or half a turn) they are left-aligned.
+pub fn tag_lines(placed: &PlacedSymbol, symbol: &Symbol, tag: &DeviceTag) -> (Align, Vec<(Point, String)>) {
+    let ta = symbol.tag_at.transform(placed.rotation, placed.mirror) + placed.at;
+    let reversed = Point::new(1.0, 0.0).transform(placed.rotation, placed.mirror).x < -0.5;
+    let align = if reversed { Align::Left } else { Align::Right };
+    let mut lines = Vec::new();
+    if !tag.function.is_empty() {
+        lines.push(format!("={}", tag.function.join(".")));
+    }
+    if !tag.location.is_empty() {
+        lines.push(format!("+{}", tag.location.join(".")));
+    }
+    lines.push(format!("-{}", tag.product.join(".")));
+    let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
+    let lines = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| (Point::new(ta.x, top + 3.0 * i as f64), l))
+        .collect();
+    (align, lines)
+}
+
 /// Cross-reference texts for a page: a coil lists its contacts with their pins and locations,
 /// a contact points back to its coil, an interruption point lists where the wire continues.
 /// Problems (a contact without a coil, an interruption point without a partner) go to `warnings`.
@@ -96,9 +121,7 @@ pub fn xref_marks(
             .collect();
         let below = placed.iter().map(|g| g.bounds().1.y).fold(s.at.y, f64::max);
         let right = placed.iter().map(|g| g.bounds().1.x).fold(s.at.x, f64::max);
-        let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
-        let tag_lines = 1 + usize::from(!tag.function.is_empty()) + usize::from(!tag.location.is_empty());
-        let tag_top = ta.y - (tag_lines as f64 - 1.0) * 1.5 + 1.2;
+        let (tag_align, tag_at) = tag_lines(s, sym, tag);
         match sym.role {
             SymbolRole::Main => {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
@@ -112,8 +135,8 @@ pub fn xref_marks(
             }
             SymbolRole::Auxiliary => match xref.mains.get(tag).and_then(|m| m.first()) {
                 Some(main) => out.push(XrefMark {
-                    at: Point::new(ta.x, tag_top + 3.0 * tag_lines as f64),
-                    align: Align::Right,
+                    at: tag_at.last().map_or(s.at, |(at, _)| *at + Point::new(0.0, 3.0)),
+                    align: tag_align,
                     text: format!("> {}", main.location()),
                     target_page_id: main.page_id.clone(),
                 }),
@@ -914,19 +937,11 @@ pub fn draw_page(
             draw_shape(&mut pen, &g.placed(s.at, s.rotation, s.mirror));
         }
         let Some(tag) = &s.tag else { continue };
-        let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
-        // One aspect per line, right-aligned, centred on the tag position.
-        let mut lines = Vec::new();
-        if !tag.function.is_empty() {
-            lines.push(format!("={}", tag.function.join(".")));
-        }
-        if !tag.location.is_empty() {
-            lines.push(format!("+{}", tag.location.join(".")));
-        }
-        lines.push(format!("-{}", tag.product.join(".")));
-        let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
-        for (i, l) in lines.iter().enumerate() {
-            pen.text((ta.x, top + 3.0 * i as f64), 2.5, 2, l);
+        // One aspect per line, centred on the tag position.
+        let (align, lines) = tag_lines(s, sym, tag);
+        let a = if align == Align::Left { 0 } else { 2 };
+        for (at, l) in lines {
+            pen.text(tuple(at), 2.5, a, &l);
         }
     }
 

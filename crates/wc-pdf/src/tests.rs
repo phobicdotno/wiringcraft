@@ -3439,3 +3439,86 @@ fn a_cable_list_page_names_the_cable_its_first_cores_belong_to() {
     let first = texts(&[layout::TableLine::Row(0), layout::TableLine::Row(1)]);
     assert_eq!(first.iter().filter(|t| t.as_str() == "-W1").count(), 1, "{first:?}");
 }
+
+#[test]
+fn a_mirrored_or_upside_down_symbol_prints_its_tag_away_from_the_drawing() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_string(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_string(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let tag = "=PUMP.STATION+CABINET-K1";
+    // Where each tag line starts and ends on the page, from left to right.
+    let spans = |rotation: wc_core::geom::Rotation, mirror: bool| -> Vec<(f64, f64)> {
+        let mut project = Project::new("x");
+        let mut page = Page::new("p1", "1", "Control");
+        let mut s = place("s1", "coil", 100.0, tag);
+        s.rotation = rotation;
+        s.mirror = mirror;
+        page.symbols.push(s);
+        project.pages = vec![page.clone()];
+        let xref = CrossRefs::build(&project, &symbols);
+        let mut warnings = Vec::new();
+        let drawn = layout::draw_page(
+            &project,
+            &page,
+            0,
+            1,
+            &symbols,
+            &xref,
+            &Options::default(),
+            &mut warnings,
+        );
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { at, height, text, .. }
+                    if (*height - 2.5).abs() < 1e-9 && ["=PUMP", "+CAB", "-K1"].iter().any(|w| text.starts_with(w)) =>
+                {
+                    Some((at.0, at.0 + writer::text_width_mm(text, 2.5)))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    // The symbol is a line at x = 100, its tag 5 mm to its left (to its right when mirrored or
+    // turned half round), and each line is wider than that gap.
+    for (rotation, mirror, left_of_drawing) in [
+        (wc_core::geom::Rotation::R0, false, true),
+        (wc_core::geom::Rotation::R0, true, false),
+        (wc_core::geom::Rotation::R180, false, false),
+        (wc_core::geom::Rotation::R180, true, true),
+    ] {
+        let lines = spans(rotation, mirror);
+        assert_eq!(lines.len(), 3, "{rotation:?} {mirror}: {lines:?}");
+        for (a, b) in lines {
+            if left_of_drawing {
+                assert!(
+                    (b - 95.0).abs() < 1e-6,
+                    "{rotation:?} {mirror}: ends at the tag: {a}..{b}"
+                );
+            } else {
+                assert!(
+                    (a - 105.0).abs() < 1e-6,
+                    "{rotation:?} {mirror}: starts at the tag: {a}..{b}"
+                );
+            }
+        }
+    }
+
+    // A mirrored contact's reference to its coil sits under its tag, aligned the same way.
+    let mut project = Project::new("x");
+    let mut page = Page::new("p1", "1", "Control");
+    page.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    let mut contact = place("s2", "no", 100.0, "-K1");
+    contact.mirror = true;
+    page.symbols.push(contact);
+    project.pages = vec![page.clone()];
+    let xref = CrossRefs::build(&project, &symbols);
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(&page, &symbols, &xref, &mut warnings);
+    let Some(back) = marks.iter().find(|m| m.text.starts_with('>')) else {
+        unreachable!("the contact points at its coil: {marks:?}")
+    };
+    assert_eq!(back.align, wc_core::geom::Align::Left);
+    assert_eq!(back.at, Point::new(105.0, 60.0 + 8.0 + 1.2 + 3.0));
+}
