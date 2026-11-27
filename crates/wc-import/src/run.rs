@@ -874,6 +874,59 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
         .file_stem()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // What a failure after the first write puts back (#1751): every file the save may write, and
+    // each scan's file with what it holds now (a picture no page uses, or nothing). Read before
+    // anything is written, so a path that cannot be read is a refusal too.
+    let ids: Vec<String> = (0..traced.len()).map(|i| format!("pdf-{}", first_page + i)).collect();
+    let project_files = snapshot_project(dir, &ids.iter().map(String::as_str).collect::<Vec<_>>(), &[])?;
+    let underlays = dir.join(wc_core::Underlay::DIR);
+    let mut scans: Written = Vec::new();
+    for (id, t) in ids.iter().zip(&traced) {
+        let Some(scan) = &t.scan else { continue };
+        let path = underlays.join(format!("{id}.{}", scan.raster.format.extension()));
+        let before = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
+            Err(x) => return Err(format!("{}: {x}", escape_field(&path.display().to_string()))),
+        };
+        scans.push((path, before));
+    }
+    // The folder is removed again only when this import makes it.
+    let makes_folder = !scans.is_empty()
+        && matches!(std::fs::symlink_metadata(&underlays), Err(x) if x.kind() == std::io::ErrorKind::NotFound);
+    let written = write_pdf_pages(dir, &mut p, traced, first_page, (&stem, source), log);
+    written.map_err(|why| {
+        let mut failed = put_files_back(&project_files);
+        failed.extend(put_files_back(&scans));
+        if makes_folder
+            && let Err(x) = std::fs::remove_dir(&underlays)
+            && x.kind() != std::io::ErrorKind::NotFound
+        {
+            failed.push(format!("{}: {x}", underlays.display()));
+        }
+        if failed.is_empty() {
+            why
+        } else {
+            format!(
+                "{why}; the project folder could not be put back as it was: {}",
+                escape_field(&failed.join("; "))
+            )
+        }
+    })
+}
+
+/// The writing half of [`import_pdf`], after its refusals: the scan of each scanned page into
+/// the underlay folder, the pages into `p`, and the save. The caller puts the folder back as it
+/// was when this fails. The pair of names is the PDF's file stem (for page titles) and its name
+/// in warnings.
+fn write_pdf_pages(
+    dir: &Path,
+    p: &mut Project,
+    traced: Vec<crate::pdf::TracePage>,
+    first_page: usize,
+    (stem, source): (&str, &str),
+    log: &mut Log,
+) -> Res<()> {
     for (i, t) in traced.into_iter().enumerate() {
         let id = format!("pdf-{}", first_page + i);
         if t.graphics.is_empty() && t.scan.is_none() {
@@ -890,7 +943,8 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
             Some(scan) => {
                 let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
                 std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).map_err(e)?;
-                std::fs::write(dir.join(&file), &scan.raster.bytes).map_err(e)?;
+                // Staged and renamed, so a write that fails leaves no picture cut short.
+                store::replace_whole(&dir.join(&file), &scan.raster.bytes).map_err(e)?;
                 out!(
                     log,
                     "page {}: scanned sheet saved as {file}, shown under the page",
@@ -932,8 +986,7 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
         p.pages.push(page);
     }
     p.sort_pages();
-    save(dir, &p)?;
-    Ok(())
+    save(dir, p)
 }
 
 /// The sheet for a traced drawing of `(width, height)` millimetres: the smallest ISO size
@@ -2334,6 +2387,73 @@ mod tests {
                 matches!(load(&dir), Ok(p) if p.page(id).and_then(|pg| pg.underlay.as_ref()).is_some_and(|u| u.file == scan))
             );
         }
+    }
+
+    /// A PDF import whose save fails leaves the project folder as it was (#1751): the scans it
+    /// wrote are removed, a picture no page used that a scan replaced is back, the underlay
+    /// folder it made is gone, and so are the page files the save got to write.
+    #[test]
+    fn a_pdf_import_whose_save_fails_leaves_the_folder_as_it_was() {
+        let tmp = tmp();
+        let file = tmp.path().join("scans.pdf");
+        assert!(std::fs::write(&file, two_scans_pdf()).is_ok());
+        // A folder with a file in it where the save stages the second page's file: the save
+        // writes the first page and fails at the second, after both scans are written.
+        let block = |dir: &Path| {
+            dir.join(store::PAGES_DIR)
+                .join(format!("pdf-6{}.tmp", store::PAGE_SUFFIX))
+        };
+        let project = |name: &str| {
+            let dir = tmp.path().join(name);
+            assert!(store::save(&dir, &Project::new("t")).is_ok());
+            assert!(std::fs::create_dir_all(block(&dir)).is_ok());
+            assert!(std::fs::write(block(&dir).join("kept"), b"x").is_ok());
+            dir
+        };
+        let underlays = |dir: &Path| dir.join(wc_core::Underlay::DIR);
+
+        // No underlay folder before: none after.
+        let dir = project("fresh");
+        let before = files(&dir);
+        let mut log = Log::default();
+        let r = pdf(&dir, &file, 5, &mut log);
+        assert!(matches!(&r, Err(why) if why.contains("pdf-6")), "{r:?}");
+        // The failure came after the scans were written, not from a refusal before them.
+        assert!(log.text().contains("page 6: scanned sheet saved as"), "{}", log.text());
+        assert_eq!(files(&dir), before);
+        assert!(!underlays(&dir).exists());
+        assert!(matches!(load(&dir), Ok(p) if p.pages.is_empty()));
+
+        // A picture no page uses, where the first scan goes, and another beside it: both as
+        // before, and the folder stays.
+        let dir = project("stray");
+        assert!(std::fs::create_dir_all(underlays(&dir)).is_ok());
+        assert!(std::fs::write(underlays(&dir).join("pdf-5.png"), b"mine").is_ok());
+        assert!(std::fs::write(underlays(&dir).join("other.png"), b"other").is_ok());
+        let before = files(&dir);
+        let r = pdf(&dir, &file, 5, &mut Log::default());
+        assert!(matches!(&r, Err(why) if why.contains("pdf-6")), "{r:?}");
+        assert_eq!(files(&dir), before);
+
+        // An underlay folder that was there and empty stays.
+        let dir = project("empty");
+        assert!(std::fs::create_dir_all(underlays(&dir)).is_ok());
+        let before = files(&dir);
+        assert!(pdf(&dir, &file, 5, &mut Log::default()).is_err());
+        assert_eq!(files(&dir), before);
+        assert!(underlays(&dir).is_dir());
+
+        // With nothing in the way the same import goes through, and leaves no staging file.
+        assert!(std::fs::remove_dir_all(block(&dir)).is_ok());
+        assert_eq!(pdf(&dir, &file, 5, &mut Log::default()), Ok(()));
+        let mut names: Vec<String> = std::fs::read_dir(underlays(&dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|en| en.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["pdf-5.png", "pdf-6.png"]);
     }
 
     /// No import gives a new page a number another page has (#869): each route refuses, naming
