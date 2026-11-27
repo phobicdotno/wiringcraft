@@ -2,9 +2,11 @@
 
 The assistant is a chat panel where you tell Claude what to draw or change in plain words. It
 works in the open project while you watch, through WiringCraft's own tools (listed at the end).
-Everything it changes in the project in one turn is one undo step (Ctrl+Z). What happens
-outside the open project is not undone that way: a commit or branch made with `versions`,
-exported files, and a todo filed with `todo` stay.
+Everything it changes in the project in one turn is one undo step (Ctrl+Z), except a
+translation the host sets or removes in a shared session: the session's history does not hold
+`translations.toml`, so Undo does not take that back. What happens outside the open project is
+not undone that way either: a commit or branch made with `versions`, exported files, and a todo
+filed with `todo` stay.
 
 Open it with View → Assistant, Ctrl+J, or the speech-bubble button at the end of the toolbar.
 **New** starts a new conversation, **Stop** stops a running turn, and **Settings** shows the
