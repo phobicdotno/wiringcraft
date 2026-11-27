@@ -2528,7 +2528,10 @@ impl App {
             Dialog::Reports(_) | Dialog::ReportLayout { .. } | Dialog::Check(_) | Dialog::Translations(_)
         );
         let screen = ctx.screen_rect();
-        let escape = escape_cancels(ctx);
+        // The symbol editor (its window shows after this one) owns an Escape that drops its
+        // half-drawn shape or cancels its drag: one press does one thing.
+        let editor_escape = self.symbol_editor.as_ref().is_some_and(|e| e.wants_escape(ctx));
+        let escape = !editor_escape && escape_cancels(ctx);
         egui::Window::new(title)
             .collapsible(false)
             .resizable(true)
@@ -5400,9 +5403,23 @@ fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool)
 
 /// Whether Escape, pressed this frame, cancels the open form dialog (rules, translations, macro
 /// placeholders, page template, PLC racks, report layout). An Escape that closes a drop-down
-/// list open since last frame only closes that list, so the form and its edits stay.
+/// list open since last frame only closes that list, so the form and its edits stay. A key
+/// repeat of a held Escape does not count: holding it to close a list would cancel the form.
 fn escape_cancels(ctx: &egui::Context) -> bool {
-    ctx.input(|i| pressed_with(i, Key::Escape, |_| true)) && !ctx.memory(|m| m.any_popup_open())
+    let pressed = ctx.input(|i| {
+        i.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::Escape,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                }
+            )
+        })
+    });
+    pressed && !ctx.memory(|m| m.any_popup_open())
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -7736,11 +7753,15 @@ mod escape_tests {
     }
 
     fn escape() -> egui::Event {
+        key(false)
+    }
+
+    pub(super) fn key(repeat: bool) -> egui::Event {
         egui::Event::Key {
             key: Key::Escape,
             physical_key: None,
             pressed: true,
-            repeat: false,
+            repeat,
             modifiers: Modifiers::NONE,
         }
     }
@@ -7750,6 +7771,8 @@ mod escape_tests {
         let ctx = egui::Context::default();
         assert!(!frame(&ctx, vec![]));
         assert!(frame(&ctx, vec![escape()]));
+        // Escape held down: its repeats do not cancel the form.
+        assert!(!frame(&ctx, vec![key(true)]));
         ctx.memory_mut(|m| m.open_popup(egui::Id::new("combo")));
         assert!(!frame(&ctx, vec![escape()]));
     }
@@ -9584,6 +9607,50 @@ mod menu_action_tests {
             .find(|s| s.id == id)
             .unwrap()
             .rotation
+    }
+
+    /// Runs one frame of the dialogs with these events.
+    fn dialog_frame(a: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| a.dialogs(ctx),
+        );
+    }
+
+    #[test]
+    fn escape_cancels_the_racks_form_once_and_is_the_symbol_editors_while_it_draws() {
+        let (_tmp, mut a, _) = app();
+        let ctx = egui::Context::default();
+        a.ed.menu_action = Some(Action::PlcRacks);
+        a.run_menu_action();
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // The symbol editor drawing a shape takes the Escape: the form stays.
+        let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(symbol_editor::Tool::Line);
+        ed.click(wc_core::Point::new(0.0, 0.0));
+        assert!(ed.drawing_shape());
+        a.symbol_editor = Some(ed);
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Escape still held: its key repeat does not cancel the form either.
+        a.symbol_editor = None;
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(true)]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        // Released and pressed again, with nothing half drawn, Escape cancels the form.
+        let release = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        dialog_frame(&mut a, &ctx, vec![release]);
+        assert!(matches!(a.dialog, Some(Dialog::Racks { .. })));
+        dialog_frame(&mut a, &ctx, vec![super::escape_tests::key(false)]);
+        assert!(a.dialog.is_none());
     }
 
     #[test]

@@ -728,6 +728,12 @@ impl SymbolEditor {
         self.drag.is_some()
     }
 
+    /// Whether Enter and Escape are the editor's this frame: a shape is half drawn or a drag
+    /// is under way, and no text field has the keyboard.
+    pub fn wants_escape(&self, ctx: &egui::Context) -> bool {
+        (self.drawing_shape() || self.dragging()) && ctx.memory(|m| m.focused().is_none())
+    }
+
     /// Whether `p` is on `item`: within 1.3 mm of a pin, or inside a shape's box made 1 mm
     /// wider. [`Self::pick`] and dragging both use it.
     fn under(&self, item: Item, p: Point) -> bool {
@@ -909,7 +915,7 @@ impl SymbolEditor {
                     }
                 }
                 // Enter ends a polyline, Escape drops the shape being drawn or cancels a drag.
-                if (self.drawing_shape() || self.dragging()) && ctx.memory(|m| m.focused().is_none()) {
+                if self.wants_escape(ctx) {
                     let (enter, escape) =
                         ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
                     if escape && self.dragging() {
