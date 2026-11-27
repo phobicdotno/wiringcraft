@@ -117,8 +117,9 @@ pub struct PlcAddress {
 
 impl PlcAddress {
     /// Reads `%IX0.0`, `%I0.0`, `I0.0`, `E0.0`, `IW64`, `A4.1`, `%QD8` and the like (spaces and
-    /// case do not matter). `None` when it is not a PLC address, a bit number is past 7 or a
-    /// bit address has no bit (or a word address has one).
+    /// case do not matter). Siemens peripheral spellings (`PEW256`, `PIW256`, `PAB4`, `PQD8`,
+    /// `%IW256:P`) read as the address they access directly. `None` when it is not a PLC
+    /// address, a bit number is past 7 or a bit address has no bit (or a word address has one).
     pub fn parse(address: &str) -> Option<Self> {
         Self::parse_any_bit(address).filter(|a| a.bit.is_none_or(|b| b <= 7))
     }
@@ -132,6 +133,14 @@ impl PlcAddress {
             .collect::<String>()
             .to_ascii_uppercase();
         let a = a.strip_prefix('%').unwrap_or(&a);
+        // TIA Portal marks a peripheral access with `:P` after the address.
+        let a = a.strip_suffix(":P").unwrap_or(a);
+        // STEP 7 writes it with a `P` in front of a byte, word or double word (`PEW256`).
+        let a = match a.strip_prefix('P') {
+            Some(rest) if matches!(rest.get(1..2), Some("B" | "W" | "D")) => rest,
+            Some(_) => return None,
+            None => a,
+        };
         let mut chars = a.chars();
         let output = match chars.next()? {
             'I' | 'E' => false,
@@ -283,7 +292,17 @@ mod tests {
         assert_eq!(iec("A4.1").as_deref(), Some("%QX4.1"));
         assert_eq!(iec("IW064").as_deref(), Some("%IW64"));
         assert_eq!(iec("%qd8").as_deref(), Some("%QD8"));
-        for bad in ["", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "%I0.1.2", "Slot 2"] {
+        // Siemens peripheral access names the same address.
+        assert_eq!(iec("PEW256").as_deref(), Some("%IW256"));
+        assert_eq!(iec("piw 256").as_deref(), Some("%IW256"));
+        assert_eq!(iec("PAB4").as_deref(), Some("%QB4"));
+        assert_eq!(iec("PQD8").as_deref(), Some("%QD8"));
+        assert_eq!(iec("%IW256:P").as_deref(), Some("%IW256"));
+        assert_eq!(iec("%I0.1:P").as_deref(), Some("%IX0.1"));
+        for bad in [
+            "", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "%I0.1.2", "Slot 2", "PE0.0", "PEX0.0", "P", "PW4",
+            "PPEW4", ":P", "%IW4:PP", "%IW4P",
+        ] {
             assert_eq!(PlcAddress::parse(bad), None, "{bad}");
         }
         // Bit 10 is read only when asked for.
@@ -314,6 +333,7 @@ mod tests {
         );
         assert_eq!(list(card("QW64", 3, None)).unwrap(), ["%QW64", "%QW66", "%QW68"]);
         assert_eq!(list(card("%IW0", 2, Some(1))).unwrap(), ["%IW0", "%IW1"]);
+        assert_eq!(list(card("PEW256", 2, None)).unwrap(), ["%IW256", "%IW258"]);
         assert!(list(card("Slot 1", 4, None)).is_err());
         assert!(list(card("%IX0.0", 0, None)).is_err());
         assert!(list(card("%IX0.0", MAX_CHANNELS + 1, None)).is_err());

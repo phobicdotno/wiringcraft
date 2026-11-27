@@ -517,7 +517,7 @@ pub struct Arranged {
 /// Put the project's devices that have a part and are not on the plate yet onto its rails, in
 /// tag order, left to right and then rail by rail, each centred on its rail. A device that would
 /// stick out over the plate's top or bottom edge on a rail goes on a later rail where it does not,
-/// or is listed as not fitting. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
+/// or is listed as not fitting; only the part of a rail on the plate is used. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
 /// the `+`) keeps only devices in that location. Devices already placed stay where they are.
 pub fn arrange(
     panel: &mut Panel,
@@ -581,7 +581,8 @@ pub fn arrange(
                     // along the same row does not use up this one.
                     .filter(|(min, max)| min.y <= at.y && max.y >= at.y && max.x > at.x && min.x < at.x + length)
                     .map(|(_, max)| max.x + GAP)
-                    .fold(at.x, f64::max);
+                    // A rail starting left of the plate is used from the plate's edge.
+                    .fold(at.x.max(0.0), f64::max);
                 Some((*at, *length, used_to))
             }
             _ => None,
@@ -613,7 +614,8 @@ pub fn arrange(
             {
                 x = past;
             }
-            let along = x + w <= at.x + *length + 1e-9;
+            // Only the part of the rail that lies on the plate counts.
+            let along = x + w <= (at.x + *length).min(panel.width) + 1e-9;
             if along && on_plate {
                 panel.items.push(PanelItem::Device {
                     tag: tag.clone(),
@@ -1479,5 +1481,55 @@ mod tests {
             unreachable!()
         };
         assert_eq!(min, Point::new(95.0 + GAP, 55.0));
+    }
+
+    #[test]
+    fn arrange_uses_only_the_part_of_a_rail_on_the_plate() {
+        // One rail starts 30 mm left of the plate, the other runs 50 mm past its right edge.
+        let mut panel = Panel::new("p", "P", 200.0, 300.0);
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(-30.0, 75.0),
+            length: 100.0,
+        });
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(100.0, 225.0),
+            length: 150.0,
+        });
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        let mut part = Part {
+            id: "c".into(),
+            ..Default::default()
+        };
+        part.properties.insert("Width".into(), "45".into());
+        part.properties.insert("Height".into(), "90".into());
+        parts.insert("c".to_string(), part);
+        let tags: Vec<DeviceTag> = ["-K1", "-K2", "-K3", "-K4"].iter().filter_map(|t| tag(t)).collect();
+        for t in &tags {
+            project.devices.insert(
+                t.clone(),
+                Device {
+                    part: Some("c".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let done = arrange(&mut panel, &project, &parts, None);
+        // 0..70 on the plate holds one 45 mm device; 100..200 holds two.
+        assert_eq!(done.placed.len(), 3, "{done:?}");
+        assert_eq!(done.did_not_fit, vec![tags[3].to_string()]);
+        assert_eq!(
+            panel.device(&tags[0]).and_then(PanelItem::device_bounds),
+            Some((Point::new(0.0, 30.0), Point::new(45.0, 120.0)))
+        );
+        for t in &tags[..3] {
+            let Some((min, max)) = panel.device(t).and_then(PanelItem::device_bounds) else {
+                unreachable!()
+            };
+            assert!(
+                panel.outline_fits(min, max.x - min.x, max.y - min.y),
+                "{t} at {min:?} is on the plate"
+            );
+        }
     }
 }

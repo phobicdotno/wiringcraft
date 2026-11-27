@@ -123,9 +123,13 @@ pub enum Prim {
         ink: Stroke,
         layer: Option<Layer>,
     },
-    /// Left-aligned text: `at` is the start of the baseline, already shifted for alignment.
+    /// Text: `at` is the start of the baseline, already shifted for alignment; `anchor` is the
+    /// point it was placed at and `align` how it lines up there (0 left, 1 centre, 2 right),
+    /// so a format with its own fonts (DXF) can keep it centred or right-aligned.
     Text {
         at: (f64, f64),
+        anchor: (f64, f64),
+        align: u8,
         height: f64,
         angle: f64,
         text: String,
@@ -705,6 +709,8 @@ impl Pen {
         let (sin, cos) = angle.to_radians().sin_cos();
         self.prims.push(Prim::Text {
             at: (at.0 + shift * cos, at.1 - shift * sin),
+            anchor: at,
+            align: if matches!(align, 1 | 2) { align } else { 0 },
             height: height_mm,
             angle,
             text: s.to_owned(),
