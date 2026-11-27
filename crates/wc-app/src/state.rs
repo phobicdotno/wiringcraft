@@ -3306,7 +3306,9 @@ impl Open {
             removed,
             moved,
         };
-        let Some(plan) = wc_core::box_edit::plan(&self.project, &old, &edit).map_err(|e| e.to_string())? else {
+        let Some(plan) = wc_core::box_edit::plan(&self.project, &old, &edit, &|id| self.symbols.get(id))
+            .map_err(|e| e.to_string())?
+        else {
             return Ok(Vec::new());
         };
         let new = plan.symbol.clone();
@@ -4695,9 +4697,7 @@ impl Open {
     /// Position of a pin on a page.
     pub fn pin_pos(&self, page: &Page, item: &str, pin: &str) -> Option<Point> {
         let placed = page.symbol(item)?;
-        let sym = self.symbols.get(&placed.symbol)?;
-        sym.pin(pin)
-            .map(|p| p.at.transform(placed.rotation, placed.mirror) + placed.at)
+        wc_core::pin_position(placed, self.symbols.get(&placed.symbol)?, pin)
     }
 
     pub fn end_pos(&self, page: &Page, e: &Endpoint) -> Option<Point> {
@@ -7038,8 +7038,23 @@ pub(crate) mod tests {
             pin: "1".into(),
         };
         o.add_wire(1, on_1.clone(), free(0.0, 0.0), Vec::new());
-        // Another wire ends freely where point 1 is (40, 45), not joined to it.
-        o.add_wire(1, free(40.0, 45.0), free(0.0, 90.0), Vec::new());
+        // A wire between two other boxes runs straight past point 1 (40, 45), not joined to it
+        // (a pin on a segment is no T). A free end there would be: it lies on w1's end.
+        let clip = [BoxPin {
+            name: "X".into(),
+            side: BoxSide::Left,
+            offset: 0.0,
+        }];
+        let ends: Vec<Endpoint> = [20.0, 70.0]
+            .into_iter()
+            .map(|y| Endpoint::Pin {
+                item: o
+                    .add_black_box(1, Point::new(40.0, y), Point::new(50.0, y + 10.0), &clip, None)
+                    .unwrap(),
+                pin: "X".into(),
+            })
+            .collect();
+        o.add_wire(1, ends[0].clone(), ends[1].clone(), Vec::new());
         let removed: std::collections::BTreeSet<String> = ["1".to_owned()].into_iter().collect();
         let before = o.project.clone();
         let symbol = o.symbols[&format!("box.{}.{id}", o.project.pages[1].id)].clone();
@@ -7055,8 +7070,9 @@ pub(crate) mod tests {
         assert_eq!(o.symbols[&symbol.id], symbol);
         assert_eq!(o.undo_mark(), steps);
 
-        // With that wire end moved away the point comes off, and its wire keeps a free end.
-        o.project.pages[1].wires[1].from = free(30.0, 45.0);
+        // With that wire moved away the point comes off, and its wire keeps a free end.
+        o.project.pages[1].wires[1].from = free(30.0, 20.0);
+        o.project.pages[1].wires[1].to = free(30.0, 70.0);
         o.edit_black_box(1, &id, (20.0, 10.0), &[], &BTreeMap::new(), &removed)
             .unwrap();
         assert_eq!(o.project.pages[1].wires[0].from, free(40.0, 45.0));

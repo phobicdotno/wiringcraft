@@ -3228,7 +3228,9 @@ fn run(mut cli: Cli) -> Res<()> {
                 moved: Point::new(0.0, 0.0),
             };
             // The reason may name points from the project file: escaped for the terminal.
-            let plan = wc_core::box_edit::plan(&p, &old, &edit).map_err(|err| escape_field(&err.to_string()))?;
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let plan = wc_core::box_edit::plan(&p, &old, &edit, &|id| symbols.get(id))
+                .map_err(|err| escape_field(&err.to_string()))?;
             let Some(plan) = plan else {
                 // Nothing changes: the files stay as they are.
                 return Ok(());
@@ -11992,8 +11994,21 @@ mod tests {
         let pg = p.page("p1").unwrap();
         let sym = store::read_vendored_symbol(&dir, &pg.symbols[0].symbol).unwrap();
         let at = wc_pdf::pin_position(&pg.symbols[0], &sym, "IN").unwrap();
-        // Another wire ends freely where IN is, not joined to it.
-        cli(&dir, &["wire", "p1", &format!("{},{}", at.x, at.y), "0,90"]).unwrap();
+        // A wire between two other boxes runs straight past IN, not joined to it (a pin on a
+        // segment is no T). A free end where IN is would be: it lies on the end of IN's wire.
+        for y in [at.y - 25.0, at.y + 25.0] {
+            let place = format!("{},{}", at.x, y);
+            cli(
+                &dir,
+                &["box", "p1", "--at", &place, "--size", "10,10", "--pin", "X:left:0"],
+            )
+            .unwrap();
+        }
+        let ids: Vec<String> = load(&dir).unwrap().page("p1").unwrap().symbols[1..]
+            .iter()
+            .map(|s| format!("{}:X", s.id))
+            .collect();
+        cli(&dir, &["wire", "p1", &ids[0], &ids[1]]).unwrap();
         let before = load(&dir).unwrap();
         let err = cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap_err();
         assert!(err.contains("would be joined"), "{err}");
