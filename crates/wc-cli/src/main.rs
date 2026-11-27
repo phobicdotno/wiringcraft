@@ -80,6 +80,21 @@ where
     r
 }
 
+/// Print `warnings` on standard error, one `warning:` line each, with [`escape_field`].
+fn warn<W: AsRef<str>>(warnings: impl IntoIterator<Item = W>) {
+    warn_to(&mut std::io::stderr(), warnings);
+}
+
+/// [`warn`] onto `err`. A line that cannot be written (a closed pipe) is dropped with the ones
+/// after it instead of panicking as `eprintln!` does, so the command still prints its result.
+fn warn_to<W: AsRef<str>>(err: &mut impl std::io::Write, warnings: impl IntoIterator<Item = W>) {
+    for w in warnings {
+        if writeln!(err, "warning: {}", escape_field(w.as_ref())).is_err() {
+            return;
+        }
+    }
+}
+
 /// `import page-dwg`: [`run::import_page_dwg`], printing what it said.
 fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
     logged(|log| run::import_page_dwg(dir, file, &page, scale, template, log))
@@ -4286,9 +4301,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             let text = read_file(&file)?;
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             s.category = category;
             s.letter_code = letter_code;
             let path = wc_library::write_symbol(&lib, &s).map_err(e)?;
@@ -4302,9 +4315,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         ImportCmd::FootprintDxf { file, part, lib } => {
             let text = read_file(&file)?;
             let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text)).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             update_library_part(
                 dir,
                 &part,
@@ -4326,9 +4337,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         ImportCmd::ModelStep { file, part, lib } => {
             let text = read_file(&file)?;
             let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text)).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             update_library_part(
                 dir,
                 &part,
@@ -4398,9 +4407,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
                 Some(bytes) => import_wago_bytes(dir, &bytes)?,
                 None => import_wago(dir, &file)?,
             };
-            for w in &done.warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&done.warnings);
             println!(
                 "WAGO configurator: {} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched",
                 done.changed,
@@ -6577,6 +6584,18 @@ mod tests {
             "{shown}"
         );
         assert_eq!(shown.matches("could not be printed").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn an_import_warning_that_cannot_be_written_does_not_panic() {
+        // A closed standard error: every warning is dropped, and the caller goes on.
+        warn_to(&mut Closed, ["no pins", "a second one"]);
+        let mut err = Vec::new();
+        warn_to(&mut err, vec!["line\nbreak".to_string()]);
+        let Ok(shown) = String::from_utf8(err) else {
+            unreachable!("the warning is UTF-8")
+        };
+        assert_eq!(shown, format!("warning: {}\n", escape_field("line\nbreak")));
     }
 
     #[cfg(unix)]
