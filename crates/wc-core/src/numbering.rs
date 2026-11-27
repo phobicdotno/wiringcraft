@@ -49,7 +49,9 @@ pub struct Numbered {
 
 /// Number the project's wires by `rule`. A connection that already has a number on any of its
 /// wires keeps it (and its other wires take it) unless `overwrite` is set; new numbers never
-/// repeat one already in use. Wires that touch no pin are left alone.
+/// repeat one already in use. Wires that touch no pin are left alone, and so are the wires of
+/// overview pages (`Page::overview`): an overview draws the schematic's connections again, so
+/// its wires take no numbers and adding one does not change the schematic's numbers.
 ///
 /// `role(symbol id)` joins interruption points and jumpers as for the net list, and
 /// `position(page, end)` gives a wire end's place on the page (pin ends need the symbol).
@@ -60,7 +62,13 @@ pub fn number_wires(
     role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
     position: impl Fn(&Page, &Endpoint) -> Option<Point>,
 ) -> Numbered {
-    let (nets, wire_net) = wire_nets(project, role);
+    // Overview pages keep their place (page indices stay valid) but draw nothing here.
+    let mut schematic = project.clone();
+    for page in schematic.pages.iter_mut().filter(|p| p.overview) {
+        page.wires.clear();
+        page.symbols.clear();
+    }
+    let (nets, wire_net) = wire_nets(&schematic, role);
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();
@@ -288,6 +296,21 @@ mod tests {
         number_wires(&mut p, Rule::Potential, false, |_| None, pos);
         // c keeps 1; e's potential reads as 1 too, so it falls back to the next free number.
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
+    }
+
+    #[test]
+    fn overview_pages_are_left_alone_and_take_no_numbers() {
+        let mut p = project();
+        // An overview as page 1 draws a connection again; it comes first in drawing order.
+        let mut overview = Page::new("p1", "1", "Overview");
+        overview.overview = true;
+        overview.wires = vec![wire("o", pin("s1", "1"), pin("s2", "2"), None, None)];
+        p.pages.insert(0, overview);
+        number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
+        // The schematic page is numbered as without the overview; the overview's wire is not.
+        assert_eq!(p.pages[0].wires[0].number, None);
+        let schematic: Vec<Option<&str>> = p.pages[1].wires.iter().map(|w| w.number.as_deref()).collect();
+        assert_eq!(schematic, [Some("3"), Some("3"), Some("1"), None, Some("2")]);
     }
 
     #[test]
