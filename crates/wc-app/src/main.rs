@@ -2591,6 +2591,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+                            .on_disabled_hover_text("Give the macro a name first.")
                             .clicked()
                             && let Some(open) = &mut self.open
                         {
@@ -3734,6 +3735,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(!text.trim().is_empty(), egui::Button::new("Add comment"))
+                            .on_disabled_hover_text("Type the comment first.")
                             .clicked()
                         {
                             self.add_comment_at(*at, text);
@@ -3999,6 +4001,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(!msg.trim().is_empty(), egui::Button::new("Commit"))
+                            .on_disabled_hover_text("Describe what changed first.")
                             .clicked()
                         {
                             let m = msg.trim().to_owned();
@@ -4314,6 +4317,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Create and switch"))
+                            .on_disabled_hover_text("Name the branch first.")
                             .clicked()
                         {
                             let n = name.trim().to_owned();
