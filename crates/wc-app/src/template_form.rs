@@ -17,6 +17,24 @@ pub fn value_keys(project: &wc_core::Project) -> Vec<String> {
     keys
 }
 
+/// Carry the boxes' open or closed headers along when the boxes move: `ids` are the headers
+/// by box index and `op` does to their open flags what is done to the boxes, so the box that
+/// was drawn earlier or the ones after a removed box keep their header open, not the box that
+/// takes their place in the list.
+fn carry_open(ctx: &egui::Context, ids: &[egui::Id], op: impl FnOnce(&mut Vec<bool>)) {
+    use egui::collapsing_header::CollapsingState;
+    let mut open: Vec<bool> = ids
+        .iter()
+        .map(|&id| CollapsingState::load(ctx, id).is_some_and(|s| s.is_open()))
+        .collect();
+    op(&mut open);
+    for (k, &id) in ids.iter().enumerate() {
+        let mut s = CollapsingState::load_with_default_open(ctx, id, false);
+        s.set_open(open.get(k).copied().unwrap_or(false));
+        s.store(ctx);
+    }
+}
+
 fn edge(ui: &mut egui::Ui, mm: &mut f64, from: &mut Side, salt: impl std::hash::Hash) -> bool {
     let mut changed = ui
         .add(egui::DragValue::new(mm).range(0.0..=600.0).speed(0.5).suffix(" mm"))
@@ -194,6 +212,18 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
                 });
             });
         }
+        if remove.is_some() || raise.is_some() {
+            let ids: Vec<egui::Id> = (0..draft.boxes.len())
+                .map(|i| ui.make_persistent_id(("box", i)))
+                .collect();
+            carry_open(ui.ctx(), &ids, |open| {
+                if let Some(i) = remove {
+                    open.remove(i);
+                } else if let Some(i) = raise {
+                    open.swap(i - 1, i);
+                }
+            });
+        }
     });
     if let Some(i) = remove {
         draft.boxes.remove(i);
@@ -221,4 +251,32 @@ pub fn show(ui: &mut egui::Ui, draft: &mut PageTemplate, keys: &[String]) -> boo
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(ctx: &egui::Context, ids: &[egui::Id]) -> Vec<bool> {
+        ids.iter()
+            .map(|&id| egui::collapsing_header::CollapsingState::load(ctx, id).is_some_and(|s| s.is_open()))
+            .collect()
+    }
+
+    #[test]
+    fn an_open_box_stays_open_when_it_moves_or_one_before_it_is_removed() {
+        let ctx = egui::Context::default();
+        let ids: Vec<egui::Id> = (0..3).map(|i| egui::Id::new(("box", i))).collect();
+        // Only the last box is open.
+        carry_open(&ctx, &ids, |o| o[2] = true);
+        assert_eq!(open(&ctx, &ids), [false, false, true]);
+        // "Draw earlier" on it: it is box 2 now, still open, and the one it passed is closed.
+        carry_open(&ctx, &ids, |o| o.swap(1, 2));
+        assert_eq!(open(&ctx, &ids), [false, true, false]);
+        // Removing the first box moves it to box 1, still open; the freed last slot is closed.
+        carry_open(&ctx, &ids, |o| {
+            o.remove(0);
+        });
+        assert_eq!(open(&ctx, &ids), [true, false, false]);
+    }
 }
