@@ -2143,6 +2143,32 @@ impl Project {
                 j.strip = to.clone();
             }
         }
+        // A strip's rail order and spares go with it, unless `to` has a layout of its own: two
+        // layouts for one strip would not load. The layout goes where `to` sorts, and each
+        // spare's device data (its part) goes along, unless the new spare tag has its own. A
+        // strip renamed to a tag below itself (`-X1` to `-X1.S1`) keeps its layout: its spares
+        // would follow it there level after level.
+        let below = to.function == from.function
+            && to.location == from.location
+            && to.product.len() > from.product.len()
+            && to.product.starts_with(&from.product);
+        if let Some(k) = self.meta.strips.iter().position(|l| &l.strip == from)
+            && !below
+            && !self.meta.strips.iter().any(|l| &l.strip == to)
+        {
+            let mut layout = self.meta.strips.remove(k);
+            layout.strip = to.clone();
+            let spares = layout.spares.clone();
+            self.meta.with_layout(to, |l| *l = layout);
+            for spare in spares {
+                let (mut old, mut new) = (from.clone(), to.clone());
+                old.product.push(spare.clone());
+                new.product.push(spare);
+                if !self.devices.contains_key(&new) {
+                    self.rename_device(&old, &new);
+                }
+            }
+        }
         for net in &mut self.meta.networks {
             net.rename_device(from, to);
         }

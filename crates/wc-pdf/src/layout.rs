@@ -50,10 +50,12 @@ impl Appearance {
         (self.page_index, self.column, self.row)
     }
 
+    /// `page/column.row`, such as `3/2.B`. Blanks around a stored page number are left out, as
+    /// wire numbering leaves them out.
     pub fn location(&self) -> String {
         format!(
             "{}/{}.{}",
-            self.page_number,
+            self.page_number.trim(),
             self.column,
             wc_core::project::row_letter(self.row)
         )
@@ -138,10 +140,17 @@ pub fn xref_marks(
         match sym.role {
             SymbolRole::Main => {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
+                    // Only named pins are listed; a contact without any shows its location alone.
+                    let pins: Vec<&str> = a.pins.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+                    let text = if pins.is_empty() {
+                        a.location()
+                    } else {
+                        format!("{} {}", pins.join("-"), a.location())
+                    };
                     out.push(XrefMark {
                         at: Point::new(s.at.x + 5.0, below + 3.5 + line_h * i as f64),
                         align: Align::Left,
-                        text: format!("{} {}", a.pins.join("-"), a.location()),
+                        text,
                         target_page_id: a.page_id.clone(),
                     });
                 }
