@@ -4454,6 +4454,15 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
     Ok(())
 }
 
+/// Refuse a blank `--name` for `import symbol-dxf` and `symbol-svg`: the library would list
+/// the symbol with no name, and the symbol editor does not save one like that either.
+fn check_symbol_name(name: &str) -> Res<()> {
+    if name.trim().is_empty() {
+        return Err("the symbol name cannot be empty: give one with --name".into());
+    }
+    Ok(())
+}
+
 /// `input`: the file of `import wago` or `import plc-csv`, read already (before the project
 /// lock).
 fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
@@ -4466,6 +4475,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             category,
             letter_code,
         } => {
+            check_symbol_name(&name)?;
             let text = read_file(&file)?;
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
@@ -4531,6 +4541,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             category,
             letter_code,
         } => {
+            check_symbol_name(&name)?;
             let text = read_text(&file)?;
             let (mut s, warnings) = wc_import::svg::symbol_with_warnings(&text, &id, &name).map_err(e)?;
             warn(&warnings);
