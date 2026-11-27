@@ -8140,6 +8140,53 @@ mod nudge_tests {
         sent
     }
 
+    /// While an import runs, its window's Grid and Dark mode controls read as on when the grid
+    /// is shown and the theme is dark, as the toolbar and menu show them.
+    #[test]
+    fn the_import_window_shows_the_grid_and_dark_mode_as_they_are() {
+        let tab = egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for (grid, dark) in [(true, true), (false, false), (true, false), (false, true)] {
+            let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            app.prefs.show_grid = grid;
+            app.prefs.theme = if dark { theme::Mode::Dark } else { theme::Mode::Light };
+            theme::apply(&ctx, app.prefs.theme);
+            let (job, _running) = imports::Job::running("plan.edz", tmp.path());
+            app.importing = Some(Importing {
+                job,
+                kind: imports::Kind::Eplan,
+                file: tmp.path().join("plan.edz"),
+                lib: None,
+                target: None,
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            // Tab through the window's controls and read whether each shows as on.
+            let mut seen: std::collections::BTreeMap<String, bool> = Default::default();
+            for _ in 0..200 {
+                let out = app_frame_output(&mut app, &ctx, vec![tab.clone()], false);
+                for e in &out.platform_output.events {
+                    if let egui::output::OutputEvent::FocusGained(w) = e
+                        && let (Some(label), Some(on)) = (&w.label, w.selected)
+                    {
+                        seen.insert(label.clone(), on);
+                    }
+                }
+                if seen.contains_key("Grid") && seen.contains_key("Dark mode") {
+                    break;
+                }
+            }
+            assert!(app.importing.is_some(), "the import still runs");
+            assert_eq!(seen.get("Grid"), Some(&grid), "grid {grid}, dark {dark}: {seen:?}");
+            assert_eq!(seen.get("Dark mode"), Some(&dark), "grid {grid}, dark {dark}: {seen:?}");
+        }
+    }
+
     /// An app with its coil moved one step: the project has unsaved changes.
     fn changed_app() -> (tempfile::TempDir, App, egui::Context) {
         let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
