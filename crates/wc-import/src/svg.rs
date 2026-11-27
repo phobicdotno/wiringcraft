@@ -187,8 +187,12 @@ fn font_size(v: &str) -> Option<f64> {
 }
 
 /// Elements whose content a browser never draws in place: definitions, markers, clip paths,
-/// masks and patterns. A `<symbol>` is drawn only through `<use>`, which is not imported.
-const NOT_DRAWN: [&str; 6] = ["defs", "symbol", "marker", "clipPath", "mask", "pattern"];
+/// masks and patterns, and the tooltip and notes elements (`<title>`, `<desc>`, `<metadata>`),
+/// whose words never join a label. A `<symbol>` is drawn only through `<use>`, which is not
+/// imported.
+const NOT_DRAWN: [&str; 9] = [
+    "defs", "symbol", "marker", "clipPath", "mask", "pattern", "title", "desc", "metadata",
+];
 
 /// Whether an element is drawn at all, and whether it is visible, from its parent's
 /// `(drawn, visible)`. `display:none` and the containers in [`NOT_DRAWN`] hide everything under
@@ -902,9 +906,9 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             path_count += 1;
         }
         let fnt = font(&e, fonts.last().copied().unwrap_or_default());
-        // An invisible `<text>` still sets up its label: a `<tspan>` in it can be visible again,
-        // and each run of words is checked on its own.
-        if !show.0 || (!show.1 && tag != "text") {
+        // An invisible `<text>` or `<tspan>` still sets up its label and place: a `<tspan>` in
+        // it can be visible again, and each run of words is checked on its own.
+        if !show.0 || (!show.1 && tag != "text" && tag != "tspan") {
             // Hidden: no shapes, pins or text, but its children still need its state.
             if !empty {
                 stack.push(m);
@@ -2045,6 +2049,29 @@ mod tests {
             "a tspan line starts at its own place"
         );
         assert!(near(texts[5].1, Point::new(2.0, 24.0)), "a missing x is the text's");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hidden_tspan_places_its_visible_words_and_notes_stay_out() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="0">A<tspan y="10" visibility="hidden"><tspan visibility="visible">B</tspan></tspan></text>
+            <text x="0" y="20">C<tspan><title>tooltip</title>D</tspan><desc>note</desc></text>
+            <text x="0" y="30">E<tspan y="40" display="none"><tspan visibility="visible">F</tspan></tspan></text>
+        </svg>"#;
+        let s = symbol(svg, "svg.hidden", "Hidden")?;
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        let words: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        assert_eq!(words, vec!["A", "B", "CD", "E"]);
+        assert!(near(texts[1].1, Point::new(0.0, 10.0)), "the hidden tspan's y places B");
         Ok(())
     }
 
