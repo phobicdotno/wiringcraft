@@ -247,7 +247,16 @@ pub fn plc_variables(i: &Inputs<'_>) -> PlcVariables {
         if !address.is_empty() && !at.ends_with('*') && address.trim() != at {
             note.push(format!("address {}", address.trim()));
         } else if !address.is_empty() && at.ends_with('*') {
-            note.push(format!("address {:?} is not a PLC address", address.trim()));
+            // Worded as the rack warnings word it: an address in the other direction is still
+            // a PLC address.
+            note.push(match PlcAddress::parse_any_bit(address) {
+                Some(a) => format!(
+                    "address {} is an {}",
+                    a.iec(),
+                    if a.output { "output" } else { "input" }
+                ),
+                None => format!("address {:?} is not a PLC address", address.trim()),
+            });
         }
         if !connected.is_empty() {
             note.push(format!("to {connected}"));
