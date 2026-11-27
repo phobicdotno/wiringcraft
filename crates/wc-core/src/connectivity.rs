@@ -72,8 +72,10 @@ impl Graph {
             let a = self.id_of(node(&w.from));
             let b = self.id_of(node(&w.to));
             self.dsu.union(a, b);
-            if let Some(name) = &w.potential {
-                let p = self.id_of(Node::Potential(name.clone()));
+            // Spaces around a name are no part of it, and a blank name is no potential: else
+            // every wire with an empty one would be joined into one nameless net.
+            if let Some(name) = w.potential.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                let p = self.id_of(Node::Potential(name.to_owned()));
                 self.dsu.union(a, p);
             }
             from.push(a);
@@ -540,6 +542,25 @@ mod tests {
         assert_eq!(nets.len(), 2);
         let big = nets.iter().find(|n| n.names == ["L1"]);
         assert_eq!(big.map(|n| n.pins.len()), Some(3));
+    }
+
+    #[test]
+    fn blank_potentials_join_nothing_and_names_are_trimmed() {
+        let mut p = Project::new("t");
+        let mut a = Page::new("a", "1", "");
+        a.wires = vec![
+            wire("w1", pin("s1", "1"), pin("s2", "1"), Some("")),
+            wire("w2", pin("s3", "1"), pin("s4", "1"), Some("  ")),
+            wire("w3", pin("s5", "1"), pin("s6", "1"), Some(" L1 ")),
+        ];
+        let mut b = Page::new("b", "2", "");
+        b.wires = vec![wire("w1", pin("s7", "1"), pin("s8", "1"), Some("L1"))];
+        p.pages = vec![a, b];
+        let nets = nets(&p);
+        assert_eq!(nets.len(), 3, "{nets:?}");
+        assert!(nets.iter().filter(|n| n.pins.len() == 2).all(|n| n.names.is_empty()));
+        let l1 = nets.iter().find(|n| n.pins.len() == 4);
+        assert_eq!(l1.map(|n| n.names.clone()), Some(vec!["L1".to_owned()]));
     }
 
     #[test]
