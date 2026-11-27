@@ -2081,8 +2081,9 @@ impl Project {
     }
 
     /// Rename device `from` to `to` everywhere it appears: its device entry, the symbols that
-    /// carry its tag, the cable cores of a cable, panel items and terminal-strip jumpers.
-    /// Returns how many symbols were retagged. It does not check that `to` is free: callers do.
+    /// carry its tag, the cable cores of a cable, panel items, terminal-strip jumpers, fieldbus
+    /// networks, and the PLC racks and cards named by it. Returns how many symbols were
+    /// retagged. It does not check that `to` is free: callers do.
     pub fn rename_device(&mut self, from: &DeviceTag, to: &DeviceTag) -> usize {
         if from == to {
             return 0;
@@ -2122,6 +2123,19 @@ impl Project {
         }
         for net in &mut self.meta.networks {
             net.rename_device(from, to);
+        }
+        // A PLC rack named after its head and a card carrying its tag follow, so the PLC card
+        // overview does not show the old tag. A name that is not this tag is left as typed.
+        let is_from = |s: &str| DeviceTag::parse(s).ok().as_ref() == Some(from);
+        for rack in &mut self.meta.racks {
+            if is_from(&rack.name) {
+                rack.name = to.to_string();
+            }
+            for card in &mut rack.cards {
+                if is_from(&card.tag) {
+                    card.tag = to.to_string();
+                }
+            }
         }
         n
     }
@@ -2555,6 +2569,39 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_device_renames_the_plc_rack_and_card_it_names() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::plc_rack::{PlcCard, PlcRack};
+        let mut p = Project::new("t");
+        p.meta.racks.push(PlcRack {
+            name: " -A1 ".into(),
+            cards: vec![
+                PlcCard {
+                    slot: 1,
+                    tag: "-A1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 2,
+                    tag: "-A1.DI1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 3,
+                    tag: "Inputs".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        p.rename_device(&DeviceTag::parse("-A1")?, &DeviceTag::parse("+S2-A5")?);
+        let rack = &p.meta.racks[0];
+        assert_eq!(rack.name, "+S2-A5");
+        let tags: Vec<&str> = rack.cards.iter().map(|c| c.tag.as_str()).collect();
+        assert_eq!(tags, ["+S2-A5", "-A1.DI1", "Inputs"], "only the renamed tag follows");
         Ok(())
     }
 
