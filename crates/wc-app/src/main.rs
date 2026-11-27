@@ -1932,13 +1932,20 @@ impl App {
                 if !clip.is_empty() {
                     let n = clip.count();
                     self.copied_text = Some(clip.summary());
+                    let copied_wires: std::collections::BTreeSet<String> =
+                        clip.wires.iter().map(|w| w.id.clone()).collect();
                     self.clipboard = clip;
                     if a == Action::Cut {
-                        // Revision clouds and the revision table are not copied: they stay,
-                        // selected, rather than go without a way back by Paste.
+                        // Revision clouds, the revision table and wires the copy left out (an
+                        // end on a missing symbol or pin) are not copied: they stay, selected,
+                        // rather than go without a way back by Paste.
                         let (kept, sel): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ed.selection)
                             .into_iter()
-                            .partition(|s| matches!(s, Selection::Cloud(_) | Selection::RevisionTable));
+                            .partition(|s| match s {
+                                Selection::Cloud(_) | Selection::RevisionTable => true,
+                                Selection::Wire(id) => !copied_wires.contains(id),
+                                _ => false,
+                            });
                         open.delete_many(page, &sel);
                         self.ed.selection = kept;
                         self.ed.message = format!("Cut {n}.");
