@@ -28,7 +28,8 @@ these: its title block fields stay empty, devices keep their part numbers as tex
 that match no library symbol are drawn as boxes.
 
 The import adds to the open project: it never replaces pages, devices or symbols the project
-already has. To see an import's result on its own, import into a new project (`wiringcraft new`).
+already has. To see an import's result on its own, make a new project first and import into it:
+`wiringcraft new pump-import`, then `wiringcraft -C pump-import import swe <path>`.
 
 ### Pages
 
@@ -134,13 +135,24 @@ archive carries, a project archive or a Content Portal download. A bare database
   with their connection points as pins, drawn from the block's DWG file in the archive, or as a
   box around the points when there is none.
 
-They go into the library folder given with `--lib`, or into the project when none is given. A
+They go into the library folder given with `--lib`, or into the project when none is given.
+With `--lib`, a file already in the folder with the same id is written over without a warning,
+so keep a copy of library items you edited by hand before importing again. A
 part or cable type without a reference, or repeating one already read, and a symbol block
 without connection points, are left out with a warning.
 The import ends with one line each for parts, cable types and symbol blocks: how many the source
 has and how many were imported.
 
-A symbol or part the project already has is replaced only when its copy is still the one the
-project pins; a copy changed in the project is refused, not replaced. To take the new version
-into such a project, import with `--lib` into a library folder, add that folder as a source
-(`lib add`) ahead of any source with the same id, and run `lib update <id>`.
+Without `--lib`, a symbol or part the project already has is replaced only when its copy is
+still the one the project pins; a copy changed in the project is refused, not replaced. A copy
+with no entry in `library.lock` (put there by hand, or its entry lost) has no pin to compare
+with and is replaced whatever it holds, so keep a copy of such a file before importing.
+
+To take a new version into a project whose copy was changed, import with `--lib` into a
+library folder and add that folder as a source with `lib add`. `lib add` puts the new source
+last and earlier sources win, so when another source has the same id, move the new
+`[[library]]` entry in `project.toml` above it. Then run `lib update <id>`. When the archive's
+item is the very version the project pins, `lib status` shows it as up to date and `lib
+update` leaves the changed copy alone; to go back to the pinned version, delete the project's
+copy (`vendor/symbols/<id>.json` or `vendor/parts/<id>.json`) and run `lib lock`, which writes
+it again.
