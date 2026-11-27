@@ -928,20 +928,29 @@ pub fn check_table(i: &Inputs<'_>) -> Table {
 }
 
 /// Wires whose two ends are on the same pin of the same symbol: they connect nothing, yet show
-/// in the wire list and silence the pin's open-pin note.
+/// in the wire list and silence the pin's open-pin note. Wire ids need not be unique, so a wire
+/// that shares its id with others on the page says which of them it is: otherwise two such wires
+/// would give the same finding and the check would show only one.
 fn same_pin_wires(i: &Inputs<'_>, out: &mut Vec<Finding>) {
     for page in &i.project.pages {
-        for w in &page.wires {
+        for (n, w) in page.wires.iter().enumerate() {
             if let (Endpoint::Pin { item, pin }, Endpoint::Pin { item: item2, pin: pin2 }) = (&w.from, &w.to)
                 && item == item2
                 && pin == pin2
             {
+                let same_id = page.wires.iter().filter(|x| x.id == w.id).count();
+                let which = if same_id > 1 {
+                    let k = page.wires.iter().take(n).filter(|x| x.id == w.id).count() + 1;
+                    format!(" (wire {k} of {same_id} with id {} on this page)", w.id)
+                } else {
+                    String::new()
+                };
                 out.push(at(
                     page,
                     &w.id,
                     Severity::Warning,
                     format!(
-                        "wire{} starts and ends on {}",
+                        "wire{} starts and ends on {}{which}",
                         w.number.as_ref().map(|n| format!(" {n}")).unwrap_or_default(),
                         crate::pin_label(i.project, &page.id, item, pin)
                     ),

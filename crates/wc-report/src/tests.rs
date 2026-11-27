@@ -3459,6 +3459,33 @@ fn project_check_flags_a_wire_on_one_pin_at_both_ends() {
 }
 
 #[test]
+fn project_check_warns_once_per_same_pin_wire_when_ids_repeat() {
+    let (mut p, s, parts) = fixture();
+    for _ in 0..2 {
+        p.pages[0]
+            .wires
+            .push(wire("w9", pin("s2", "13"), pin("s2", "13"), None, None));
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("starts and ends on"))
+        .map(|f| f.message)
+        .collect();
+    assert_eq!(
+        found,
+        [
+            "wire starts and ends on =A+C1-K1:13 (wire 1 of 2 with id w9 on this page)",
+            "wire starts and ends on =A+C1-K1:13 (wire 2 of 2 with id w9 on this page)",
+        ]
+    );
+}
+
+#[test]
 fn check_names_a_connection_with_two_wire_numbers_and_a_number_on_two_connections() {
     let (mut p, s, parts) = fixture();
     let found = |p: &Project| {
