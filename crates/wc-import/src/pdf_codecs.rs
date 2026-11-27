@@ -797,3 +797,130 @@ mod tests {
         assert_eq!(symbol_dictionary_bytes(&[0x00]), 0);
     }
 }
+
+#[cfg(test)]
+mod fax_and_box_tests {
+    use super::*;
+
+    fn group4(columns: u32, rows: u32, black_is_1: bool) -> FaxParms {
+        FaxParms {
+            k: -1,
+            columns,
+            rows,
+            end_of_line: false,
+            encoded_byte_align: false,
+            end_of_block: true,
+            black_is_1,
+        }
+    }
+
+    #[test]
+    fn pictures_with_no_size_or_too_many_pixels_do_not_fit() {
+        assert!(fits(1, 1));
+        assert!(!fits(0, 10));
+        assert!(!fits(10, 0));
+        assert!(fits(20_000, 10_000), "exactly the pixel limit fits");
+        assert!(!fits(20_000, 10_001));
+        assert!(!fits(u32::MAX, u32::MAX), "no overflow on huge sizes");
+    }
+
+    #[test]
+    fn a_decoder_panic_refuses_the_picture() {
+        let got: Result<(), String> = guarded("test", || std::panic::resume_unwind(Box::new("decoder bug")));
+        assert_eq!(got, Err("the test picture is damaged".into()));
+        assert_eq!(guarded("test", || Ok(7)), Ok(7));
+        assert_eq!(
+            guarded::<()>("test", || Err("own error".into())),
+            Err("own error".into())
+        );
+    }
+
+    #[test]
+    fn packed_rows_are_padded_to_whole_bytes_msb_first() {
+        let mut p = Packer::new(10, true);
+        for x in 0..12 {
+            // Two pixels past the width are dropped.
+            p.push(x % 3 == 0);
+        }
+        p.end_row();
+        // A short row is filled with white.
+        p.push(true);
+        p.end_row();
+        assert_eq!(p.rows, 2);
+        assert_eq!(p.out, vec![0b1001_0010, 0b0100_0000, 0b1000_0000, 0]);
+        // With black as 0, the same pixels set the other bits; padding bits stay 0.
+        let mut q = Packer::new(10, false);
+        q.push(true);
+        q.end_row();
+        assert_eq!(q.out, vec![0b0111_1111, 0b1100_0000]);
+    }
+
+    #[test]
+    fn fax_pictures_with_no_size_are_refused_before_decoding() {
+        let got = ccitt(&[0xFF], &group4(0, 4, false));
+        assert!(matches!(got, Err(e) if e.contains("no size")));
+        let got = ccitt(&[0xFF], &group4(100_000, 100_000, false));
+        assert!(matches!(got, Err(e) if e.contains("too large")));
+    }
+
+    #[test]
+    fn empty_fax_data_holds_no_rows_and_is_refused() {
+        assert!(ccitt(&[], &group4(8, 2, false)).is_err());
+    }
+
+    #[test]
+    fn group4_white_rows_follow_black_is_1() {
+        // In Group 4 a row the same as the one above (all white at the start) is one `1` bit.
+        let Ok((white, None)) = ccitt(&[0xFF], &group4(10, 3, false)) else {
+            unreachable!("three white rows decode");
+        };
+        // Black is 0 by default, so white pixels are 1 bits; the padding stays 0.
+        assert_eq!(white, [0xFF, 0xC0].repeat(3));
+        let Ok((inverted, None)) = ccitt(&[0xFF], &group4(10, 3, true)) else {
+            unreachable!("three white rows decode");
+        };
+        assert_eq!(inverted, vec![0; 6]);
+    }
+
+    #[test]
+    fn a_fax_picture_short_of_rows_is_kept_with_the_rest_white() {
+        // Two white rows then the end-of-block code, for a picture of four rows.
+        let eofb = [0b1100_0000, 0b0000_0100, 0b0000_0000, 0b0100_0000];
+        let Ok((samples, Some(why))) = ccitt(&eofb, &group4(8, 4, false)) else {
+            unreachable!("a short picture is kept with a reason");
+        };
+        assert_eq!(samples, vec![0xFF; 4]);
+        assert!(why.contains("of 4"), "{why}");
+    }
+
+    #[test]
+    fn jp2_boxes_follow_their_length_kinds() {
+        // A 64-bit length box, then a box running to the end.
+        let mut data = vec![0, 0, 0, 1];
+        data.extend_from_slice(b"long");
+        data.extend_from_slice(&18u64.to_be_bytes());
+        data.extend_from_slice(b"ab");
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        data.extend_from_slice(b"rest");
+        data.extend_from_slice(b"xyz");
+        let Some(boxes) = jp2_boxes(&data) else {
+            unreachable!("the boxes fit");
+        };
+        assert_eq!(boxes, vec![(&b"long"[..], &b"ab"[..]), (&b"rest"[..], &b"xyz"[..])]);
+        // A length shorter than its own header is refused rather than looping.
+        assert_eq!(jp2_boxes(&[0, 0, 0, 4, b'j', b'p', b'2', b'c']), None);
+        assert_eq!(
+            jp2_boxes(&[0, 0, 0, 1, b'j', b'p', b'2', b'c', 0, 0, 0, 0, 0, 0, 0, 8]),
+            None
+        );
+        // A header cut short is refused; no data holds no boxes.
+        assert_eq!(jp2_boxes(&[0, 0, 0, 12, b'j']), None);
+        assert_eq!(jp2_boxes(&[]), Some(vec![]));
+    }
+
+    #[test]
+    fn data_that_is_not_jpeg_2000_is_refused() {
+        assert!(matches!(jpx(b"%PDF-1.7 not a picture", None), Err(e) if e.contains("JPEG 2000")));
+        assert!(jpx(&[], Some(3)).is_err());
+    }
+}
