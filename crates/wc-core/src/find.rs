@@ -877,14 +877,15 @@ mod tests {
         // Drawn terminals renamed with their strip keep their rail order.
         let mut p = Project::new("Strip");
         let mut pg = Page::new("p1", "1", "Strip");
-        pg.symbols = vec![sym("a", "-X12"), sym("b", "-X12.2"), sym("c", "-X12.1")];
+        pg.symbols = vec![sym("a", "-X2"), sym("b", "-X2.2"), sym("c", "-X2.1")];
         p.pages = vec![pg];
-        p.meta.strips = vec![layout("-X12", &["2", "1"], &[])];
+        p.meta.strips = vec![layout("-X2", &["2", "1"], &[])];
         let hits = all(&p, "2");
         assert!(replace(&mut p, &hits, "2", "5", opts).is_ok());
-        assert_eq!(p.meta.strips, [layout("-X15", &["5", "1"], &[])]);
+        assert_eq!(p.meta.strips, [layout("-X5", &["5", "1"], &[])]);
 
-        // Spare numbers are mapped from one snapshot: S1 -> S11 and S11 -> S1111.
+        // Spare numbers follow the rename as tags do: S1 -> S7, and S11 is a longer number left
+        // alone.
         let mut p = Project::new("Strip");
         let mut pg = Page::new("p1", "1", "Strip");
         pg.symbols = vec![sym("a", "-X1")];
@@ -893,13 +894,14 @@ mod tests {
         p.devices.insert(tag("-X1.S1"), part.clone());
         p.devices.insert(tag("-X1.S11"), part.clone());
         let hits = all(&p, "1");
-        assert!(replace(&mut p, &hits, "1", "11", opts).is_ok());
+        assert!(replace(&mut p, &hits, "1", "7", opts).is_ok());
         let l = &p.meta.strips[0];
+        assert_eq!(l.strip, tag("-X7"));
         assert_eq!(
             (l.spares.as_slice(), l.order.as_slice()),
             (
-                &["S11".to_owned(), "S1111".to_owned()][..],
-                &["S11".to_owned(), "S1111".to_owned()][..]
+                &["S7".to_owned(), "S11".to_owned()][..],
+                &["S7".to_owned(), "S11".to_owned()][..]
             )
         );
 
@@ -965,13 +967,13 @@ mod tests {
             ..Default::default()
         };
         p.meta.strips.push(crate::project::StripLayout {
-            strip: tag("-X12"),
+            strip: tag("-X1"),
             order: vec!["S2".into()],
             spares: vec!["S2".into()],
         });
-        p.devices.insert(tag("-X12"), Device::default());
-        p.devices.insert(tag("-X12.S2"), with_part("A"));
-        p.devices.insert(tag("-X2.S12"), with_part("B"));
+        p.devices.insert(tag("-X1"), Device::default());
+        p.devices.insert(tag("-X1.S2"), with_part("A"));
+        p.devices.insert(tag("-X2.S1"), with_part("B"));
         let opts = FindOptions { match_case: true };
         let pick = |p: &Project, query: &str, tags: &[&str]| -> Vec<Hit> {
             find(p, query, opts)
@@ -979,22 +981,30 @@ mod tests {
                 .filter(|h| h.kind == FindKind::Tag && tags.contains(&h.value.as_str()))
                 .collect()
         };
-        // -X12 takes its spare to -X2.S2, where -X2.S12 is renamed too.
+        // -X1 takes its spare to -X2.S2, where -X2.S1 is renamed too.
         let before = p.clone();
-        let hits = pick(&p, "1", &["-X12", "-X2.S12"]);
+        let hits = pick(&p, "1", &["-X1", "-X2.S1"]);
         assert_eq!(
-            replace(&mut p, &hits, "1", "", opts),
+            replace(&mut p, &hits, "1", "2", opts),
             Err("-X2.S2 is already used.".into())
         );
         assert_eq!(p, before);
 
         // A spare renamed with its strip goes where its own rename says, not where the strip
         // would take it.
-        let hits = pick(&p, "2", &["-X12", "-X12.S2"]);
-        let (_, renamed) = replace_renaming(&mut p, &hits, "2", "5", opts).unwrap_or_default();
-        assert_eq!(renamed.get(&tag("-X12.S2")), Some(&tag("-X15.S5")));
-        assert_eq!(part(&p, "-X15.S5"), Some("A".into()));
-        assert!(!p.devices.contains_key(&tag("-X15.S2")));
+        let mut p = sample();
+        p.meta.strips.push(crate::project::StripLayout {
+            strip: tag("-X1"),
+            order: vec!["S1".into()],
+            spares: vec!["S1".into()],
+        });
+        p.devices.insert(tag("-X1"), Device::default());
+        p.devices.insert(tag("-X1.S1"), with_part("A"));
+        let hits = pick(&p, "1", &["-X1", "-X1.S1"]);
+        let (_, renamed) = replace_renaming(&mut p, &hits, "1", "5", opts).unwrap_or_default();
+        assert_eq!(renamed.get(&tag("-X1.S1")), Some(&tag("-X5.S5")));
+        assert_eq!(part(&p, "-X5.S5"), Some("A".into()));
+        assert!(!p.devices.contains_key(&tag("-X5.S1")));
         let layout = &p.meta.strips[0];
         assert_eq!(
             (layout.spares.clone(), layout.order.clone()),
@@ -1005,13 +1015,12 @@ mod tests {
             [("S5".to_owned(), true)],
             "the part's spare is on the rail"
         );
-        assert_eq!(part(&p, "-X2.S12"), Some("B".into()));
         assert!(p.devices.keys().all(|t| !t.to_string().contains("WCFIND")));
 
         // A strip renamed to its own unassigned spare returns, and its layout stays.
-        p.rename_device(&tag("-X15"), &tag("-X15.S2"));
+        p.rename_device(&tag("-X5"), &tag("-X5.S1"));
         assert_eq!(p.meta.strips.len(), 1);
-        assert_eq!(p.meta.strips[0].strip, tag("-X15"));
+        assert_eq!(p.meta.strips[0].strip, tag("-X5"));
     }
 
     #[test]
