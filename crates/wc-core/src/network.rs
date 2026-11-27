@@ -170,7 +170,8 @@ impl Network {
 
     /// What is wrong with this network: a node or link end that is not a device tag, a device
     /// listed twice, two nodes with one address or one station name, a link end on a device that is not a node of
-    /// the network, a link from a port to itself, and a port used by two links.
+    /// the network, a link from a port to itself, a link cable that is not a device tag, and a port used by two
+    /// links.
     pub fn warnings(&self) -> Vec<String> {
         let name = &self.name;
         let mut out = Vec::new();
@@ -178,7 +179,9 @@ impl Network {
             out.push("a network has no name".to_owned());
         }
         let mut devices = BTreeSet::new();
-        let mut addresses: BTreeMap<&str, &str> = BTreeMap::new();
+        // One address can be written in more than one way: `FE80::1` and `fe80:0:0:0:0:0:0:1` are
+        // the same IPv6 address, `0x1A` and `0x1a` the same station address.
+        let mut addresses: BTreeMap<String, &str> = BTreeMap::new();
         // Station names are DNS-style on PROFINET, so `PLC` and `plc` are the same name.
         let mut stations: BTreeMap<String, &str> = BTreeMap::new();
         for n in &self.nodes {
@@ -192,7 +195,7 @@ impl Network {
             }
             let a = n.address.trim();
             if !a.is_empty()
-                && let Some(other) = addresses.insert(a, n.device.as_str())
+                && let Some(other) = addresses.insert(address_key(a), n.device.as_str())
             {
                 out.push(format!(
                     "network {name}: {} and {} have the same address {a}",
@@ -235,6 +238,13 @@ impl Network {
             if looped && let [Ok(a), _] = &ends {
                 out.push(format!("network {name}: link {} joins {a} to itself", i + 1));
             }
+            // A cable that is not a device tag is told like a node or link end that is not one;
+            // a link with no cable is fine.
+            if !l.cable.trim().is_empty()
+                && let Err(e) = l.cable.parse::<DeviceTag>()
+            {
+                out.push(format!("network {name}: link {} cable {:?}: {e}", i + 1, l.cable));
+            }
         }
         for (port, n) in used {
             if n > 1 {
@@ -242,6 +252,15 @@ impl Network {
             }
         }
         out
+    }
+}
+
+/// `address` as compared for duplicates: an IP address in its standard form, any other address
+/// in lower case.
+fn address_key(address: &str) -> String {
+    match address.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => address.to_lowercase(),
     }
 }
 
@@ -316,6 +335,21 @@ cable = "-W20"
     }
 
     #[test]
+    fn a_link_cable_that_is_not_a_device_tag_is_told() -> R {
+        let mut n: Network = toml::from_str(TOML)?;
+        n.links[0].cable = "W 30".into();
+        let w = n.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("network PN1: link 1 cable \"W 30\": "), "{w:?}");
+        // No cable, or only spaces, says nothing.
+        for blank in ["", "  "] {
+            n.links[0].cable = blank.into();
+            assert!(n.warnings().is_empty(), "{:?}", n.warnings());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn warns_about_duplicates_strangers_and_ports_used_twice() -> R {
         let mut n: Network = toml::from_str(TOML)?;
         n.nodes.push(Node {
@@ -369,5 +403,32 @@ cable = "-W20"
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn warns_about_one_address_written_two_ways() {
+        let node = |device: &str, address: &str| Node {
+            device: device.into(),
+            address: address.into(),
+            ..Node::default()
+        };
+        let net = Network {
+            name: "PN1".into(),
+            nodes: vec![
+                node("-A1", "FE80::1"),
+                node("-K10", "fe80:0:0:0:0:0:0:1"),
+                node("-K11", "0x1A"),
+                node("-K12", "0x1a"),
+                node("-K13", "192.168.0.13"),
+            ],
+            ..Network::default()
+        };
+        assert_eq!(
+            net.warnings(),
+            [
+                "network PN1: -A1 and -K10 have the same address fe80:0:0:0:0:0:0:1",
+                "network PN1: -K11 and -K12 have the same address 0x1a",
+            ]
+        );
     }
 }

@@ -116,10 +116,13 @@ replaced 2 value(s)
 
 Things to know:
 
-- Find matches text inside a tag, so `find -K1 --replace -K2` also turns `-K15` into `-K25`.
-  A full tag matches longer tags too: `find =PUMP+CAB1-K1 --replace =PUMP+CAB1-K5` also turns
-  `=PUMP+CAB1-K15` into `=PUMP+CAB1-K55`. The command line replaces every match; check the list
-  with `find <tag>` first. In the app, replace only the hits of the device to rename.
+- Find matches text inside a tag, so `find -K1` also lists `-K15` and `-K1A`. A replace changes
+  only whole parts of a tag (a run of letters, a run of digits), so `find -K1 --replace -K2`
+  leaves `-K15` and `-K1A` as they are, while `find K --replace Q` turns `-K15` into `-Q15`.
+  With `--replace` such a hit is listed with a fourth field, `not changed: another tag`, and
+  the status line counts them: `replaced 2 value(s); left alone: 1 hit(s) another tag`. The
+  app's Find and replace window marks these hits the same way once a replacement text is typed,
+  and leaves them out of the replace.
 - A rename onto a tag another device already uses is refused (`... is already used.`), and so
   is a replace that would give two devices the same tag. Nothing changes then.
 - A replace that renames `-K1` to `-K2` and `-K2` to `-K3` in one go works.

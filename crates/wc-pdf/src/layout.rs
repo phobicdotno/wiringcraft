@@ -32,6 +32,8 @@ pub fn pin_position(placed: &PlacedSymbol, symbol: &Symbol, pin: &str) -> Option
 #[derive(Debug, Clone)]
 pub struct Appearance {
     pub page_id: String,
+    /// The page's position in the project's page order.
+    pub page_index: usize,
     pub page_number: String,
     pub column: usize,
     /// The reference row, 1 for `A`.
@@ -43,6 +45,11 @@ pub struct Appearance {
 }
 
 impl Appearance {
+    /// Where it sits in reading order: page, then column, then row.
+    pub fn position(&self) -> (usize, usize, usize) {
+        (self.page_index, self.column, self.row)
+    }
+
     /// `page/column.row`, such as `3/2.B`. Blanks around a stored page number are left out, as
     /// wire numbering leaves them out.
     pub fn location(&self) -> String {
@@ -170,7 +177,7 @@ pub fn xref_marks(
                 // A point on a schematic page continues only on schematic pages; one on an
                 // overview page may have its partner anywhere (as the project check counts).
                 let repeats = xref.overview_links.get(tag).filter(|_| page.overview);
-                let others: Vec<&Appearance> = xref
+                let mut others: Vec<&Appearance> = xref
                     .links
                     .get(tag)
                     .into_iter()
@@ -178,6 +185,7 @@ pub fn xref_marks(
                     .flatten()
                     .filter(|a| !(a.page_id == page.id && a.item == s.id))
                     .collect();
+                others.sort_by_key(|a| a.position());
                 match others.first() {
                     Some(first) => out.push(XrefMark {
                         at: Point::new(right + 1.5, s.at.y + 0.7 + (below - s.at.y) / 2.0),
@@ -197,13 +205,14 @@ pub fn xref_marks(
 impl CrossRefs {
     pub fn build(project: &Project, symbols: &BTreeMap<String, Symbol>) -> Self {
         let mut x = CrossRefs::default();
-        for page in &project.pages {
+        for (page_index, page) in project.pages.iter().enumerate() {
             for s in &page.symbols {
                 let (Some(tag), Some(sym)) = (&s.tag, symbols.get(&s.symbol)) else {
                     continue;
                 };
                 let a = Appearance {
                     page_id: page.id.clone(),
+                    page_index,
                     page_number: page.number.clone(),
                     column: project.column_of(page, s.at.x),
                     row: page.size.row_of(s.at.y),
@@ -224,6 +233,16 @@ impl CrossRefs {
                 }
             }
         }
+        // Every list reads in page order, then by column and row within a page, not in the
+        // order the symbols were placed (#1331).
+        for list in x
+            .auxes
+            .values_mut()
+            .chain(x.links.values_mut())
+            .chain(x.overview_links.values_mut())
+        {
+            list.sort_by_key(Appearance::position);
+        }
         // A contact points to its coil's first drawing: the detailed one on a schematic page,
         // not a repeat on an overview page (line diagram) that may come first in page order.
         let overview: BTreeSet<&str> = project
@@ -233,7 +252,7 @@ impl CrossRefs {
             .map(|p| p.id.as_str())
             .collect();
         for list in x.mains.values_mut() {
-            list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
+            list.sort_by_key(|a| (overview.contains(a.page_id.as_str()), a.position()));
         }
         // The same for a breaker: its contacts point to its schematic drawing (#1467).
         for list in x.standalones.values_mut() {

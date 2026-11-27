@@ -3,7 +3,7 @@
 //! hit on its page when clicked, and replaces the hits that are ticked as one undo step.
 
 use eframe::egui::{self, RichText};
-use wc_core::find::{FindKind, FindOptions, FindTarget, Hit, find};
+use wc_core::find::{FindKind, FindOptions, FindTarget, Hit, LeftAlone, find, left_alone};
 use wc_core::project::Project;
 
 use crate::state::Selection;
@@ -79,14 +79,51 @@ impl FindState {
         }
     }
 
-    /// The hits that are ticked.
+    /// The hits that are ticked and that the replace would change.
     pub fn chosen_hits(&self) -> Vec<Hit> {
         self.hits
             .iter()
             .zip(&self.chosen)
-            .filter(|(_, c)| **c)
+            .filter(|(h, c)| **c && self.left_alone(h).is_none())
             .map(|(h, _)| h.clone())
             .collect()
+    }
+
+    /// Whether the replace with the typed text would leave this hit as it is, and why: the tag
+    /// `-K15` found for `-K1` is another device's. Nothing is left alone while no replacement
+    /// text is typed: that is a plain search.
+    pub fn left_alone(&self, hit: &Hit) -> Option<LeftAlone> {
+        if self.with.is_empty() {
+            return None;
+        }
+        left_alone(hit, &self.query, &self.with, self.options())
+    }
+
+    /// A short note on how a replace in `hits` went. With an empty replacement field no hit is
+    /// marked beforehand (that looks like a plain search), so the note names the ticked hits
+    /// that were another device's tag and kept it.
+    pub fn replaced_note(&self, n: usize, hits: &[Hit]) -> String {
+        let note = replaced_note(n, hits);
+        let other = hits
+            .iter()
+            .filter(|h| left_alone(h, &self.query, &self.with, self.options()) == Some(LeftAlone::AnotherTag))
+            .count();
+        match other {
+            0 => note,
+            1 => format!("{note} 1 ticked hit is another tag and was not changed."),
+            k => format!("{note} {k} ticked hits are other tags and were not changed."),
+        }
+    }
+
+    /// The line above the hits: how many were found, and how many of them the replace with the
+    /// typed text leaves alone.
+    fn found_note(&self) -> String {
+        let alone = self.hits.iter().filter(|h| self.left_alone(h).is_some()).count();
+        let found = match alone {
+            0 => format!("{} found.", self.hits.len()),
+            n => format!("{} found, {n} not changed by this replace.", self.hits.len()),
+        };
+        format!("{found} Click one to show it; untick those to leave alone.")
     }
 
     /// Draw the window. The hits follow every change to `project`.
@@ -131,13 +168,19 @@ impl FindState {
                 } else if self.hits.is_empty() {
                     ui.label("Nothing found.");
                 } else {
-                    ui.label(format!("{} found. Click one to show it; untick those to leave alone.", self.hits.len()));
+                    ui.label(self.found_note());
                 }
+                let alone: Vec<Option<LeftAlone>> = self.hits.iter().map(|h| self.left_alone(h)).collect();
                 let number = |id: &str| project.page(id).map(|p| p.number.clone()).unwrap_or_default();
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    egui::Grid::new("find-hits").striped(true).num_columns(4).show(ui, |ui| {
-                        for (hit, chosen) in self.hits.iter().zip(self.chosen.iter_mut()) {
-                            ui.checkbox(chosen, "");
+                    egui::Grid::new("find-hits").striped(true).num_columns(5).show(ui, |ui| {
+                        for ((hit, chosen), alone) in self.hits.iter().zip(self.chosen.iter_mut()).zip(&alone) {
+                            // A hit the replace leaves alone shows no tick; its own tick is kept
+                            // for when the replacement text changes.
+                            match alone {
+                                Some(_) => ui.add_enabled(false, egui::Checkbox::new(&mut false, "")),
+                                None => ui.checkbox(chosen, ""),
+                            };
                             ui.label(hit.target.page().map(number).unwrap_or_else(|| "-".into()));
                             ui.label(RichText::new(hit.kind.label()).weak());
                             match go_to(hit) {
@@ -150,13 +193,20 @@ impl FindState {
                                     ui.label(&hit.value).on_hover_text("Not drawn on any page");
                                 }
                             }
+                            if let Some(why) = alone {
+                                ui.label(RichText::new(format!("not changed: {}", why.reason())).weak());
+                            }
                             ui.end_row();
                         }
                     });
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let any = self.chosen.iter().any(|c| *c);
+                    let any = self
+                        .hits
+                        .iter()
+                        .zip(&self.chosen)
+                        .any(|(h, c)| *c && self.left_alone(h).is_none());
                     if ui
                         .add_enabled(any, egui::Button::new("Replace ticked"))
                         .on_hover_text("Replace in the ticked hits, as one undo step. A device tag is renamed everywhere it appears.")
@@ -188,8 +238,10 @@ impl FindState {
             "Type what to find first."
         } else if self.hits.is_empty() {
             "Nothing found to replace."
-        } else {
+        } else if !self.chosen.iter().any(|c| *c) {
             "Tick a hit to replace in it."
+        } else {
+            "This replace changes none of the ticked hits."
         }
     }
 }
@@ -371,6 +423,70 @@ mod tests {
         assert!(!f.hits.is_empty());
         f.chosen.iter_mut().for_each(|c| *c = false);
         assert_eq!(f.replace_blocked(), "Tick a hit to replace in it.");
+    }
+
+    /// With a replacement text typed, a tag hit the replace will not change is marked, counted
+    /// and kept out of the replace; a plain search lists it like any other hit.
+    #[test]
+    fn a_tag_the_replace_leaves_alone_is_marked_and_not_replaced() {
+        let mut p = project();
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "s2".into(),
+            symbol: "wc.coil".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: wc_core::DeviceTag::parse("-K15").ok(),
+        });
+        let mut f = FindState {
+            query: "-K1".into(),
+            ..Default::default()
+        };
+        f.refresh(&p);
+        let values = |hits: &[Hit]| hits.iter().map(|h| h.value.clone()).collect::<Vec<_>>();
+        assert_eq!(values(&f.hits), ["-K1", "-K15"]);
+        // A plain search: nothing is marked.
+        assert!(f.hits.iter().all(|h| f.left_alone(h).is_none()));
+        assert_eq!(values(&f.chosen_hits()), ["-K1", "-K15"]);
+        assert_eq!(
+            f.found_note(),
+            "2 found. Click one to show it; untick those to leave alone."
+        );
+        f.with = "-K2".into();
+        f.refresh(&p);
+        assert_eq!(values(&f.hits), ["-K1", "-K15"], "still listed");
+        assert_eq!(f.left_alone(&f.hits[0]), None);
+        assert_eq!(f.left_alone(&f.hits[1]), Some(LeftAlone::AnotherTag));
+        assert_eq!(values(&f.chosen_hits()), ["-K1"]);
+        assert_eq!(
+            f.found_note(),
+            "2 found, 1 not changed by this replace. Click one to show it; untick those to leave alone."
+        );
+        // Only the hit the replace leaves alone is ticked: the button says why it is greyed out.
+        f.chosen[0] = false;
+        assert!(f.chosen_hits().is_empty());
+        assert_eq!(f.replace_blocked(), "This replace changes none of the ticked hits.");
+        // An empty replacement field marks nothing, so the note after the replace gives the
+        // reason for a ticked hit that kept its tag.
+        f.with.clear();
+        f.query = "K1".into();
+        f.refresh(&p);
+        f.chosen = vec![true; f.hits.len()];
+        let hits = f.chosen_hits();
+        assert_eq!(values(&hits), ["-K1", "-K15"]);
+        assert_eq!(
+            f.replaced_note(0, &hits[1..]),
+            "Nothing to replace in the ticked hits. 1 ticked hit is another tag and was not changed."
+        );
+        assert_eq!(f.replaced_note(1, &hits[..1]), "Replaced 1 value.");
+        f.query = "-K1".into();
+        f.with = "-K2".into();
+        f.refresh(&p);
+        // The window draws with a marked hit.
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            f.show(ctx, &p);
+        });
     }
 
     #[test]

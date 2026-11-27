@@ -18,10 +18,11 @@ Creates the folder `pump` with a project in it and makes it a git repository wit
 commit (`--no-git` skips that). The name defaults to the folder's name. A new project has one
 page, `p0001`, number 1, marked as the cover page.
 
-`--template <folder or git URL>` starts from a base project instead: its pages, settings,
-title block, library sources and pictures are copied (not its review comments or history), and
-`{name}` and `{date}` in its title block and page titles become the new project's name and
-today's date.
+`--template <folder or git URL>` starts from a base project instead. Everything in it is copied
+except its review comments, its history and symbolic links: pages, settings, title block, library sources,
+pictures, macros (`macros/`), device data (`devices.json`) and the vendored library items
+(`vendor/`). `{name}` and `{date}` in its title block and page titles become the new project's
+name and today's date.
 
 A new project has no library sources, so `place` finds no symbols until one is added, e.g.
 `wiringcraft lib add builtin folder <path to the library folder>`.
@@ -185,5 +186,8 @@ Finds text in free texts, device tags, wire numbers, potentials and device descr
 every page and prints one hit per line: page number, kind, value (tab-separated). Case does not
 matter unless `--match-case`. A query or replacement that starts with `-` is taken as text.
 `--replace` replaces the text in every hit; replacing a device tag renames the device
-everywhere. Status lines (`replaced ...`, `nothing found`) go to stderr, so stdout holds only
+everywhere. With `--replace`, a hit the replace does not change gets a fourth field with the
+reason (`not changed: another tag` for `-K15` found for `-K1`, `not changed: already so`), and
+the status line counts them: `replaced 1 value(s); left alone: 1 hit(s) another tag`. A plain
+`find` always prints three fields. Status lines (`replaced ...`, `nothing found`) go to stderr, so stdout holds only
 hits. Finding nothing is not an error.

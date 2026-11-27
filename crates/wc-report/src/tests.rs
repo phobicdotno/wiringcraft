@@ -1830,6 +1830,21 @@ fn plc_io_list_and_contents() {
     assert_eq!(t.rows[2][4], "-P1:X2");
     assert_eq!(t.rows[3][2], "u1 (no tag)");
 
+    // A blank `Address` left on the device does not hide its `PLC address`.
+    let mut q = p.clone();
+    let dev = q.devices.get_mut(&DeviceTag::parse("-A1.Q1").unwrap()).unwrap();
+    dev.properties.insert("Address".into(), "  ".into());
+    dev.properties.insert("PLC address".into(), "%Q0.1".into());
+    let blank = build(
+        Kind::Plc,
+        &Inputs {
+            project: &q,
+            symbols: &s,
+            parts: &parts,
+        },
+    );
+    assert_eq!(blank.rows[2][..3], ["%Q0.1", "Output", "-A1.Q1"]);
+
     let c = build(Kind::Contents, &i);
     assert_eq!(c.columns, ["Page", "Title", "Devices", "Wires"]);
     // K1 counts once for its coil and contact; the untagged input has no device.
@@ -1844,6 +1859,53 @@ fn plc_io_list_and_contents() {
     assert!(lines[4].starts_with("    A1_Q1 AT %QX0.0 : BOOL; (* -A1.Q1, point -A1.Q1, address %Q0.0, to -P1:X2"));
     assert!(lines[5].starts_with("    u1 AT %I* : BOOL;"));
     assert_eq!(lines[6], "END_VAR");
+}
+
+#[test]
+fn plc_variables_say_a_wrong_direction_address_is_one_of_the_other_kind() {
+    let (mut p, mut s, parts) = fixture();
+    for (id, pin) in [("wc.plc.input", "I"), ("wc.plc.output", "Q")] {
+        let mut y = sym(id, SymbolRole::Standalone, &[pin]);
+        y.category = "plc".into();
+        s.insert(y.id.clone(), y);
+    }
+    let page = &mut p.pages[0];
+    page.symbols.push(place("q1", "wc.plc.output", 300.0, Some("-Q1")));
+    page.symbols.push(place("i1", "wc.plc.input", 310.0, Some("-I1")));
+    page.symbols.push(place("i2", "wc.plc.input", 320.0, Some("-I2")));
+    for (tag, addr) in [("-Q1", "%I0.0"), ("-I1", "%QW64"), ("-I2", "Slot 1")] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                properties: [("Address".to_string(), addr.to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let v = plc_variables(&i);
+    assert_eq!((v.variables, v.unlocated), (3, 3));
+    assert!(
+        v.text
+            .contains("Q1 AT %Q* : BOOL; (* -Q1, address %IX0.0 is an input, page"),
+        "{}",
+        v.text
+    );
+    assert!(
+        v.text
+            .contains("I1 AT %I* : BOOL; (* -I1, address %QW64 is an output, page"),
+        "{}",
+        v.text
+    );
+    assert!(
+        v.text.contains("(* -I2, address \"Slot 1\" is not a PLC address, page"),
+        "{}",
+        v.text
+    );
 }
 
 #[test]
