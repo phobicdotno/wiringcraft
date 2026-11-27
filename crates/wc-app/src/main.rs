@@ -655,9 +655,11 @@ impl App {
         // So does a close, from the frame it waits for a typed value until the window is gone
         // (after Don't save, a join would save what the person chose to drop), and an Open
         // whose file dialog has not been shown yet. And so does the unsaved-changes question:
-        // its answer saves or drops the project it was asked about.
+        // its answer saves or drops the project it was asked about. And an assistant's open
+        // waiting for a typed value, until the panels have entered it (#1091).
         let busy = busy
             || !self.after_typed.is_empty()
+            || self.assistant.enter_typed
             || self.closing != Closing::No
             || matches!(self.pending, Some(Pending::Open))
             || matches!(self.dialog, Some(Dialog::Unsaved(_)));
@@ -5779,7 +5781,8 @@ impl eframe::App for App {
         // the panels enter its value before the close asks about unsaved changes.
         let close_waited = self.closing == Closing::WaitsForTyped;
         // An assistant's open waited for a typed value the same way (#1091).
-        let assistant_waited = std::mem::take(&mut self.assistant.enter_typed);
+        // It stays set until the panels have entered the value: a session join waits for it.
+        let assistant_waited = self.assistant.enter_typed;
         if close_waited || assistant_waited {
             enter_typed_value(ctx);
         }
@@ -5960,6 +5963,9 @@ impl eframe::App for App {
         };
         for a in after_panels {
             self.run(a);
+        }
+        if assistant_waited {
+            self.assistant.enter_typed = false;
         }
         if close_waited && self.closing == Closing::WaitsForTyped {
             self.close_or_ask();
@@ -8286,6 +8292,52 @@ mod nudge_tests {
             "the typed tag is saved in the project it was typed in"
         );
         assert_ne!(app.open.as_ref().unwrap().dir, first, "then the joined copy opened");
+    }
+
+    /// A session join waits while an assistant's open waits for a typed value: the value is
+    /// entered in the project it was typed in before the joined copy can open (#1091).
+    #[test]
+    fn a_session_join_waits_while_an_assistant_open_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let first = app.open.as_ref().unwrap().dir.clone();
+        let page = app.ed.page;
+        let before = app.open.as_ref().unwrap().project.pages[page].symbols[1]
+            .tag
+            .as_ref()
+            .map(ToString::to_string);
+        let typed = format!("{}7", before.unwrap());
+        app_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())], false);
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let path = serde_json::json!({ "path": other.display().to_string() });
+        assert!(app.agent_tool("open_project", &path).is_err(), "the open waits");
+        // A host has let this window in: the joined copy opens at the next sync that may.
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.sync_session_now(false);
+        assert_eq!(
+            app.open.as_ref().unwrap().dir,
+            first,
+            "the join waits for the typed value"
+        );
+        // The panels enter the value, then the frame's sync lets the join in: the joined copy
+        // replaces the project only after its unsaved work, the typed value, is saved.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(!app.assistant.enter_typed, "the wait is over once the value is entered");
+        assert_ne!(app.open.as_ref().unwrap().dir, first, "then the joined copy opened");
+        let saved = wc_core::store::load(&first).unwrap();
+        assert_eq!(
+            saved.pages[page].symbols[1].tag.as_ref().map(ToString::to_string),
+            Some(typed),
+            "the typed tag is saved in the project it was typed in"
+        );
     }
 
     /// A black box form changed and not applied is applied by Ctrl+S: the project read back
