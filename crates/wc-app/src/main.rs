@@ -7273,6 +7273,38 @@ mod icon_tests {
 }
 
 #[cfg(test)]
+mod theme_mode_tests {
+    use super::theme;
+    use eframe::egui;
+
+    /// One frame with the OS reporting `system` as its mode.
+    fn frame_with_system(ctx: &egui::Context, system: egui::Theme) {
+        let raw = egui::RawInput {
+            system_theme: Some(system),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |_| {});
+    }
+
+    #[test]
+    fn the_chosen_mode_stays_when_the_system_mode_changes() {
+        for (mode, dark, other) in [
+            (theme::Mode::Light, false, egui::Theme::Dark),
+            (theme::Mode::Dark, true, egui::Theme::Light),
+        ] {
+            let ctx = egui::Context::default();
+            frame_with_system(&ctx, if dark { egui::Theme::Dark } else { egui::Theme::Light });
+            theme::apply(&ctx, mode);
+            frame_with_system(&ctx, other);
+            let v = ctx.style().visuals.clone();
+            assert_eq!(v.dark_mode, dark, "{mode:?}");
+            assert_eq!(v.panel_fill, theme::Theme::new(dark).panel, "{mode:?}");
+            assert_eq!(theme::Theme::of(&ctx).panel, theme::Theme::new(dark).panel);
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod picker_tests {
     use super::*;
