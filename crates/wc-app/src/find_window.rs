@@ -99,7 +99,7 @@ impl FindState {
                 egui::Grid::new("find-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Find");
                     let field = ui.add(egui::TextEdit::singleline(&mut self.query).desired_width(280.0));
-                    if self.searched.is_none() || std::mem::take(&mut self.focus) {
+                    if std::mem::take(&mut self.focus) || self.searched.is_none() {
                         field.request_focus();
                     }
                     ui.end_row();
@@ -319,6 +319,24 @@ mod tests {
             FindOutcome::None
         );
         assert_eq!(f.query, "pump", "the Find field has the keyboard when the window opens");
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![key(egui::Key::Escape)]),
+            FindOutcome::Close
+        );
+    }
+
+    #[test]
+    fn escape_right_after_opening_closes_the_window() {
+        // Opened by Find, which asks for the keyboard: that request is used up on the first
+        // pass, so it cannot put the keyboard back after Escape on the next one.
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState {
+            focus: true,
+            ..Default::default()
+        };
+        assert_eq!(frame(&ctx, &mut f, &p, vec![]), FindOutcome::None);
+        assert!(!f.focus);
         assert_eq!(
             frame(&ctx, &mut f, &p, vec![key(egui::Key::Escape)]),
             FindOutcome::Close
