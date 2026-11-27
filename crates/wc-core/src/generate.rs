@@ -433,6 +433,22 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_name_with_control_characters_is_shown_escaped() -> Result<()> {
+        let mut m = starter()?;
+        m.name = "evil\u{1b}[31m".into();
+        let typo = err_of(rows_from_table(&m, &table(&[&["nmae"], &["x"]]), &[]));
+        let set = err_of(apply_rows(
+            &m,
+            &rows_from_table(&m, &table(&[&["set"], &["nope"]]), &[])?,
+            None,
+        ));
+        for err in [typo, set] {
+            assert!(!err.contains('\u{1b}') && err.contains("\\u{1b}"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn copies_fill_pages_in_rows_and_get_their_own_tags() -> Result<()> {
         let m = starter()?;
         let mut project = Project::new("x");
