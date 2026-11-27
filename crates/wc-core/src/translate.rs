@@ -261,8 +261,10 @@ fn set_translation_checked(
         )));
     }
     let was = dict.clone();
+    // A blank stored translation counts as none, as in `lookup`: removing it removes nothing.
+    let nothing_to_remove = translation.trim().is_empty() && dict.lookup(text, &lang).is_none();
     dict.set(text, &lang, translation);
-    if dict == was {
+    if nothing_to_remove || dict == was {
         // Nothing to set or remove (a text with no translation, say): the file, whatever its
         // layout, is left as it was, and none is made where there was none.
         return Ok(false);
@@ -575,9 +577,12 @@ nb = ""
         // A hand-formatted file stays byte for byte as it was.
         let dir = tempfile::tempdir()?;
         let file = dir.path().join(TRANSLATIONS_FILE);
-        let hand = "# kept as typed\nsource = 'en'\n\n[[texts]]\nen = 'Pumps'\nnb = 'Pumper'\n";
+        let hand = "# kept as typed\nsource = 'en'\n\n[[text]]\nen = 'Pumps'\nnb = 'Pumper'\nde = ''\n";
         std::fs::write(&file, hand)?;
+        assert_eq!(Dictionary::load(dir.path())?.texts.len(), 1);
         assert!(!set_translation(dir.path(), "Pumpz", "nb", "")?);
+        assert!(!set_translation(dir.path(), "Pumps", "fr", "")?);
+        // A blank translation is no translation: there is nothing to remove.
         assert!(!set_translation(dir.path(), "Pumps", "de", "")?);
         assert_eq!(std::fs::read_to_string(&file)?, hand);
         // A project without a dictionary does not get one.

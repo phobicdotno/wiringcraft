@@ -8803,9 +8803,13 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
         // A hand-formatted file is not rewritten by a remove that finds nothing.
-        let hand = "# kept as typed\nsource = 'en'\n\n[[texts]]\nen = 'Pumps'\nnb = 'Pumper'\n";
+        let hand = "# kept as typed\nsource = 'en'\n\n[[text]]\nen = 'Pumps'\nnb = 'Pumper'\nde = ''\n";
         std::fs::write(&file, hand).unwrap();
+        assert_eq!(wc_core::translate::Dictionary::load(&dir).unwrap().texts.len(), 1);
         assert!(cli(&dir, &["translations", "remove", "Pumpz", "--lang", "nb"]).is_err());
+        // A blank translation is none, so there is nothing to remove.
+        let err = cli(&dir, &["translations", "remove", "Pumps", "--lang", "de"]).unwrap_err();
+        assert!(err.contains("no translation into de"), "{err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), hand);
         std::fs::remove_file(&file).unwrap();
         // Nor is one made when the project has none.
