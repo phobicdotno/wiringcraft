@@ -132,6 +132,40 @@ fn parts_list_groups_by_part_and_lists_gaps() {
 }
 
 #[test]
+fn parts_list_sorts_numbers_by_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.extend([
+        place("s10", "lamp", 200.0, Some("-P10")),
+        place("s11", "lamp", 210.0, Some("-P2")),
+        place("s12", "coil", 220.0, Some("-K10")),
+        place("s13", "coil", 230.0, Some("-K2")),
+    ]);
+    for tag in ["-K10", "-K2"] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                part: Some("acme.r24".into()),
+                ..Default::default()
+            },
+        );
+    }
+    let t = parts_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][5], "-K2, -K10, =A+C1-K1");
+    let lamps: Vec<&str> = t
+        .rows
+        .iter()
+        .filter(|r| r[4] == "no part assigned")
+        .map(|r| r[5].as_str())
+        .filter(|d| d.starts_with("-P"))
+        .collect();
+    assert_eq!(lamps, ["-P1", "-P2", "-P10"]);
+}
+
+#[test]
 fn parts_list_counts_accessories_with_their_quantity() {
     let (mut p, s, mut parts) = fixture();
     let marker = wc_core::Part {

@@ -729,7 +729,7 @@ fn pages_of(p: &Project, uses: &[(String, String)]) -> String {
 
 /// Parts list (bill of materials): one row per part, with quantity and the devices using it.
 /// A device's accessories count with their quantity. Devices without any part come last so the
-/// gaps are visible.
+/// gaps are visible. Tags are sorted with numbers by value (`-K2` before `-K10`).
 pub fn parts_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Parts list",
@@ -761,6 +761,10 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
             }
         }
     }
+    for (_, tags) in by_part.values_mut() {
+        tags.sort_by_cached_key(|t| natural_key(&t.to_string()));
+    }
+    without.sort_by_cached_key(|t| natural_key(&t.to_string()));
     let mut pos = 0;
     for (part_id, (qty, tags)) in &by_part {
         pos += 1;
