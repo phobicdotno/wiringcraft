@@ -135,6 +135,18 @@ pub struct Imported {
 /// Read every symbol of a `.kicad_sym` library. Ids are `<prefix>.<name>` (lower case, other
 /// characters as `_`), coordinates are multiplied by `scale`. Returns the symbols and warnings.
 pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, Vec<String>)> {
+    symbols_described(text, None, prefix, scale)
+}
+
+/// [`symbols`], an old `.lib` library taking its symbols' descriptions from `docs`, the text
+/// of its `.dcm` file. A `.dcm` file that cannot be read is a warning; a new `.kicad_sym`
+/// library keeps its descriptions inside and does not read one.
+pub fn symbols_described(
+    text: &str,
+    docs: Option<&str>,
+    prefix: &str,
+    scale: f64,
+) -> Result<(Vec<Imported>, Vec<String>)> {
     if !(scale.is_finite() && scale > 0.0 && scale <= 100.0) {
         return Err(Error::Format(format!("scale {scale} must be above 0 and at most 100")));
     }
@@ -142,7 +154,18 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
     let mut warnings = Vec::new();
     let converted;
     let text = if crate::kicad_legacy::is_legacy(text) {
-        let (new, old_warnings) = crate::kicad_legacy::to_kicad_sym(text)?;
+        let docs = match docs.map(crate::kicad_legacy::descriptions) {
+            Some(Ok((docs, more))) => {
+                warnings.extend(more);
+                docs
+            }
+            Some(Err(e)) => {
+                warnings.push(format!("descriptions not read: {e}"));
+                Default::default()
+            }
+            None => Default::default(),
+        };
+        let (new, old_warnings) = crate::kicad_legacy::to_kicad_sym_described(text, &docs)?;
         warnings.extend(old_warnings);
         converted = new;
         converted.as_str()

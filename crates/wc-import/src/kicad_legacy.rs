@@ -8,6 +8,9 @@
 //! mils (a thousandth of an inch) with y pointing up. Each drawing item names its unit (0 for
 //! every unit) and body style (0 for both, 2 for the De Morgan alternative). Written from the
 //! published file format description.
+//!
+//! A library's descriptions are kept beside it in a `.dcm` file (`EESchema-DOCLIB`): one
+//! `$CMP name` ... `$ENDCMP` record per symbol or alias, its `D` line the description.
 
 use std::fmt::Write as _;
 
@@ -19,6 +22,63 @@ pub const HEADER: &str = "EESchema-LIBRARY";
 const MM: f64 = 0.0254;
 /// Most symbols read from one file; real libraries have a few hundred.
 const MAX_SYMBOLS: usize = 20_000;
+
+/// The first word of an old KiCad symbol documentation file (`.dcm`).
+pub const DOC_HEADER: &str = "EESchema-DOCLIB";
+
+/// The descriptions of an old library's `.dcm` file, by symbol (or alias) name: each record's
+/// `D` line, taken when its `$ENDCMP` is read. Keywords (`K`) and links (`F`) are not read; a
+/// record without a description is left out. A record the file ends inside (cut short) is left
+/// out with a warning, the records before it kept.
+pub fn descriptions(text: &str) -> Result<(std::collections::BTreeMap<String, String>, Vec<String>)> {
+    let starts = text
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .strip_prefix(DOC_HEADER)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+    if !starts {
+        return Err(Error::Format(format!(
+            "not an old KiCad documentation file ({DOC_HEADER})"
+        )));
+    }
+    let mut out = std::collections::BTreeMap::new();
+    let mut warnings = Vec::new();
+    // The open record: its name, the line it starts on, and its description so far.
+    let mut open: Option<(String, usize, Option<String>)> = None;
+    for (i, line) in text.lines().map(str::trim).enumerate() {
+        if let Some(rest) = line.strip_prefix("$CMP") {
+            if let Some((name, line, _)) = open.take() {
+                warnings.push(format!(
+                    "descriptions: the record for {name} from line {line} has no $ENDCMP before the next one; its description was not read"
+                ));
+            }
+            // `$CMP` and the name are one word apart; `$CMPX` is no record.
+            open = rest
+                .starts_with(char::is_whitespace)
+                .then(|| rest.trim().to_owned())
+                .filter(|n| !n.is_empty())
+                .map(|n| (n, i + 1, None));
+        } else if line == "$ENDCMP" {
+            if let Some((name, _, Some(d))) = open.take() {
+                if out.len() >= MAX_SYMBOLS && !out.contains_key(&name) {
+                    return Err(Error::Format(format!(
+                        "more than {MAX_SYMBOLS} descriptions in one file"
+                    )));
+                }
+                out.insert(name, d);
+            }
+        } else if let (Some((_, _, d)), Some(text)) = (open.as_mut(), line.strip_prefix("D ")) {
+            let text = text.trim();
+            *d = (!text.is_empty()).then(|| text.to_owned());
+        }
+    }
+    if let Some((name, line, _)) = open {
+        warnings.push(format!(
+            "descriptions: the record for {name} from line {line} has no $ENDCMP (the file is cut short); its description was not read"
+        ));
+    }
+    Ok((out, warnings))
+}
 
 /// Whether `text` is an old KiCad symbol library.
 pub fn is_legacy(text: &str) -> bool {
@@ -421,6 +481,16 @@ fn draw_item(w: &[String], quoted: &[bool]) -> std::result::Result<(i64, i64, St
 
 /// The `.kicad_sym` text of an old library, and warnings for lines that were not read.
 pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
+    to_kicad_sym_described(text_in, &Default::default())
+}
+
+/// [`to_kicad_sym`], each symbol and alias given its description from `docs` (see
+/// [`descriptions`]) unless one of its fields is already called `Description`. An alias with
+/// no description of its own takes its symbol's.
+pub fn to_kicad_sym_described(
+    text_in: &str,
+    docs: &std::collections::BTreeMap<String, String>,
+) -> Result<(String, Vec<String>)> {
     if !is_legacy(text_in) {
         return Err(Error::Format(
             "not an old KiCad symbol library (EESchema-LIBRARY)".into(),
@@ -506,7 +576,7 @@ pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
                     done.items.retain(|(unit, _), _| *unit <= max);
                     done.units = max;
                 }
-                write_symbol(&mut out, &done);
+                write_symbol(&mut out, &done, docs);
             }
             (_, None) => {}
             (f, Some(d))
@@ -556,13 +626,23 @@ pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
 }
 
 /// Write one symbol, and one derived symbol per alias, as `.kicad_sym` items.
-fn write_symbol(out: &mut String, d: &Def) {
+fn write_symbol(out: &mut String, d: &Def, docs: &std::collections::BTreeMap<String, String>) {
     let _ = writeln!(out, "  (symbol {}", q(&d.name));
     let has_reference = d.properties.iter().any(|p| p.starts_with("(property \"Reference\""));
     if !has_reference {
         let _ = writeln!(out, "    (property \"Reference\" {} (at 0 0 0))", q(&d.reference));
     }
     for p in &d.properties {
+        let _ = writeln!(out, "    {p}");
+    }
+    let has_description = d.properties.iter().any(|p| p.starts_with("(property \"Description\""));
+    let description = |name: &str| {
+        (!has_description)
+            .then(|| docs.get(name))
+            .flatten()
+            .map(|text| format!("(property \"Description\" {} (at 0 0 0))", q(text)))
+    };
+    if let Some(p) = description(&d.name) {
         let _ = writeln!(out, "    {p}");
     }
     let mut blocks: std::collections::BTreeMap<(i64, i64), Vec<&String>> = std::collections::BTreeMap::new();
@@ -602,6 +682,9 @@ fn write_symbol(out: &mut String, d: &Def) {
                 }
             }
         }
+        if let Some(p) = description(alias).or_else(|| description(&d.name)) {
+            let _ = write!(out, " {p}");
+        }
         out.push_str(")\n");
     }
 }
@@ -640,6 +723,48 @@ ENDDEF
 #
 #End Library
 "#;
+
+    #[test]
+    fn a_dcm_file_gives_each_symbol_and_alias_its_description() -> Result<()> {
+        let dcm = "\u{feff}EESchema-DOCLIB  Version 2.0\n#\n$CMP RELAY\nD Relay, two units\nK relay\nF ~\n$ENDCMP\n#\n$CMP RELAY_24V\nD 24 V relay \\ coil\n$ENDCMP\n$CMP EMPTY\nD   \n$ENDCMP\nD outside a record\n#End Doc Library\n";
+        let (docs, warnings) = descriptions(dcm)?;
+        assert_eq!(docs.len(), 2, "{docs:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // A file cut short inside a record: the records before it are kept, the open one is not.
+        let (cut, warnings) =
+            descriptions("EESchema-DOCLIB Version 2.0\n$CMP LAMP\nD Lamp\n$ENDCMP\n$CMP RELAY\nD Relay coil desc")?;
+        assert_eq!(cut.keys().collect::<Vec<_>>(), ["LAMP"]);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("RELAY from line 5"),
+            "{warnings:?}"
+        );
+        // A record left open when the next starts: a warning, and the next one is still read.
+        let (next, warnings) = descriptions("EESchema-DOCLIB\n$CMP LAMP\nD Lamp\n$CMP RELAY\nD Relay\n$ENDCMP\n")?;
+        assert_eq!(next.keys().collect::<Vec<_>>(), ["RELAY"]);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("LAMP from line 2"),
+            "{warnings:?}"
+        );
+        assert!(descriptions("EESchema-DOCLIBX\n").is_err());
+        let (sym, _) = to_kicad_sym_described(RELAY, &docs)?;
+        let (symbols, _) = crate::kicad::symbols(&sym, "kicad.relays", 1.0)?;
+        let of = |id: &str| {
+            symbols
+                .iter()
+                .find(|i| i.symbol.id == id)
+                .map(|i| i.symbol.description.clone())
+        };
+        assert_eq!(of("kicad.relays.relay_a").as_deref(), Some("Relay, two units"));
+        assert_eq!(of("kicad.relays.relay_24v_b").as_deref(), Some("24 V relay \\ coil"));
+        // Read through the importer, a broken `.dcm` text is a warning, not a failure.
+        let (symbols, warnings) = crate::kicad::symbols_described(RELAY, Some("nonsense"), "kicad.r", 1.0)?;
+        assert!(!symbols.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.starts_with("descriptions not read")),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn an_old_library_reads_as_the_new_format() -> Result<()> {
