@@ -125,10 +125,13 @@ pub fn records(text: &str, delim: char) -> Rows {
     out
 }
 
-fn guess_delimiter(header: &str) -> char {
+/// The separator a CSV text uses: the one that splits the header [`records`] reads into the most
+/// cells. Reading the header with [`records`] itself keeps the guess to the same header line, the
+/// same line endings and the same quoting rules, also when blank lines come before it.
+fn guess_delimiter(text: &str) -> char {
     [';', '\t', ',', '|']
         .into_iter()
-        .max_by_key(|d| header.matches(*d).count())
+        .max_by_key(|d| records(text, *d).cells.first().map_or(0, Vec::len))
         .unwrap_or(',')
 }
 
@@ -205,8 +208,7 @@ pub enum CsvKind {
 pub fn kind(text: &str) -> Option<CsvKind> {
     // The same header the readers take: the first record that is not blank, quoted line
     // breaks and all.
-    let first_line = text.lines().next().unwrap_or("");
-    kind_of_rows(&records(text, guess_delimiter(first_line)))
+    kind_of_rows(&records(text, guess_delimiter(text)))
 }
 
 /// [`kind`] for rows already split into cells, such as an Excel worksheet's.
@@ -234,15 +236,13 @@ pub fn file_rows(bytes: &[u8]) -> Result<Rows> {
         ));
     }
     let text = decode(bytes);
-    let first_line = text.lines().next().unwrap_or("");
-    Ok(records(&text, guess_delimiter(first_line)))
+    Ok(records(&text, guess_delimiter(&text)))
 }
 
 /// Parse a parts list. The first row is the header; columns are matched by name (several
 /// languages), anything unrecognised becomes a part property. Returns parts and warnings.
 pub fn parts(text: &str) -> Result<(Vec<Part>, Vec<String>)> {
-    let first_line = text.lines().next().unwrap_or("");
-    parts_from_rows(&records(text, guess_delimiter(first_line)))
+    parts_from_rows(&records(text, guess_delimiter(text)))
 }
 
 /// The most contacts of one kind a part may have.
@@ -424,8 +424,7 @@ fn classify_plc(h: &str) -> PlcCol {
 /// in several languages; a description column is optional). The `plc` report written as CSV
 /// reads back unchanged. Returns the rows and warnings for rows that were skipped.
 pub fn plc_addresses(text: &str) -> Result<(Vec<PlcAddress>, Vec<String>)> {
-    let first_line = text.lines().next().unwrap_or("");
-    plc_addresses_from_rows(&records(text, guess_delimiter(first_line)))
+    plc_addresses_from_rows(&records(text, guess_delimiter(text)))
 }
 
 /// [`plc_addresses`] for rows already split into cells: an Excel worksheet's, or [`file_rows`]'.
@@ -586,6 +585,41 @@ mod tests {
         // Rows given without numbers count from 1.
         let given = Rows::from(vec![vec!["Order number".to_owned()], vec![String::new()]]);
         assert_eq!(parts_from_rows(&given)?.1, ["row 2: no order number, skipped"]);
+        Ok(())
+    }
+
+    #[test]
+    fn separators_inside_quotes_or_after_a_literal_quote_do_not_count() {
+        assert_eq!(guess_delimiter("Order number;\"Description\n,,,,\"\nA1;example\n"), ';');
+        assert_eq!(guess_delimiter("Order number;Size (\")\nA1;,,,,\n"), ';');
+    }
+
+    #[test]
+    fn a_line_break_inside_a_quoted_header_does_not_end_it() {
+        assert_eq!(guess_delimiter("\"Order\rnumber\";Description\r\nA1;example\r\n"), ';');
+        assert_eq!(guess_delimiter("\"Order\nnumber\";Description\nA1;example\n"), ';');
+    }
+
+    #[test]
+    fn a_header_ended_by_a_lone_carriage_return_sets_the_separator() {
+        // Old Mac line endings: the header is only the text up to the first `\r`.
+        assert_eq!(guess_delimiter("\nManufacturer;Order number\rABB;1SBL,,,\r"), ';');
+    }
+
+    #[test]
+    fn blank_lines_before_the_header_do_not_change_the_separator() -> Result<()> {
+        let list = "Manufacturer;Order number;Description\r\nABB;1SBL;Contactor, 3 pole\r\n";
+        for lead in ["\r\n", "\n\n", "  \t\n"] {
+            let text = format!("{lead}{list}");
+            assert_eq!(kind(&text), Some(CsvKind::Parts), "{lead:?}");
+            assert_eq!(parts(&text)?, parts(list)?, "{lead:?}");
+            let Ok(rows) = file_rows(text.as_bytes()) else {
+                unreachable!("{lead:?} reads");
+            };
+            assert_eq!(rows[0], ["Manufacturer", "Order number", "Description"]);
+        }
+        let (rows, _) = plc_addresses("\nDevice;Address\n-K1;%I0.0\n")?;
+        assert_eq!(rows.len(), 1);
         Ok(())
     }
 

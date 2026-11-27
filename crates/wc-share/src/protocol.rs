@@ -998,3 +998,280 @@ pub(crate) fn check_edit(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn line<T: Serialize>(msg: &T) -> std::result::Result<String, serde_json::Error> {
+        serde_json::to_string(msg)
+    }
+
+    fn picture(file: &str, len: usize) -> Picture {
+        Picture {
+            file: file.into(),
+            data: vec![7; len],
+        }
+    }
+
+    #[test]
+    fn a_picture_of_the_largest_size_is_carried_and_one_byte_more_is_not() {
+        assert_eq!(picture("pictures/logo.png", MAX_PICTURE).problem(), None);
+        let Some(why) = picture("pictures/logo.png", MAX_PICTURE + 1).problem() else {
+            unreachable!("a picture over the limit is refused")
+        };
+        assert!(why.contains("larger than 16 MB"), "{why}");
+        let Some(why) = picture("underlays/p0001.png", 0).problem() else {
+            unreachable!("an empty picture is refused")
+        };
+        assert!(why.contains("is empty"), "{why}");
+    }
+
+    #[test]
+    fn only_files_inside_the_picture_folders_are_carried() {
+        for ok in ["pictures/logo.png", "underlays/p0001.jpg", "pictures/sub/a.png"] {
+            assert!(Picture::file_ok(ok), "{ok}");
+        }
+        for bad in [
+            "pictures",
+            "pictures/",
+            "picturesx/a.png",
+            "underlays",
+            "project.toml",
+            "vendor/symbols/x.png",
+            "/pictures/a.png",
+            "pictures/../project.toml",
+            "",
+        ] {
+            assert!(!Picture::file_ok(bad), "{bad}");
+        }
+        // The folder check comes before the size check.
+        let Some(why) = picture("project.toml", 0).problem() else {
+            unreachable!("a file outside the picture folders is refused")
+        };
+        assert!(why.contains("is not in the project's"), "{why}");
+    }
+
+    #[test]
+    fn picture_bytes_that_are_not_base64_do_not_read() {
+        for bad in [
+            r#"{"file":"pictures/a.png","data":"not base64!"}"#,
+            r#"{"file":"pictures/a.png","data":"QUJD="}"#,
+            r#"{"file":"pictures/a.png","data":[1,2,3]}"#,
+            r#"{"file":"pictures/a.png"}"#,
+        ] {
+            assert!(serde_json::from_str::<Picture>(bad).is_err(), "{bad}");
+        }
+        let Ok(empty) = serde_json::from_str::<Picture>(r#"{"file":"pictures/a.png","data":""}"#) else {
+            unreachable!("empty base64 reads as no bytes")
+        };
+        assert!(empty.data.is_empty());
+    }
+
+    #[test]
+    fn a_cut_off_message_never_reads() -> TestResult {
+        let msgs = [
+            line(&GuestMsg::Join {
+                name: "Ola".into(),
+                email: "o@x".into(),
+                protocol: PROTOCOL_VERSION,
+            })?,
+            line(&GuestMsg::Revert { change: 12 })?,
+            line(&HostMsg::Picture {
+                picture: picture("pictures/logo.png", 5),
+            })?,
+            line(&HostMsg::Refused {
+                refusal: Refusal::PageLocked {
+                    page: "p0001".into(),
+                    by: 2,
+                },
+                take_back: true,
+                edit: Some(4),
+                put_back: None,
+            })?,
+        ];
+        for whole in &msgs {
+            // Every proper prefix is cut off; the whole line reads.
+            for end in 0..whole.len() {
+                let Some(cut) = whole.get(..end) else { continue };
+                assert!(
+                    serde_json::from_str::<GuestMsg>(cut).is_err() && serde_json::from_str::<HostMsg>(cut).is_err(),
+                    "{cut}"
+                );
+            }
+            assert!(
+                serde_json::from_str::<GuestMsg>(whole).is_ok() || serde_json::from_str::<HostMsg>(whole).is_ok(),
+                "{whole}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_messages_do_not_read() {
+        for bad in [
+            "",
+            "null",
+            "[]",
+            "{}",
+            r#"{"type":"join","email":"o@x"}"#,
+            r#"{"type":"join","name":1,"email":"o@x"}"#,
+            r#"{"type":"revert"}"#,
+            r#"{"type":"revert","change":-1}"#,
+            r#"{"type":"revert","change":"7"}"#,
+            r#"{"type":"Undo"}"#,
+            r#"{"type":"open","page":5}"#,
+            r#"{"type":"edit_project","seq":1}"#,
+        ] {
+            assert!(serde_json::from_str::<GuestMsg>(bad).is_err(), "{bad}");
+        }
+        for bad in [
+            r#"{"type":"unchanged"}"#,
+            r#"{"type":"refused"}"#,
+            r#"{"type":"refused","refusal":{"type":"page_locked","page":"p1"}}"#,
+            r#"{"type":"declined","version":{"host":1}}"#,
+            r#"{"type":"locks","locks":{"p1":"host"}}"#,
+        ] {
+            assert!(serde_json::from_str::<HostMsg>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fields_an_older_build_leaves_out_read_as_their_defaults() -> TestResult {
+        assert_eq!(
+            serde_json::from_str::<GuestMsg>(r#"{"type":"join","name":"Ola","email":"o@x"}"#)?,
+            GuestMsg::Join {
+                name: "Ola".into(),
+                email: "o@x".into(),
+                protocol: 0,
+            }
+        );
+        let edit = r#"{"type":"edit_project","edit":{"type":"renumber","numbers":[["p1","2"]]}}"#;
+        assert!(matches!(
+            serde_json::from_str::<GuestMsg>(edit)?,
+            GuestMsg::EditProject { seq: 0, .. }
+        ));
+        // A field a newer build adds is skipped rather than refused.
+        assert_eq!(
+            serde_json::from_str::<GuestMsg>(r#"{"type":"open","page":"p1","colour":"red"}"#)?,
+            GuestMsg::Open {
+                page: Some("p1".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn small_host_messages_survive_the_wire_and_leave_out_empty_fields() -> TestResult {
+        let msgs = [
+            HostMsg::Waiting,
+            HostMsg::Closed,
+            HostMsg::Declined { version: None },
+            HostMsg::Declined {
+                version: Some(VersionMismatch { host: 5, guest: 4 }),
+            },
+            HostMsg::Unchanged { seq: u64::MAX },
+            HostMsg::Locks {
+                locks: [("p0001".to_owned(), 3)].into(),
+            },
+            HostMsg::Peers {
+                peers: vec![
+                    Peer {
+                        id: 0,
+                        name: "Host \"H\"\n".into(),
+                        page: None,
+                    },
+                    Peer {
+                        id: 1,
+                        name: "Ærlig Øyvind".into(),
+                        page: Some("p0002".into()),
+                    },
+                ],
+            },
+            HostMsg::Items {
+                symbols: Vec::new(),
+                parts: Vec::new(),
+            },
+        ];
+        for m in msgs {
+            let text = line(&m)?;
+            assert!(!text.contains('\n'), "{text}");
+            assert_eq!(serde_json::from_str::<HostMsg>(&text)?, m);
+        }
+        assert_eq!(line(&HostMsg::Declined { version: None })?, r#"{"type":"declined"}"#);
+        assert_eq!(
+            line(&HostMsg::Items {
+                symbols: Vec::new(),
+                parts: Vec::new()
+            })?,
+            r#"{"type":"items"}"#
+        );
+        let peer = line(&Peer {
+            id: 4,
+            name: "G".into(),
+            page: None,
+        })?;
+        assert_eq!(peer, r#"{"id":4,"name":"G"}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn every_refusal_survives_the_wire() -> TestResult {
+        let all = [
+            Refusal::NotApproved,
+            Refusal::PageLocked {
+                page: "p0001".into(),
+                by: 2,
+            },
+            Refusal::NoLock { page: "p0002".into() },
+            Refusal::UnknownPage { page: "p9".into() },
+            Refusal::Invalid { reason: "why".into() },
+            Refusal::NotRecorded {
+                reason: "disk full".into(),
+            },
+            Refusal::PictureNameTaken {
+                file: "pictures/logo.png".into(),
+            },
+        ];
+        for r in all {
+            let msg = HostMsg::Refused {
+                refusal: r.clone(),
+                take_back: false,
+                edit: Some(1),
+                put_back: None,
+            };
+            assert_eq!(serde_json::from_str::<HostMsg>(&line(&msg)?)?, msg);
+            assert_eq!(serde_json::from_str::<Refusal>(&line(&r)?)?, r);
+        }
+        assert_eq!(line(&Refusal::NotApproved)?, r#"{"type":"not_approved"}"#);
+        assert_eq!(
+            Refusal::PageLocked {
+                page: "p0001".into(),
+                by: 2
+            }
+            .to_string(),
+            "page p0001 is open by participant 2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_version_mismatch_says_which_side_to_update() {
+        let host_newer = VersionMismatch { host: 5, guest: 3 }.to_string();
+        assert!(
+            host_newer.contains("version 5") && host_newer.contains("version 3"),
+            "{host_newer}"
+        );
+        assert!(
+            host_newer.ends_with("to the host's WiringCraft version"),
+            "{host_newer}"
+        );
+        let guest_newer = VersionMismatch { host: 0, guest: 5 }.to_string();
+        assert!(
+            guest_newer.ends_with("to the guest's WiringCraft version"),
+            "{guest_newer}"
+        );
+    }
+}
