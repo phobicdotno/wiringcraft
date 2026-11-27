@@ -149,9 +149,15 @@ A part is an orderable article. It is read into `wc_core::Part`
 a part's width and height come from its `Width` and `Height` properties first, then its
 footprint, then its model; its depth from `Depth`, then the model. German and Norwegian names
 work too: `Breite` and `Bredde`, `Höhe`, `Hoehe`, `Høyde` and `Hoyde`, `Tiefe` and `Dybde`
-(`Width mm`, `Height mm` and `Depth mm` also work). Width and height names are matched without regard to the case
-of the letters A to Z only, so write `ö` and `ø` in lower case (`HÖHE` is not found, `HöHE` is).
-The leading number of the value is used, so `"45 mm"` and `"45"` are both 45.
+(`Width mm`, `Height mm` and `Depth mm` also work). Width and height names are matched
+without regard to the case of the letters A to Z only, so write `ö` and `ø` in lower case
+(`HÖHE` is not found, `HöHE` is); depth names in any case.
+
+The value is read in millimetres from its leading digits, points and commas, so `"45 mm"` and
+`"45"` are both 45 and `"17,5"` is 17.5. There is no exponent form: `"4.5e1"` reads as 4.5. A
+width or height must be above 0 and at most 5000 mm, a depth at most 2000 mm; a value outside
+that, or one that does not read as a number, is skipped and the next source is used (the footprint, then the
+model; for depth the model).
 
 `library/parts/example.ex-ct-9-24dc.json`:
 
