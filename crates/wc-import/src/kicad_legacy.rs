@@ -47,6 +47,11 @@ pub fn descriptions(text: &str) -> Result<(std::collections::BTreeMap<String, St
     let mut open: Option<(String, usize, Option<String>)> = None;
     for (i, line) in text.lines().map(str::trim).enumerate() {
         if let Some(rest) = line.strip_prefix("$CMP") {
+            if let Some((name, line, _)) = open.take() {
+                warnings.push(format!(
+                    "descriptions: the record for {name} from line {line} has no $ENDCMP before the next one; its description was not read"
+                ));
+            }
             // `$CMP` and the name are one word apart; `$CMPX` is no record.
             open = rest
                 .starts_with(char::is_whitespace)
@@ -731,6 +736,13 @@ ENDDEF
         assert_eq!(cut.keys().collect::<Vec<_>>(), ["LAMP"]);
         assert!(
             warnings.len() == 1 && warnings[0].contains("RELAY from line 5"),
+            "{warnings:?}"
+        );
+        // A record left open when the next starts: a warning, and the next one is still read.
+        let (next, warnings) = descriptions("EESchema-DOCLIB\n$CMP LAMP\nD Lamp\n$CMP RELAY\nD Relay\n$ENDCMP\n")?;
+        assert_eq!(next.keys().collect::<Vec<_>>(), ["RELAY"]);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("LAMP from line 2"),
             "{warnings:?}"
         );
         assert!(descriptions("EESchema-DOCLIBX\n").is_err());
