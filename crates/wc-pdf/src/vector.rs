@@ -73,8 +73,9 @@ pub fn page_drawings(
     drawings(project, symbols, options, true)
 }
 
-/// As [`page_drawings`], but without the logo and underlays: they are neither looked up nor
-/// warned about, for formats that do not show pictures (DXF).
+/// As [`page_drawings`], but without the logo and underlays, for formats that do not show
+/// pictures (DXF). Their files are not looked up; a warning names each page whose underlay is
+/// left out, and the logo once when a sheet has a place for it.
 pub fn page_lines(
     project: &Project,
     symbols: &BTreeMap<String, Symbol>,
@@ -110,9 +111,14 @@ fn drawings(
             .ok()
             .map(|((mime, size), b)| (mime, size, std::sync::Arc::new(b.clone())))
     });
+    // Without pictures, whether a sheet had a place for the logo, to say it is left out.
+    let mut logo_left_out = false;
     let xref = layout::CrossRefs::build(project, symbols);
     let total = pages.len() + options.panels.len();
-    let logo_pictures = |page: &wc_core::Page| -> Vec<Picture> {
+    let mut logo_pictures = |page: &wc_core::Page| -> Vec<Picture> {
+        if !with_pictures {
+            logo_left_out |= !layout::logo_boxes(project, page).is_empty();
+        }
         let Some((mime, size, bytes)) = &logo else {
             return Vec::new();
         };
@@ -136,6 +142,12 @@ fn drawings(
         .map(|(i, page)| {
             let drawn = layout::draw_page(project, page, i, total, symbols, &xref, options, &mut report.warnings);
             let mut pictures = Vec::new();
+            if let Some(u) = page.underlay.as_ref().filter(|_| !with_pictures) {
+                report.warnings.push(format!(
+                    "page {}: the underlay {} is left out: DXF has no pictures (the SVG export shows it)",
+                    page.number, u.file
+                ));
+            }
             if let Some(u) = page.underlay.as_ref().filter(|_| with_pictures) {
                 let found = picture_bytes(options, &u.file, "underlay")
                     .map_err(|w| format!("page {}: {w}", page.number))
@@ -190,6 +202,12 @@ fn drawings(
             prims: drawn.prims,
             panel: true,
         });
+    }
+    if let Some(l) = project.meta.logo.as_ref().filter(|_| logo_left_out) {
+        report.warnings.push(format!(
+            "the logo {} is left out: DXF has no pictures (the SVG export shows it)",
+            l.file
+        ));
     }
     (out, report)
 }
