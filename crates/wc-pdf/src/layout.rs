@@ -202,6 +202,23 @@ impl CrossRefs {
                 }
             }
         }
+        // Every list reads in page order, then by column and row within a page, not in the
+        // order the symbols were placed (#1331).
+        let index: BTreeMap<&str, usize> = project
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.as_str(), i))
+            .collect();
+        let position = |a: &Appearance| (index.get(a.page_id.as_str()).copied(), a.column, a.row);
+        for list in x
+            .auxes
+            .values_mut()
+            .chain(x.links.values_mut())
+            .chain(x.overview_links.values_mut())
+        {
+            list.sort_by_key(position);
+        }
         // A contact points to its coil's first drawing: the detailed one on a schematic page,
         // not a repeat on an overview page (line diagram) that may come first in page order.
         let overview: BTreeSet<&str> = project
@@ -211,7 +228,7 @@ impl CrossRefs {
             .map(|p| p.id.as_str())
             .collect();
         for list in x.mains.values_mut() {
-            list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
+            list.sort_by_key(|a| (overview.contains(a.page_id.as_str()), position(a)));
         }
         x
     }

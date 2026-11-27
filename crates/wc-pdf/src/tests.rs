@@ -1655,6 +1655,35 @@ fn an_interruption_point_does_not_point_to_its_copy_on_an_overview_page() {
 }
 
 #[test]
+fn a_coil_lists_its_contacts_by_column_not_by_drawing_order() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    symbols.insert("nc".to_owned(), sym("nc", SymbolRole::Auxiliary, ["21", "22"]));
+    symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut first = Page::new("p1", "1", "Control");
+    first.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    first.symbols.push(place("s2", "arrow", 50.0, "-L1"));
+    let mut second = Page::new("p2", "2", "Control");
+    // Drawn right to left: the contact at column 7 first, then the one at column 2.
+    second.symbols.push(place("s3", "no", 260.0, "-K1"));
+    second.symbols.push(place("s4", "nc", 80.0, "-K1"));
+    second.symbols.push(place("s5", "arrow", 260.0, "-L1"));
+    second.symbols.push(place("s6", "arrow", 80.0, "-L1"));
+    project.pages = vec![first, second];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let texts: Vec<&str> = marks.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["21-22 2/2.B", "13-14 2/7.B", "2/2.B 2/7.B"], "{marks:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
 fn cross_references_give_page_column_and_row() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
