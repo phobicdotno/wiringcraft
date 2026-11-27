@@ -31,7 +31,9 @@ Some things to know:
   once in a project.
 - Letters must print in the PDF as themselves, so only characters from Latin-1 are taken.
   `revision add Ω` is refused.
-- The date is free text and is printed exactly as you type it.
+- The date is free text, printed as it is stored. Like the text and the author, it is kept to
+  200 characters: control characters are removed, spaces around it are trimmed, and a longer
+  value is cut to 200 characters.
 - The list is in the order the revisions were added, not sorted by letter. The **latest**
   revision is the one added last.
 - A revision cannot be removed while a cloud on some page still carries its letter. Remove
