@@ -866,6 +866,10 @@ fn a_path_that_is_not_utf8_is_read_in_quoted_form() {
     assert_eq!(git::path_text(b"a\xffb"), r#""a\377b""#);
     assert_eq!(git::path_text(b"a\xfeb"), r#""a\376b""#);
     assert_eq!(git::path_text(b"\"x\\\xff"), r#""\"x\\\377""#);
+    // A UTF-8 name that looks like a quoted one is quoted itself, so the two stay apart.
+    assert_eq!(git::path_text(br#""a\377.txt""#), r#""\"a\\377.txt\"""#);
+    assert_ne!(git::path_text(br#""a\377.txt""#), git::path_text(b"a\xff.txt"));
+    assert_eq!(git::path_text(br#"a"b"#), r#"a"b"#, "a quote inside a name is kept");
     assert_eq!(
         git::path_text("ø\u{fffd}".as_bytes()),
         "ø\u{fffd}",
