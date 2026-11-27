@@ -38,7 +38,12 @@ pub struct ProjectMeta {
     #[serde(default, rename = "location", skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
     /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
-    #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "jumper",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "merged_jumpers"
+    )]
     pub jumpers: Vec<Jumper>,
     /// Terminal strips arranged in the terminal strip editor: their terminal order and spare
     /// terminals. A strip that is not listed keeps the usual order (by terminal number).
@@ -266,6 +271,28 @@ pub struct StripLayout {
     /// later is that drawn terminal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spares: Vec<String>,
+}
+
+/// Read the `[[jumper]]` list as [`ProjectMeta::add_jumper`] keeps it: jumpers of one strip
+/// that share a terminal are one jumper (the first part in file order counts), rather than two
+/// jumpers each counting its part and showing in the terminal plan and the configurator
+/// export. Each jumper was checked on its own when read (see [`StoredJumper`]).
+fn merged_jumpers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Jumper>, D::Error> {
+    let list = Vec::<Jumper>::deserialize(d)?;
+    let mut meta = ProjectMeta::new("");
+    for j in &list {
+        // Each jumper was checked when read, so this only merges.
+        let _ = meta.add_jumper_with(&j.strip, &j.terminals, None);
+    }
+    // Each entry ended up in exactly one merged jumper; its part is the first one in file order
+    // among them, however later entries joined the groups.
+    for m in &mut meta.jumpers {
+        m.part = list
+            .iter()
+            .filter(|j| j.strip == m.strip && j.terminals.iter().any(|t| m.terminals.iter().any(|u| u == t.trim())))
+            .find_map(|j| j.part.clone());
+    }
+    Ok(meta.jumpers)
 }
 
 /// Read the `[[strip]]` layouts, refusing two for the same strip: which one counts would
@@ -756,9 +783,11 @@ impl ProjectMeta {
         let parsed = location_path(path);
         let raw = path.trim();
         let before = self.locations.len();
-        // The normal form first, then the path as typed (an entry stored as `+L1`).
+        // By normal form, so an entry stored as typed (`+L1`) goes by `L1` too, as
+        // [`Self::set_location`] finds it; then by the path as typed (an unreadable entry).
         if let Ok(key) = &parsed {
-            self.locations.retain(|l| l.path != *key);
+            self.locations
+                .retain(|l| l.path != *key && location_path(&l.path).as_ref() != Ok(key));
         }
         if self.locations.len() == before {
             self.locations.retain(|l| l.path != raw);
@@ -1498,8 +1527,8 @@ impl PageSize {
     }
 
     /// How many reference rows run down the sides of the frame, by the sheet's height: A to F
-    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to K up to A1
-    /// landscape (594 mm), A to M above. Fixed per sheet size, so a reference never moves.
+    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to J up to A1
+    /// landscape (594 mm), A to L above. Fixed per sheet size, so a reference never moves.
     pub fn frame_rows(self) -> usize {
         let (_, h) = self.mm();
         if h <= 297.0 {
@@ -2183,8 +2212,9 @@ impl Project {
     }
 
     /// Rename device `from` to `to` everywhere it appears: its device entry, the symbols that
-    /// carry its tag, the cable cores of a cable, panel items and terminal-strip jumpers.
-    /// Returns how many symbols were retagged. It does not check that `to` is free: callers do.
+    /// carry its tag, the cable cores of a cable, panel items, terminal-strip jumpers, fieldbus
+    /// networks, and the PLC racks and cards named by it. Returns how many symbols were
+    /// retagged. It does not check that `to` is free: callers do.
     pub fn rename_device(&mut self, from: &DeviceTag, to: &DeviceTag) -> usize {
         if from == to {
             return 0;
@@ -2250,6 +2280,19 @@ impl Project {
         }
         for net in &mut self.meta.networks {
             net.rename_device(from, to);
+        }
+        // A PLC rack named after its head and a card carrying its tag follow, so the PLC card
+        // overview does not show the old tag. A name that is not this tag is left as typed.
+        let is_from = |s: &str| DeviceTag::parse(s).ok().as_ref() == Some(from);
+        for rack in &mut self.meta.racks {
+            if is_from(&rack.name) {
+                rack.name = to.to_string();
+            }
+            for card in &mut rack.cards {
+                if is_from(&card.tag) {
+                    card.tag = to.to_string();
+                }
+            }
         }
         n
     }
@@ -2753,6 +2796,39 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_device_renames_the_plc_rack_and_card_it_names() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::plc_rack::{PlcCard, PlcRack};
+        let mut p = Project::new("t");
+        p.meta.racks.push(PlcRack {
+            name: " -A1 ".into(),
+            cards: vec![
+                PlcCard {
+                    slot: 1,
+                    tag: "-A1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 2,
+                    tag: "-A1.DI1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 3,
+                    tag: "Inputs".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        p.rename_device(&DeviceTag::parse("-A1")?, &DeviceTag::parse("+S2-A5")?);
+        let rack = &p.meta.racks[0];
+        assert_eq!(rack.name, "+S2-A5");
+        let tags: Vec<&str> = rack.cards.iter().map(|c| c.tag.as_str()).collect();
+        assert_eq!(tags, ["+S2-A5", "-A1.DI1", "Inputs"], "only the renamed tag follows");
+        Ok(())
+    }
+
+    #[test]
     fn jumper_edits_trim_the_terminal_number_like_adding_does() -> Result<(), Box<dyn std::error::Error>> {
         let x1 = DeviceTag::parse("-X1")?;
         let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
@@ -2785,6 +2861,45 @@ mod tests {
         let old: ProjectMeta =
             toml::from_str("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = [\"1\", \"2\"]\n")?;
         assert_eq!(old.jumpers[0].part, None);
+        // Hand-edited jumpers read as add_jumper keeps them: a two-level number or a jumper
+        // that joins nothing is refused, two sharing a terminal are one.
+        let read = |jumpers: &str| toml::from_str::<ProjectMeta>(&format!("name = \"t\"\n{jumpers}"));
+        let jumper = |strip: &str, t: &str| format!("[[jumper]]\nstrip = \"{strip}\"\nterminals = [{t}]\n");
+        let err = read(&jumper("-X1", "\"1\", \"2.3\"")).err().map(|e| e.to_string());
+        assert!(err.as_deref().is_some_and(|e| e.contains("one tag level")), "{err:?}");
+        let err = read(&jumper("-X1", "\"1\", \"1\"")).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("two different terminals")),
+            "{err:?}"
+        );
+        let shared = read(&format!(
+            "{}part = \"acme.bridge\"\n{}{}",
+            jumper("-X1", "\"3\", \"4\""),
+            jumper("-X1", "\"1\", \"3\""),
+            jumper("-X2", "\"1\", \"3\"")
+        ))?;
+        assert_eq!(shared.jumpers.len(), 2, "{:?}", shared.jumpers);
+        assert_eq!(shared.jumpers[0].terminals, s(&["1", "3", "4"]));
+        assert_eq!(shared.jumpers[0].part.as_deref(), Some("acme.bridge"));
+        // Conflicting parts: the first in the file counts, also when a later entry bridges two
+        // groups that were apart until then.
+        let conflict = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n",
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"3\"")
+        ))?;
+        assert_eq!(conflict.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert_eq!(conflict.jumpers[0].part.as_deref(), Some("first"));
+        let bridged = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n{}",
+            jumper("-X1", "\"8\", \"9\""),
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"8\"")
+        ))?;
+        assert_eq!(bridged.jumpers.len(), 1, "{:?}", bridged.jumpers);
+        assert_eq!(bridged.jumpers[0].terminals, s(&["1", "2", "8", "9"]));
+        assert_eq!(bridged.jumpers[0].part.as_deref(), Some("first"));
+        assert_eq!(shared.jumpers[1].strip, DeviceTag::parse("-X2")?);
         // Extended by another jumper: the part stays.
         m.add_jumper(&x1, &s(&["2", "3"]))?;
         assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-402"));
@@ -3034,6 +3149,13 @@ mod tests {
         });
         assert_eq!(m.remove_location("+L5"), Ok(()));
         assert!(!m.locations.iter().any(|l| l.path == "+L5"));
+        // Removed without its sign as well, as setting it would find it.
+        m.locations.push(Location {
+            path: "+L6".into(),
+            description: String::new(),
+        });
+        assert_eq!(m.remove_location("L6"), Ok(()));
+        assert!(!m.locations.iter().any(|l| l.path.ends_with("L6")));
         let why = m.remove_location("+L1-K1");
         assert!(why.as_ref().is_err_and(|e| e.contains("not a location")), "{why:?}");
         assert_eq!(m.locations.len(), 1);

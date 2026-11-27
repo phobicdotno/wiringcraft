@@ -381,7 +381,9 @@ fn ribbon_rects(ui: &mut egui::Ui, state: &mut ChromeState, status: &dyn Status,
             } else {
                 text
             };
-            let r = ui.add(egui::Label::new(text).sense(Sense::click()));
+            // Not selectable: a tab is a button, so no text cursor on hover and a drag over
+            // it does not select its word.
+            let r = ui.add(egui::Label::new(text).selectable(false).sense(Sense::click()));
             if on {
                 ui.painter().line_segment(
                     [
@@ -928,6 +930,45 @@ mod tests {
         frame(1220.0, vec![key(true)], &mut out);
         frame(1220.0, vec![key(false)], &mut out);
         assert_eq!(out, [Action::Undo]);
+    }
+
+    #[test]
+    fn a_ribbon_tab_shows_no_text_cursor_and_opens_on_click() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let mut state = ChromeState { ribbon_tab: 1 };
+        let mut out = Vec::new();
+        // Just inside the first tab's word: 8 points of panel margin and 4 of space before it.
+        let at = egui::pos2(16.0, 12.0);
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let frame = |state: &mut ChromeState, out: &mut Vec<Action>, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1210.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::TopBottomPanel::top("menus")
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 4)))
+                    .show(ctx, |ui| {
+                        ribbon_rects(ui, state, &AllOn, out);
+                    });
+            })
+            .platform_output
+            .cursor_icon
+        };
+        frame(&mut state, &mut out, vec![egui::Event::PointerMoved(at)]);
+        let cursor = frame(&mut state, &mut out, vec![egui::Event::PointerMoved(at)]);
+        assert_ne!(cursor, egui::CursorIcon::Text, "a ribbon tab reads as text to select");
+        frame(&mut state, &mut out, vec![press(true)]);
+        frame(&mut state, &mut out, vec![press(false)]);
+        assert_eq!(state.ribbon_tab, 0, "the point is not on the first tab");
     }
 
     #[test]

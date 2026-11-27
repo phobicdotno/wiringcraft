@@ -1675,6 +1675,7 @@ fn plc_kind(sym: &Symbol) -> Option<&'static str> {
 #[derive(Debug, Clone)]
 pub(crate) struct PlcPoint {
     /// The device property `Address` (or `PLC address`), trimmed; empty when there is none.
+    /// When the device has both, the first one that is not blank.
     pub address: String,
     /// `Input` or `Output`.
     pub kind: &'static str,
@@ -1741,8 +1742,11 @@ pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
                 .and_then(|d| {
                     d.properties
                         .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("address") || k.eq_ignore_ascii_case("plc address"))
-                        .map(|(_, v)| v.trim().to_owned())
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("address") || k.eq_ignore_ascii_case("plc address"))
+                        .map(|(_, v)| v.trim())
+                        // An emptied `Address` does not hide a `PLC address` that is filled in.
+                        .find(|v| !v.is_empty())
+                        .map(str::to_owned)
                 })
                 .unwrap_or_default();
             let mut others: Vec<&PinRef> = Vec::new();
