@@ -2022,7 +2022,8 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
         sep(ui);
         ui.label(RichText::new(format!("{:.0} %", ed.view.zoom / 3.78 * 100.0)).color(t.muted));
         sep(ui);
-        ui.label(RichText::new(&ed.message).color(t.muted));
+        // The right-hand texts are drawn first so the message gets only the space between,
+        // cut short with "…" (the whole text on hover) rather than running under them.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(o) = open {
                 if let Some((mut text, pending, failed)) = live {
@@ -2063,6 +2064,9 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
                     ui.painter().circle_filled(r.center(), 3.5, t.success);
                 }
             }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(&ed.message).color(t.muted)).truncate());
+            });
         });
     });
     show_check
@@ -2437,6 +2441,32 @@ fn drawing_rows(g: &Shape) -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long status message is cut short to the room left by the right-hand texts, so the
+    /// status bar stays inside a narrow window instead of running under them (#1478).
+    #[test]
+    fn a_long_status_message_stays_inside_the_status_bar() {
+        let (_tmp, o) = crate::state::tests::project();
+        let mut ed = Editor::default();
+        ed.message = format!("Opened {}", "/a/very/long/folder/name".repeat(20));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let mut used = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let room = ui.max_rect();
+                let r = ui.scope(|ui| status_bar(ui, Some(&o), &ed, None)).response.rect;
+                used = Some((r, room));
+            });
+        });
+        let (r, max) = used.unwrap();
+        assert!(r.right() <= max.right() + 0.5, "{r:?} runs past {max:?}");
+        assert!(r.height() < 24.0, "the bar stays one line high: {r:?}");
+    }
 
     /// A device picked in the Devices list while a panel layout is shown is shown on its page:
     /// the panel view closes (#1203).
