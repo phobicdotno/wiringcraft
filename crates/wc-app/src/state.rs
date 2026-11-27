@@ -565,6 +565,9 @@ impl LibraryEntry {
 #[derive(Default)]
 pub(crate) struct TakenParts {
     loaded: Vec<String>,
+    /// Parts that were loaded and were loaded again (another version, the pinned one), with
+    /// what was loaded before.
+    replaced: Vec<(String, Part)>,
     copies: Vec<PathBuf>,
 }
 
@@ -1273,13 +1276,15 @@ impl Open {
         let mut taken = TakenParts::default();
         let mut r = Ok(());
         for id in ids {
-            let was_loaded = self.parts.contains_key(id);
+            let was = self.parts.get(id).cloned();
             let missing = store::vendor_path(&self.dir, ItemKind::Part, id)
                 .ok()
                 .filter(|path| !path.try_exists().unwrap_or(true));
             r = self.ensure_part(id);
-            if !was_loaded && self.parts.contains_key(id) {
-                taken.loaded.push(id.to_owned());
+            match was {
+                None if self.parts.contains_key(id) => taken.loaded.push(id.to_owned()),
+                Some(was) if self.parts.get(id) != Some(&was) => taken.replaced.push((id.to_owned(), was)),
+                _ => {}
             }
             taken.copies.extend(missing.filter(|path| path.exists()));
             if r.is_err() {
@@ -1299,6 +1304,9 @@ impl Open {
     ) -> Result<R, String> {
         for id in taken.loaded {
             self.parts.remove(&id);
+        }
+        for (id, was) in taken.replaced {
+            self.parts.insert(id, was);
         }
         let mut left = Vec::new();
         for path in taken.copies {
@@ -1324,21 +1332,27 @@ impl Open {
         }
     }
 
-    /// The devices placing a group (`symbols`, `wires` and the group's own `devices`) with its own
-    /// data first gives the tags it places, as [`wc_core::placement::place`] picks them: the
-    /// group's device for a tag, else the project's. The tags are those of the symbols and the
-    /// cables of the wires.
+    /// The devices placing a group (`symbols`, `wires` and the group's own `devices`) gives the
+    /// tags it places, as [`wc_core::placement::place`] picks them: the group's device for a
+    /// tag, else (with `project_too`, its own data first) the project's; without it (its data
+    /// only, as macros are placed) none. The tags are those of the symbols and the cables of
+    /// the wires.
     pub(crate) fn group_devices<'a>(
         &'a self,
         symbols: &'a [PlacedSymbol],
         wires: &'a [Wire],
         devices: &'a BTreeMap<DeviceTag, wc_core::Device>,
+        project_too: bool,
     ) -> impl Iterator<Item = &'a wc_core::Device> + 'a {
         let tags = symbols
             .iter()
             .filter_map(|s| s.tag.as_ref())
             .chain(wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)));
-        tags.filter_map(|t| devices.get(t).or_else(|| self.project.devices.get(t)))
+        tags.filter_map(move |t| {
+            devices
+                .get(t)
+                .or_else(|| project_too.then(|| self.project.devices.get(t)).flatten())
+        })
     }
 
     /// The parts `devices` name (their main parts and accessories) that a macro or a copy from
@@ -4187,7 +4201,8 @@ impl Open {
         let parts = self.parts_to_take(
             copies
                 .iter()
-                .flat_map(|c| self.group_devices(&c.symbols, &c.wires, &c.devices)),
+                // Placed with the macro's own data only (`macros::place`).
+                .flat_map(|c| self.group_devices(&c.symbols, &c.wires, &c.devices, false)),
         );
         let lock = self.project.lock.clone();
         let (taken, r) = match parts {

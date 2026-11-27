@@ -944,7 +944,9 @@ impl Open {
         // The parts the copied devices name come along then, all or none, as `macro place`
         // takes them (#1855); Undo takes their pins back.
         let parts = match data {
-            DeviceData::GroupFirst => self.parts_to_take(self.group_devices(&clip.symbols, &clip.wires, &clip.devices)),
+            DeviceData::GroupFirst => {
+                self.parts_to_take(self.group_devices(&clip.symbols, &clip.wires, &clip.devices, true))
+            }
             DeviceData::ProjectFirst | DeviceData::GroupOnly => Ok(Vec::new()),
         };
         let lock = self.project.lock.clone();
@@ -1642,6 +1644,56 @@ mod tests {
         other.paste(page2, &clip, Point::new(150.0, 100.0)).unwrap();
         assert!(other.project.lock.parts.contains_key(MAIN));
         assert!(other.parts.contains_key(MAIN));
+    }
+
+    #[test]
+    fn a_refused_macro_puts_back_a_part_it_loaded_again() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let path = macro_with_parts(&mut o, page, MAIN, "NO-SUCH");
+        o.insert_macro(page, &path, None).unwrap();
+        // Loaded in another version than the copy on disk, which is the pinned one: the insert
+        // loads the copy again, then the accessory refuses it.
+        let mut changed = o.parts[MAIN].clone();
+        changed.description = "loaded before".into();
+        o.parts.insert(MAIN.into(), changed.clone());
+        o.project.lock.parts.insert(
+            ACCESSORY.into(),
+            wc_core::LockEntry {
+                source: "example".into(),
+                hash: "0000".into(),
+            },
+        );
+        let path = macro_with_parts(&mut o, page, MAIN, ACCESSORY);
+        assert!(o.insert_macro(page, &path, None).is_err());
+        assert_eq!(o.parts.get(MAIN), Some(&changed), "the part loaded before is put back");
+    }
+
+    #[test]
+    fn a_table_generation_takes_no_part_from_a_device_the_macro_has_no_data_for() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let path = macro_with_parts(&mut o, page, MAIN, "NO-SUCH");
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        m.devices.clear();
+        m.placeholders.push(wc_core::macros::Placeholder {
+            name: "n".into(),
+            ..Default::default()
+        });
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        // The project's own device of that tag names a part no copy can be found for: macros
+        // are placed with their own data only, so it is not needed.
+        let tag = m.symbols[0].tag.clone().unwrap();
+        o.project.devices.entry(tag).or_default().part = Some(ACCESSORY.into());
+        o.project.lock.parts.insert(
+            ACCESSORY.into(),
+            wc_core::LockEntry {
+                source: "example".into(),
+                hash: "0000".into(),
+            },
+        );
+        let table = o.dir.join("rows.csv");
+        std::fs::write(&table, "n\n1\n").unwrap();
+        o.generate_from_table(page, &path, &table, None).unwrap();
+        assert!(!o.parts.contains_key(ACCESSORY));
     }
 
     #[test]
