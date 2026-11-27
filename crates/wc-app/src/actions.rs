@@ -281,7 +281,12 @@ impl Action {
                 "Ctrl+Shift+S",
             ),
             Action::Undo => i("Undo", "Undo the last change", Icon::Undo, "Ctrl+Z"),
-            Action::Redo => i("Redo", "Redo", Icon::Redo, "Ctrl+Y"),
+            Action::Redo => i(
+                "Redo",
+                "Redo the last change undone (Ctrl+Shift+Z also redoes)",
+                Icon::Redo,
+                "Ctrl+Y",
+            ),
             Action::Select => i("Select", "Select and move", Icon::Select, "Esc"),
             Action::PlaceSymbol => i(
                 "Symbol",
@@ -479,8 +484,8 @@ impl Action {
                 Icon::PageDelete,
                 "",
             ),
-            Action::ZoomIn => i("Zoom in", "Zoom in", Icon::ZoomIn, "+"),
-            Action::ZoomOut => i("Zoom out", "Zoom out", Icon::ZoomOut, "-"),
+            Action::ZoomIn => i("Zoom in", "Show the page larger", Icon::ZoomIn, "+"),
+            Action::ZoomOut => i("Zoom out", "Show more of the page, smaller", Icon::ZoomOut, "-"),
             Action::ZoomFit => i("Fit page", "Show the whole page", Icon::ZoomFit, "F"),
             Action::ToggleGrid => i("Grid", "Show or hide the grid", Icon::Grid, "G"),
             Action::Layers => i(

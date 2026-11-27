@@ -557,6 +557,19 @@ mod tests {
         }
     }
 
+    /// A button's tooltip is its label, its shortcut and its tip: a tip that only says the label
+    /// again tells nothing (Redo, Zoom in and Zoom out did).
+    #[test]
+    fn no_tooltip_repeats_the_label() {
+        for a in Action::ALL {
+            let info = a.info();
+            assert!(
+                !info.tip.trim().eq_ignore_ascii_case(info.label.trim()),
+                "{a:?}: the tip only repeats the label"
+            );
+        }
+    }
+
     /// The rectangles of the classic toolbar's switches and button groups in a window `width`
     /// points wide.
     fn toolbar_rects(width: f32) -> Vec<Rect> {
