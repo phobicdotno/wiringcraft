@@ -6,7 +6,8 @@
 //! `terminal` (connection points with an orientation `n`, `e`, `s` or `w`). Coordinates are
 //! screen pixels (y down) around the element's hotspot; QElectroTech's grid is 10 px. Written
 //! from the published element format; no element files are copied into WiringCraft. The
-//! symbol's description comes from `<elementInformations>`, the entry named `description`.
+//! symbol's description comes from `<elementInformations>`, the entry named `description`, and
+//! its letter code from the entry named `label` when that reads as a reference such as `-K1`.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -223,6 +224,24 @@ fn rounded_rect_points(x0: f64, y0: f64, x1: f64, y1: f64, rx: f64, ry: f64) -> 
     points
 }
 
+/// The letter code in an element's default label: `-K1` and `K1` give `K`, `-PG1` gives `PG`.
+/// QElectroTech's label is free text, so only a label of an optional `-` (the product sign of
+/// IEC 81346), one to three letters and then digits counts; a name such as `SICK UM 30` or a
+/// formula such as `%prefix` gives no letter code.
+fn letter_code(label: &str) -> String {
+    let l = label.trim();
+    let l = l.strip_prefix('-').unwrap_or(l);
+    let letters = l.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    match (l.get(..letters), l.get(letters..)) {
+        (Some(code), Some(number))
+            if (1..=3).contains(&letters) && !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            code.to_ascii_uppercase()
+        }
+        _ => String::new(),
+    }
+}
+
 /// Read one `.elmt` element. The id is `<prefix>.<file stem>`-style text given by the caller,
 /// coordinates are multiplied by `scale`. Returns the symbol and warnings.
 pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String>)> {
@@ -246,9 +265,10 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Open elements, to know where a `<name>` text or a dynamic text's `<info_name>` belongs.
     let mut path: Vec<String> = Vec::new();
     let mut name_lang: Option<String> = None;
-    // The element's `<elementInformation name="description">` text, and whether one is open.
+    // The element's `<elementInformation>` texts named `description` and `label`, and which one is open.
     let mut description = String::new();
-    let mut in_info_description = false;
+    let mut label = String::new();
+    let mut in_info: Option<&'static str> = None;
     // A dynamic text waiting for its `<info_name>`: its position.
     let mut dynamic_at: Option<Point> = None;
     let mut unknown: std::collections::BTreeMap<String, usize> = Default::default();
@@ -275,10 +295,12 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
             match (tag.as_str(), path.last().map(String::as_str)) {
                 ("description", Some("definition")) => in_description = true,
                 ("name", Some("names")) => name_lang = Some(attr(&e, "lang").unwrap_or_default()),
-                ("elementInformation", Some("elementInformations"))
-                    if path.len() == 2 && attr(&e, "name").as_deref() == Some("description") =>
-                {
-                    in_info_description = !empty;
+                ("elementInformation", Some("elementInformations")) if path.len() == 2 && !empty => {
+                    in_info = match attr(&e, "name").as_deref() {
+                        Some("description") => Some("description"),
+                        Some("label") => Some("label"),
+                        _ => None,
+                    };
                 }
                 _ if in_description && path.last().map(String::as_str) == Some("description") => {
                     shape(
@@ -311,20 +333,29 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                     match tag.as_str() {
                         "description" => in_description = false,
                         "name" => name_lang = None,
-                        "elementInformation" => in_info_description = false,
+                        "elementInformation" => in_info = None,
                         "dynamic_text" => dynamic_at = None,
                         _ => {}
                     }
                 }
             }
-            // The description is kept whole (text around a comment, CDATA) and trimmed once at the end.
-            Event::Text(t) if in_info_description => match t.unescape() {
-                Ok(v) => description.push_str(&v),
-                Err(e) => warnings.push(format!(
-                    "the element's description has text that cannot be read ({e}); it is left out"
-                )),
+            // An information is kept whole (text around a comment, CDATA) and trimmed once at the end.
+            Event::Text(t) if in_info.is_some() => {
+                let (info, into) = match in_info {
+                    Some("label") => ("label", &mut label),
+                    _ => ("description", &mut description),
+                };
+                match t.unescape() {
+                    Ok(v) => into.push_str(&v),
+                    Err(e) => warnings.push(format!(
+                        "the element's {info} has text that cannot be read ({e}); it is left out"
+                    )),
+                }
+            }
+            Event::CData(t) if in_info.is_some() => match in_info {
+                Some("label") => label.push_str(&String::from_utf8_lossy(&t)),
+                _ => description.push_str(&String::from_utf8_lossy(&t)),
             },
-            Event::CData(t) if in_info_description => description.push_str(&String::from_utf8_lossy(&t)),
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
                 if let Some(lang) = &name_lang {
@@ -424,7 +455,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         id: id.to_owned(),
         name: qet_name.clone(),
         category: String::new(),
-        letter_code: String::new(),
+        letter_code: letter_code(&label),
         role,
         graphics,
         pins: out_pins,
@@ -600,11 +631,22 @@ fn shape(
                     .unwrap_or(9.0);
                 // Qt turns clockwise on screen; WiringCraft's angle turns the other way.
                 let angle = (-n("rotation").unwrap_or(0.0)).rem_euclid(360.0);
+                // `x`/`y` is the left end of the baseline, unless `anchor="alignment"` makes it the
+                // point `Halignment` names (centre or right end; absent is left). Without the
+                // anchor, `Halignment` only lines up the lines of a multi-line text, so the text
+                // stays left-aligned at its left end. `Valignment` does not move the point, which
+                // stays on the baseline.
+                let align = match attr(e, "Halignment").as_deref() {
+                    _ if attr(e, "anchor").as_deref() != Some("alignment") => Align::Left,
+                    Some("AlignHCenter") => Align::Center,
+                    Some("AlignRight") => Align::Right,
+                    _ => Align::Left,
+                };
                 graphics.push(Shape::Text {
                     at: pt(x, y),
                     text: t,
                     height: size * 0.75 * scale,
-                    align: Align::Left,
+                    align,
                     angle,
                 });
             }
@@ -709,6 +751,75 @@ mod tests {
             let (imp, _) = element(&el(infos), "q.k", DEFAULT_SCALE)?;
             assert_eq!(imp.symbol.description, "", "{infos}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn letter_code_comes_from_the_label_information() -> Result<()> {
+        let el = |infos: &str| {
+            format!(
+                r#"<definition type="element"><elementInformations>{infos}</elementInformations>
+<description><line x1="0" y1="0" x2="10" y2="0"/></description></definition>"#
+            )
+        };
+        for (label, code) in [
+            ("-K1", "K"),
+            (" -PG1 ", "PG"),
+            ("A", ""),
+            ("-PG", ""),
+            ("q12", "Q"),
+            ("<![CDATA[-F]]>3", "F"),
+            ("SICK UM 30", ""),
+            ("Motor", ""),
+            ("%prefix%autonum", ""),
+            ("-K1.2", ""),
+            ("", ""),
+        ] {
+            let infos = format!(
+                r#"<elementInformation show="1" name="description">Relay</elementInformation>
+<elementInformation show="1" name="label">{label}</elementInformation>"#
+            );
+            let (imp, warnings) = element(&el(&infos), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.symbol.letter_code, code, "{label}");
+            assert_eq!(imp.symbol.description, "Relay", "{label}");
+            assert!(warnings.is_empty(), "{label}: {warnings:?}");
+        }
+        // No label information, or an empty one, gives no letter code.
+        for infos in ["", r#"<elementInformation name="label"/>"#] {
+            let (imp, _) = element(&el(infos), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.symbol.letter_code, "", "{infos}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_alignment_follows_halignment_with_the_alignment_anchor() -> Result<()> {
+        let align = |attrs: &str| -> Result<Align> {
+            let el = format!(
+                r#"<definition type="element"><description><text x="10" y="4" text="K" size="9" {attrs}/></description></definition>"#
+            );
+            let (imp, _) = element(&el, "q.k", DEFAULT_SCALE)?;
+            let Some(Shape::Text { align, at, .. }) = imp.symbol.graphics.first() else {
+                unreachable!("{:?}", imp.symbol.graphics)
+            };
+            // The point stays where the file puts it, whatever the alignment.
+            assert_eq!((at.x, at.y), (5.0, 2.0), "{attrs}");
+            Ok(*align)
+        };
+        assert_eq!(align("")?, Align::Left);
+        assert_eq!(align(r#"Halignment="AlignHCenter" anchor="alignment""#)?, Align::Center);
+        assert_eq!(
+            align(r#"Halignment="AlignRight" anchor="alignment" Valignment="AlignBottom""#)?,
+            Align::Right
+        );
+        assert_eq!(align(r#"Halignment="AlignLeft" anchor="alignment""#)?, Align::Left);
+        assert_eq!(align(r#"anchor="alignment""#)?, Align::Left);
+        // Without the anchor, x/y is the text's left end, so it stays left-aligned there.
+        assert_eq!(align(r#"Halignment="AlignRight""#)?, Align::Left);
+        assert_eq!(
+            align(r#"Halignment="AlignHCenter" Valignment="AlignVCenter""#)?,
+            Align::Left
+        );
         Ok(())
     }
 
