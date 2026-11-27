@@ -17,13 +17,13 @@ shown highlighted. Hover over an item to see a longer note on what it does.
 - **Save**: save all changed pages.
 - **Save as**: save the project as a copy in a new folder and go on working in the copy.
 - ---
-- **Project properties**: the project name and the title-block fields.
+- **Project properties**: edit the project's name, title-block fields, locations and revisions.
 - **Translations**: translate the project's texts into other languages (`translations.toml`).
 - ---
-- **Check**: check the project for devices drawn twice, missing coils, shorts and open pins.
+- **Check**: check the project for problems such as devices drawn twice, contacts without a coil, shorts and open pins.
 - **Check while drawing**: check the project again shortly after each edit and mark problems on the canvas. Click again to turn it off.
-- **Reports**: contents, parts, devices, wires, nets, terminals, cables, PLC I/O and locations as tables.
-- **PLC racks**: add and edit the PLC racks and the I/O cards in their slots.
+- **Reports**: show the contents, parts, devices, wires, nets, terminals, cables, PLC I/O, PLC cards, locations and networks as tables.
+- **PLC racks**: add and edit the PLC racks and the I/O cards in their slots, laid out on the PLC card overview.
 - **PDF**: export all pages and the reports to PDF.
 - **SVG/DXF**: export every page as an SVG and a DXF drawing.
 - **AutomationML**: export devices, part data and connections as AutomationML.
@@ -47,21 +47,21 @@ shown highlighted. Hover over an item to see a longer note on what it does.
 ### Edit
 
 - **Undo**: undo the last change.
-- **Redo**: redo the change you undid.
+- **Redo**: redo the last change you undid (Ctrl+Shift+Z works too).
 - ---
 - **Cut**: cut the selection.
 - **Copy**: copy the selection.
 - **Paste**: paste at the pointer; devices get the next free tags.
-- **Duplicate**: put a copy of the selection one grid step down and right; devices get the next free tags.
+- **Duplicate**: put a copy of the selection one grid step down and right, selected so it can be moved; devices get the next free tags.
 - **Select all**: select everything on this page.
 - **Find**: find and replace texts, device tags, wire numbers, potentials and descriptions on every page.
 - ---
-- **Rotate**: turn the selected symbols 90°, or the symbol being placed.
+- **Rotate**: rotate the selected symbols 90°, the symbol being placed, or the device picked on a panel layout.
 - **Mirror**: mirror the selected symbols left to right, or the symbol being placed.
 - **Delete**: delete the selection.
 - ---
 - **Number wires**: give every connection without a number one, from its page and column (for example 3.4).
-- **Terminal strips**: order the terminals on the rail, add spares and set levels.
+- **Terminal strips**: edit terminal strips: order the terminals on the rail, add spares, set levels; the terminal plan and WAGO export follow.
 
 While the symbol editor is open, Undo, Redo and Delete work on the symbol being drawn, not on
 the schematic behind it.
@@ -71,7 +71,7 @@ the schematic behind it.
 - **Select**: the select and move tool.
 - **Symbol**: place the symbol chosen in the library picker.
 - **Wire**: draw a wire: click a pin or point, then the other end.
-- **Auto-wire**: draw wires between pins that line up when a symbol is placed or moved. Click again to turn it off.
+- **Auto-wire**: draw wires between pins that line up when a symbol is placed or moved (hold Alt to skip once). Click again to turn it off.
 - ---
 - **Macro**: insert a saved group of symbols and wires from the project or the library.
 - **Save as macro**: save the selected symbols, wires and drawings as a macro.
@@ -79,10 +79,10 @@ the schematic behind it.
 ### Page
 
 - **New page**: add a schematic page.
-- **Cover page**: open the cover page and edit the project's name and fields.
+- **Cover page**: open the cover page and edit the project's name and fields; they show on the cover and every title block.
 - **Page template**: edit the frame's reference columns and the title block's boxes, shared by every page.
 - **Duplicate page**: copy this page; its devices get the next free tags.
-- **Page properties**: number, title and sheet size of this page.
+- **Page properties**: edit this page's number, title, sheet size and its own title-block values.
 - ---
 - **Move page up**: swap this page's number with the one before.
 - **Move page down**: swap this page's number with the one after.
@@ -90,7 +90,7 @@ the schematic behind it.
 - **Previous page**: open the page before this one.
 - **Next page**: open the page after this one.
 - ---
-- **Delete page**: delete this page.
+- **Delete page**: delete this page (asks first).
 - ---
 - **Panel layout**: add a cabinet panel layout: a 600 x 800 mm mounting plate with wire ducts and DIN rails.
 - **Arrange devices**: put the devices that have a part and are not on the plate yet onto its DIN rails.
@@ -98,8 +98,8 @@ the schematic behind it.
 
 ### View
 
-- **Zoom in**: zoom in.
-- **Zoom out**: zoom out.
+- **Zoom in**: show the page larger.
+- **Zoom out**: show the page smaller.
 - **Fit page**: show the whole page.
 - ---
 - **Grid**: show or hide the grid.
@@ -107,12 +107,12 @@ the schematic behind it.
 - **Layout**: switch between the classic toolbars and the ribbon.
 - **Dark mode**: switch between the light and dark interface.
 - ---
-- **Assistant**: show the AI assistant, which works in the open project.
+- **Assistant**: show or hide the AI assistant: tell it what to draw or change and it works in the open project.
 
 ### Library
 
 - **Library**: compare the project's library items with the library.
-- **Update**: take the newer library versions.
+- **Update**: take the newer library versions of the project's symbols and parts, then show the library status.
 - ---
 - **New symbol**: draw a new symbol and save it into a library folder.
 - **Edit symbol**: change a library symbol (the selected one, or pick one).
