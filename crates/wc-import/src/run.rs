@@ -1397,7 +1397,18 @@ pub fn kicad_prefix(name: &str) -> String {
 
 /// Read a KiCad library's symbols, printing its warnings; nothing is written yet.
 pub fn read_kicad(text: &str, prefix: &str, scale: f64, log: &mut Log) -> Res<Vec<crate::kicad::Imported>> {
-    let (symbols, warnings) = crate::kicad::symbols(text, prefix, scale).map_err(e)?;
+    read_kicad_described(text, None, prefix, scale, log)
+}
+
+/// [`read_kicad`], an old `.lib` library taking its descriptions from `docs`, its `.dcm` text.
+pub fn read_kicad_described(
+    text: &str,
+    docs: Option<&str>,
+    prefix: &str,
+    scale: f64,
+    log: &mut Log,
+) -> Res<Vec<crate::kicad::Imported>> {
+    let (symbols, warnings) = crate::kicad::symbols_described(text, docs, prefix, scale).map_err(e)?;
     for w in warnings {
         err!(log, "warning: {}", escape_field(&w));
     }

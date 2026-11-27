@@ -1411,6 +1411,92 @@ mod tests {
     }
 
     #[test]
+    fn a_table_places_a_macro_once_per_row_on_new_pages_in_one_undo_step() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        let path = o.save_macro(&clip, "Two coils", "").unwrap();
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        m.placeholders.push(wc_core::macros::Placeholder {
+            name: "what".into(),
+            ..Default::default()
+        });
+        for d in m.devices.values_mut() {
+            d.description = "Coil for {{what}}".into();
+        }
+        wc_core::macros::write_macro(&o.dir, "two-coils", &m).unwrap();
+        let before = o.project.clone();
+        let table = o.dir.join("pumps.csv");
+        // A typo in a column changes nothing.
+        std::fs::write(&table, "wat\nPump 1\n").unwrap();
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.contains("\"wat\""), "{err}");
+        assert_eq!(o.project, before);
+        // So does a file cut short inside a quoted cell.
+        std::fs::write(&table, "what\nPump 1\n\"Pump 2\n").unwrap();
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.contains("line 3: a quoted cell is not closed"), "{err}");
+        assert_eq!(o.project, before);
+
+        std::fs::write(&table, "What\nPump 1\nPump 2\nFan\n").unwrap();
+        let done = o.generate_from_table(page, &path, &table, None).unwrap();
+        assert_eq!((done.copies, done.pages.len()), (3, 1));
+        let new = o.project.page(&done.pages[0]).unwrap();
+        assert_eq!(new.symbols.len(), 6);
+        assert_eq!(new.size, o.project.pages[page].size);
+        let described: BTreeSet<String> = new
+            .symbols
+            .iter()
+            .map(|s| o.project.devices[s.tag.as_ref().unwrap()].description.clone())
+            .collect();
+        assert_eq!(
+            described,
+            ["Coil for Fan", "Coil for Pump 1", "Coil for Pump 2"]
+                .map(String::from)
+                .into()
+        );
+        assert!(o.undo());
+        assert_eq!(o.project, before, "one undo step takes it all back");
+    }
+
+    #[test]
+    fn a_table_generation_that_fails_takes_back_the_symbol_it_pinned_and_undo_does_too() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        let path = o.save_macro(&clip, "Valves", "").unwrap();
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        m.placeholders.push(wc_core::macros::Placeholder {
+            name: "what".into(),
+            ..Default::default()
+        });
+        // A symbol the project does not pin yet: placing takes it from the library.
+        for s in &mut m.symbols {
+            s.symbol = "wc.coil.valve".into();
+        }
+        let at = m.symbols[1].at;
+        m.symbols[1].at = Point::new(at.x + 3000.0, at.y);
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        let before = o.project.clone();
+        assert!(!before.lock.symbols.contains_key("wc.coil.valve"));
+        let table = o.dir.join("valves.csv");
+        std::fs::write(&table, "what\nV1\n").unwrap();
+        // Too wide for any page: nothing is placed, and the pin and loaded symbol go back.
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.contains("does not fit"), "{err}");
+        assert_eq!(o.project, before);
+        assert!(!o.symbols.contains_key("wc.coil.valve"));
+
+        m.symbols[1].at = at;
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        let done = o.generate_from_table(page, &path, &table, None).unwrap();
+        assert_eq!(done.copies, 1);
+        assert!(o.project.lock.symbols.contains_key("wc.coil.valve"));
+        assert!(o.undo());
+        assert_eq!(o.project, before, "undo takes the new pin back too");
+    }
+
+    #[test]
     fn macros_save_list_and_insert_like_a_paste() {
         let (_tmp, mut o, page, _a, _b) = setup();
         o.project.pages[page].wires[0].number = Some("7".into());

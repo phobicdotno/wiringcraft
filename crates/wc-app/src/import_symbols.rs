@@ -180,7 +180,19 @@ fn read(file: &Path) -> Result<FileSymbols, String> {
         Some("kicad_sym" | "lib") => {
             let text = read_text(file, MAX_LEN)?;
             let prefix = format!("kicad.{}", stem(file));
-            let (symbols, w) = wc_import::kicad::symbols(&text, &prefix, 1.0).map_err(|e| e.to_string())?;
+            // An old library keeps its descriptions beside it, in a `.dcm` file of the same name.
+            let dcm = file.with_extension("dcm");
+            // One that cannot be read is a warning: the symbols come without descriptions.
+            let mut w = Vec::new();
+            let docs = (wc_import::kicad_legacy::is_legacy(&text) && dcm.is_file())
+                .then(|| read_text(&dcm, MAX_LEN))
+                .and_then(|r| {
+                    r.map_err(|e| w.push(format!("descriptions not read: {}: {e}", dcm.display())))
+                        .ok()
+                });
+            let (symbols, more) =
+                wc_import::kicad::symbols_described(&text, docs.as_deref(), &prefix, 1.0).map_err(|e| e.to_string())?;
+            w.extend(more);
             Ok((symbols.into_iter().map(|i| (i.symbol, i.kicad_name)).collect(), w))
         }
         Some("elmt") => {
@@ -290,6 +302,11 @@ mod tests {
             std::fs::write(&p, text).unwrap();
             p
         };
+        // Beside the old library, not picked: its descriptions.
+        write(
+            "Old Lamps.dcm",
+            "EESchema-DOCLIB  Version 2.0\n$CMP LAMP\nD Pilot lamp\n$ENDCMP\n",
+        );
         let files = vec![
             write("Coil.svg", SVG),
             write("broken.svg", "<svg"),
@@ -318,6 +335,8 @@ mod tests {
         ] {
             assert!(symbols.join(format!("{id}.json")).is_file(), "{id}: {out:?}");
         }
+        let lamp = std::fs::read_to_string(symbols.join("kicad.old_lamps.lamp.json")).unwrap();
+        assert!(lamp.contains("Pilot lamp"), "{lamp}");
         assert_eq!(out.written.len(), 5, "{out:?}");
         assert_eq!(out.failed.len(), 3, "{out:?}");
         assert!(out.failed.iter().any(|f| f.contains("broken.svg")));
@@ -341,6 +360,25 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("3 failed"), "{report}");
+    }
+
+    #[test]
+    fn an_old_kicad_library_whose_dcm_file_cannot_be_read_still_imports() {
+        let src = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let file = src.path().join("lamps.lib");
+        std::fs::write(&file, OLD_KICAD).unwrap();
+        // Past the size limit (a sparse file): a warning, not a failure.
+        let dcm = std::fs::File::create(src.path().join("lamps.dcm")).unwrap();
+        dcm.set_len(MAX_LEN as u64 + 1).unwrap();
+        let out = import(&[file], lib.path(), false);
+        assert_eq!(out.written.len(), 1, "{out:?}");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("descriptions not read") && w.contains("lamps.dcm")),
+            "{out:?}"
+        );
     }
 
     #[test]

@@ -242,7 +242,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Scripting API | yes (C# scripts, API) | yes (API) | yes: the `wiringcraft` command line | done |
-| Generating schematics from tables or configurators | add-on (Cogineer) | no | partly: `wiringcraft macro generate` places a macro once per row of a CSV or Excel table, the cells filling its placeholders and value set, on new pages ([docs](cli/library-and-macros.md#pages-from-a-table)); the assistant draws from plain words; not yet in the app's menus, and no rules that pick macros or draw connections between copies | partly done (#1837); app menu later |
+| Generating schematics from tables or configurators | add-on (Cogineer) | no | partly: `wiringcraft macro generate` places a macro once per row of a CSV or Excel table, the cells filling its placeholders and value set, on new pages ([docs](cli/library-and-macros.md#pages-from-a-table)); in the app with Insert > Macro, From table…; the assistant draws from plain words; not yet: rules that pick macros or draw connections between copies | partly done (#1837) |
 | AI assistant that edits the open project | no | no | yes: its `get_state` also tells how the grid, auto-wiring, checking while drawing, theme and menu style are set, so it switches one knowingly | done |
 | Log file for bug reports | yes | yes | yes | done (#48) |
 

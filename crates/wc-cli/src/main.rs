@@ -9,8 +9,8 @@ use wc_core::lock::ItemKind;
 use wc_core::project::LibrarySource;
 use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Wire, store};
 use wc_import::run::{
-    self, escape_field, kicad_prefix, load, page_mut, put_file_back, put_files_back, read_file, read_kicad, save,
-    snapshot_project, terminal_numbers_after, vendored_bytes, write_kicad,
+    self, escape_field, kicad_prefix, load, page_mut, put_file_back, put_files_back, read_file, read_kicad_described,
+    save, snapshot_project, terminal_numbers_after, vendored_bytes, write_kicad,
 };
 #[cfg(test)]
 use wc_import::run::{
@@ -4948,7 +4948,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         } => {
             let text = read_text(&file)?;
             let prefix = prefix.unwrap_or_else(|| kicad_prefix(&file.to_string_lossy()));
-            import_kicad(&text, &lib, &prefix, scale, &category)?;
+            // An old library keeps its descriptions beside it, in a `.dcm` file of the same name.
+            let docs = kicad_docs(&file, &text);
+            import_kicad(&text, docs, &lib, &prefix, scale, &category)?;
         }
         ImportCmd::SymbolQet {
             files,
@@ -6737,11 +6739,44 @@ fn import_wago_bytes(dir: &Path, bytes: &[u8]) -> Res<WagoImported> {
     })
 }
 
+/// The text of the `.dcm` file beside an old KiCad library `file` (the same name), which holds
+/// its symbols' descriptions; None for a new `.kicad_sym` library or when there is no such file.
+/// One that cannot be read is an error here, and a warning to the import (see [`import_kicad`]).
+fn kicad_docs(file: &Path, text: &str) -> Option<Res<String>> {
+    if !wc_import::kicad_legacy::is_legacy(text) {
+        return None;
+    }
+    let dcm = file.with_extension("dcm");
+    dcm.is_file().then(|| read_text(&dcm))
+}
+
 /// Import every symbol (one per unit) of a KiCad library text into `lib`, printing each.
-fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str) -> Res<usize> {
+/// `docs` is the library's `.dcm` text; one that could not be read is a warning, and the
+/// symbols are imported without descriptions.
+fn import_kicad(
+    text: &str,
+    docs: Option<Res<String>>,
+    lib: &Path,
+    prefix: &str,
+    scale: f64,
+    category: &str,
+) -> Res<usize> {
     let mut n = 0;
     logged(|log| {
-        n = write_kicad(read_kicad(text, prefix, scale, log)?, lib, category, log)?;
+        let docs = match docs {
+            Some(Err(why)) => {
+                log.err(format!("warning: descriptions not read: {why}"));
+                None
+            }
+            docs => docs.and_then(Result::ok),
+        };
+        let docs = docs.as_deref();
+        n = write_kicad(
+            read_kicad_described(text, docs, prefix, scale, log)?,
+            lib,
+            category,
+            log,
+        )?;
         Ok(())
     })?;
     // A library with no symbols, or whose every symbol was skipped, is not a success.

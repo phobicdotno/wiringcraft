@@ -4073,6 +4073,79 @@ impl Open {
         self.paste(page, &clip, at)
     }
 
+    /// Insert > Macro, From table…: place the macro once per row of `table` (CSV or `.xlsx`),
+    /// each row's cells filling its placeholders and a `set` column picking the row's value
+    /// set (else `default_set`), on new pages the size of page `page`, as `wiringcraft macro
+    /// generate` does. One undo step; nothing changes when a row or a copy cannot be placed.
+    pub fn generate_from_table(
+        &mut self,
+        page: usize,
+        path: &Path,
+        table: &Path,
+        default_set: Option<&str>,
+    ) -> Result<wc_core::generate::Generated, String> {
+        use wc_core::generate;
+        let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", table.display()))?;
+        let rows = wc_import::csv::file_rows(&bytes).map_err(|e| format!("{}: {e}", table.display()))?;
+        // A file cut short inside a quoted cell would place a row with half a value.
+        if let Some(line) = rows.open_quote {
+            return Err(format!(
+                "{}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed",
+                table.display()
+            ));
+        }
+        let rows = generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(|e| e.to_string())?;
+        let copies = generate::apply_rows(&m, &rows, default_set).map_err(|e| e.to_string())?;
+        if copies.is_empty() {
+            return Ok(generate::Generated::default());
+        }
+        let ids: std::collections::BTreeSet<&str> = copies
+            .iter()
+            .flat_map(|c| c.symbols.iter().map(|s| s.symbol.as_str()))
+            .collect();
+        // The change before this one is settled first (its jumpers follow their terminals),
+        // so neither the copy generated from nor the undo step loses it.
+        self.follow_terminals();
+        // A symbol taken from the library is pinned and loaded here: when no copy can be
+        // placed that is taken back, and undo goes back to the project before the pin.
+        let before = self.project.clone();
+        let (symbols, library, terminals) = (
+            self.symbols.clone(),
+            self.library.clone(),
+            self.terminals_before.clone(),
+        );
+        self.ensure_symbols(ids)?;
+        // A symbol loaded here can renumber terminals already placed (a strip-only tag): that
+        // is settled in the live project before the copy is made, so the copy keeps it.
+        self.follow_terminals();
+        let extent = generate::extent(&copies, |id| self.symbols.get(id).cloned());
+        let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
+        let mut project = self.project.clone();
+        match generate::generate(&mut project, &copies, extent, size, &m.name) {
+            Ok(done) => {
+                // The undo step is the project as it was, taken as it is (nothing followed in
+                // it); the change in progress is then measured from the settled project.
+                let settled = std::mem::replace(&mut self.project, before);
+                self.forget_terminal_change();
+                self.checkpoint();
+                self.project = settled;
+                let base = self.project.meta.follows_terminals().then(|| self.terminal_numbers());
+                self.project = project;
+                self.terminals_before = base;
+                Ok(done)
+            }
+            Err(e) => {
+                self.project = before;
+                self.symbols = symbols;
+                self.library = library;
+                self.terminals_before = terminals;
+                self.touch();
+                Err(e.to_string())
+            }
+        }
+    }
+
     /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
     /// recorded when no number changes. In a shared session the pages someone else has open
     /// keep their wires as they are; their numbers are listed in `skipped`, and a later run
