@@ -6295,13 +6295,16 @@ mod tests {
             a.ed.message,
             "Cut was not done: revision clouds and the revision table are not copied."
         );
+        assert_eq!(a.clipboard.graphics.len(), 1, "the earlier copy stays");
         a.run(Action::Duplicate);
         assert_eq!(
             a.ed.message,
             "Nothing was duplicated: revision clouds and the revision table are not copied."
         );
+        assert_eq!(a.clipboard.graphics.len(), 1, "the earlier copy stays");
         let o = a.open.as_ref().unwrap();
         assert!(o.project.pages[0].revision_table.is_some(), "the table stays");
+        assert_eq!(o.project.pages[0].graphics.len(), 1, "the line stays");
         assert_eq!(o.undo_steps(), steps, "no undo step");
         assert_eq!(a.ed.selection, vec![Selection::RevisionTable]);
     }
