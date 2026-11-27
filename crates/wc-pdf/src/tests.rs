@@ -3157,3 +3157,43 @@ fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
         vec!["page 1: the PDF cannot print Ω Ж а р in its text; they show as ?".to_string()]
     );
 }
+
+#[test]
+fn document_properties_show_drawn_by_and_the_description() {
+    let info = |project: &Project| -> String {
+        let (pdf, _) = export(project, &BTreeMap::new(), &Options::default());
+        let text = String::from_utf8_lossy(&pdf).into_owned();
+        let Some(obj) = text.split("endobj").find(|o| o.contains("/Producer (WiringCraft)")) else {
+            unreachable!("no info dictionary in {text}");
+        };
+        obj.to_owned()
+    };
+    let mut project = Project::new("Pump station");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    project
+        .meta
+        .title_block
+        .insert("drawn_by".into(), "Kari Nordmann".into());
+    project
+        .meta
+        .title_block
+        .insert("description".into(), "Pumpe – Ålesund".into());
+    let dict = info(&project);
+    assert!(
+        dict.contains(&format!("/Author {}", writer::pdf_text_string("Kari Nordmann"))),
+        "{dict}"
+    );
+    let Some(at) = dict.find("/Subject ") else {
+        unreachable!("no subject in {dict}");
+    };
+    let subject = dict[at + "/Subject ".len()..].split_whitespace().next().unwrap_or("");
+    assert_eq!(decode_text_string(subject).as_deref(), Some("Pumpe – Ålesund"));
+    // The title still comes first, next to the producer.
+    assert!(dict.contains(&format!("/Title {} /Producer", writer::pdf_text("Pump station"))));
+
+    // Blank or missing fields add no entry.
+    project.meta.title_block.insert("drawn_by".into(), "   ".into());
+    project.meta.title_block.remove("description");
+    let dict = info(&project);
+    assert!(!dict.contains("/Author") && !dict.contains("/Subject"), "{dict}");
+}

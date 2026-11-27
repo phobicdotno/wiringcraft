@@ -205,6 +205,10 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         report.warnings.push(NOTHING_TO_EXPORT.into());
     }
     let mut doc = writer::Doc::new(&project.meta.name);
+    // The reader's document properties show who drew the project and what it is (#1095).
+    let field = |k: &str| project.meta.title_block.get(k).map_or("", String::as_str);
+    doc.set_info("Author", field("drawn_by"));
+    doc.set_info("Subject", field("description"));
     let mut sheet = 0;
     let mut report_no = 0;
     let mut add_reports = |doc: &mut writer::Doc,
