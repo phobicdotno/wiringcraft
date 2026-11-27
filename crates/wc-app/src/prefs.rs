@@ -256,6 +256,10 @@ impl Prefs {
     }
 
     pub fn save(&self) {
+        // A test's preferences never replace the ones of whoever runs the tests.
+        if cfg!(test) {
+            return;
+        }
         let Some(p) = path() else { return };
         if let Ok(text) = toml::to_string_pretty(self) {
             let _ = wc_core::store::write_if_changed(&p, &text);

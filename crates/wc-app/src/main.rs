@@ -3511,22 +3511,7 @@ impl App {
                         && let Some(o) = self.open.as_ref()
                         && let Some(i) = o.project.pages.iter().position(|p| p.id == pid)
                     {
-                        self.ed.page = i;
-                        self.ed.set_tool(Tool::Select);
-                        self.ed.view.fit = true;
-                        self.ed.selection = item
-                            .and_then(|it| {
-                                let pg = &o.project.pages[i];
-                                if pg.symbol(&it).is_some() {
-                                    Some(Selection::Symbol(it))
-                                } else if pg.wires.iter().any(|w| w.id == it) {
-                                    Some(Selection::Wire(it))
-                                } else {
-                                    None
-                                }
-                            })
-                            .into_iter()
-                            .collect();
+                        show_check_result(&mut self.ed, &o.project.pages[i], i, item);
                     }
                 }
                 Dialog::Reports(kind) => {
@@ -6548,6 +6533,26 @@ fn panel_pick_before(
     Some((p.id.clone(), pick))
 }
 
+/// A click on a result in the Check results dialog: page `i` (`pg`) is shown (a panel layout shown
+/// closes, as from the Pages list) with the result's symbol or wire selected.
+fn show_check_result(ed: &mut Editor, pg: &wc_core::project::Page, i: usize, item: Option<String>) {
+    ed.show_page(i);
+    ed.set_tool(Tool::Select);
+    ed.view.fit = true;
+    ed.selection = item
+        .and_then(|it| {
+            if pg.symbol(&it).is_some() {
+                Some(Selection::Symbol(it))
+            } else if pg.wires.iter().any(|w| w.id == it) {
+                Some(Selection::Wire(it))
+            } else {
+                None
+            }
+        })
+        .into_iter()
+        .collect();
+}
+
 /// After a shared-session sync, or an undo or redo: show panel `id` and pick its item again, wherever they are now.
 /// A device is found by its tag; a rail or duct by its kind and exact place and size, at its old
 /// place in the list when it is still there. A panel or item that is gone is no longer shown or
@@ -9321,6 +9326,28 @@ mod held_tests {
         // The panel was removed.
         follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (None, None));
+    }
+
+    /// A check result picked while a panel layout is shown is shown on its page: the panel view
+    /// closes (#1212).
+    #[test]
+    fn a_check_result_picked_over_a_panel_shows_its_page() {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let Ok(id) = o.place(1, "wc.coil", wc_core::Point::new(100.0, 100.0)) else {
+            unreachable!("the starter library has a coil")
+        };
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(2);
+        show_check_result(&mut ed, &o.project.pages[1], 1, Some(id.clone()));
+        assert_eq!(ed.page, 1);
+        assert_eq!(ed.panel, None, "the panel view closes");
+        assert_eq!(ed.panel_pick, None);
+        assert_eq!(ed.selection, vec![Selection::Symbol(id)]);
+        // A result naming nothing on the page selects nothing.
+        show_check_result(&mut ed, &o.project.pages[1], 1, Some("gone".into()));
+        assert_eq!((ed.page, ed.panel), (1, None));
+        assert!(ed.selection.is_empty());
     }
 
     #[test]

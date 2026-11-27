@@ -820,6 +820,68 @@ fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
 }
 
 #[test]
+fn a_cable_named_only_on_wires_is_a_device_without_a_part() {
+    let (mut p, s, parts) = fixture();
+    let core = |cable: &str| {
+        Some(wc_core::CableCore {
+            cable: DeviceTag::parse(cable).unwrap(),
+            core: "1".into(),
+        })
+    };
+    // -W9 has no symbol and no entry in the devices file: it is only the cable of a wire.
+    p.pages[0].wires.iter_mut().find(|w| w.id == "w2").unwrap().cable = core("-W9");
+    // A line diagram draws the connection again, there as -W8: that one does not count.
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols = vec![
+        place("s20", "term", 10.0, Some("-X1.1")),
+        place("s21", "lamp", 40.0, Some("-P1")),
+    ];
+    let mut again = wire("w20", pin("s20", "2"), pin("s21", "X1"), None, None);
+    again.cable = core("-W8");
+    overview.wires.push(again);
+    p.pages.push(overview);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let bom = parts_list(&i);
+    let gap = bom.rows.iter().find(|r| r[5] == "-W9").unwrap();
+    assert_eq!(gap[4], "no part assigned");
+    assert_eq!(device_list(&i).rows.iter().filter(|r| r[0] == "-W9").count(), 1);
+    let notes = check(&i);
+    assert!(
+        notes
+            .iter()
+            .any(|f| f.severity == Severity::Note && f.message == "-W9 has no part")
+    );
+    assert!(
+        !bom.rows.iter().any(|r| r[5] == "-W8"),
+        "an overview wire names no device"
+    );
+    assert!(!device_list(&i).rows.iter().any(|r| r[0] == "-W8"));
+    assert!(!notes.iter().any(|f| f.message == "-W8 has no part"));
+    // With a part in the devices file the cable is an ordinary row, listed once.
+    p.devices.insert(
+        DeviceTag::parse("-W9").unwrap(),
+        Device {
+            part: Some("acme.r24".into()),
+            ..Default::default()
+        },
+    );
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let bom = parts_list(&i);
+    assert_eq!(bom.rows[0][5], "-W9, =A+C1-K1");
+    assert_eq!(bom.rows.iter().filter(|r| r[5].contains("-W9")).count(), 1);
+    assert!(!check(&i).iter().any(|f| f.message == "-W9 has no part"));
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {

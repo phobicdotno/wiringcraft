@@ -369,6 +369,53 @@ fn a_merge_with_unrecorded_changes_is_refused() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_merge_conflict_names_a_file_with_an_accent_as_it_is() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    std::fs::create_dir_all(dir.join("pages")).map_err(|e| wc_core::Error::io("pages", e))?;
+    let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).map_err(|e| wc_core::Error::io(name, e));
+    write("pages/øvre.page.json", "base\n")?;
+    write("two words.txt", "base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("pages/øvre.page.json", "other\n")?;
+    write("two words.txt", "other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("pages/øvre.page.json", "main\n")?;
+    write("two words.txt", "main\n")?;
+    git.commit("main")?;
+    assert_eq!(
+        git.merge("other")?,
+        MergeOutcome::Conflicts(vec!["pages/øvre.page.json".into(), "two words.txt".into()])
+    );
+    Ok(())
+}
+
+#[test]
+fn a_version_that_starts_with_a_dash_is_not_a_git_option() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    // As an option, `--output=<file>` makes git write that file and report no error.
+    assert!(changes(&git, "--output=x", None).is_err());
+    assert!(!dir.join("x").exists());
+    assert!(changes(&git, &base, Some("--output=y")).is_err());
+    assert!(!dir.join("y").exists());
+    assert!(changes(&git, "--output=x", Some("--output=y")).is_err());
+    assert!(!dir.join("x").exists() && !dir.join("y").exists());
+    // A real version is still read.
+    assert!(changes(&git, &base, None)?.is_empty());
+    assert!(changes(&git, &base, Some(&base))?.is_empty());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {
@@ -765,5 +812,49 @@ fn a_new_branch_is_current_and_keeps_changes_not_yet_recorded() -> Result<()> {
         store::load(dir)?.meta.title_block.get("customer").map(String::as_str),
         Some("ACME")
     );
+    Ok(())
+}
+
+#[test]
+fn a_page_version_that_cannot_be_read_is_listed_as_a_file_in_its_history() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let path = dir.join("pages/p0001.page.json");
+    let good = std::fs::read(&path).map_err(|e| wc_core::Error::io(&path, e))?;
+    let write = |bytes: &[u8]| std::fs::write(&path, bytes).map_err(|e| wc_core::Error::io(&path, e));
+
+    write(b"<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs\n")?;
+    git.commit("Broken")?;
+    write(b"not a page")?;
+    git.commit("Still broken")?;
+    write(&good)?;
+    git.commit("Fixed")?;
+    write(b"not a page")?;
+    git.commit("Broken again")?;
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io(&path, e))?;
+    git.commit("Removed")?;
+
+    let file = |status: &str| {
+        vec![Change::File {
+            path: "pages/p0001.page.json".into(),
+            status: status.into(),
+        }]
+    };
+    let h = page_history(&git, "p0001", 10)?;
+    let got: Vec<(&str, &[Change])> = h.iter().map(|v| (v.subject.as_str(), v.changes.as_slice())).collect();
+    let (removed, changed) = (file("removed"), file("changed"));
+    let expected: Vec<(&str, &[Change])> = vec![
+        ("Removed", &removed),
+        ("Broken again", &changed),
+        ("Fixed", &changed),
+        ("Still broken", &changed),
+        ("Broken", &changed),
+    ];
+    assert_eq!(got[..5], expected[..], "{got:?}");
+    // The first version, readable, is still an added page.
+    assert!(matches!(got.get(5), Some((_, [Change::PageAdded { .. }]))), "{got:?}");
     Ok(())
 }
