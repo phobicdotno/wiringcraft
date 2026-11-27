@@ -1645,6 +1645,27 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_cable_takes_the_part_the_destination_gives_its_tag() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let w1 = wc_core::DeviceTag::parse("-W1").unwrap();
+        o.project.pages[page].wires[0].cable = Some(wc_core::project::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        assert!(!clip.devices.contains_key(&w1), "a cable is copied without device data");
+        // The destination's -W1 names a library part it does not pin yet: placing takes that
+        // device data for the new cable, so the part comes along.
+        let (_tmp2, mut other, page2, _, _) = setup();
+        other.project.devices.entry(w1).or_default().part = Some(MAIN.into());
+        assert!(!other.project.lock.parts.contains_key(MAIN));
+        other.paste(page2, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert!(other.project.lock.parts.contains_key(MAIN), "taken and pinned");
+        assert!(other.parts.contains_key(MAIN));
+    }
+
+    #[test]
     fn a_table_generation_takes_the_parts_and_gives_them_back_when_it_fails() {
         let (_tmp, mut o, page, _a, _b) = setup();
         let path = macro_with_parts(&mut o, page, MAIN, "NO-SUCH");
