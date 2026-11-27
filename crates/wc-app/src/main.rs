@@ -5844,9 +5844,12 @@ impl eframe::App for App {
         }
         self.poll_import(ctx);
         self.log_messages();
-        // In the frame the field gives up the keyboard its value is entered only by the panels,
-        // after the assistant's tools ran: an open asked again in this frame still waits.
+        // In the frame the field gives up the keyboard (for the assistant's open, a close or a
+        // save) its value is entered only by the panels, after the assistant's tools ran: an
+        // open asked in this frame still waits.
         self.assistant.typed_field = assistant_waited
+            || close_waited
+            || typed_waits
             || ctx
                 .memory(egui::Memory::focused)
                 .is_some_and(|f| Some(f) != self.assistant.input_id);
@@ -7825,6 +7828,10 @@ mod nudge_tests {
         assert!(
             matches!(app.pending, Some(Pending::Open)),
             "the Open waited behind the save"
+        );
+        assert!(
+            app.assistant.typed_field,
+            "an assistant's open in the frame the value is entered waits too (#1091)"
         );
         assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
         let open = app.open.as_ref().unwrap();
