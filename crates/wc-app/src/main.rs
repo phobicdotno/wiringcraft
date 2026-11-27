@@ -1997,9 +1997,11 @@ impl App {
             }
             Action::Paste => {
                 // At the pointer when it is over the sheet, otherwise a little below the original.
+                // The pointer on the desk beside the sheet would paste off the page (#1293).
                 let at = self
                     .ed
                     .cursor
+                    .filter(|&at| canvas::on_paper(open, page, at))
                     .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
                 match open.paste(page, &self.clipboard, at) {
                     Ok(pasted) if !pasted.is_empty() => {
