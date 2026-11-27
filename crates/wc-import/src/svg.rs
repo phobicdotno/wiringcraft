@@ -162,6 +162,22 @@ fn split_important(v: &str) -> (&str, bool) {
     }
 }
 
+/// A `font-size` value in user units: a bare number or `px` as it is, `pt` at 4/3 px each.
+/// Other units (`em`, `%`, ...) and keywords are not read.
+fn font_size(v: &str) -> Option<f64> {
+    let v = v.trim();
+    let (n, scale) = if let Some(n) = v.strip_suffix("pt") {
+        (n, 4.0 / 3.0)
+    } else {
+        (v.strip_suffix("px").unwrap_or(v), 1.0)
+    };
+    let n: f64 = n.trim().parse().ok()?;
+    // Zero is a size that was set (a browser draws nothing), so it is kept; a size that is not a
+    // number, below zero or too big to scale is not read.
+    let px = n * scale;
+    (n >= 0.0 && px.is_finite()).then_some(px)
+}
+
 /// Elements whose content a browser never draws in place: definitions, markers, clip paths,
 /// masks and patterns. A `<symbol>` is drawn only through `<use>`, which is not imported.
 const NOT_DRAWN: [&str; 6] = ["defs", "symbol", "marker", "clipPath", "mask", "pattern"];
@@ -741,10 +757,10 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 None
             }
             "text" => {
-                let size = attr(&e, "font-size")
-                    .and_then(|s| numbers(&s).first().copied())
-                    .unwrap_or(3.5);
-                let align = match attr(&e, "text-anchor").as_deref() {
+                // Read from `style` first (Inkscape writes them there), then the attribute.
+                let value = |name| presentation(&e, name).map(|v| split_important(&v).0.trim().to_ascii_lowercase());
+                let size = value("font-size").and_then(|s| font_size(&s)).unwrap_or(3.5);
+                let align = match value("text-anchor").as_deref() {
                     Some("middle") => Align::Center,
                     Some("end") => Align::Right,
                     _ => Align::Left,
@@ -1304,6 +1320,55 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn text_size_and_alignment_in_style() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text style="font-size:10px;text-anchor:end" x="0" y="0">A</text>
+            <text font-size="10" text-anchor="end" x="0" y="5">B</text>
+            <text font-size="4" style="font-size:8px" x="0" y="10">C</text>
+            <text x="0" y="15">D</text>
+            <text style="font-size:6pt; text-anchor: Middle" x="0" y="20">E</text>
+            <text font-size="2em" x="0" y="25">F</text>
+        </svg>"#;
+        let s = symbol(svg, "svg.text", "Text")?;
+        let texts: Vec<(&str, f64, Align)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text {
+                    text, height, align, ..
+                } => Some((text.as_str(), *height, *align)),
+                _ => None,
+            })
+            .collect();
+        let h = |name: &str| texts.iter().find(|t| t.0 == name).map(|t| (t.1, t.2));
+        let (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) = (h("A"), h("B"), h("C"), h("D"), h("E"), h("F"))
+        else {
+            unreachable!("all six texts come in: {texts:?}");
+        };
+        assert_eq!(a, b, "style reads like the attributes");
+        assert_eq!(a.1, Align::Right);
+        assert!((c.0 - 0.8 * a.0).abs() < 1e-9, "style's 8 wins over the attribute's 4");
+        assert!((d.0 - 0.35 * a.0).abs() < 1e-9, "the 3.5 fallback");
+        assert!((e.0 - 0.8 * a.0).abs() < 1e-9, "6pt is 8px");
+        assert_eq!(e.1, Align::Center);
+        assert_eq!(f.0, d.0, "em is not read: the fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn font_size_zero_is_kept_and_an_overflow_is_not_read() {
+        assert_eq!(font_size("0"), Some(0.0));
+        assert_eq!(font_size("0px"), Some(0.0));
+        assert_eq!(font_size("0pt"), Some(0.0));
+        assert_eq!(font_size("6pt"), Some(8.0));
+        assert_eq!(font_size("1.5e308pt"), None, "pt to px overflows");
+        assert_eq!(font_size("-1px"), None);
+        assert_eq!(font_size("NaN"), None);
+        assert_eq!(font_size("inf"), None);
     }
 
     #[test]

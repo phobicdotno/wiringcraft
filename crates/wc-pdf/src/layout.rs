@@ -162,7 +162,9 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
-                    SymbolRole::Auxiliary => x.auxes.entry(tag.clone()).or_default().push(a),
+                    // A contact repeated on an overview page (line diagram) is not listed
+                    // under its coil again: the schematic page draws it in detail (#1076).
+                    SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),
                     SymbolRole::Interruption => x.links.entry(tag.clone()).or_default().push(a),
                     _ => {}
                 }

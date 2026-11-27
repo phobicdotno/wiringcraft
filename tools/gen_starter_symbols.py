@@ -121,6 +121,16 @@ sym("wc.potentiometer", "Potentiometer", "passive", "R", "standalone",
      line((1.8, 10), (5, 10)), line((1.8, 10), (3.3, 9.1)), line((1.8, 10), (3.3, 10.9))],
     [pin("1", 0, 0, "up"), pin("2", 5, 10, "right"), pin("3", 0, 20, "down")], tag_at=(-6, 10),
     desc="Adjustable resistor (setpoint, speed reference); 1 and 3 are the ends, 2 is the wiper.")
+sym("wc.inductor", "Inductor", "passive", "R", "standalone",
+    # Four half-loops stacked along the lead.
+    [line((0, 0), (0, 3.5)),
+     arc((0, 4.5), 1, 270, 90),
+     arc((0, 6.5), 1, 270, 90),
+     arc((0, 8.5), 1, 270, 90),
+     arc((0, 10.5), 1, 270, 90),
+     line((0, 11.5), (0, 15))],
+    vpins("1", "2"), tag_at=(-5, 8),
+    desc="Inductor or choke, such as a line or DC choke on a drive or a filter choke.")
 sym("wc.connector.socket", "Socket (female contact)", "terminals", "X", "standalone",
     # Lead into a half-circle cup that opens downwards, towards the mating plug.
     [line((0, 0), (0, 5)), arc((0, 7.5), 2.5, 180, 360)],

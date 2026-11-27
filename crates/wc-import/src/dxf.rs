@@ -111,7 +111,7 @@ pub(crate) fn draw_mapped(
     shapes(
         d,
         ents,
-        Xf { m, at: (0.0, 0.0), rot },
+        Xf { m, rot, ..Xf::ID },
         1.0,
         0,
         &|_| false,
@@ -231,6 +231,9 @@ fn parse(text: &str) -> Result<Drawing> {
 /// unevenly scaled ones compose exactly, plus the sum of the turns for text directions.
 #[derive(Debug, Clone, Copy)]
 struct Xf {
+    /// The block's base point, taken off each coordinate before anything else: kept apart from
+    /// `at` so a far base point does not swallow a small move such as an array copy's offset.
+    base: (f64, f64),
     /// Linear part, row by row: x' = m[0] x + m[1] y, y' = m[2] x + m[3] y.
     m: [f64; 4],
     at: (f64, f64),
@@ -240,6 +243,7 @@ struct Xf {
 
 impl Xf {
     const ID: Xf = Xf {
+        base: (0.0, 0.0),
         m: [1.0, 0.0, 0.0, 1.0],
         at: (0.0, 0.0),
         rot: 0.0,
@@ -252,28 +256,75 @@ impl Xf {
             m: [c * sx, -s * sy, s * sx, c * sy],
             at,
             rot,
+            ..Xf::ID
         }
     }
-    /// A move by `by`.
-    fn shift(by: (f64, f64)) -> Xf {
-        Xf { at: by, ..Xf::ID }
+    /// A move that puts the base point `base` on (0, 0).
+    fn from_base(base: (f64, f64)) -> Xf {
+        Xf { base, ..Xf::ID }
     }
     /// DXF coordinates (y up) to DXF coordinates.
     fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         let m = &self.m;
-        (self.at.0 + m[0] * x + m[1] * y, self.at.1 + m[2] * x + m[3] * y)
+        // The point less the base point, exactly: the rounded difference and what rounding
+        // left off (Knuth's two-sum), so a far base point next to a far insertion point keeps
+        // the block's own small lengths.
+        let two_sum = |a: f64, b: f64| {
+            let hi = a + b;
+            let bb = hi - a;
+            (hi, (a - (hi - bb)) + (b - bb))
+        };
+        let ((hx, lx), (hy, ly)) = (two_sum(x, -self.base.0), two_sum(y, -self.base.1));
+        // The origin plus each product, every product and sum with what rounding left off kept
+        // and added in at the end, so a large scale of a far difference does not round it off.
+        let sum = |at: f64, terms: [(f64, f64); 4]| {
+            let (mut total, mut rest) = (at, 0.0);
+            for (a, b) in terms {
+                let p = a * b;
+                let (t, e) = two_sum(total, p);
+                total = t;
+                rest += e + a.mul_add(b, -p);
+            }
+            total + rest
+        };
+        let placed = (
+            sum(self.at.0, [(m[0], hx), (m[1], hy), (m[0], lx), (m[1], ly)]),
+            sum(self.at.1, [(m[2], hx), (m[3], hy), (m[2], lx), (m[3], ly)]),
+        );
+        if placed.0.is_finite() && placed.1.is_finite() {
+            return placed;
+        }
+        // The difference, or the difference placed, is past the numbers: the base point and the
+        // point are placed each on their own then, so a placement that brings them back in range
+        // still draws them.
+        let (bx, by) = self.base;
+        let at = (self.at.0 - (m[0] * bx + m[1] * by), self.at.1 - (m[2] * bx + m[3] * by));
+        (at.0 + m[0] * x + m[1] * y, at.1 + m[2] * x + m[3] * y)
     }
-    /// This placement inside `outer`: `outer` applied after this one.
+    /// This placement inside `outer`: `outer` applied after this one. This one's base point
+    /// stays apart; `outer`'s is taken off this one's origin.
     fn then(&self, outer: &Xf) -> Xf {
         let (a, b) = (&outer.m, &self.m);
+        let mut at = outer.apply(self.at.0, self.at.1);
+        let mut base = self.base;
+        if !(at.0.is_finite() && at.1.is_finite()) {
+            // This origin is past the numbers once placed: with this base point taken off it
+            // first, the far base point and origin may cancel and keep it in range.
+            let (bx, by) = base;
+            let folded = outer.apply(self.at.0 - (b[0] * bx + b[1] * by), self.at.1 - (b[2] * bx + b[3] * by));
+            if folded.0.is_finite() && folded.1.is_finite() {
+                (at, base) = (folded, (0.0, 0.0));
+            }
+        }
         Xf {
+            base,
             m: [
                 a[0] * b[0] + a[1] * b[2],
                 a[0] * b[1] + a[1] * b[3],
                 a[2] * b[0] + a[3] * b[2],
                 a[2] * b[1] + a[3] * b[3],
             ],
-            at: outer.apply(self.at.0, self.at.1),
+            at,
             rot: self.rot + outer.rot,
         }
     }
@@ -691,7 +742,7 @@ fn shapes(
                     // the range of numbers is not refused here: its shapes are, one by one, and
                     // each copy takes from the budget like any other.
                     let cell_xf = |cell: usize| {
-                        Xf::shift((-bx, -by))
+                        Xf::from_base((bx, by))
                             .then(&Xf::insert(array.at(cell, (ix, iy)), sx, sy, rot))
                             .then(&xf)
                     };
@@ -749,7 +800,7 @@ fn shapes(
                 if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
                     // Placed by its base point like any block (normally (0, 0) for a dimension).
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
-                    let dxf = Xf::shift((-bx, -by)).then(&xf);
+                    let dxf = Xf::from_base((bx, by)).then(&xf);
                     shapes(
                         d,
                         inner,
@@ -3993,8 +4044,7 @@ mod tests {
         assert_eq!(g.len(), 1, "{g:?}");
         assert!(g.iter().all(finite_shape), "{g:?}");
         assert_eq!(skipped.get(LINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
-        // A block whose base point is far out: the placement's own origin overflows once
-        // scaled, but the line drawn from it is in range and kept.
+        // A block whose base point is far out: the line drawn from it is in range and kept.
         let based = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n";
         for ents in [
             "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n",
@@ -4578,6 +4628,149 @@ mod tests {
             _ => false,
         };
         assert!(g.len() == 1 && g.iter().all(placed), "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn array_copies_of_a_block_with_a_far_base_point_stay_apart() -> Result<()> {
+        // The base point is far past the column spacing: the spacing must not be lost to it.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nFAR\n10\n0\n20\n0\n70\n2\n44\n5\n", blocks))?;
+        let (mut raw, mut skipped) = (Vec::new(), BTreeMap::new());
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            2.0,
+            0,
+            &|_| false,
+            &|_| false,
+            &mut raw,
+            &mut Vec::new(),
+            &mut skipped,
+            &mut { MAX_DRAWN },
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let lines: Vec<(Point, Point)> = raw
+            .iter()
+            .filter_map(|(_, s)| match s {
+                Shape::Line { a, b } => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        // At page scale 2: the copies start at x = 0 and x = 10 and run 2 up the page.
+        assert_eq!(
+            lines,
+            [
+                (Point::new(0.0, 0.0), Point::new(0.0, -2.0)),
+                (Point::new(10.0, 0.0), Point::new(10.0, -2.0)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_point_far_from_a_far_base_point_is_placed_when_shrunk() -> Result<()> {
+        // The point minus the base point is past the numbers, but halved it is in range.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n-1e308\n20\n0\n11\n-1e308\n21\n1\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n41\n0.5\n42\n0.5\n";
+        let (g, skipped) = drawn(ents, blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(-1e308, 0.0),
+                b: Point::new(-1e308, -0.5)
+            }]
+        );
+        let imported = page(&dxf(ents, blocks), 1.0, &BTreeSet::new());
+        assert!(imported.is_ok(), "{:?}", imported.err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_far_block_on_a_far_insertion_point_keeps_its_small_lengths() -> Result<()> {
+        // Base point and insertion point alike far out: the line keeps its length of 1.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nFAR\n10\n1e308\n20\n0\n", blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(1.0, 0.0)
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_point_whose_placed_difference_overflows_is_placed_another_way() -> Result<()> {
+        // The point less the base point is a number, doubled it is not; placed each on their
+        // own, the line comes back in range.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n5e307\n20\n0\n0\nLINE\n10\n-5e307\n20\n0\n11\n-5e307\n21\n1\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nFAR\n10\n1e308\n20\n0\n41\n2\n42\n2\n", blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(-1e308, 0.0),
+                b: Point::new(-1e308, -2.0)
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scaled_far_difference_keeps_the_block_length() -> Result<()> {
+        // Base point 2^54, insertion point 3 * 2^54, scale 3: the line of length 3 is 9 long,
+        // from 3 * 2^54 + 3 * (0 - 2^54) = 0 to 3 * 2^54 + 3 * (3 - 2^54) = 9.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n18014398509481984\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n3\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nFAR\n10\n54043195528445952\n20\n0\n41\n3\n42\n3\n50\n0\n";
+        let (g, skipped) = drawn(ents, blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(9.0, 0.0)
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_far_block_inside_a_far_block_is_drawn() -> Result<()> {
+        // OUTER's base point is far out one way, INNER's origin and base point far out the
+        // other: placed one after the other they cancel, and the line lands at x = 0.
+        let blocks = "0\nBLOCK\n2\nINNER\n10\n-1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nOUTER\n10\n1e308\n20\n0\n0\nINSERT\n2\nINNER\n10\n-1e308\n20\n0\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n10\n0\n20\n0\n", blocks)?;
+        assert_eq!(skipped.get(LINE_NOT_NUMBERS), None, "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, -1.0)
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_block_with_a_far_base_point_in_a_scaled_block_is_placed() -> Result<()> {
+        // The dimension's base point doubled is past the numbers; its line placed is not.
+        let blocks = "0\nBLOCK\n2\n*D1\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nOUTER\n10\n0\n20\n0\n0\nDIMENSION\n2\n*D1\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n41\n2\n42\n2\n", blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, -2.0)
+            }]
+        );
         Ok(())
     }
 

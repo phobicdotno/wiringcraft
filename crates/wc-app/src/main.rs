@@ -4949,14 +4949,16 @@ fn subway(ui: &mut egui::Ui, rows: &[wc_vcs::subway::Row]) {
 }
 
 /// The project check, with the check rules of the project's library sources as they are now.
+/// A used part whose library copy is there but cannot be read is reported with the reason.
 fn run_check(open: &Open) -> Vec<wc_report::Finding> {
-    wc_report::check_with(
+    wc_report::check_with_unreadable(
         &wc_report::Inputs {
             project: &open.project,
             symbols: &open.symbols,
             parts: &open.parts,
         },
         &wc_library::library_rules(&open.dir, &open.project),
+        &state::unreadable_parts(&open.dir, &open.project, &open.parts),
     )
 }
 

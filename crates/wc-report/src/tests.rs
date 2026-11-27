@@ -355,6 +355,32 @@ fn cable_list_groups_cores_by_cable() {
 }
 
 #[test]
+fn cable_list_names_a_part_missing_from_the_library_copy_by_its_id() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    p.devices.insert(
+        w1.clone(),
+        Device {
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    assert!(!parts.contains_key("LAPP.1119203"));
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][..2], ["-W1", "LAPP.1119203"]);
+}
+
+#[test]
 fn check_names_a_cable_core_on_two_connections() {
     let (mut p, s, parts) = fixture();
     let found = |p: &Project| {
@@ -788,6 +814,36 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
     assert!(!check(&i).iter().any(|f| f.message.contains("contact -K9 has no coil")));
 }
 
+#[test]
+fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    // The same point again, on a line diagram.
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.symbols.push(place("s20", "arrow", 100.0, Some("-L1")));
+    p.pages.push(overview);
+    let lonely = |p: &Project| -> Vec<Option<String>> {
+        check(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .into_iter()
+        .filter(|f| f.message == "interruption point -L1 has no partner")
+        .map(|f| f.page_id)
+        .collect()
+    };
+    assert!(lonely(&p).is_empty(), "on a normal page the two points are partners");
+    p.pages[1].overview = true;
+    assert_eq!(
+        lonely(&p),
+        vec![Some(p.pages[0].id.clone())],
+        "the schematic point has no partner; the overview copy still has the schematic one"
+    );
+}
+
 /// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
 fn caex_file_name(xml: &str) -> Option<String> {
     use quick_xml::events::Event;
@@ -918,6 +974,44 @@ fn plc_io_list_and_contents() {
     assert!(lines[4].starts_with("    A1_Q1 AT %QX0.0 : BOOL; (* -A1.Q1, point -A1.Q1, address %Q0.0, to -P1:X2"));
     assert!(lines[5].starts_with("    u1 AT %I* : BOOL;"));
     assert_eq!(lines[6], "END_VAR");
+}
+
+#[test]
+fn plc_points_repeated_on_an_overview_page_are_listed_once() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    s.insert(input.id.clone(), input);
+    p.pages[0]
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    overview
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    p.pages.insert(0, overview);
+    p.devices.insert(
+        DeviceTag::parse("-A1.I1").unwrap(),
+        Device {
+            properties: [("Address".to_string(), "%I0.2".to_string())].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // Listed once, linked to the schematic page, and declared once.
+    let t = build(Kind::Plc, &i);
+    assert_eq!(t.rows.len(), 1);
+    assert_eq!(t.rows[0][2], "-A1.I1");
+    assert_eq!(t.rows[0][5], "2");
+    assert_eq!(t.row_pages, [p.pages[1].id.clone()]);
+    let v = plc_variables(&i);
+    assert_eq!(v.variables, 1);
+    assert!(!v.text.contains("A1_I1_2"));
 }
 
 #[test]
@@ -1309,6 +1403,24 @@ fn marker_list_headers_and_types_follow_the_language_and_warnings_still_find_wir
     assert!(nb.rows.iter().any(|r| r[0] == "Komponent"));
     assert_eq!(Language::parse("NO"), Some(Language::Nb));
     assert_eq!(Language::parse("fr"), None);
+}
+
+#[test]
+fn a_numbered_wire_repeated_on_an_overview_gets_no_extra_markers() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].wires[0].number = Some("7".into());
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Wires]);
+    let rows: Vec<String> = t.rows.iter().map(|r| r.join("|")).collect();
+    assert!(rows.contains(&"Wire||7|2".to_owned()), "{rows:?}");
 }
 
 #[test]

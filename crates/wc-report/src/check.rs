@@ -252,22 +252,34 @@ pub fn check_with_unreadable(
         }
     }
 
-    // Contacts without a coil, interruption points without a partner.
+    // Contacts without a coil, interruption points without a partner. A copy on an overview
+    // page links nothing in the schematic, so it is no partner of an interruption point on a
+    // schematic page; one on an overview page may have its partner anywhere.
     let mut links: BTreeMap<DeviceTag, usize> = BTreeMap::new();
+    let mut overview_links: BTreeMap<DeviceTag, usize> = BTreeMap::new();
     for page in &p.pages {
         for s in &page.symbols {
             if let (Some(tag), Some(SymbolRole::Interruption)) = (&s.tag, role(&s.symbol)) {
-                *links.entry(tag.clone()).or_default() += 1;
+                let count = if page.overview { &mut overview_links } else { &mut links };
+                *count.entry(tag.clone()).or_default() += 1;
             }
         }
     }
+    let partnered = |page: &Page, tag: &DeviceTag| {
+        let schematic = links.get(tag).copied().unwrap_or(0);
+        if page.overview {
+            schematic + overview_links.get(tag).copied().unwrap_or(0) >= 2
+        } else {
+            schematic >= 2
+        }
+    };
     for page in &p.pages {
         for s in &page.symbols {
             match (role(&s.symbol), &s.tag) {
                 (Some(SymbolRole::Auxiliary), Some(tag)) if !mains.contains(tag) => {
                     out.push(at(page, &s.id, Severity::Warning, format!("contact {tag} has no coil")))
                 }
-                (Some(SymbolRole::Interruption), Some(tag)) if links.get(tag).copied().unwrap_or(0) < 2 => {
+                (Some(SymbolRole::Interruption), Some(tag)) if !partnered(page, tag) => {
                     out.push(at(
                         page,
                         &s.id,

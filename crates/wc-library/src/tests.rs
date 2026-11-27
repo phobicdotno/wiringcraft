@@ -125,6 +125,38 @@ fn lock_then_detect_change_then_update() -> Result<()> {
 }
 
 #[test]
+fn an_update_naming_an_id_the_project_does_not_have_takes_nothing()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    write_symbol(&f.company, &sym("coil", 12.5))?;
+    let pinned = f.project.lock.clone();
+
+    // A typo beside a real update stops the whole update, naming the typo and what is known.
+    let only = ["coil".to_owned(), "coill".to_owned()];
+    let err = update(&f.proj, &mut f.project, &lib, Some(&only))
+        .err()
+        .ok_or("updated")?;
+    assert!(matches!(err, Error::NotInProject { .. }), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("does not use or pin \"coill\""), "{msg}");
+    assert!(msg.contains("are \"coil\""), "{msg}");
+    assert_eq!(f.project.lock, pinned);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+
+    // A library item the project does not use is no more an update than a typo.
+    let only = ["other".to_owned()];
+    assert!(update(&f.proj, &mut f.project, &lib, Some(&only)).is_err());
+    let only = ["coil".to_owned()];
+    assert_eq!(update(&f.proj, &mut f.project, &lib, Some(&only))?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn removed_items_keep_working_from_vendor() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
@@ -914,6 +946,28 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
         let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["1", "2"], "{id}");
     }
+    Ok(())
+}
+
+#[test]
+fn the_starter_inductor_has_two_pins() -> Result<()> {
+    // #770: an inductor for line and DC chokes on drives and in filters.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (l, _) = lib.symbol("wc.inductor")?;
+    assert_eq!(l.role, SymbolRole::Standalone);
+    assert_eq!(l.letter_code, "R");
+    assert_eq!(l.category, "passive");
+    let names: Vec<_> = l.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2"]);
     Ok(())
 }
 

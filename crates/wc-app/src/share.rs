@@ -3459,6 +3459,29 @@ impl Share {
         std::mem::take(&mut self.notes)
     }
 
+    /// Everyone who has joined the session, the host first, each with whether it is this
+    /// person. Each one's page is the page the locks here give them (what is read-only here),
+    /// not the page last announced, which can lag behind. Empty outside a session and while a
+    /// guest waits to be let in.
+    pub fn participants(&self) -> Vec<(Peer, bool)> {
+        let Some(role) = &self.role else {
+            return Vec::new();
+        };
+        let me = role.me();
+        let locks = role.locks();
+        role.peers()
+            .into_iter()
+            .map(|mut p| {
+                p.page = locks
+                    .iter()
+                    .find(|(_, holder)| **holder == p.id)
+                    .map(|(page, _)| page.clone());
+                let you = Some(p.id) == me;
+                (p, you)
+            })
+            .collect()
+    }
+
     /// Who holds each page other than this person: page id to name.
     pub fn held_by_others(&self) -> BTreeMap<String, String> {
         let Some(role) = &self.role else {
