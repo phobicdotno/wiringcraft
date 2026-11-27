@@ -75,10 +75,18 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
-/// Every tag the project uses: on its pages and in its device data.
+/// Every tag the project uses: on its pages, in its device data and as the cable of a wire
+/// core (a cable with cores but no symbol drawn and no device entry is still taken).
 pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
     let mut used: BTreeSet<DeviceTag> = project.tag_index().into_keys().collect();
     used.extend(project.devices.keys().cloned());
+    used.extend(
+        project
+            .pages
+            .iter()
+            .flat_map(|p| &p.wires)
+            .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone())),
+    );
     used
 }
 
@@ -100,7 +108,15 @@ pub fn place(
     let mut used = used_tags(project);
     let mut renamed: BTreeMap<&DeviceTag, Option<DeviceTag>> = BTreeMap::new();
     let mut devices: Vec<(DeviceTag, Device)> = Vec::new();
-    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()) {
+    // The cable of a wire core is a device of the group too, unless the group is a copy within
+    // this project: there the tag names the same real cable, while a macro's or another
+    // project's `-W1` would join an unrelated cable of the project.
+    let cables = group
+        .wires
+        .iter()
+        .filter(|_| data != DeviceData::ProjectFirst)
+        .filter_map(|w| w.cable.as_ref().map(|c| &c.cable));
+    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()).chain(cables) {
         if renamed.contains_key(old) {
             continue;
         }
@@ -143,9 +159,9 @@ pub fn place(
     }
     for w in group.wires {
         let mut w = w.clone();
-        // A core of a cable the group holds runs in that cable under its new tag; when the
-        // cable is placed without a tag, the core runs in no cable (not in the project's cable
-        // of the old tag).
+        // A core of a cable the group holds (drawn in it, or named by its cores outside a copy
+        // within the project) runs in that cable under its new tag; when the cable is placed
+        // without a tag, the core runs in no cable (not in the project's cable of the old tag).
         if let Some(c) = &w.cable
             && let Some(new) = renamed.get(&c.cable)
         {
@@ -274,6 +290,66 @@ mod tests {
                 "{data:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_core_whose_cable_is_not_drawn_in_the_group_gets_a_new_cable_unless_copied_within() {
+        // Core BN of -W1, with the group's data for -W1 but no symbol tagged -W1.
+        let core = Wire {
+            id: "w1".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: Some(crate::project::CableCore {
+                cable: tag("-W1"),
+                core: "BN".into(),
+            }),
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        let wires = [core];
+        let group_devices = BTreeMap::from([(tag("-W1"), device("group's cable"))]);
+        let group = Group {
+            symbols: &[],
+            wires: &wires,
+            graphics: &[],
+            devices: &group_devices,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let cable_of = |p: &Project, placed: &Placed| {
+            let w = p.pages[0].wires.iter().find(|w| w.id == placed.wires[0]).unwrap();
+            w.cable.as_ref().map(|c| (c.cable.to_string(), c.core.clone()))
+        };
+        // The project already has a cable -W1 of its own.
+        let mut p = project();
+        p.devices.insert(tag("-W1"), device("project's cable"));
+        for data in [DeviceData::GroupOnly, DeviceData::GroupFirst] {
+            let mut p = p.clone();
+            let first = place(&mut p, 0, group, Point::new(0.0, 0.0), data, OutOfTags::Fail).unwrap();
+            let second = place(&mut p, 0, group, Point::new(0.0, 0.0), data, OutOfTags::Fail).unwrap();
+            assert_eq!(cable_of(&p, &first), Some(("-W2".into(), "BN".into())), "{data:?}");
+            assert_eq!(cable_of(&p, &second), Some(("-W3".into(), "BN".into())), "{data:?}");
+            assert_eq!(p.devices[&tag("-W2")].description, "group's cable");
+            assert_eq!(p.devices[&tag("-W1")].description, "project's cable");
+        }
+        // A copy within the project keeps the core in the project's cable.
+        let placed = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        )
+        .unwrap();
+        assert_eq!(cable_of(&p, &placed), Some(("-W1".into(), "BN".into())));
+        assert!(!p.devices.contains_key(&tag("-W2")));
     }
 
     #[test]
