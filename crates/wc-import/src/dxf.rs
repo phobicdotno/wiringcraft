@@ -2512,8 +2512,9 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
     let mut tag_warnings = Vec::new();
-    // Per symbol: how many were placed at an angle that is not a right angle, and the first.
-    let mut odd_angles: BTreeMap<String, (usize, f64)> = BTreeMap::new();
+    // Per symbol: how many were placed at an angle that is not a right angle, and the first
+    // such angle as the file gives it (none when out of range).
+    let mut odd_angles: BTreeMap<String, (usize, Option<f64>)> = BTreeMap::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -2560,24 +2561,17 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                             })
                             .ok()
                     });
-                // Taken to a turn first: a huge angle (a damaged file) would saturate the cast
-                // and overflow when negated.
                 // A symbol only turns in right angles: any other angle is taken to the nearest
                 // one and said, so a symbol turned 45 degrees in the file is not placed
-                // unturned without a word.
-                // Past a turn of a billion degrees (a damaged file) the angle has no meaning
-                // left: it is placed unturned, and said like any other odd angle.
+                // unturned without a word. Past a turn of a billion degrees (a damaged file) the
+                // angle has no meaning left: it is placed unturned, and said as out of range.
+                // Taken to a quarter turn before the cast, which a huge angle would saturate.
                 let angle = e.f(50);
-                let turn = if angle.abs() < 1e9 {
-                    angle.round().rem_euclid(360.0)
-                } else {
-                    f64::NAN
-                };
-                let quarter = if turn.is_finite() { (turn / 90.0).round() } else { 0.0 };
-                if !turn.is_finite() || (turn - quarter * 90.0).abs() > 0.0 {
-                    let odd = odd_angles.entry((*id).clone()).or_insert((0, turn));
-                    odd.0 += 1;
-                }
+                let in_range = angle.abs() < 1e9;
+                let turn = if in_range { angle.rem_euclid(360.0) } else { 0.0 };
+                let quarter = (turn / 90.0).round();
+                // A DWG angle comes in radians: a right angle can be off by a rounding error.
+                let odd = !in_range || (turn - quarter * 90.0).abs() > 1e-6;
                 let rotation = Rotation::from_degrees(-(quarter as i64) * 90).unwrap_or_default();
                 // An array places one symbol per copy. The copies share the attributes, so
                 // only the first keeps the device tag: the rest would repeat it.
@@ -2599,6 +2593,12 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                         break;
                     }
                     budget -= 1;
+                    if odd {
+                        let entry = odd_angles
+                            .entry((*id).clone())
+                            .or_insert((0, in_range.then_some(angle)));
+                        entry.0 += 1;
+                    }
                     let (x, y) = cells.at(cell, (ix, iy));
                     out.symbols.push(PlacedSymbol {
                         id: String::new(),
@@ -2619,11 +2619,7 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         i = j;
     }
     for (id, (count, first)) in odd_angles {
-        let angle = if first.is_finite() {
-            format!("{first} degrees")
-        } else {
-            "an angle out of range".to_owned()
-        };
+        let angle = first.map_or_else(|| "an angle out of range".to_owned(), |a| format!("{a} degrees"));
         let what = if count == 1 {
             "1 placed".to_owned()
         } else {
@@ -3179,6 +3175,48 @@ mod tests {
         assert!(
             odd.iter()
                 .any(|w| w.starts_with("wc.coil: 2 placed, the first at 45 degrees")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// The angle is rounded once, to the nearest quarter turn: 44.6 is nearer 0 than 90, and
+    /// 89.6 is near but not at a right angle, so it is said. The warning gives the angle as the
+    /// file does.
+    #[test]
+    fn a_fractional_angle_takes_the_nearest_quarter_turn_and_is_said() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        for (angle, want) in [
+            ("44.6", Rotation::R0),
+            ("45.4", Rotation::R270),
+            ("89.6", Rotation::R270),
+            ("-100", Rotation::R90),
+        ] {
+            let ents = format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+            let p = page(&dxf(&ents, ""), 1.0, &known)?;
+            assert_eq!(p.symbols.first().map(|s| s.rotation), Some(want), "{angle}");
+            let said = format!("wc.coil: 1 placed at {angle} degrees, turned to the nearest right angle");
+            assert!(
+                p.warnings.iter().any(|w| w.starts_with(&said)),
+                "{angle}: {:?}",
+                p.warnings
+            );
+        }
+        Ok(())
+    }
+
+    /// An array counts each copy it places.
+    #[test]
+    fn an_array_at_an_odd_angle_counts_its_copies() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n45\n70\n3\n71\n2\n44\n10\n45\n10\n";
+        let p = page(&dxf(ents, ""), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 6);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.starts_with("wc.coil: 6 placed, the first at 45 degrees")),
             "{:?}",
             p.warnings
         );
