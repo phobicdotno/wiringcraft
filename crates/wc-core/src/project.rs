@@ -1148,7 +1148,8 @@ impl ProjectMeta {
 
     /// Add spare terminal `number` to `strip`, placed right after terminal `after` when given
     /// (`current` is the strip's rail order, see [`strip_terminals`]), else at the end. Refused
-    /// when the strip already has that terminal or the number cannot be a terminal of it.
+    /// when the strip already has that terminal or the number cannot be a terminal of it. A
+    /// spare that leaves the strip in number order sets no rail order.
     pub fn add_spare(
         &mut self,
         strip: &DeviceTag,
@@ -1179,7 +1180,35 @@ impl ProjectMeta {
             l.spares.push(number.to_owned());
             l.order = order;
         });
+        self.forget_usual_order(strip, current);
         Ok(())
+    }
+
+    /// Forget the rail order of `strip` when it is just the usual one for the terminals on its
+    /// rail (`current`, see [`strip_terminals`]): drawn terminals by number, then spares by
+    /// number. A spare added at the end, or a terminal moved back, then leaves the strip in
+    /// number order, so a terminal drawn later goes where its number puts it, not at the end.
+    fn forget_usual_order(&mut self, strip: &DeviceTag, current: &[(String, bool)]) {
+        let mut drawn: Vec<String> = current
+            .iter()
+            .filter(|(_, spare)| !spare)
+            .map(|(t, _)| t.clone())
+            .collect();
+        drawn.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+        let Some(l) = self.strips.iter_mut().find(|l| &l.strip == strip) else {
+            return;
+        };
+        let usual = StripLayout {
+            strip: strip.clone(),
+            order: Vec::new(),
+            spares: l.spares.clone(),
+        }
+        .arrange(&drawn);
+        // The rail as arranged, not the stored order: that can leave out terminals drawn since.
+        if !l.order.is_empty() && l.arrange(&drawn) == usual {
+            l.order.clear();
+            self.drop_empty_layouts();
+        }
     }
 
     /// Take spare terminal `number` off `strip`, and out of its jumper; `current` is the strip's
@@ -1199,6 +1228,7 @@ impl ProjectMeta {
         if !drawn {
             l.order.retain(|t| t != number);
         }
+        self.forget_usual_order(strip, current);
         self.drop_empty_layouts();
         if !drawn {
             self.remove_from_jumper(strip, number);
@@ -1207,7 +1237,8 @@ impl ProjectMeta {
     }
 
     /// Move terminal `number` of `strip` to `to` (0 is first) in its rail order; `current` is
-    /// the strip's rail order (see [`strip_terminals`]). Returns whether anything changed.
+    /// the strip's rail order (see [`strip_terminals`]). A move back into number order forgets
+    /// the rail order. Returns whether anything changed.
     pub fn move_terminal(
         &mut self,
         strip: &DeviceTag,
@@ -1225,7 +1256,10 @@ impl ProjectMeta {
         if order.iter().eq(current.iter().map(|(t, _)| t)) {
             return Ok(false);
         }
-        self.set_terminal_order(strip, &order)
+        let before = self.strips.clone();
+        self.set_terminal_order(strip, &order)?;
+        self.forget_usual_order(strip, current);
+        Ok(self.strips != before)
     }
 
     /// The jumper a terminal (`-X1.4`) is in, if any.
@@ -3070,6 +3104,64 @@ mod tests {
         let err = toml::from_str::<ProjectMeta>(twice).err().ok_or("loaded")?.to_string();
         assert!(err.contains("-X1 is arranged twice"), "{err}");
         assert!(toml::from_str::<ProjectMeta>("name = \"t\"\n")?.strips.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_at_the_end_or_a_move_back_leaves_the_strip_in_number_order() -> Result<(), String> {
+        let x1 = DeviceTag::parse("-X1").map_err(|e| e.to_string())?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let drawn = s(&["1", "2", "4"]);
+        let rail = |m: &ProjectMeta, drawn: &[String]| -> Vec<String> {
+            let arranged = match m.strip_layout(&x1) {
+                Some(l) => l.arrange(drawn),
+                None => drawn.iter().map(|n| (n.clone(), false)).collect(),
+            };
+            arranged.into_iter().map(|(t, _)| t).collect()
+        };
+        let current = |m: &ProjectMeta| -> Vec<(String, bool)> {
+            let l = m.strip_layout(&x1).cloned();
+            l.map_or_else(
+                || drawn.iter().map(|n| (n.clone(), false)).collect(),
+                |l| l.arrange(&drawn),
+            )
+        };
+        let mut m = ProjectMeta::new("t");
+        // A spare at the end: the strip is still in number order, so no order is kept and a
+        // terminal 3 drawn later goes between 2 and 4, not after the spare.
+        m.add_spare(&x1, "S1", None, &current(&m))?;
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        assert_eq!(rail(&m, &s(&["1", "2", "3", "4"])), s(&["1", "2", "3", "4", "S1"]));
+        // A spare out of number order keeps the order.
+        m.add_spare(&x1, "S0", None, &current(&m))?;
+        assert_eq!(rail(&m, &drawn), s(&["1", "2", "4", "S1", "S0"]));
+        assert!(m.remove_spare(&x1, "S0", &current(&m)));
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        // Moved away and back: the order is forgotten again.
+        assert!(m.move_terminal(&x1, "4", 0, &current(&m))?);
+        assert_eq!(rail(&m, &drawn), s(&["4", "1", "2", "S1"]));
+        assert!(m.move_terminal(&x1, "4", 2, &current(&m))?);
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        // An order set before terminal 5 was drawn names only 1, 4 and the spare: with the
+        // spare off, the rail is in number order and the order goes, so 3 drawn later goes
+        // between 1 and 4.
+        let mut n = ProjectMeta::new("t");
+        let early = s(&["1", "4"]);
+        let rail_of = |m: &ProjectMeta, d: &[String]| m.strip_layout(&x1).map(|l| l.arrange(d)).unwrap_or_default();
+        n.add_spare(
+            &x1,
+            "S1",
+            Some("1"),
+            &early.iter().map(|t| (t.clone(), false)).collect::<Vec<_>>(),
+        )?;
+        let later = s(&["1", "4", "5"]);
+        assert!(n.remove_spare(&x1, "S1", &rail_of(&n, &later)));
+        assert!(n.strips.is_empty(), "{:?}", n.strips);
+        // Without spares nothing is left of the layout.
+        assert!(m.remove_spare(&x1, "S1", &current(&m)));
+        assert!(m.move_terminal(&x1, "2", 0, &current(&m))?);
+        assert!(m.move_terminal(&x1, "2", 1, &current(&m))?);
+        assert!(m.strips.is_empty());
         Ok(())
     }
 
