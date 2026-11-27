@@ -1203,6 +1203,23 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
 }
 
 #[test]
+fn an_auxiliary_contact_of_a_standalone_breaker_has_no_missing_coil() {
+    // A breaker or MPCB is one standalone symbol; its aux contact belongs to it (#1467).
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s11", "no", 320.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s12", "lamp", 360.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s13", "no", 400.0, Some("-Q8")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let findings = check(&i);
+    assert!(!findings.iter().any(|f| f.message.contains("contact -Q9 has no coil")));
+    assert!(findings.iter().any(|f| f.message.contains("contact -Q8 has no coil")));
+}
+
+#[test]
 fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
@@ -1229,6 +1246,38 @@ fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
         lonely(&p),
         vec![Some(p.pages[0].id.clone())],
         "the schematic point has no partner; the overview copy still has the schematic one"
+    );
+}
+
+#[test]
+fn check_warns_about_a_coil_or_contact_without_a_tag() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s10", "coil", 200.0, None));
+    p.pages[0].symbols.push(place("s11", "no", 230.0, None));
+    p.pages[0].symbols.push(place("s12", "lamp", 260.0, None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let untagged: Vec<(Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("has no tag"))
+        .map(|f| (f.item, f.message))
+        .collect();
+    assert_eq!(
+        untagged,
+        vec![
+            (
+                Some("s10".into()),
+                "coil has no tag, so it links nothing in cross-references".into()
+            ),
+            (
+                Some("s11".into()),
+                "contact has no tag, so it links nothing in cross-references".into()
+            ),
+        ],
+        "a lamp needs no tag to work; the tagged coil and contact are fine"
     );
 }
 
@@ -3041,6 +3090,14 @@ fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
     let found = overflow(&p, &s, &parts);
     assert!(found[0].message.ends_with("(1 NC too many)"), "{found:?}");
 
+    // An accessory missing from the library copy has unknown contacts: no overflow is claimed.
+    p.devices.get_mut(&k1).unwrap().accessories.push(wc_core::DevicePart {
+        part: "acme.gone".into(),
+        qty: 1,
+    });
+    assert!(overflow(&p, &s, &parts).is_empty());
+    p.devices.get_mut(&k1).unwrap().accessories.pop();
+
     // A contact repeated on an overview page does not count.
     p.pages[0].symbols.pop();
     let mut overview = Page::new("p9", "9", "Overview");
@@ -4508,4 +4565,32 @@ fn a_device_drawn_twice_lists_its_pages_in_page_order() {
         "{found:?}"
     );
     assert!(found.iter().any(|m| m == "-P1 is drawn 2 times (page 2)"), "{found:?}");
+}
+
+#[test]
+fn terminals_tagged_with_only_their_strip_are_not_drawn_twice_but_one_number_is() {
+    let (mut p, mut s, parts) = fixture();
+    // Two more -X2 terminals: the strip numbers them 2 and 3, they are three terminals.
+    p.pages[0].symbols.push(place("s7", "term", 140.0, Some("-X2")));
+    p.pages[0].symbols.push(place("s8", "term", 160.0, Some("-X2")));
+    // -X1.1 again, with another terminal symbol: terminal 1 of -X1 is drawn twice.
+    s.insert("term.pe".into(), sym("term.pe", SymbolRole::Terminal, &["1", "2"]));
+    p.pages[0].symbols.push(place("s9", "term.pe", 170.0, Some("-X1.1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<(Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("is drawn"))
+        .map(|f| (f.item, f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (Some("s4".into()), "-X1.1 is drawn 2 times (page 2)".into()),
+            (Some("s9".into()), "-X1.1 is drawn 2 times (page 2)".into()),
+        ]
+    );
 }
