@@ -34,7 +34,7 @@ use quick_xml::reader::Reader;
 use wc_core::DeviceTag;
 use wc_core::geom::Point;
 
-use crate::aml::{self, AmlDevice, AmlImport, AmlLink, Section};
+use crate::aml::{self, AmlDevice, AmlImport, AmlLink, AmlPotential, Section};
 use crate::{Error, Result};
 
 /// Classes of the records this importer reads.
@@ -766,6 +766,23 @@ pub fn split_end(end: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// For a connection with a pin at one end and a bare name at the other (`K1:A1` to `L1`): the
+/// device, the pin and the potential's name. `None` when both or neither end has a pin, or when
+/// the bare name is a device of the project (a cable end, say), which is no potential.
+pub(crate) fn potential_end<'a>(
+    is_device: &dyn Fn(&str) -> bool,
+    (da, pa): (&'a str, Option<&'a str>),
+    (db, pb): (&'a str, Option<&'a str>),
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let (dev, pin, name) = match (pa, pb) {
+        (Some(pa), None) => (da, pa, db),
+        (None, Some(pb)) => (db, pb, da),
+        _ => return None,
+    };
+    let name = name.trim();
+    (!name.is_empty() && !is_device(name)).then_some((dev, pin, name))
+}
+
 /// A WiringCraft tag for an Eplan device name: `PUMPE1-M1` -> `-PUMPE1.M1`. Characters a tag
 /// cannot hold become `_`.
 pub fn device_tag(name: &str) -> Option<DeviceTag> {
@@ -807,12 +824,28 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
     }
     let mut pins: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
     let mut links = Vec::new();
+    let mut potentials = Vec::new();
     let mut skipped = 0;
     for c in &p.connections {
         let (da, pa) = split_end(&c.from);
         let (db, pb) = split_end(&c.to);
         let (Some(pa), Some(pb)) = (pa, pb) else {
-            skipped += 1;
+            // A pin to a named potential (`K1:A1` to `L1`) puts the pin on that potential.
+            let is_device = |n: &str| p.functions.iter().any(|f| f.tag == n);
+            let Some((dev, pin, name)) = potential_end(&is_device, (da, pa), (db, pb)) else {
+                skipped += 1;
+                continue;
+            };
+            let i = add(dev, &mut names);
+            if let Some(pg) = c.page {
+                page_of.entry(i).or_insert(pg);
+            }
+            pins.entry(i).or_default().insert(pin.to_owned());
+            potentials.push(AmlPotential {
+                a: (i, pin.to_owned()),
+                name: name.to_owned(),
+                spec: c.spec(),
+            });
             continue;
         };
         let (ia, ib) = (add(da, &mut names), add(db, &mut names));
@@ -832,7 +865,8 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
     }
     if skipped > 0 {
         warnings.push(format!(
-            "{skipped} connection(s) to a name without a pin (potentials, cable ends) were not imported"
+            "{skipped} connection(s) without a pin at either end, or to a device without a pin (cable ends), were \
+             not imported"
         ));
     }
 
@@ -969,6 +1003,7 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
     let imp = AmlImport {
         devices,
         links,
+        potentials,
         warnings: Vec::new(),
         locations: Vec::new(),
     };

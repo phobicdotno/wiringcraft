@@ -508,9 +508,9 @@ fn builds_overview_pages_per_eplan_page() {
     assert_eq!(wires, 4);
     // It is dropped, not kept anywhere: the warning says so and its ends become no device.
     assert!(
-        warnings
-            .iter()
-            .any(|w| w == "1 connection(s) to a name without a pin (potentials, cable ends) were not imported"),
+        warnings.iter().any(|w| w
+            == "1 connection(s) without a pin at either end, or to a device without a pin (cable ends), were not \
+                    imported"),
         "{warnings:?}"
     );
     for end in ["-L", "-PE"] {
@@ -646,12 +646,21 @@ fn drawn_wires_get_the_section_and_colour_of_their_connection() {
         // A second connection over the same wires does not overwrite the first.
         conn("X2:3", "K1:21", "2.5", "RD"),
     ];
-    assert_eq!(drawing::spec_from_connections(&mut page, &owners, &connections), 3);
+    assert_eq!(
+        drawing::spec_from_connections(&mut page, &owners, &connections, &|_| false),
+        3
+    );
     for w in &page.wires[..3] {
         assert_eq!(w.spec.section.as_deref(), Some("1.5 mm²"), "{}", w.id);
         assert_eq!(w.spec.colour.as_deref(), Some("BU"), "{}", w.id);
     }
     assert!(page.wires[3].spec.is_empty(), "w4 is not on the connection");
+    // K1:22 to potential L1 names w4; a bare name that is a device (cable W5) names nothing.
+    let to_potential = vec![conn("L1", "K1:22", "", ""), conn("K1:21", "W5", "", "")];
+    let is_device = |n: &str| n == "W5";
+    drawing::spec_from_connections(&mut page, &owners, &to_potential, &is_device);
+    assert_eq!(page.wires[3].potential.as_deref(), Some("L1"));
+    assert!(page.wires[..3].iter().all(|w| w.potential.is_none()));
     assert_eq!(conn("a:1", "b:1", "0", "").spec(), wc_core::WireSpec::default());
     assert_eq!(
         conn("a:1", "b:1", "18 AWG", "").spec().section.as_deref(),
@@ -807,4 +816,56 @@ fn elk_target_encodings_and_rejections() {
     assert_eq!(elk_target(b""), None);
     assert_eq!(elk_target(b"   \nPlant.edb\n"), None);
     assert_eq!(elk_target(b"..\\evil.edb\n"), None);
+}
+
+#[test]
+fn a_pin_to_a_named_potential_becomes_a_potential_stub() {
+    let function = |tag: &str| EplanFunction {
+        tag: tag.into(),
+        ..Default::default()
+    };
+    let conn = |from: &str, to: &str| EplanConnection {
+        from: from.into(),
+        to: to.into(),
+        colour: "BU".into(),
+        ..Default::default()
+    };
+    let p = EplanProject {
+        functions: vec![function("K1"), function("W5")],
+        connections: vec![
+            conn("K1:A1", "L1"),
+            conn("PE", "K1:A2"),
+            // Two bare names: no device to hold it.
+            conn("L1", "PE"),
+            // A bare name that is a device (a cable end) is no potential.
+            conn("K1:13", "W5"),
+        ],
+        ..Default::default()
+    };
+    let (b, warnings) = build(&p, 1);
+    let wires: Vec<&wc_core::Wire> = b.pages.iter().flat_map(|pg| &pg.wires).collect();
+    let on = |name: &str| -> Vec<String> {
+        wires
+            .iter()
+            .filter(|w| w.potential.as_deref() == Some(name))
+            .filter_map(|w| match &w.from {
+                wc_core::Endpoint::Pin { pin, .. } => Some(pin.clone()),
+                wc_core::Endpoint::Point { .. } => None,
+            })
+            .collect()
+    };
+    assert_eq!(on("L1"), ["A1"]);
+    assert_eq!(on("PE"), ["A2"]);
+    assert_eq!(wires.len(), 2, "{wires:?}");
+    assert!(wires.iter().all(|w| w.spec.colour.as_deref() == Some("BU")));
+    // No device for a potential.
+    for name in ["-L1", "-PE"] {
+        assert!(!b.devices.contains_key(&DeviceTag::parse(name).unwrap()), "{name}");
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("2 connection(s) without a pin at either end")),
+        "{warnings:?}"
+    );
 }

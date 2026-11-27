@@ -36,10 +36,21 @@ pub struct AmlLink {
     pub spec: wc_core::WireSpec,
 }
 
+/// A device pin connected to a named potential (`L1`, `PE`) rather than to another pin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmlPotential {
+    pub a: (usize, String),
+    /// The potential's name.
+    pub name: String,
+    pub spec: wc_core::WireSpec,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AmlImport {
     pub devices: Vec<AmlDevice>,
     pub links: Vec<AmlLink>,
+    /// Pins on a named potential: each is drawn as a short wire from the pin carrying the name.
+    pub potentials: Vec<AmlPotential>,
     pub warnings: Vec<String>,
     /// Structure elements that are locations (`+L1`), with their description.
     pub locations: Vec<wc_core::Location>,
@@ -665,6 +676,39 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     });
                 }
             }
+        }
+    }
+    // Pins on a named potential: a stub down from the pin, carrying the name.
+    for (k, pot) in imp.potentials.iter().enumerate() {
+        let Some(Some((page, at))) = placements.get(pot.a.0) else {
+            continue;
+        };
+        let Some(sym) = symbol_of.get(pot.a.0).copied().flatten() else {
+            continue;
+        };
+        let Some(pin) = built.symbols[sym].pins.iter().find(|p| p.name == pot.a.1) else {
+            continue;
+        };
+        let (name, p) = (pin.name.clone(), *at + pin.at);
+        let lane = 6.0 + 2.5 * ((imp.links.len() + k) % 12) as f64;
+        if let Some(pg) = built.pages.get_mut(*page) {
+            let id = pg.next_id("w");
+            pg.wires.push(Wire {
+                id,
+                from: Endpoint::Pin {
+                    item: format!("d{}", pot.a.0 + 1),
+                    pin: name,
+                },
+                to: Endpoint::Point {
+                    at: Point::new(p.x, p.y + lane),
+                },
+                via: vec![],
+                number: None,
+                potential: Some(pot.name.clone()),
+                cable: None,
+                route: Default::default(),
+                spec: pot.spec.clone(),
+            });
         }
     }
     built

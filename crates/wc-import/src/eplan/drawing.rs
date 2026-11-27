@@ -392,11 +392,14 @@ struct End {
 /// Give drawn wires the cross-section and colour of the Eplan connection they draw: the shortest
 /// chain of wires on this page between the connection's two pins (through junctions). A terminal
 /// end (`X2:3`) is any pin of terminal 3 of strip X2. A wire keeps the first spec it gets.
-/// Returns how many wires got one.
+/// A connection from a pin to a named potential (`K1:A1` to `L1`, see
+/// [`super::potential_end`]; `is_device` tells device names apart) gives the wires on that pin
+/// that have no potential the name. Returns how many wires got a spec.
 pub(super) fn spec_from_connections(
     page: &mut Page,
     owners: &[(String, String, String)],
     connections: &[EplanConnection],
+    is_device: &dyn Fn(&str) -> bool,
 ) -> usize {
     let key = |e: &Endpoint| match e {
         Endpoint::Pin { item, pin } => format!("p\u{1}{item}\u{1}{pin}"),
@@ -427,6 +430,18 @@ pub(super) fn spec_from_connections(
         }
         out
     };
+    for c in connections {
+        let (a, b) = (split_end(&c.from), split_end(&c.to));
+        let Some((dev, pin, name)) = super::potential_end(is_device, a, b) else {
+            continue;
+        };
+        let on_pin = pins_of(dev, pin);
+        for w in &mut page.wires {
+            if w.potential.is_none() && (on_pin.contains(&key(&w.from)) || on_pin.contains(&key(&w.to))) {
+                w.potential = Some(name.to_owned());
+            }
+        }
+    }
     let mut given = 0;
     for c in connections {
         let spec = c.spec();
@@ -666,7 +681,8 @@ pub fn pages(p: &EplanProject, first_page_number: usize) -> Drawing {
                 spec: Default::default(),
             });
         }
-        spec_from_connections(&mut page, &owners, &p.connections);
+        let is_device = |n: &str| p.functions.iter().any(|f| f.tag == n);
+        spec_from_connections(&mut page, &owners, &p.connections, &is_device);
         if page.symbols.is_empty() && page.graphics.is_empty() {
             continue;
         }

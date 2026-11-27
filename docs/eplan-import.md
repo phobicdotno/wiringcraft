@@ -113,11 +113,17 @@ the drawn ones: one section per EPLAN page, titled `Connections, Eplan page <nam
 schematic page. There, each device is a box with its connection points, and every connection of
 EPLAN's connection list between two of them is a wire, with its cross-section and colour.
 
+A connection from a connection point to a bare name that is no device of the project, such as
+`K1:A1` to `L1` or `PE`, puts that point on a potential of that name. On an overview page the
+point gets a short wire carrying the potential name. On a rebuilt page, the wires on that point
+that have no potential yet take the name. The name does not become a device.
+
 Not imported:
 
-- connections to a name without a connection point, such as a potential or a cable end;
+- connections with no connection point at either end (`L1` to `PE`), and connections to a bare
+  name that is a device of the project, such as a cable end;
 - the cable a connection runs in (cables come across only as devices with their properties);
-- wire numbers and potential names.
+- wire numbers, and potential names other than those of the connections above.
 
 ### Warnings
 
@@ -127,8 +133,8 @@ drawn: 85 devices, 240 connections`. Before it, it may print:
 - `no pages or devices were recognised; the project may use a newer format`: the tables were
   found but nothing in them could be read.
 - `<n> connection(s) without named ends were skipped`.
-- `<n> connection(s) to a name without a pin (potentials, cable ends) were not imported`: see
-  the list above. They are not kept in the device properties either.
+- `<n> connection(s) without a pin at either end, or to a device without a pin (cable ends),
+  were not imported`: see the list above. They are not kept in the device properties either.
 - `<n> connection(s) of the connection list to devices on drawn pages were left out; their wires
   are traced from the drawing`: expected. Compare the drawn pages with EPLAN's if a wire is
   missing.
