@@ -169,7 +169,7 @@ places them. Texts in a macro can hold placeholders, `{{name}}`, filled from a n
 | `macro list` | The macros, project first, with their value sets. |
 | `macro show <name>` | Description, placeholders, value sets, the placeholders its texts use, and a problem `edit` would refuse to save. |
 | `macro edit <name> [options]` | Change a project macro's description, placeholders and value sets. A library's macros are not edited here. |
-| `macro place <page> <name> --at x,y` | Place it with its top-left corner at `--at` (mm). `--set <set>` picks the value set (needed when it has any); `--value name=value` (repeatable) overrides one value. Prints the new symbol ids. |
+| `macro place <page> <name> --at x,y` | Place it with its top-left corner at `--at` (mm). `--set <set>` picks the value set (needed when it has any); `--value name=value` (repeatable) overrides one value. The symbols it uses and the parts its devices and accessories name are copied into the project and pinned, as `device --part` does (a part no library has stays a plain name). Prints the new symbol ids. |
 
 `macro edit` options, all repeatable except `--description`:
 
@@ -208,8 +208,9 @@ s2
 ```
 
 The symbols get the next free tags (here `-F2`), and the devices get the macro's data with the
-placeholders filled (`Feeder Pump`). Symbols the project does not have yet are copied and pinned.
-Parts named by the macro are not: run `lib lock` after placing to pin them.
+placeholders filled (`Feeder Pump`). Symbols the project does not have yet are copied and pinned,
+and so are the parts the macro's devices and accessories name. A part no library source has stays
+a plain name on the device; `check` reports it.
 
 ## template
 

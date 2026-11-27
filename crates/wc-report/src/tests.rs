@@ -385,6 +385,25 @@ fn wire_list_names_the_potential_of_a_wire_between_two_junctions() {
 }
 
 #[test]
+fn wire_list_shows_the_net_name_past_a_blank_potential() {
+    let (mut p, s, parts) = fixture();
+    // Spaces around a name are no part of it, and a blank name is no potential: w8 is in the
+    // 24V net through the coil's pin A1, as w1 is.
+    p.pages[0].wires[0].potential = Some(" 24V ".into());
+    let at = Endpoint::Point {
+        at: Point::new(50.0, 0.0),
+    };
+    p.pages[0].wires.push(wire("w8", pin("s1", "A1"), at, None, Some("  ")));
+    let t = wire_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][2], "24V");
+    assert_eq!(t.rows[4][2], "24V");
+}
+
+#[test]
 fn wire_list_shows_section_colour_and_type() {
     let (mut p, s, parts) = fixture();
     let w = p
@@ -819,6 +838,22 @@ fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
         "cable core -W1:1 is on 2 connections".to_owned(),
     )];
     assert_eq!(found(&p), expected);
+    // Core names match ignoring case and surrounding spaces: "bn" and " BN " are one core.
+    for w in p.pages[0].wires.iter_mut() {
+        let core = if w.id == "w1" { "bn" } else { " BN " };
+        if let Some(c) = w.cable.as_mut() {
+            c.core = core.into();
+        }
+    }
+    let bn = [(
+        Some("p2".to_owned()),
+        Some("w4".to_owned()),
+        "cable core -W1:bn is on 2 connections".to_owned(),
+    )];
+    assert_eq!(found(&p), bn);
+    for c in p.pages[0].wires.iter_mut().filter_map(|w| w.cable.as_mut()) {
+        c.core = "1".into();
+    }
     // An overview page whose wiring joins the 24V and 0V potentials into one net.
     let mut overview = Page::new("ov", "1", "Overview");
     overview.overview = true;
@@ -1003,6 +1038,39 @@ fn a_cable_named_only_on_wires_is_a_device_without_a_part() {
 }
 
 #[test]
+fn a_blank_potential_name_does_not_hide_a_wire_end_in_the_air() {
+    let (mut p, s, parts) = fixture();
+    let air = |id: &str, y: f64, potential: Option<&str>| {
+        wire(
+            id,
+            pin("s6", "X2"),
+            Endpoint::Point {
+                at: Point::new(400.0, y),
+            },
+            None,
+            potential,
+        )
+    };
+    p.pages[0].wires.push(air("w20", 400.0, Some("  ")));
+    p.pages[0].wires.push(air("w21", 500.0, Some("")));
+    p.pages[0].wires.push(air("w22", 600.0, Some("24V")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    let air_at = |y: &str| {
+        found
+            .iter()
+            .any(|f| f.message == format!("wire ends in the air at 400.0, {y}"))
+    };
+    assert!(air_at("400.0"), "a blank name is no potential: {found:?}");
+    assert!(air_at("500.0"), "an empty name is no potential: {found:?}");
+    assert!(!air_at("600.0"), "a named potential joins across pages");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
@@ -1044,6 +1112,29 @@ fn project_check_finds_the_usual_mistakes() {
     assert_eq!(found[0].severity, Severity::Error);
     assert!(found.iter().filter(|f| f.page_id.is_some()).all(|f| f.item.is_some()));
     assert_eq!(check_table(&i).rows.len(), found.len());
+}
+
+#[test]
+fn project_check_finds_a_short_made_only_of_wires() {
+    let (mut p, s, parts) = fixture();
+    let at = |x: f64| Endpoint::Point {
+        at: Point::new(x, 500.0),
+    };
+    // An L1 wire and an L2 wire meet at a junction, with no device pin on either.
+    p.pages[0].wires.push(wire("w8", at(0.0), at(10.0), None, Some("L1")));
+    p.pages[0].wires.push(wire("w9", at(10.0), at(20.0), None, Some("L2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    assert!(
+        found
+            .iter()
+            .any(|f| f.severity == Severity::Error && f.message == "potentials L1 and L2 are connected to each other"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -1092,6 +1183,30 @@ fn project_check_warns_about_parts_missing_from_the_library_copy() {
     );
     // -P1 has a part now, even if it is missing, so no "has no part" note.
     assert!(!found.iter().any(|f| f.message == "-P1 has no part"), "{found:?}");
+}
+
+#[test]
+fn project_check_notes_a_drawn_device_whose_main_part_is_blank() {
+    let (mut p, s, parts) = fixture();
+    // A blank main part is no part: the device gets the "has no part" note, not silence.
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some("  ".into()),
+            ..Default::default()
+        },
+    );
+    let found = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert!(
+        found
+            .iter()
+            .any(|f| f.severity == Severity::Note && f.message == "-P1 has no part"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -3461,6 +3576,16 @@ fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
     overview.symbols.push(place("s30", "nc", 10.0, Some("=A+C1-K1")));
     p.pages.push(overview);
     assert!(overflow(&p, &s, &parts).is_empty());
+
+    // A hand-edited quantity of 0 counts the block once, as the parts list does (#1330):
+    // its NO covers the second NO drawn, and one of the two NCs drawn is too many.
+    p.devices.get_mut(&k1).unwrap().accessories[0].qty = 0;
+    let found = overflow(&p, &s, &parts);
+    assert!(!found.is_empty(), "{found:?}");
+    assert!(
+        found.iter().all(|f| f.message.ends_with("(1 NC too many)")),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -4351,6 +4476,36 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
         parts: &parts,
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
+    // A bit card ignores its step, so a stray one still has it compared by bits: %IX8.0 to
+    // %IX8.7 lie in byte 8, which a byte card at %IB8 also covers, whichever card came first.
+    p.meta.racks[0].cards.push(PlcCard {
+        step: Some(4),
+        ..card(5, 8, "%IX8.0")
+    });
+    p.meta.racks[0].cards.push(card(6, 1, "%IB8"));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("slot 6: address %IB8 is also on PLC rack \"R\" slot 5")),
+        "{w:?}"
+    );
+    p.meta.racks[0].cards.swap(4, 5);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("slot 5: address %IX8.0 is also on PLC rack \"R\" slot 6")),
+        "{w:?}"
+    );
 }
 
 #[test]
@@ -4979,6 +5134,39 @@ fn a_device_drawn_twice_lists_its_pages_in_page_order() {
         "{found:?}"
     );
     assert!(found.iter().any(|m| m == "-P1 is drawn 2 times (page 2)"), "{found:?}");
+}
+
+#[test]
+fn project_check_warns_once_about_a_symbol_with_two_pins_of_one_name() {
+    let (mut p, mut s, parts) = fixture();
+    s.insert("no2".into(), sym("no2", SymbolRole::Auxiliary, &["13", "14", "13"]));
+    p.pages[0].symbols.push(place("s20", "no2", 300.0, Some("=A+C1-K1")));
+    p.pages[0].symbols.push(place("s21", "no2", 320.0, Some("=A+C1-K1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    let twice: Vec<&Finding> = found
+        .iter()
+        .filter(|f| f.message.contains("more than one pin"))
+        .collect();
+    assert_eq!(twice.len(), 1, "{found:?}");
+    assert_eq!(twice[0].severity, Severity::Warning);
+    assert_eq!(twice[0].item.as_deref(), Some("s20"));
+    assert_eq!(
+        twice[0].message,
+        "symbol no2 has more than one pin named 13: wires reach only the first"
+    );
+    // Symbols whose pins all differ are not told.
+    let (p, s, parts) = fixture();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!check(&i).iter().any(|f| f.message.contains("more than one pin")));
 }
 
 #[test]

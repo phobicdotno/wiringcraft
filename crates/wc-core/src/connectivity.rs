@@ -224,8 +224,52 @@ pub fn wire_nets_by_place(
     project: &Project,
     role: impl Fn(&str) -> Option<SymbolRole>,
 ) -> (Vec<Net>, BTreeMap<(usize, usize), usize>) {
+    let (mut g, wire_nodes) = linked_graph(project, role);
+    let mut index_of_root: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut nets = Vec::new();
+    for (root, net) in groups(&mut g) {
+        if !net.pins.is_empty() {
+            index_of_root.insert(root, nets.len());
+            nets.push(net);
+        }
+    }
+    let wires = wire_nodes
+        .into_iter()
+        .filter_map(|(w, node)| index_of_root.get(&g.dsu.find(node)).map(|n| (w, *n)))
+        .collect();
+    (nets, wires)
+}
+
+/// The nets of [`nets_linked`] that carry more than one potential name (a short, such as L1
+/// joined to L2), together with such groups that touch no pin: wires that meet only each other
+/// at junctions still short their potentials, though they make no net of their own.
+pub fn shorted_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> Vec<Net> {
+    let (mut g, _) = linked_graph(project, role);
+    groups(&mut g).into_values().filter(|n| n.names.len() > 1).collect()
+}
+
+/// Every connected group of `g`, by its root: its pins and potential names.
+fn groups(g: &mut Graph) -> BTreeMap<usize, Net> {
+    let mut groups: BTreeMap<usize, Net> = BTreeMap::new();
+    for (node, id) in &g.ids {
+        let root = g.dsu.find(*id);
+        let net = groups.entry(root).or_default();
+        match node {
+            Node::Pin(p) => net.pins.push(p.clone()),
+            Node::Potential(n) => net.names.push(n.clone()),
+            Node::Point(..) | Node::Link(_) => {}
+        }
+    }
+    groups
+}
+
+/// Each wire's `from` node, by its place: ((page index, wire index), node).
+type WireNodes = Vec<((usize, usize), usize)>;
+
+/// The connection graph of [`wire_nets_by_place`], with each wire's `from` node by its place.
+fn linked_graph(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> (Graph, WireNodes) {
     let mut g = Graph::default();
-    let mut wire_nodes: Vec<((usize, usize), usize)> = Vec::new();
+    let mut wire_nodes: WireNodes = Vec::new();
     for (pi, page) in project.pages.iter().enumerate() {
         let from = g.add_wires(page);
         wire_nodes.extend(from.into_iter().enumerate().map(|(wi, a)| ((pi, wi), a)));
@@ -270,29 +314,7 @@ pub fn wire_nets_by_place(
             }
         }
     }
-    let mut groups: BTreeMap<usize, Net> = BTreeMap::new();
-    for (node, id) in &g.ids {
-        let root = g.dsu.find(*id);
-        let net = groups.entry(root).or_default();
-        match node {
-            Node::Pin(p) => net.pins.push(p.clone()),
-            Node::Potential(n) => net.names.push(n.clone()),
-            Node::Point(..) | Node::Link(_) => {}
-        }
-    }
-    let mut index_of_root: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut nets = Vec::new();
-    for (root, net) in groups {
-        if !net.pins.is_empty() {
-            index_of_root.insert(root, nets.len());
-            nets.push(net);
-        }
-    }
-    let wires = wire_nodes
-        .into_iter()
-        .filter_map(|(w, node)| index_of_root.get(&g.dsu.find(node)).map(|n| (w, *n)))
-        .collect();
-    (nets, wires)
+    (g, wire_nodes)
 }
 
 #[cfg(test)]
@@ -561,6 +583,30 @@ mod tests {
         assert!(nets.iter().filter(|n| n.pins.len() == 2).all(|n| n.names.is_empty()));
         let l1 = nets.iter().find(|n| n.pins.len() == 4);
         assert_eq!(l1.map(|n| n.names.clone()), Some(vec!["L1".to_owned()]));
+    }
+
+    #[test]
+    fn potentials_joined_only_by_wires_are_a_short() {
+        let mut p = Project::new("t");
+        let mut a = Page::new("a", "1", "");
+        let free = |x: f64| Endpoint::Point {
+            at: Point::new(x, 10.0),
+        };
+        // An L1 wire and an L2 wire meet at a junction; no device pin anywhere.
+        a.wires = vec![
+            wire("w1", free(0.0), free(10.0), Some("L1")),
+            wire("w2", free(10.0), free(20.0), Some("L2")),
+            wire("w3", free(30.0), free(40.0), Some("L3")),
+        ];
+        p.pages = vec![a];
+        assert!(nets(&p).is_empty(), "no pin, no net");
+        let shorts = shorted_nets(&p, |_| None);
+        assert_eq!(shorts.len(), 1, "{shorts:?}");
+        assert_eq!(shorts[0].names, ["L1", "L2"]);
+        assert!(shorts[0].pins.is_empty());
+        // With a pin on it, the short is the net itself.
+        p.pages[0].wires.push(wire("w4", free(20.0), pin("k1", "A1"), None));
+        assert_eq!(shorted_nets(&p, |_| None), nets(&p));
     }
 
     #[test]
