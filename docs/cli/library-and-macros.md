@@ -4,7 +4,10 @@ A short reference for `wiringcraft lib`, `macro`, `template`, `logo` and `transl
 examples. Every command takes `-C <dir>` (or `--project <dir>`) for the project folder; the
 default is the current folder. `wiringcraft <command> --help` gives the full option list.
 
-The examples start from a new project with the repository's `library/` folder as its source:
+The examples start from a new project with the repository's `library/` folder as its source.
+Run them from the folder that holds your `wiringcraft` checkout, so that `demo` is made beside it
+and `../wiringcraft/library` points at the library from inside `demo`. From anywhere else, give
+`lib add` the path to the checkout's `library/` folder instead:
 
 ```sh
 wiringcraft new demo
@@ -75,7 +78,7 @@ Git sources are cloned into a cache folder, `<cache>/git/<name>`, where `<cache>
 with an error when any source could not be synced.
 
 ```sh
-wiringcraft lib search button no
+wiringcraft lib search "button no"
 ```
 
 ```text
@@ -83,7 +86,8 @@ symbol  wc.button.no                     std          Push button, make
 part    example.ex-pb-grn-no             std          Example EX-PB-GRN-NO Push button green, 1 NO (example data)
 ```
 
-An item matches when it holds every word of the query, in any order and any case.
+An item matches when it holds every word of the query, in any order and any case. The query is
+one argument, so quote it when it has more than one word.
 
 ### Status and update
 
@@ -178,6 +182,11 @@ places them. Texts in a macro can hold placeholders, `{{name}}`, filled from a n
 
 The macro is written only when the result checks out (for example, every placeholder its texts
 use is declared).
+
+The example below needs a project macro named `feeder`. `macro edit` does not create one (it
+stops with `no macro "feeder"`), so first make it in the app: select the breaker on page `power`,
+use "Save as macro" and name it `feeder`. The commands then change that macro's
+description, placeholders and value sets.
 
 ```sh
 wiringcraft macro edit feeder --description "Breaker feeder" \
