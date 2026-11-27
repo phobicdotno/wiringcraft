@@ -669,14 +669,35 @@ pub fn location_list(i: &Inputs<'_>) -> Table {
     for tag in all_tags(i).iter().filter(|t| !t.location.is_empty()) {
         *count.entry(tag.location.join(".")).or_default() += 1;
     }
+    // One row per location as the project means it: a path stored as typed (`+L1`) is the
+    // same location as `L1`, so entries with one normal form share a row, where the first of
+    // them is, with the first description that is not empty. A path that is not a location
+    // keeps its row as stored, with the reason in the note.
+    let mut rows: Vec<(String, String, String)> = Vec::new();
     for l in &i.project.meta.locations {
-        let n = count.remove(&l.path).unwrap_or(0);
-        t.rows.push(vec![
-            format!("+{}", l.path),
-            l.description.clone(),
-            n.to_string(),
-            String::new(),
-        ]);
+        let (path, note) = match wc_core::project::location_path(&l.path) {
+            Ok(path) => (path, String::new()),
+            Err(why) => {
+                let raw = l.path.trim();
+                (raw.strip_prefix('+').unwrap_or(raw).to_owned(), why)
+            }
+        };
+        match rows
+            .iter_mut()
+            .find(|(p, n, _)| *p == path && n.is_empty() && note.is_empty())
+        {
+            Some((_, _, description)) if description.is_empty() => description.clone_from(&l.description),
+            Some(_) => {}
+            None => rows.push((path, note, l.description.clone())),
+        }
+    }
+    for (path, note, description) in rows {
+        let n = if note.is_empty() {
+            count.remove(&path).unwrap_or(0)
+        } else {
+            0
+        };
+        t.rows.push(vec![format!("+{path}"), description, n.to_string(), note]);
     }
     for (path, n) in count {
         t.rows.push(vec![
