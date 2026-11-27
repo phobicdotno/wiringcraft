@@ -576,6 +576,25 @@ impl Job {
         }
     }
 
+    /// A job named `name` that has not ended: it ends only when the sender gives its result or
+    /// is dropped. For tests of what the app shows while an import runs.
+    #[cfg(test)]
+    pub fn running(name: &str, dir: &Path) -> (Job, mpsc::Sender<(run::Res<()>, run::Log)>) {
+        let (tx, done) = mpsc::channel();
+        let job = Job {
+            kind: Kind::Eplan,
+            name: name.to_owned(),
+            dir: dir.to_path_buf(),
+            lib: None,
+            lib_before: None,
+            note: String::new(),
+            adopt: Adopt::Nothing,
+            lines: Default::default(),
+            done,
+        };
+        (job, tx)
+    }
+
     /// Wait for the worker to end and give its result.
     #[cfg(test)]
     pub fn wait(&self) -> (run::Res<()>, run::Log) {

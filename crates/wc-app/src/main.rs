@@ -435,6 +435,17 @@ const IMPORT_VIEW_CONTROLS: &[Action] = &[
     Action::Layers,
 ];
 
+/// Whether an import window view control ([`IMPORT_VIEW_CONTROLS`]) shows as on: the same
+/// state its toolbar button and menu item show, so the grid and dark theme read as on there too.
+fn import_view_control_on(a: Action, prefs: &Prefs, show_layers: bool) -> bool {
+    match a {
+        Action::ToggleGrid => prefs.show_grid,
+        Action::ToggleTheme => prefs.theme == theme::Mode::Dark,
+        Action::Layers => show_layers,
+        _ => false,
+    }
+}
+
 /// Make a new project's folder a repository with its first version.
 fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
     let git = wc_vcs::Git::new(dir);
@@ -1382,7 +1393,7 @@ impl App {
                 ui.weak("View:");
                 for a in IMPORT_VIEW_CONTROLS {
                     let info = a.info();
-                    let on = *a == Action::Layers && self.show_layers;
+                    let on = import_view_control_on(*a, &self.prefs, self.show_layers);
                     if ui.selectable_label(on, info.label).on_hover_text(info.tip).clicked() {
                         actions.push(*a);
                     }
@@ -8495,6 +8506,53 @@ mod nudge_tests {
         sent
     }
 
+    /// While an import runs, its window's Grid and Dark mode controls read as on when the grid
+    /// is shown and the theme is dark, as the toolbar and menu show them.
+    #[test]
+    fn the_import_window_shows_the_grid_and_dark_mode_as_they_are() {
+        let tab = egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for (grid, dark) in [(true, true), (false, false), (true, false), (false, true)] {
+            let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            app.prefs.show_grid = grid;
+            app.prefs.theme = if dark { theme::Mode::Dark } else { theme::Mode::Light };
+            theme::apply(&ctx, app.prefs.theme);
+            let (job, _running) = imports::Job::running("plan.edz", tmp.path());
+            app.importing = Some(Importing {
+                job,
+                kind: imports::Kind::Eplan,
+                file: tmp.path().join("plan.edz"),
+                lib: None,
+                target: None,
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            // Tab through the window's controls and read whether each shows as on.
+            let mut seen: std::collections::BTreeMap<String, bool> = Default::default();
+            for _ in 0..200 {
+                let out = app_frame_output(&mut app, &ctx, vec![tab.clone()], false);
+                for e in &out.platform_output.events {
+                    if let egui::output::OutputEvent::FocusGained(w) = e
+                        && let (Some(label), Some(on)) = (&w.label, w.selected)
+                    {
+                        seen.insert(label.clone(), on);
+                    }
+                }
+                if seen.contains_key("Grid") && seen.contains_key("Dark mode") {
+                    break;
+                }
+            }
+            assert!(app.importing.is_some(), "the import still runs");
+            assert_eq!(seen.get("Grid"), Some(&grid), "grid {grid}, dark {dark}: {seen:?}");
+            assert_eq!(seen.get("Dark mode"), Some(&dark), "grid {grid}, dark {dark}: {seen:?}");
+        }
+    }
+
     fn key(key: Key, modifiers: Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
@@ -10313,5 +10371,48 @@ mod import_folder_tests {
         assert_eq!(got.kind, "folder");
         assert_eq!(got.name, "vendor-2");
         assert_eq!(Path::new(&got.location), other.as_path());
+    }
+}
+
+#[cfg(test)]
+mod import_view_control_tests {
+    use super::*;
+
+    /// The import window's view controls read as on exactly when their toolbar buttons and menu
+    /// items do: a shown grid and the dark theme too, not only an open layer list.
+    #[test]
+    fn the_import_window_view_controls_show_the_state_the_menu_shows() {
+        let ed = Editor::default();
+        let clipboard = edit::Clipboard::default();
+        for (grid, dark, layers) in [
+            (false, false, false),
+            (true, true, true),
+            (true, false, false),
+            (false, true, true),
+        ] {
+            let prefs = Prefs {
+                show_grid: grid,
+                theme: if dark { theme::Mode::Dark } else { theme::Mode::Light },
+                ..Prefs::default()
+            };
+            let status = StatusView {
+                open: None,
+                ed: &ed,
+                prefs: &prefs,
+                clipboard: &clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: layers,
+                symbol_editor: None,
+            };
+            for a in IMPORT_VIEW_CONTROLS {
+                assert_eq!(
+                    import_view_control_on(*a, &prefs, layers),
+                    chrome::Status::active(&status, *a),
+                    "{a:?} with grid {grid}, dark {dark}, layers {layers}"
+                );
+            }
+        }
     }
 }
