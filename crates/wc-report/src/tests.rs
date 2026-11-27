@@ -1232,6 +1232,38 @@ fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
     );
 }
 
+#[test]
+fn check_warns_about_a_coil_or_contact_without_a_tag() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s10", "coil", 200.0, None));
+    p.pages[0].symbols.push(place("s11", "no", 230.0, None));
+    p.pages[0].symbols.push(place("s12", "lamp", 260.0, None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let untagged: Vec<(Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("has no tag"))
+        .map(|f| (f.item, f.message))
+        .collect();
+    assert_eq!(
+        untagged,
+        vec![
+            (
+                Some("s10".into()),
+                "coil has no tag, so it links nothing in cross-references".into()
+            ),
+            (
+                Some("s11".into()),
+                "contact has no tag, so it links nothing in cross-references".into()
+            ),
+        ],
+        "a lamp needs no tag to work; the tagged coil and contact are fine"
+    );
+}
+
 /// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
 fn caex_file_name(xml: &str) -> Option<String> {
     use quick_xml::events::Event;
