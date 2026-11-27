@@ -3292,6 +3292,10 @@ fn run(mut cli: Cli) -> Res<()> {
             let pg = page_mut(&mut p, &page)?;
             let from = parse_end(dir, pg, &from)?;
             let to = parse_end(dir, pg, &to)?;
+            // A wire from a pin or point to itself has no length, so refuse it as the app does.
+            if from == to {
+                return Err("a wire needs two different ends".into());
+            }
             let id = pg.next_id("w");
             pg.wires.push(Wire {
                 id: id.clone(),
@@ -7140,6 +7144,16 @@ mod tests {
             err,
             format!("symbol {s1} (-F1) on page p1 has no pin \"99\"; its pins are 1, 2")
         );
+        assert!(
+            load(&dir).unwrap().page("p1").unwrap().wires.is_empty(),
+            "nothing saved"
+        );
+
+        // A wire from a pin or a point to itself is refused, as in the app (#1308).
+        for end in [format!("{s1}:1"), "5,5".to_owned()] {
+            let err = cli(&dir, &["wire", "p1", &end, &end]).unwrap_err();
+            assert_eq!(err, "a wire needs two different ends");
+        }
         assert!(
             load(&dir).unwrap().page("p1").unwrap().wires.is_empty(),
             "nothing saved"
