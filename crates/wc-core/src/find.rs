@@ -241,7 +241,14 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
     }
     let shown = project.tag_index();
     // A device that no page draws is found by its tag here; a drawn one by its symbols above.
-    for tag in project.devices.keys().filter(|t| !shown.contains_key(*t)) {
+    // A cable that only wire cores name (no symbol, no device entry) is found here too.
+    let undrawn: std::collections::BTreeSet<&DeviceTag> = project
+        .devices
+        .keys()
+        .chain(core_cables(project))
+        .filter(|t| !shown.contains_key(*t))
+        .collect();
+    for tag in undrawn {
         let value = tag.to_string();
         if contains(&value, query, opts) {
             hits.push(Hit {
@@ -267,6 +274,14 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
         }
     }
     hits
+}
+
+/// The cables named by wire cores on any page.
+fn core_cables(project: &Project) -> impl Iterator<Item = &DeviceTag> {
+    project
+        .pages
+        .iter()
+        .flat_map(|p| p.wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)))
 }
 
 /// Replace `query` with `with` in the chosen `hits` (from [`find`] with the same query and
@@ -369,7 +384,9 @@ pub fn replace_renaming(
                     FindTarget::Symbol { page, id } => {
                         p.page(page).and_then(|pg| pg.symbol(id)).and_then(|s| s.tag.clone())
                     }
-                    FindTarget::Device { tag, .. } => p.devices.contains_key(tag).then(|| tag.clone()),
+                    FindTarget::Device { tag, .. } => {
+                        (p.devices.contains_key(tag) || core_cables(&p).any(|c| c == tag)).then(|| tag.clone())
+                    }
                     _ => None,
                 };
                 if tag.as_ref().map(ToString::to_string).as_deref() != Some(hit.value.as_str()) {
@@ -758,6 +775,41 @@ mod tests {
         // A drawn device is found by its symbols only, not once more as a device.
         assert!(
             find(&p, "K12", opts)
+                .iter()
+                .all(|h| matches!(h.target, FindTarget::Symbol { .. }))
+        );
+    }
+
+    #[test]
+    fn a_cable_only_wire_cores_name_is_found_and_renamed() {
+        let mut p = sample();
+        // -W1 has two cores drawn but no cable symbol and no device entry.
+        for (i, core) in ["1", "2"].into_iter().enumerate() {
+            if let Some(w) = p.pages.get_mut(i).and_then(|pg| pg.wires.first_mut()) {
+                w.cable = Some(crate::project::CableCore {
+                    cable: tag("-W1"),
+                    core: core.into(),
+                });
+            }
+        }
+        let opts = FindOptions { match_case: true };
+        let hits = find(&p, "-W1", opts);
+        assert_eq!(hits.len(), 1, "found once, not once per core: {hits:?}");
+        assert_eq!(hits[0].kind, FindKind::Tag);
+        assert_eq!(hits[0].target.page(), None);
+        assert_eq!(replace(&mut p, &hits, "-W1", "-W5", opts), Ok(1));
+        let cables: Vec<_> = p
+            .pages
+            .iter()
+            .flat_map(|pg| pg.wires.iter().filter_map(|w| w.cable.as_ref()))
+            .map(|c| (c.cable.to_string(), c.core.clone()))
+            .collect();
+        assert_eq!(cables, [("-W5".into(), "1".into()), ("-W5".into(), "2".into())]);
+        assert!(!p.devices.contains_key(&tag("-W5")), "no device entry is made up");
+        // A drawn cable is found by its symbol only.
+        p.pages[0].symbols[0].tag = Some(tag("-W5"));
+        assert!(
+            find(&p, "-W5", opts)
                 .iter()
                 .all(|h| matches!(h.target, FindTarget::Symbol { .. }))
         );
