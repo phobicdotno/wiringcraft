@@ -957,22 +957,28 @@ pub fn black_box_draft_refused(ps: &PanelState, ed: &Editor) -> bool {
     })
 }
 
+/// Whether the black box form shown holds a change [`apply_black_box_draft`] would apply: the
+/// box is still selected, the form was changed, and the box's symbol is still the one the
+/// form was read from.
+pub fn black_box_draft_applies(open: &Open, ps: &PanelState, ed: &Editor) -> bool {
+    ps.black_box.as_ref().is_some_and(|((page, id, hash), form)| {
+        black_box_form_shown(ed, *page, id)
+            && form.changed()
+            && open
+                .project
+                .pages
+                .get(*page)
+                .and_then(|p| p.symbol(id))
+                .and_then(|s| open.symbols.get(&s.symbol))
+                .is_some_and(|sym| &sym.hash() == hash)
+    })
+}
+
 /// Whether the black box form shown holds a change not in the project: one
 /// [`apply_black_box_draft`] would apply, or one it refused. Closing the window or opening
 /// another project asks about it as about other unsaved changes (#1024).
 pub fn black_box_draft_pending(open: &Open, ps: &PanelState, ed: &Editor) -> bool {
-    black_box_draft_refused(ps, ed)
-        || ps.black_box.as_ref().is_some_and(|((page, id, hash), form)| {
-            black_box_form_shown(ed, *page, id)
-                && form.changed()
-                && open
-                    .project
-                    .pages
-                    .get(*page)
-                    .and_then(|p| p.symbol(id))
-                    .and_then(|s| open.symbols.get(&s.symbol))
-                    .is_some_and(|sym| &sym.hash() == hash)
-        })
+    black_box_draft_refused(ps, ed) || black_box_draft_applies(open, ps, ed)
 }
 
 /// Apply the black box form shown in the Properties panel when it has changes not applied yet
@@ -982,22 +988,12 @@ pub fn black_box_draft_pending(open: &Open, ps: &PanelState, ed: &Editor) -> boo
 /// it again. Returns what to check after the change went in (`Ok(Some)`), or why it was refused
 /// (`Err`), which the form also shows.
 pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Result<Option<String>, String> {
-    let Some(((page, id, hash), form)) = ps.black_box.as_mut() else {
+    if !black_box_draft_applies(open, ps, ed) {
+        return Ok(None);
+    }
+    let Some(((page, id, _), form)) = ps.black_box.as_mut() else {
         return Ok(None);
     };
-    if !black_box_form_shown(ed, *page, id) {
-        return Ok(None);
-    }
-    let current = open
-        .project
-        .pages
-        .get(*page)
-        .and_then(|p| p.symbol(id))
-        .and_then(|s| open.symbols.get(&s.symbol))
-        .map(|sym| sym.hash());
-    if current.as_ref() != Some(hash) || !form.changed() {
-        return Ok(None);
-    }
     match apply_box_form(open, ed, form, *page, id) {
         Ok(warnings) => {
             ps.black_box = None;
@@ -2780,6 +2776,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
         });
         let steps = o.undo_steps();
+        assert!(!black_box_draft_applies(&o, &ps, &ed));
         assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert_eq!(o.undo_steps(), steps, "an unchanged form applies nothing");
         if let Some((_, f)) = ps.black_box.as_mut() {
@@ -2794,6 +2791,7 @@ mod tests {
             },
             Vec::new(),
         ));
+        assert!(black_box_draft_applies(&o, &ps, &ed));
         assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert!(ed.wire.is_none(), "the wire from the renamed point is dropped");
         assert_eq!(o.undo_steps(), steps + 1, "one undo step");
@@ -2827,10 +2825,12 @@ mod tests {
             f.rows[0].name = "B".into();
             f.error = None;
         }
+        assert!(!black_box_draft_applies(&o, &ps, &ed));
         assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert_eq!(o.undo_steps(), steps + 1, "a hidden form is not applied");
         assert!(ps.black_box.is_some(), "and is kept");
         ed.selection = vec![Selection::Symbol(id.clone())];
+        assert!(black_box_draft_applies(&o, &ps, &ed));
         assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert_eq!(o.undo_steps(), steps + 2, "applied once shown again");
         Ok(())

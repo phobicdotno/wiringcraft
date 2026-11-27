@@ -4745,8 +4745,18 @@ fn field_picker_start(field: &prefs::FolderField) -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What the next folder picker gives in a test, instead of showing the system's (#1092).
+    static PICKED_FOLDER: std::cell::Cell<Option<Picked>> = const { std::cell::Cell::new(None) };
+}
+
 /// The system's folder picker, opening in `start` when given.
 fn pick_folder_in(title: &str, start: Option<PathBuf>) -> Picked {
+    #[cfg(test)]
+    if let Some(p) = PICKED_FOLDER.take() {
+        return p;
+    }
     // On Linux rfd tries the desktop portal, then zenity; both are given their chance.
     let mut dialog = rfd::FileDialog::new().set_title(title);
     if let Some(d) = start {
@@ -7923,6 +7933,15 @@ mod nudge_tests {
         events: Vec<egui::Event>,
         close: bool,
     ) -> Vec<egui::ViewportCommand> {
+        let out = app_frame_output(app, ctx, events, close);
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// [`app_frame`], returning all the frame gave: what it painted too.
+    fn app_frame_output(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>, close: bool) -> egui::FullOutput {
         let mut frame = eframe::Frame::_new_kittest();
         let mut raw = egui::RawInput {
             events,
@@ -7935,11 +7954,40 @@ mod nudge_tests {
                 .events
                 .push(egui::ViewportEvent::Close);
         }
-        let out = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
-        out.viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .map(|v| v.commands.clone())
-            .unwrap_or_default()
+        ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame))
+    }
+
+    /// Click the button labelled `label` where the frame painted it (the topmost one, as in an
+    /// open dialog), as a person does: the pointer moves onto it, presses and lets go. Then one
+    /// more frame, for the work the click asked for. Returns the commands those frames sent to
+    /// the window.
+    fn click_button(app: &mut App, ctx: &egui::Context, label: &str) -> Vec<egui::ViewportCommand> {
+        // A window just opened is laid out unseen in its first frame: a second one shows it.
+        let Some(at) = (0..2).find_map(|_| {
+            let out = app_frame_output(app, ctx, Vec::new(), false);
+            out.shapes.iter().rev().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => Some(t.visual_bounding_rect().center()),
+                _ => None,
+            })
+        }) else {
+            unreachable!("no {label} button painted")
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let mut sent = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![button(true)],
+            vec![button(false)],
+            Vec::new(),
+        ] {
+            sent.extend(app_frame(app, ctx, events, false));
+        }
+        sent
     }
 
     /// An app with its coil moved one step: the project has unsaved changes.
@@ -7972,14 +8020,8 @@ mod nudge_tests {
                 matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
                 "{answer}: the person is asked"
             );
-            // The buttons close the dialog and run their work.
-            app.dialog = None;
-            match answer {
-                "Don't save" => app.leave(Leave::Close),
-                "Save" => app.save_and_leave(Leave::Close),
-                _ => {}
-            }
-            let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+            let sent = click_button(&mut app, &ctx, answer);
+            assert!(app.dialog.is_none(), "{answer}: the question is answered");
             assert_eq!(sent.contains(&Close), answer != "Cancel", "{answer}: the window closes");
             if answer != "Cancel" {
                 // The close request that makes is let through, without asking again.
@@ -8084,15 +8126,11 @@ mod nudge_tests {
             let mut prefs = Prefs::default();
             app.open_dir(&other, &mut prefs);
             assert_eq!(app.open.as_ref().unwrap().dir, first, "{answer}: not replaced yet");
-            let Some(Dialog::Unsaved(Leave::Open(asked))) = app.dialog.take() else {
-                unreachable!("{answer}: the person is asked")
-            };
-            match answer {
-                "Don't save" => app.leave(Leave::Open(asked)),
-                "Save" => app.save_and_leave(Leave::Open(asked)),
-                _ => {}
-            }
-            app_frame(&mut app, &ctx, Vec::new(), false);
+            assert!(
+                matches!(&app.dialog, Some(Dialog::Unsaved(Leave::Open(asked))) if *asked == other),
+                "{answer}: the person is asked"
+            );
+            click_button(&mut app, &ctx, answer);
             let open = app.open.as_ref().unwrap();
             let opened = answer != "Cancel";
             assert_eq!(open.dir != first, opened, "{answer}: the other project is open");
@@ -8355,13 +8393,8 @@ mod nudge_tests {
                 matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
                 "{answer}: the person is asked"
             );
-            app.dialog = None;
-            match answer {
-                "Don't save" => app.leave(Leave::Close),
-                "Save" => app.save_and_leave(Leave::Close),
-                _ => {}
-            }
-            let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+            let sent = click_button(&mut app, &ctx, answer);
+            assert!(app.dialog.is_none(), "{answer}: the question is answered");
             assert_eq!(sent.contains(&Close), answer != "Cancel", "{answer}: the window closes");
             if answer == "Cancel" {
                 let form = panels::black_box_form_mut(&mut app.panels).unwrap();
@@ -8396,15 +8429,11 @@ mod nudge_tests {
             let mut prefs = Prefs::default();
             app.open_dir(&other, &mut prefs);
             assert_eq!(app.open.as_ref().unwrap().dir, first, "{answer}: not replaced yet");
-            let Some(Dialog::Unsaved(Leave::Open(asked))) = app.dialog.take() else {
-                unreachable!("{answer}: the person is asked")
-            };
-            match answer {
-                "Don't save" => app.leave(Leave::Open(asked)),
-                "Save" | "Save refused" => app.save_and_leave(Leave::Open(asked)),
-                _ => {}
-            }
-            app_frame(&mut app, &ctx, Vec::new(), false);
+            assert!(
+                matches!(&app.dialog, Some(Dialog::Unsaved(Leave::Open(asked))) if *asked == other),
+                "{answer}: the person is asked"
+            );
+            click_button(&mut app, &ctx, answer.trim_end_matches(" refused"));
             let opened = matches!(answer, "Don't save" | "Save");
             assert_eq!(
                 app.open.as_ref().unwrap().dir != first,
@@ -8583,6 +8612,47 @@ mod nudge_tests {
         // The file dialog ran, or was cancelled: the pending Open is gone.
         app.pending = None;
         assert!(app.fetch_may_open(), "the fetch is taken up again");
+    }
+
+    /// The same through whole frames, with the folder picker answered by the test: a base
+    /// project fetched while Open waits for its folder picker is not opened in that frame; once
+    /// the picker is cancelled, the next frame opens it (#1092).
+    #[test]
+    fn a_fetched_project_opens_after_the_open_folder_picker_is_cancelled() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        // A first frame lays the window out, so the frames below each run their work once.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let was_open = app.open.as_ref().unwrap().dir.clone();
+        let new_dir = tmp.path().join("fetched");
+        wc_core::store::create(&new_dir, "Fetched").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        app.fetch = Some(BaseFetch {
+            dir: new_dir.clone(),
+            source: "https://example.invalid/base.git".into(),
+            was_open: Some(was_open.clone()),
+            made: false,
+            cancel: std::sync::Arc::default(),
+            done,
+        });
+        app.run(Action::Open);
+        assert!(matches!(app.pending, Some(Pending::Open)));
+        PICKED_FOLDER.set(Some(Picked::Cancelled));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(PICKED_FOLDER.take().is_none(), "the folder picker was shown");
+        assert!(app.pending.is_none(), "and cancelled");
+        assert!(app.fetch.is_some(), "the fetch waited");
+        assert_eq!(
+            app.open.as_ref().unwrap().dir,
+            was_open,
+            "not replaced while the picker waited"
+        );
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(app.fetch.is_none(), "the fetch is taken up");
+        assert_eq!(app.open.as_ref().unwrap().dir, new_dir, "the fetched project is open");
     }
 
     /// A close asked for while a field has the keyboard waits a frame for the typed value; a
