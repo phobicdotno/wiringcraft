@@ -114,8 +114,9 @@ Writes one file per page into a folder, drawn as in the PDF (frame, title block,
 cross-references), and one file per panel layout. Pages are named `<page number>.<format>` and
 panel layouts `panel-<name>.<format>`; characters that do not belong in a file name become `_`.
 `--format` is `svg` (the default) or `dxf`. Only SVG shows pictures placed on pages.
-`--page`, `--date` and `--lang` work as for `pdf`, and panel layouts are written whichever pages
-are chosen.
+`--date` and `--lang` work as for `pdf`. `--page` writes only the pages named, by id (repeat it
+for more than one), and no panel layouts; without it every page and every panel layout is
+written.
 
 ```
 $ wiringcraft drawing svg
@@ -123,6 +124,7 @@ wrote 4 svg file(s) to svg
 $ ls svg
 1.svg  2.svg  3.svg  panel-Cabinet_1.svg
 $ wiringcraft drawing dxf --format dxf --page p0003
+wrote 1 dxf file(s) to dxf
 ```
 
 ## aml
