@@ -894,20 +894,25 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
             "Type",
         ],
     );
-    let (_, net_of) = net_names(i);
+    // The net of each wire itself, so a wire between two junction points, which has no pin end,
+    // still shows its net's name.
+    let (nets, net_of) = connectivity::wire_nets_by_place(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let names: Vec<String> = nets
+        .iter()
+        .zip(auto_net_names(i, &nets))
+        .map(|(net, auto)| net.names.first().cloned().unwrap_or(auto))
+        .collect();
     // An overview (line diagram) draws connections again; the list shows each wire once.
-    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
-        for w in &page.wires {
+    for (pi, page) in i.project.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
             let end = |e: &Endpoint| match e {
                 Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
                 Endpoint::Point { at } => format!("junction {:.1},{:.1}", at.x, at.y),
             };
-            let potential = w.potential.clone().or_else(|| {
-                [&w.from, &w.to].into_iter().find_map(|e| match e {
-                    Endpoint::Pin { item, pin } => net_of.get(&(page.id.clone(), item.clone(), pin.clone())).cloned(),
-                    Endpoint::Point { .. } => None,
-                })
-            });
+            let potential = w
+                .potential
+                .clone()
+                .or_else(|| net_of.get(&(pi, wi)).and_then(|n| names.get(*n)).cloned());
             t.push_linked(
                 vec![
                     page.number.clone(),
