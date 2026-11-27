@@ -711,6 +711,16 @@ fn need_s<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
     s(v, key).ok_or_else(|| format!("`{key}` is missing."))
 }
 
+/// The report `text` names, as the assistant may write it: trimmed, in any case, with `_` for
+/// `-` (`plc_cards`). A miss names the reports there are, so the next try can pick one.
+fn report_kind(text: &str) -> Result<wc_report::Kind, String> {
+    let name = text.trim().to_lowercase().replace('_', "-");
+    wc_report::Kind::parse(&name).ok_or_else(|| {
+        let names: Vec<&str> = wc_report::Kind::ALL.iter().map(|k| k.name()).collect();
+        format!("Unknown report {text:?}: use one of {}.", names.join(", "))
+    })
+}
+
 fn need_num(v: &Value, key: &str) -> Result<f64, String> {
     num(v, key).ok_or_else(|| format!("`{key}` must be a number."))
 }
@@ -2085,7 +2095,7 @@ impl App {
                 Ok(clip_text(lines.join("\n"), 40_000))
             }
             "get_report" => {
-                let kind = wc_report::Kind::parse(need_s(v, "kind")?).ok_or("Unknown report.")?;
+                let kind = report_kind(need_s(v, "kind")?)?;
                 let open = need_open(self.open.as_mut())?;
                 let inputs = wc_report::Inputs {
                     project: &open.project,
@@ -3376,9 +3386,7 @@ impl App {
     fn tool_report_layouts(&mut self, v: &Value) -> Result<String, String> {
         use crate::report_layout_form::Form;
         let action = need_s(v, "action")?;
-        let kind = s(v, "kind")
-            .map(|k| wc_report::Kind::parse(k.trim()).ok_or_else(|| format!("Unknown report {k:?}.")))
-            .transpose()?;
+        let kind = s(v, "kind").map(report_kind).transpose()?;
         let open = need_open(self.open.as_mut())?;
         let builtin = |open: &crate::state::Open, kind| {
             let inputs = wc_report::Inputs {
@@ -9768,6 +9776,31 @@ mod tests {
             );
             call(&mut a, "get_report", json!({"kind": kind.name()})).unwrap();
         }
+    }
+
+    #[test]
+    fn report_kinds_read_as_the_assistant_writes_them() {
+        let (_tmp, mut a) = app(vec![]);
+        let want = call(&mut a, "get_report", json!({"kind": "plc-cards"})).unwrap();
+        for kind in ["plc_cards", " PLC-Cards ", "Plc_Cards"] {
+            assert_eq!(
+                call(&mut a, "get_report", json!({"kind": kind})).unwrap(),
+                want,
+                "{kind}"
+            );
+        }
+        let err = call(&mut a, "get_report", json!({"kind": "bom"})).unwrap_err();
+        assert!(
+            err.contains("\"bom\"") && err.contains("plc-cards") && err.contains("networks"),
+            "{err}"
+        );
+        let layout = call(&mut a, "report_layouts", json!({"action": "get", "kind": "plc_cards"})).unwrap();
+        assert_eq!(
+            layout,
+            call(&mut a, "report_layouts", json!({"action": "get", "kind": "plc-cards"})).unwrap()
+        );
+        let err = call(&mut a, "report_layouts", json!({"action": "get", "kind": "bom"})).unwrap_err();
+        assert!(err.contains("plc-cards"), "{err}");
     }
 
     #[test]
