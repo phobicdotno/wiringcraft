@@ -267,6 +267,55 @@ fn device_list_merges_symbols_of_one_device() {
 }
 
 #[test]
+fn device_list_pages_of_a_cable_include_the_pages_of_its_cores() {
+    let (mut p, s, parts) = fixture();
+    let core = |cable: &str| {
+        let Ok(cable) = DeviceTag::parse(cable) else {
+            unreachable!("tag {cable}")
+        };
+        Some(wc_core::CableCore {
+            cable,
+            core: "1".into(),
+        })
+    };
+    // -W9 is only the cable of a wire on page 2; -W7 also has a symbol on page 5.
+    for w in p.pages[0].wires.iter_mut() {
+        match w.id.as_str() {
+            "w2" => w.cable = core("-W9"),
+            "w3" => w.cable = core("-W7"),
+            _ => {}
+        }
+    }
+    let mut other = Page::new("p5", "5", "Cables");
+    other.symbols = vec![place("s30", "lamp", 10.0, Some("-W7"))];
+    p.pages.push(other);
+    // An overview draws -W9 again on page 9: that page is not one of the cable's.
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols = vec![
+        place("s20", "term", 10.0, Some("-X1.1")),
+        place("s21", "lamp", 40.0, Some("-P1")),
+    ];
+    let mut again = wire("w20", pin("s20", "2"), pin("s21", "X1"), None, None);
+    again.cable = core("-W9");
+    overview.wires.push(again);
+    p.pages.push(overview);
+    let t = device_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let pages = |tag: &str| {
+        let Some(row) = t.rows.iter().find(|r| r[0] == tag) else {
+            unreachable!("no row for {tag}")
+        };
+        row[4].clone()
+    };
+    assert_eq!(pages("-W9"), "2");
+    assert_eq!(pages("-W7"), "2, 5");
+}
+
+#[test]
 fn device_list_sorts_numbers_by_value() {
     let (mut p, s, parts) = fixture();
     p.pages[0].symbols.extend([
