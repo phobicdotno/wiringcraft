@@ -572,7 +572,8 @@ struct MarkingArgs {
 enum CommentCmd {
     /// Pin a comment on a page. Prints its id.
     Add {
-        /// The page's id or number.
+        /// The page's id or number. An id wins: when one page's number is another page's id,
+        /// the page with that id is taken, so give the id of the page you mean.
         page: String,
         /// The comment.
         text: String,
@@ -610,7 +611,8 @@ enum CommentCmd {
     },
     /// List the comments, of one page or all; open ones only unless --all.
     List {
-        /// Only this page's comments (the page's id or number).
+        /// Only this page's comments: the page's id or number. An id wins when one page's
+        /// number is another page's id.
         page: Option<String>,
         /// Resolved comments too.
         #[arg(long)]
