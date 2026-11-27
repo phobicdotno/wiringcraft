@@ -30,7 +30,9 @@ plate or down it.
 
 A new layout (`panel new`, or "Panel layout" in the app, 600 x 800 mm by default) starts with
 the usual arrangement: ducts around the edge, and the height split into rows of at least
-125 mm with a duct between rows and a rail in the middle of each row. You can add and remove
+125 mm with a duct between rows and a rail in the middle of each row. A plate lower than
+205 mm (two ducts and one row) or narrower than 120 mm starts empty, so add its rails and
+ducts yourself before arranging. You can add and remove
 rails and ducts afterwards, and change the plate size. A new size that would leave a rail, duct
 or device sticking out of the plate is refused.
 
@@ -65,7 +67,9 @@ A device's size on the plate comes from its part, in this order for each of widt
 2. the part's footprint drawing, a maker's DXF outline added with `import footprint-dxf`;
 3. the size of the part's 3D model, added with `import model-step`.
 
-A part with none of these is drawn as one 18 mm DIN module, 90 mm high, with a warning. When
+A part that does not give both a width and a height this way (for example one with only a
+`Width` property) is drawn as one 18 mm DIN module, 90 mm high, with a warning; a
+lone width or height is not used. When
 the part has a footprint drawing, the layout draws the maker's outline instead of a plain box.
 
 The size is stored in the layout when the device is placed. Placing the device again with
