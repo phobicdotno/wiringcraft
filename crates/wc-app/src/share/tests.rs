@@ -2465,18 +2465,25 @@ fn a_symbol_taken_from_the_session_is_offered_in_the_symbol_list() -> TestResult
     let mut open = project(&tmp.path().join("p"))?;
     open.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
     let coil = open.symbols.remove("wc.coil").ok_or("no coil")?;
-    open.library.retain(|(i, _)| i != "wc.coil");
+    open.library.retain(|e| e.id != "wc.coil");
     let offered = [("wc.coil".to_owned(), coil)].into_iter().collect();
     assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
     assert!(open.symbols.contains_key("wc.coil"));
-    assert!(open.library.iter().any(|(i, _)| i == "wc.coil"));
-    // A newer definition under the same id is listed by its new name.
+    let listed = |open: &Open| open.library.iter().find(|e| e.id == "wc.coil").cloned();
+    let entry = listed(&open).ok_or("not listed")?;
+    assert_eq!(entry.description, open.symbols["wc.coil"].description);
+    // A newer definition under the same id is listed by its new name and description.
     let mut renamed = open.symbols["wc.coil"].clone();
     renamed.name = "Coil B".into();
+    renamed.description = "Solenoid winding".into();
     open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = renamed.hash();
     let offered = [("wc.coil".to_owned(), renamed)].into_iter().collect();
     assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
-    assert!(open.library.iter().any(|(i, n)| i == "wc.coil" && n == "Coil B"));
+    let entry = listed(&open).ok_or("not listed")?;
+    assert_eq!(entry.name, "Coil B");
+    assert_eq!(entry.description, "Solenoid winding");
+    assert!(entry.matches("solenoid"));
+    assert_eq!(open.library.iter().filter(|e| e.id == "wc.coil").count(), 1);
     Ok(())
 }
 
@@ -6522,4 +6529,17 @@ fn a_refusal_that_comes_with_the_end_of_the_session_is_still_told() -> Result<()
     assert!(g.role.is_none(), "the session ended");
     assert!(g.take_refused_pages().contains("p0003"));
     Ok(())
+}
+
+/// A guest asking to join a host sharing a project in `tmp`, already let in: the guest's
+/// next frame that is not busy opens the joined copy (under `tmp`/guest). The host is
+/// returned too, to keep the session alive.
+pub(crate) fn let_in_guest(tmp: &Path) -> std::result::Result<(Share, Share), Box<dyn std::error::Error>> {
+    let mut host_open = project(&tmp.join("host"))?;
+    let (mut h, _) = host(&host_open);
+    let g = guest(&mut h, "Ola", &tmp.join("guest"));
+    h.frame(Some(&mut host_open), None, false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    Ok((h, g))
 }

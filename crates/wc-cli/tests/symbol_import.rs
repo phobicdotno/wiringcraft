@@ -102,6 +102,34 @@ fn symbol_svg_fails_with_a_message_on_a_missing_or_broken_file() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn symbol_svg_warns_about_a_path_that_stops_at_bad_data() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The second path's arc is cut short: its line is drawn, the arc is not.
+    let svg = SVG.replace("</svg>", r#"<path id="arm" d="M 0 0 L 1 0 A 5 5 0 0 1 10"/></svg>"#);
+    std::fs::write(tmp.path().join("arm.svg"), svg)?;
+    let (out, err) = run_ok(
+        tmp.path(),
+        &[
+            "import",
+            "symbol-svg",
+            "arm.svg",
+            "--id",
+            "my.arm",
+            "--name",
+            "Arm",
+            "--lib",
+            "lib",
+        ],
+    )?;
+    assert!(out.starts_with("wrote "), "{out}");
+    assert_eq!(pin_names(&symbol(&tmp.path().join("lib"), "my.arm")?), ["A1", "A2"]);
+    let want = "warning: path 1 (id \"arm\") is drawn only in part: stopped at command 3 (A): an arc is cut short \
+                after argument 6 (an arc takes 7)";
+    assert!(err.lines().any(|l| l == want), "{err}");
+    Ok(())
+}
+
 /// One DXF entity: its type and group code / value pairs.
 fn entity(kind: &str, codes: &[(u32, &str)]) -> String {
     let mut s = format!("0\n{kind}\n8\n0\n");
@@ -281,6 +309,20 @@ fn symbol_qet_writes_the_symbol_with_its_category_and_letter_code() -> TestResul
     assert_eq!(s.graphics.len(), 1, "{:?}", s.graphics);
     assert!(out.starts_with("NO contact -> "), "{out}");
     assert!(out.contains("qet.no_contact.json (2 pins, 1 shapes)"), "{out}");
+    Ok(())
+}
+
+#[test]
+fn symbol_qet_keeps_the_letter_code_from_the_label_without_the_option() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let labelled = QET.replace(
+        "<names>",
+        r#"<elementInformations><elementInformation name="label" show="1">-K1</elementInformation></elementInformations><names>"#,
+    );
+    std::fs::write(tmp.path().join("no_contact.elmt"), labelled)?;
+    run_ok(tmp.path(), &["import", "symbol-qet", "no_contact.elmt", "--lib", "lib"])?;
+    let s = symbol(&tmp.path().join("lib"), "qet.no_contact")?;
+    assert_eq!(s.letter_code, "K");
     Ok(())
 }
 

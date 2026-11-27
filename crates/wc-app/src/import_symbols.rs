@@ -173,8 +173,8 @@ fn read(file: &Path) -> Result<FileSymbols, String> {
         Some("svg") => {
             let text = read_text(file, MAX_LEN)?;
             let id = format!("svg.{}", stem(file));
-            let s = wc_import::svg::symbol(&text, &id, &display_name).map_err(|e| e.to_string())?;
-            Ok((vec![(s, display_name)], Vec::new()))
+            let (s, w) = wc_import::svg::symbol_with_warnings(&text, &id, &display_name).map_err(|e| e.to_string())?;
+            Ok((vec![(s, display_name)], w))
         }
         Some("kicad_sym") => {
             let text = read_text(file, MAX_LEN)?;

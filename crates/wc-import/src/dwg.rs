@@ -40,6 +40,96 @@ pub mod r2007;
 
 pub use objects::{Drawing, read_drawing};
 
+/// A DWG drawing as a page, as [`crate::dxf::page`] reads a DXF one: block references whose
+/// name matches a library symbol become placed symbols, the rest is drawn as graphics. The
+/// warnings also say what the DWG reader could not read (entities of kinds it does not decode,
+/// such as multi-line attributes, and damaged objects), so the page is never silently short.
+pub fn page(
+    bytes: &[u8],
+    scale: f64,
+    known_symbols: &std::collections::BTreeSet<String>,
+) -> Result<crate::dxf::ImportedPage> {
+    page_of(&read_sections(bytes)?, scale, known_symbols)
+}
+
+/// [`page`] for the sections [`read_sections`] read from a file.
+pub fn page_of(
+    sections: &Sections,
+    scale: f64,
+    known_symbols: &std::collections::BTreeSet<String>,
+) -> Result<crate::dxf::ImportedPage> {
+    page_drawing(sections)?.page(scale, known_symbols)
+}
+
+/// The entities of a DWG file's sections, read for [`PageDrawing::page`]. Fails when the file's
+/// object structure cannot be read (no object map, no objects section): a file the reader
+/// cannot read, which a converter may still turn into DXF.
+pub fn page_drawing(sections: &Sections) -> Result<PageDrawing> {
+    Ok(PageDrawing(objects::dxf_drawing(sections)?))
+}
+
+/// A DWG drawing read by [`page_drawing`], to be placed on a page.
+pub struct PageDrawing(objects::Read);
+
+impl PageDrawing {
+    /// The drawing as a page: see [`page`].
+    pub fn page(
+        &self,
+        scale: f64,
+        known_symbols: &std::collections::BTreeSet<String>,
+    ) -> Result<crate::dxf::ImportedPage> {
+        page_from(&self.0, scale, known_symbols)
+    }
+}
+
+fn page_from(
+    read: &objects::Read,
+    scale: f64,
+    known_symbols: &std::collections::BTreeSet<String>,
+) -> Result<crate::dxf::ImportedPage> {
+    // Checked first, so an error from the page below is about the drawing.
+    crate::dxf::check_scale(scale)?;
+    let mut notes = Vec::new();
+    let classes_damaged = read.skipped.contains_key(objects::CLASSES_DAMAGED);
+    let (classes_why, objects_why) = read.damage_reasons();
+    if classes_damaged {
+        notes.push(format!("{classes_why}; its custom entities are not counted"));
+    }
+    notes.extend(read.warnings.iter().cloned());
+    let mut skipped = read.skipped.clone();
+    skipped.remove(objects::CLASSES_DAMAGED);
+    // The objects' reasons come first, then those of the base points.
+    let damaged = skipped.remove(objects::DAMAGED);
+    let (object_why, base_why) = objects_why.split_at(damaged.unwrap_or(0).min(objects_why.len()));
+    if let Some(n) = damaged {
+        let first = object_why.first().map(String::as_str).unwrap_or("");
+        notes.push(format!(
+            "{n} object(s) could not be read and are not drawn, the first because of: {first}"
+        ));
+    }
+    if let Some(n) = skipped.remove(objects::BASE_UNREAD) {
+        let kind = objects::BASE_UNREAD;
+        match base_why.first() {
+            Some(first) => notes.push(format!("{n} {kind}, the first because of: {first}")),
+            None => notes.push(format!("{n} {kind}")),
+        }
+    }
+    for kind in [objects::UNRESOLVED_INSERT, objects::ORPHANS] {
+        if let Some(n) = skipped.remove(kind) {
+            notes.push(format!("{n} {kind}"));
+        }
+    }
+    notes.extend(crate::dxf::skipped_warnings(skipped));
+    // A drawing with nothing to draw says what could not be read, if anything.
+    let mut out = crate::dxf::page_of(&read.drawing, scale, known_symbols).map_err(|e| match e {
+        crate::Error::Format(why) if !notes.is_empty() => crate::Error::Format(format!("{why}: {}", notes.join("; "))),
+        e => e,
+    })?;
+    notes.append(&mut out.warnings);
+    out.warnings = notes;
+    Ok(out)
+}
+
 /// The most a single page may decompress to, in bytes.
 pub const MAX_PAGE: usize = 64 * 1024 * 1024;
 /// The most all sections of a file may hold in all, in bytes, so a small hostile file cannot
@@ -681,3 +771,63 @@ impl<T: AsRef<[u8]>> Reader<T> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod page_tests {
+    use super::objects::tests::{TestEntity as E, model_space_dwg};
+
+    /// A DWG page is read by the built-in reader, no converter needed (#600): its lines are
+    /// drawn, a block named like a library symbol is placed as that symbol, and what could
+    /// not be read is in the warnings.
+    #[test]
+    fn a_dwg_page_imports_with_the_built_in_reader() {
+        let bytes = model_space_dwg(&[E::Line((0.0, 0.0), (100.0, 0.0)), E::Insert((50.0, 20.0)), E::Damaged]);
+        let known: std::collections::BTreeSet<String> = ["frame".to_owned()].into();
+        let page = match super::page(&bytes, 1.0, &known) {
+            Ok(page) => page,
+            Err(e) => unreachable!("{e}"),
+        };
+        assert_eq!(page.symbols.len(), 1, "{page:?}");
+        assert_eq!(page.symbols[0].symbol, "frame");
+        assert!(!page.graphics.is_empty());
+        assert!(
+            page.warnings
+                .iter()
+                .any(|w| w.starts_with("1 object(s) could not be read")),
+            "{:?}",
+            page.warnings
+        );
+        // Not a symbol of the library: the block is drawn instead.
+        let page = match super::page(&bytes, 2.0, &Default::default()) {
+            Ok(page) => page,
+            Err(e) => unreachable!("{e}"),
+        };
+        assert!(page.symbols.is_empty());
+        assert!(page.graphics.len() >= 2);
+        assert!(super::page(&bytes, 0.0, &known).is_err());
+        // Nothing readable: the error says why the objects could not be read.
+        let err = super::page(&model_space_dwg(&[E::Damaged]), 1.0, &known)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("no entities") && e.contains("1 object(s) could not be read")),
+            "{err:?}"
+        );
+        assert!(super::page(b"not a drawing", 1.0, &known).is_err());
+    }
+
+    /// A file whose sections hold no object map is refused by [`super::page_drawing`], before
+    /// anything is placed: the CLI then tries a converter.
+    #[test]
+    fn a_drawing_without_its_object_map_is_refused_when_read() {
+        let bytes = model_space_dwg(&[E::Line((0.0, 0.0), (100.0, 0.0))]);
+        let mut sections = match super::read_sections(&bytes) {
+            Ok(sections) => sections,
+            Err(e) => unreachable!("{e}"),
+        };
+        sections.sections.retain(|s| s.name != "AcDb:Handles");
+        let err = super::page_drawing(&sections).err().map(|e| e.to_string());
+        assert!(err.as_deref().is_some_and(|e| e.contains("object map")), "{err:?}");
+    }
+}

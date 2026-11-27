@@ -25,28 +25,44 @@ impl DeviceTag {
         let mut tag = DeviceTag::default();
         let mut current: Option<char> = None;
         let mut buf = String::new();
+        // Errors quote the whole tag as typed, so they name what the user entered.
         let flush = |tag: &mut DeviceTag, aspect: Option<char>, buf: &mut String| -> Result<()> {
             let Some(a) = aspect else {
                 return if buf.is_empty() {
                     Ok(())
                 } else {
-                    Err(Error::Tag(buf.clone(), "must start with =, + or -"))
+                    Err(Error::Tag(s.into(), "must start with =, + or -"))
                 };
             };
+            let (target, why_unnamed, why_empty_level, why_twice) = match a {
+                '=' => (
+                    &mut tag.function,
+                    "the function aspect (=) has no name",
+                    "the function aspect (=) has an empty level",
+                    "the function aspect (=) is given twice",
+                ),
+                '+' => (
+                    &mut tag.location,
+                    "the location aspect (+) has no name",
+                    "the location aspect (+) has an empty level",
+                    "the location aspect (+) is given twice",
+                ),
+                _ => (
+                    &mut tag.product,
+                    "the product aspect (-) has no name",
+                    "the product aspect (-) has an empty level",
+                    "the product aspect (-) is given twice",
+                ),
+            };
             if buf.is_empty() {
-                return Err(Error::Tag(format!("{a}"), "aspect without a name"));
+                return Err(Error::Tag(s.into(), why_unnamed));
             }
             let levels: Vec<String> = buf.split('.').map(str::to_owned).collect();
             if levels.iter().any(|l| l.is_empty()) {
-                return Err(Error::Tag(buf.clone(), "empty level"));
+                return Err(Error::Tag(s.into(), why_empty_level));
             }
-            let target = match a {
-                '=' => &mut tag.function,
-                '+' => &mut tag.location,
-                _ => &mut tag.product,
-            };
             if !target.is_empty() {
-                return Err(Error::Tag(buf.clone(), "aspect given twice"));
+                return Err(Error::Tag(s.into(), why_twice));
             }
             *target = levels;
             buf.clear();
@@ -69,7 +85,6 @@ impl DeviceTag {
         Ok(tag)
     }
 
-    /// The letter code of the product aspect, e.g. `K` for `-K12`.
     /// A terminal's strip and number: `-X1.3` is terminal `3` of strip `-X1`. A tag with one
     /// product level (`-X1`) is the strip itself, without a number (one is given in drawing
     /// order). Every place that names a terminal's strip uses this, so they agree.
@@ -83,6 +98,9 @@ impl DeviceTag {
         (strip, number)
     }
 
+    /// The letter code of the product aspect: the leading letters of its last level, e.g. `K`
+    /// for `-K12` and `XD` for `-XD3`. Empty when that level starts with a digit (as the
+    /// terminal number in `-X1.3` does).
     pub fn letter_code(&self) -> String {
         self.product
             .last()
@@ -148,9 +166,34 @@ mod tests {
     }
 
     #[test]
+    fn letter_code_is_the_leading_letters_of_the_last_product_level() -> Result<()> {
+        assert_eq!(DeviceTag::parse("-K12")?.letter_code(), "K");
+        assert_eq!(DeviceTag::parse("=A+C1-XD3")?.letter_code(), "XD");
+        assert_eq!(DeviceTag::parse("-X1.3")?.letter_code(), "");
+        Ok(())
+    }
+
+    #[test]
     fn product_only() -> Result<()> {
         assert_eq!(DeviceTag::parse("-Q1")?.to_string(), "-Q1");
         Ok(())
+    }
+
+    #[test]
+    fn errors_quote_the_whole_tag_and_name_the_aspect() {
+        for (bad, why) in [
+            ("-K1-K2", "the product aspect (-) is given twice"),
+            ("=A+B=C-K1", "the function aspect (=) is given twice"),
+            ("-K1.", "the product aspect (-) has an empty level"),
+            ("+C1..R2-K1", "the location aspect (+) has an empty level"),
+            ("=-K1", "the function aspect (=) has no name"),
+            ("K1", "must start with =, + or -"),
+        ] {
+            let Err(e) = DeviceTag::parse(bad) else {
+                unreachable!("{bad} should fail");
+            };
+            assert_eq!(e.to_string(), format!("invalid device tag {bad:?}: {why}"));
+        }
     }
 
     #[test]
