@@ -1624,7 +1624,11 @@ impl App {
             }
             Action::Find => {
                 if self.open.is_some() {
-                    self.find.get_or_insert_with(Default::default);
+                    match self.find.as_mut() {
+                        // Already open: Ctrl+F again takes you back to its Find field.
+                        Some(find) => find.focus_query = true,
+                        None => self.find = Some(Default::default()),
+                    }
                 }
                 return;
             }
