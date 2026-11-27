@@ -2,9 +2,10 @@
 
 The desktop app keeps your own settings in one file, `prefs.toml`. It is yours, not the
 project's: nothing in it goes into a project folder, a commit or a shared session. The
-command line does not read it. One exception: when the variable that picks the settings folder
-(see below) is empty or a relative path, the folder is taken from the folder the app was started
-in, which can be a project folder. Make sure the first of `XDG_CONFIG_HOME`, `APPDATA` and `HOME`
+command line does not read it. One exception: the file goes wherever the variable that picks
+the settings folder (see below) points. A path inside a project puts it in that project, and so
+does an empty or relative value when the app is started in a project folder, since that value is
+read from the folder the app was started in. Make sure the first of `XDG_CONFIG_HOME`, `APPDATA` and `HOME`
 that is set holds a full path outside every project, or leave the first two unset.
 
 ## Where the file is
