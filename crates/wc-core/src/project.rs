@@ -85,6 +85,12 @@ pub struct ProjectMeta {
     /// ([`crate::network`]).
     #[serde(default, rename = "network", skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<crate::network::Network>,
+    /// The report pages the PDF export prints when none are asked for (`wiringcraft pdf`
+    /// without `--report`, the app's Export PDF), by report name (`parts`, `terminals`, or
+    /// `all`). `None` leaves the choice to the export (the CLI prints none, the app every
+    /// report that has rows); an empty list prints none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_reports: Option<Vec<String>>,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -865,6 +871,7 @@ impl ProjectMeta {
             rules_off: Vec::new(),
             racks: Vec::new(),
             networks: Vec::new(),
+            pdf_reports: None,
         }
     }
 

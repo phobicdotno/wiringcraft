@@ -381,6 +381,8 @@ enum Cmd {
         #[arg(long, default_value = "")]
         date: String,
         /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, or all.
+        /// Without it the project's own choice is printed (`pdf-reports`), if it has one;
+        /// `none` prints no report.
         #[arg(long = "report")]
         reports: Vec<String>,
         /// Print the project's texts in this language from `translations.toml`, such as `nb`,
@@ -388,6 +390,16 @@ enum Cmd {
         /// translation are printed as drawn and listed as warnings.
         #[arg(long)]
         lang: Option<String>,
+    },
+    /// The report pages `pdf` prints when no `--report` is given, kept in `project.toml`. With
+    /// no name it prints the choice; names (contents, parts, ..., `all`, or `none` for no
+    /// report) replace it; `--clear` removes it, so `pdf` prints only the reports it is asked for.
+    PdfReports {
+        /// The reports, in the order they are printed.
+        names: Vec<String>,
+        /// Remove the project's choice.
+        #[arg(long, conflicts_with = "names")]
+        clear: bool,
     },
     /// The project's translation dictionary (`translations.toml`): list the texts that have no
     /// translation into a language (exits with an error when any is missing, so it can guard a
@@ -4337,6 +4349,19 @@ fn run(mut cli: Cli) -> Res<()> {
         } => {
             let p = in_language(dir, load(dir)?, lang)?;
             check_pages(&p, &pages)?;
+            // No `--report`: the project's own choice, if it has one.
+            let chosen = reports.is_empty() && p.meta.pdf_reports.is_some();
+            let reports = match (&p.meta.pdf_reports, reports.is_empty()) {
+                (Some(names), true) => names.clone(),
+                _ => reports,
+            };
+            let reports = pdf_report_names(&reports).map_err(|e| {
+                if chosen {
+                    format!("{e} (in the project's pdf_reports; change it with `wiringcraft pdf-reports`)")
+                } else {
+                    e
+                }
+            })?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
@@ -4401,6 +4426,21 @@ fn run(mut cli: Cli) -> Res<()> {
                 eprintln!("warning: {}", escape_field(w));
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
+        }
+        Cmd::PdfReports { names, clear } => {
+            let mut p = load(dir)?;
+            if clear || !names.is_empty() {
+                let chosen = if clear { None } else { Some(pdf_report_names(&names)?) };
+                if p.meta.pdf_reports != chosen {
+                    p.meta.pdf_reports = chosen;
+                    save(dir, &p)?;
+                }
+            }
+            match &p.meta.pdf_reports {
+                None => println!("no reports chosen: `pdf` prints only those named with --report"),
+                Some(names) if names.is_empty() => println!("none"),
+                Some(names) => println!("{}", names.join(" ")),
+            }
         }
         Cmd::Translations { lang, edit } => {
             let lang = lang.ok_or("--lang is needed, such as --lang nb")?;
@@ -6514,6 +6554,32 @@ fn keep_lock_out_of_git(dir: &Path) {
             escape_field(&err.to_string())
         );
     }
+}
+
+/// `names` for `pdf --report` and `pdf-reports`: each checked, `all` kept as it is (it leaves
+/// out the PLC cards and networks of a project without them), the others by their own name;
+/// `none`, alone, is no report.
+fn pdf_report_names(names: &[String]) -> Result<Vec<String>, String> {
+    let names: Vec<&str> = names.iter().map(|n| n.trim()).collect();
+    if names.contains(&"none") {
+        return if names.iter().all(|n| *n == "none") {
+            Ok(Vec::new())
+        } else {
+            Err("`none` cannot be named with other reports".into())
+        };
+    }
+    let mut out: Vec<String> = Vec::new();
+    for n in names {
+        let name = if n == "all" {
+            "all".to_owned()
+        } else {
+            report_kinds(&[n.to_owned()])?[0].name().to_owned()
+        };
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out)
 }
 
 /// The reports `names` asks for, in order. A report named twice (or named besides `all`) is

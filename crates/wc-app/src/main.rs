@@ -74,6 +74,10 @@ enum Dialog {
         /// the locations are.
         revisions: Vec<state::RevisionRow>,
         loaded_revisions: Vec<state::RevisionRow>,
+        /// The reports Export PDF prints (`None`: every report), and as loaded; left alone on
+        /// OK while unchanged.
+        pdf_reports: Option<Vec<wc_report::Kind>>,
+        loaded_pdf_reports: Option<Vec<wc_report::Kind>>,
     },
     /// The cover page form: changes show on the page as they are typed; `since` is the undo
     /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
@@ -2150,6 +2154,18 @@ impl App {
                     locations,
                     revisions: state::RevisionRow::of(&open.project.meta.revisions),
                     loaded_revisions: state::RevisionRow::of(&open.project.meta.revisions),
+                    pdf_reports: open
+                        .project
+                        .meta
+                        .pdf_reports
+                        .as_ref()
+                        .map(|_| pdf_report_kinds(&open.project.meta)),
+                    loaded_pdf_reports: open
+                        .project
+                        .meta
+                        .pdf_reports
+                        .as_ref()
+                        .map(|_| pdf_report_kinds(&open.project.meta)),
                 });
             }
             Action::CoverPage => {
@@ -3198,6 +3214,8 @@ impl App {
                     loaded_locations,
                     revisions,
                     loaded_revisions,
+                    pdf_reports,
+                    loaded_pdf_reports,
                 } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
@@ -3288,6 +3306,31 @@ impl App {
                     if ui.button("Add revision").clicked() {
                         revisions.push(state::RevisionRow::default());
                     }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Reports in the PDF").strong());
+                    let mut choose = pdf_reports.is_some();
+                    if ui
+                        .checkbox(&mut choose, "Print only these reports (otherwise every report with rows)")
+                        .changed()
+                    {
+                        *pdf_reports = choose.then(|| wc_report::Kind::ALL.to_vec());
+                    }
+                    if let Some(chosen) = pdf_reports.as_mut() {
+                        ui.horizontal_wrapped(|ui| {
+                            for k in wc_report::Kind::ALL {
+                                let mut on = chosen.contains(&k);
+                                if ui.checkbox(&mut on, report_title(k)).changed() {
+                                    if on {
+                                        chosen.push(k);
+                                        // Printed in the usual order.
+                                        chosen.sort_by_key(|c| wc_report::Kind::ALL.iter().position(|a| a == c));
+                                    } else {
+                                        chosen.retain(|c| *c != k);
+                                    }
+                                }
+                            }
+                        });
+                    }
                     let rev_bad = self
                         .open
                         .as_ref()
@@ -3307,6 +3350,11 @@ impl App {
                             let l = (locations != loaded_locations).then(|| locations.clone());
                             let r = (revisions != loaded_revisions).then(|| revisions.clone());
                             let loaded = loaded_revisions.clone();
+                            let pdf = (pdf_reports != loaded_pdf_reports).then(|| {
+                                pdf_reports
+                                    .as_ref()
+                                    .map(|ks| ks.iter().map(|k| k.name().to_owned()).collect::<Vec<_>>())
+                            });
                             then = Some(Box::new(move |app: &mut App| {
                                 let Some(o) = app.open.as_mut() else {
                                     return;
@@ -3314,7 +3362,7 @@ impl App {
                                 // Checked again: a sync may have come in since the dialog was drawn.
                                 if let Some(why) = r.as_deref().and_then(|r| o.revision_draft_problem(&loaded, r)) {
                                     app.ed.message = why;
-                                } else if let Err(e) = o.set_project_props(&n, &f, l.as_deref(), r.as_deref()) {
+                                } else if let Err(e) = o.set_project_props_with(&n, &f, l.as_deref(), r.as_deref(), pdf) {
                                     app.ed.message = e;
                                 }
                             }));
@@ -5493,6 +5541,28 @@ fn run_check(open: &Open) -> Vec<wc_report::Finding> {
     )
 }
 
+/// The reports Export PDF prints: the project's choice (Project properties, or
+/// `wiringcraft pdf-reports`) in its order, else every report. A name the app does not know is
+/// passed over. Only reports with rows are printed.
+fn pdf_report_kinds(meta: &wc_core::project::ProjectMeta) -> Vec<wc_report::Kind> {
+    let Some(names) = &meta.pdf_reports else {
+        return wc_report::Kind::ALL.to_vec();
+    };
+    let mut out = Vec::new();
+    for n in names {
+        let kinds = match n.trim() {
+            "all" => wc_report::Kind::ALL.to_vec(),
+            n => wc_report::Kind::parse(n).into_iter().collect(),
+        };
+        for k in kinds {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
 fn report_title(k: wc_report::Kind) -> &'static str {
     match k {
         wc_report::Kind::Parts => "Parts",
@@ -5757,7 +5827,7 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
     };
     let pictures = wc_pdf::read_pictures(&open.dir, project);
     let options = wc_pdf::Options {
-        reports: wc_report::Kind::ALL
+        reports: pdf_report_kinds(&project.meta)
             .into_iter()
             .map(|k| wc_report::build(k, &inputs))
             .filter(|t| !t.rows.is_empty())
@@ -9786,6 +9856,38 @@ mod nudge_tests {
         let open = app.open.as_ref().unwrap();
         assert_eq!(open.dir, first, "not joined while the Open waits");
         assert!(open.dirty, "nothing was saved without asking");
+    }
+
+    /// Project properties' report choice: Export PDF prints those reports in their order,
+    /// every report without one, and the choice is one undo step (#1882).
+    #[test]
+    fn the_project_s_report_choice_picks_the_reports_export_pdf_prints() {
+        use wc_report::Kind;
+        let (_tmp, mut app, _ctx) = app(Point::new(55.0, 60.0), false);
+        let o = app.open.as_mut().unwrap();
+        assert_eq!(pdf_report_kinds(&o.project.meta), Kind::ALL.to_vec());
+        let before = o.project.clone();
+        let name = o.project.meta.name.clone();
+        let fields = form_fields(&o.project.meta.title_block);
+        let chosen = vec![
+            "terminals".to_owned(),
+            "parts".to_owned(),
+            "terminals".to_owned(),
+            "nonsense".to_owned(),
+        ];
+        o.set_project_props_with(&name, &fields, None, None, Some(Some(chosen)))
+            .unwrap();
+        assert_eq!(pdf_report_kinds(&o.project.meta), [Kind::Terminals, Kind::Parts]);
+        o.project.meta.pdf_reports = Some(vec!["all".into()]);
+        assert_eq!(pdf_report_kinds(&o.project.meta), Kind::ALL.to_vec());
+        o.project.meta.pdf_reports = Some(Vec::new());
+        assert!(pdf_report_kinds(&o.project.meta).is_empty());
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        // Left out, the choice stays as it is.
+        o.project.meta.pdf_reports = Some(vec!["parts".into()]);
+        o.set_project_props(&name, &fields, None, None).unwrap();
+        assert_eq!(o.project.meta.pdf_reports, Some(vec!["parts".into()]));
     }
 
     /// A project with nothing unsaved still does not close over a dialog holding work of its
