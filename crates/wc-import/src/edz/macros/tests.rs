@@ -730,6 +730,32 @@ fn a_variant_with_only_variant_as_points_leaves_the_overview_to_complete_the_sym
     Ok(())
 }
 
+/// Points taken from variant B or the overview keep their descriptions, matched to their
+/// designation's place (#1877).
+#[test]
+fn points_from_other_variants_keep_their_descriptions() -> TestResult {
+    let described = |text: String| -> std::result::Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        let s = read("plc.ema", &text)?.symbol;
+        Ok(s.pins.into_iter().map(|p| (p.name, p.description)).collect())
+    };
+    let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect()
+    };
+    // Variant B: 3 described, 4 not.
+    let text = split_module(true).replacen(r#"A185="3">"#, r#"A185="3" A186="Pump on">"#, 1);
+    assert_eq!(
+        described(text)?,
+        pairs(&[("1", ""), ("2", ""), ("3", "Pump on"), ("4", "")])
+    );
+    // The overview: descriptions in the order of its designations, one missing at the end.
+    let text = split_module(false).replace(r#"A185="1;2;3;4;5""#, r#"A185="1;2;3;4;5" A186="a;b;c;;""#);
+    assert_eq!(
+        described(text)?,
+        pairs(&[("1", ""), ("2", ""), ("3", "c"), ("4", ""), ("5", "")])
+    );
+    Ok(())
+}
+
 #[test]
 fn points_from_other_variants_count_toward_the_most_a_macro_may_hold() {
     let mut text = many_points(MAX_PINS).replace("</EplanPxfRoot>", "");

@@ -48,7 +48,7 @@
 //! each of its designations (pairs top and bottom), and category 502 is drawn as fuses. Variant A may hold only
 //! some of a device's terminals; named connection points that only the other multi-line
 //! variants hold (or, when none do, the overview) are added as pins in a column to the right of
-//! the drawing, facing right. What is left out is counted.
+//! the drawing, facing right, each with its description. What is left out is counted.
 //!
 //! Input is hostile: a damaged macro is an error, never a panic.
 
@@ -949,13 +949,13 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     };
     // The variants that gave a pin; they are not counted as left out.
     let mut givers: BTreeSet<usize> = BTreeSet::new();
-    for (row, (from, letter, number, name)) in extra.into_iter().enumerate() {
+    for (row, (from, letter, number, name, description)) in extra.into_iter().enumerate() {
         givers.insert(from);
         pins.push(Pin {
             name,
             at: Point::new(right, top + PIN_STEP * row as f64),
             dir: PinDir::Right,
-            ..Default::default()
+            description,
         });
         owners.push((letter, number));
         if pins.len() > MAX_PINS {
@@ -1087,16 +1087,17 @@ fn more_terminal_points(s: &mut Symbol, count: usize) {
     }
 }
 
+/// A connection point taken from another variant: the index of the variant in `all`, its
+/// device tag letter and counting number, its designation and its description (`A186`, empty
+/// when it has none).
+type OtherPoint = (usize, String, String, String, String);
+
 /// The named connection points of the macro's other multi-line variants, in variant order, as
-/// (index of the variant in `all`, device tag letter, counting number, designation). A variant
+/// [`OtherPoint`]s. A variant
 /// A may hold only some of a device's terminals (a PLC module with 1-10 in A and 11-20 in B).
 /// Only points not in `have` (variant A's) are taken, each once. When no other multi-line
 /// variant adds any, the overview representation's are taken, since it lists all of them.
-fn other_points<'a>(
-    all: &'a [Variant],
-    a: &Variant,
-    have: &BTreeSet<(String, String, String)>,
-) -> Vec<(usize, String, String, String)> {
+fn other_points<'a>(all: &'a [Variant], a: &Variant, have: &BTreeSet<(String, String, String)>) -> Vec<OtherPoint> {
     let named = |k: usize, v: &'a Variant| {
         v.placements
             .iter()
@@ -1105,8 +1106,13 @@ fn other_points<'a>(
                 p.pins
                     .iter()
                     .flatten()
-                    .filter(|n| !n.is_empty())
-                    .map(move |n| (k, p.letter.clone(), p.number.clone(), n.clone()))
+                    .enumerate()
+                    .filter(|(_, n)| !n.is_empty())
+                    .map(move |(i, n)| {
+                        // Descriptions are in the order of the designations, as in variant A.
+                        let text = p.descriptions.get(i).cloned().unwrap_or_default();
+                        (k, p.letter.clone(), p.number.clone(), n.clone(), text)
+                    })
             })
     };
     let mut others: Vec<(usize, &Variant)> = all
@@ -1124,9 +1130,9 @@ fn other_points<'a>(
         if o.doc == Some(OVERVIEW) && !points.is_empty() {
             break;
         }
-        for (k, letter, number, name) in named(k, o) {
+        for (k, letter, number, name, text) in named(k, o) {
             if seen.insert((letter.clone(), number.clone(), name.clone())) {
-                points.push((k, letter, number, name));
+                points.push((k, letter, number, name, text));
                 if points.len() > MAX_PINS {
                     return points;
                 }
