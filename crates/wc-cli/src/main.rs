@@ -804,7 +804,8 @@ enum MacroCmd {
     /// row's value set (over `--set`), and an empty cell leaves the value set's or default
     /// value. A macro that declares a placeholder `set` takes that column as the placeholder,
     /// and then `--set` alone picks the value set. A column `macro` names another macro for its
-    /// row (`--set` is then not used for that row). The copies go on new pages after the last
+    /// row (`--set` is then not used for that row), as does a `--rule` for a row that names none.
+    /// The copies go on new pages after the last
     /// one, left to right and row below row, each with the next free tags. Prints the new pages'
     /// ids and the number of copies.
     Generate {
@@ -822,6 +823,12 @@ enum MacroCmd {
         /// The new pages' size, as `page add --size` takes it.
         #[arg(long, default_value = "A3")]
         size: String,
+        /// A rule `column=value:macro`: a row whose `macro` cell is empty and whose column
+        /// holds the value (case ignored) places that macro; the first rule it matches wins.
+        /// Repeat it for more rules. A column only a rule reads is given to a macro with a
+        /// placeholder of its name only.
+        #[arg(long = "rule")]
+        rules: Vec<String>,
     },
     /// Show a macro: its description, placeholders (name, default, description), value sets,
     /// the placeholders its texts use, and a problem `edit` would refuse to save.
@@ -4037,9 +4044,15 @@ fn run(mut cli: Cli) -> Res<()> {
                     set,
                     title,
                     size,
+                    rules,
                 } => {
                     let path = find_macro(&found, &name)?.path.clone();
                     let size = PageSize::parse(&size)?;
+                    let rules = rules
+                        .iter()
+                        .map(|r| wc_core::generate::MacroRule::parse(r))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(e)?;
                     let m = wc_core::macros::read_macro(&path).map_err(e)?;
                     // Read before the project lock was taken (#658).
                     let bytes = match import_bytes.take() {
@@ -4049,7 +4062,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     // A row's `macro` column names another macro, found as the one named here.
                     let other = |n: &str| wc_core::macros::read_macro(&find_macro(&found, n)?.path).map_err(e);
                     let (copies, pages) =
-                        run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref(), other)?;
+                        run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref(), &rules, other)?;
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.

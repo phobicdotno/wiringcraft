@@ -809,7 +809,7 @@ pub fn macro_table_copies(
     name: &str,
     default_set: Option<&str>,
 ) -> Res<Vec<wc_core::macros::Macro>> {
-    macro_table(m, bytes, name, default_set, |other| {
+    macro_table(m, bytes, name, default_set, &[], |other| {
         Err(format!("no macro {other:?} to pick"))
     })
     .map(|(copies, _)| copies)
@@ -817,12 +817,14 @@ pub fn macro_table_copies(
 
 /// [`macro_table_copies`], with the page title each copy asks for (the table's `page`
 /// column), as [`wc_core::generate::generate_titled`] takes them. A row of the table's
-/// `macro` column places the macro `find` gives for its name instead of `m`.
+/// `macro` column places the macro `find` gives for its name instead of `m`, as does a row
+/// that names none and matches one of `rules`.
 pub fn macro_table(
     m: &wc_core::macros::Macro,
     bytes: &[u8],
     name: &str,
     default_set: Option<&str>,
+    rules: &[wc_core::generate::MacroRule],
     mut find: impl FnMut(&str) -> Res<wc_core::macros::Macro>,
 ) -> Res<(Vec<wc_core::macros::Macro>, Vec<Option<String>>)> {
     let shown = escape_field(name);
@@ -832,7 +834,7 @@ pub fn macro_table(
             "{shown}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed"
         ));
     }
-    let rows = wc_core::generate::rows_from_table(m, &rows.cells, &rows.numbers).map_err(e)?;
+    let rows = wc_core::generate::rows_from_table_ruled(m, &rows.cells, &rows.numbers, rules).map_err(e)?;
     let copies = wc_core::generate::apply_rows_with(m, &rows, default_set, |name| {
         find(name).map_err(wc_core::Error::Invalid)
     })
