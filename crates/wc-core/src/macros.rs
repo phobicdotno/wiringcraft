@@ -386,8 +386,10 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
 
 /// A macro of everything on page `page`: its symbols, its wires (their numbers cleared, as a
 /// placed wire is numbered afresh), its drawings and the device data of the tags its symbols
-/// carry, anchored at the page's top-left corner, so [`place`] at `(0, 0)` draws each item
-/// where it was. A page with nothing on it is refused, as no macro can be empty.
+/// carry and of the cables its wires are cores of, anchored at the page's top-left corner, so
+/// [`place`] at `(0, 0)` draws each item where it was. The `{{name}}` placeholders its texts
+/// use are declared, without defaults, so a placement fills them. A page with nothing on it is
+/// refused, as no macro can be empty, and so is one whose macro [`Macro::check`] refuses.
 pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -> Result<Macro> {
     let Some(p) = project.page(page) else {
         return Err(Error::Invalid(format!("no page {page}")));
@@ -401,9 +403,10 @@ pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -
         .symbols
         .iter()
         .filter_map(|s| s.tag.as_ref())
+        .chain(p.wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)))
         .filter_map(|t| project.devices.get(t).map(|d| (t.clone(), d.clone())))
         .collect();
-    Ok(Macro {
+    let mut m = Macro {
         name: name.trim().to_owned(),
         description: description.trim().to_owned(),
         symbols: p.symbols.clone(),
@@ -421,7 +424,17 @@ pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -
         anchor: Point::new(0.0, 0.0),
         placeholders: Vec::new(),
         value_sets: Vec::new(),
-    })
+    };
+    m.placeholders = m
+        .used_placeholders()
+        .into_iter()
+        .map(|name| Placeholder {
+            name,
+            ..Default::default()
+        })
+        .collect();
+    m.check()?;
+    Ok(m)
 }
 
 /// How placeholder and value set names are compared: trimmed, without regard to case.
@@ -987,6 +1000,42 @@ mod tests {
             p.pages[1].symbols[0].tag.as_ref().map(ToString::to_string).as_deref(),
             Some("-Q2")
         );
+        // The device data of a cable only a wire names is kept; a placeholder a text uses is
+        // declared, so the macro places with a value for it.
+        let w1 = DeviceTag::parse("-W1")?;
+        p.devices.insert(
+            w1.clone(),
+            Device {
+                description: "Feed cable".into(),
+                ..Default::default()
+            },
+        );
+        p.pages[0].wires[0].cable = Some(crate::project::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+        p.pages[0].graphics.push(Shape::Text {
+            at: Point::new(10.0, 10.0),
+            text: "{{voltage}} V".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let saved = from_page(&p, "p1", "Fed", "")?;
+        assert_eq!(saved.devices[&w1].description, "Feed cable");
+        let names: Vec<&str> = saved.placeholders.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["voltage"]);
+        let values = BTreeMap::from([("voltage".to_owned(), "24".to_owned())]);
+        assert!(saved.apply(None, &values).is_ok());
+        // A text whose braces are not closed makes no macro.
+        p.pages[0].graphics.push(Shape::Text {
+            at: Point::new(10.0, 20.0),
+            text: "{{open".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        assert!(from_page(&p, "p1", "Open", "").is_err());
         // An empty page and a missing one are refused.
         p.pages.push(crate::project::Page::new("p3", "3", "Empty"));
         assert_eq!(
