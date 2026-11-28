@@ -384,6 +384,46 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
     Ok(placed.symbols.into_iter().chain(placed.wires).collect())
 }
 
+/// A macro of everything on page `page`: its symbols, its wires (their numbers cleared, as a
+/// placed wire is numbered afresh), its drawings and the device data of the tags its symbols
+/// carry, anchored at the page's top-left corner, so [`place`] at `(0, 0)` draws each item
+/// where it was. A page with nothing on it is refused, as no macro can be empty.
+pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -> Result<Macro> {
+    let Some(p) = project.page(page) else {
+        return Err(Error::Invalid(format!("no page {page}")));
+    };
+    if p.symbols.is_empty() && p.wires.is_empty() && p.graphics.is_empty() {
+        return Err(Error::Invalid(format!(
+            "page {page} has no symbols, wires or drawings to make a macro of"
+        )));
+    }
+    let devices = p
+        .symbols
+        .iter()
+        .filter_map(|s| s.tag.as_ref())
+        .filter_map(|t| project.devices.get(t).map(|d| (t.clone(), d.clone())))
+        .collect();
+    Ok(Macro {
+        name: name.trim().to_owned(),
+        description: description.trim().to_owned(),
+        symbols: p.symbols.clone(),
+        wires: p
+            .wires
+            .iter()
+            .cloned()
+            .map(|mut w| {
+                w.number = None;
+                w
+            })
+            .collect(),
+        graphics: p.graphics.clone(),
+        devices,
+        anchor: Point::new(0.0, 0.0),
+        placeholders: Vec::new(),
+        value_sets: Vec::new(),
+    })
+}
+
 /// How placeholder and value set names are compared: trimmed, without regard to case.
 pub fn key(name: &str) -> String {
     name.trim().to_lowercase()
@@ -917,6 +957,43 @@ mod tests {
         assert!(err_of(write_macro_file(&path, &broken)).contains("{{power}} is used"));
         assert_eq!(read_macro(&path)?, m, "an unchecked macro is not written");
         assert!(write_macro_file(&tmp.path().join("starter.json"), &m).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_becomes_a_macro_that_places_its_items_where_they_were() -> Result<()> {
+        let m = starter()?.apply(Some("3 kW"), &BTreeMap::new())?;
+        let mut p = Project::new("x");
+        p.pages.push(crate::project::Page::new("p1", "1", "Motors"));
+        place(&mut p, "p1", &m, Point::new(50.0, 60.0))?;
+        p.pages[0].wires[0].number = Some("12".into());
+        let saved = from_page(&p, "p1", " Starter page ", " A whole page ")?;
+        assert_eq!(
+            (saved.name.as_str(), saved.description.as_str()),
+            ("Starter page", "A whole page")
+        );
+        assert_eq!(saved.anchor, Point::new(0.0, 0.0));
+        assert_eq!(saved.wires[0].number, None, "a placed wire is numbered afresh");
+        let tag = DeviceTag::parse("-Q1")?;
+        assert_eq!(saved.devices[&tag].description, "Motor starter 3 kW");
+        // Placed at the corner of another page, each item is where it was, with a new tag.
+        p.pages.push(crate::project::Page::new("p2", "2", "Copy"));
+        place(&mut p, "p2", &saved, Point::new(0.0, 0.0))?;
+        let at = |i: usize| -> Vec<Point> { p.pages[i].symbols.iter().map(|s| s.at).collect() };
+        assert_eq!(at(0), at(1));
+        let graphics = |i: usize| p.pages[i].graphics.clone();
+        assert_eq!(graphics(0), graphics(1));
+        assert_eq!(
+            p.pages[1].symbols[0].tag.as_ref().map(ToString::to_string).as_deref(),
+            Some("-Q2")
+        );
+        // An empty page and a missing one are refused.
+        p.pages.push(crate::project::Page::new("p3", "3", "Empty"));
+        assert_eq!(
+            err_of(from_page(&p, "p3", "x", "")),
+            "page p3 has no symbols, wires or drawings to make a macro of"
+        );
+        assert!(err_of(from_page(&p, "p9", "x", "")).contains("no page p9"));
         Ok(())
     }
 
