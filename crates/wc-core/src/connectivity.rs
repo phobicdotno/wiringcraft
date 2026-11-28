@@ -447,6 +447,7 @@ mod tests {
                     name: (*n).into(),
                     at: *at,
                     dir: Default::default(),
+                    ..Default::default()
                 })
                 .collect(),
             tag_at: Point::default(),

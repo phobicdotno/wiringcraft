@@ -1442,6 +1442,7 @@ fn box_symbol(block: &str, origin: Point, corner: Option<Point>, pins: &[(String
             name: n,
             at: local,
             dir,
+            ..Default::default()
         });
     }
     let mut graphics = vec![Shape::Rect { min, max }];

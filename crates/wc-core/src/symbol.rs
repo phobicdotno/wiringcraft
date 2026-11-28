@@ -16,13 +16,16 @@ pub enum PinDir {
     Right,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Pin {
     /// Connection designation printed next to the pin, e.g. `13`, `A1`, `L1`.
     pub name: String,
     pub at: Point,
     #[serde(default)]
     pub dir: PinDir,
+    /// The connection point's description, e.g. `Coil +`, as the maker's symbol gives it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 /// What a symbol stands for, used for cross-references between coil and contacts.
@@ -203,6 +206,7 @@ pub fn black_box(id: &str, name: &str, width: f64, height: f64, pins: &[BoxPin])
             name: pin_name.to_owned(),
             at,
             dir,
+            ..Default::default()
         });
     }
     Ok(Symbol {
@@ -340,5 +344,58 @@ mod black_box_tests {
         assert_eq!(BoxSide::parse("Left"), Some(BoxSide::Left));
         assert_eq!(BoxSide::parse("b"), Some(BoxSide::Bottom));
         assert_eq!(BoxSide::parse("middle"), None);
+    }
+}
+
+#[cfg(test)]
+mod pin_description_tests {
+    use super::*;
+
+    const CONTACT: &str = include_str!("../../../library/symbols/wc.contact.no.json");
+
+    /// Projects pin a symbol by its hash in their lock file: a symbol without pin descriptions
+    /// keeps the hash and the file text it had before pins could carry one (#513).
+    #[test]
+    fn a_symbol_without_pin_descriptions_keeps_its_hash_and_text() -> crate::Result<()> {
+        let text = CONTACT.replace("\r\n", "\n");
+        let s: Symbol = serde_json::from_str(&text).map_err(|e| crate::Error::Invalid(e.to_string()))?;
+        assert_eq!(s.hash(), "sha256:27f281d6636f05ee");
+        assert_eq!(crate::store::to_json(&s)?, text);
+        let made = black_box(
+            "box.a1",
+            "-A1",
+            40.0,
+            20.0,
+            &[BoxPin {
+                name: "1".into(),
+                side: BoxSide::Left,
+                offset: 5.0,
+            }],
+        )?;
+        assert_eq!(made.hash(), "sha256:38d214109414cc14");
+        Ok(())
+    }
+
+    #[test]
+    fn a_pin_description_is_written_read_back_and_part_of_the_hash() -> crate::Result<()> {
+        let text = CONTACT.replace("\r\n", "\n");
+        let plain: Symbol = serde_json::from_str(&text).map_err(|e| crate::Error::Invalid(e.to_string()))?;
+        assert!(plain.pins.iter().all(|p| p.description.is_empty()));
+        let mut s = plain.clone();
+        if let Some(p) = s.pins.first_mut() {
+            p.description = "Coil +".into();
+        }
+        let json = crate::store::to_json(&s)?;
+        assert_eq!(json.matches("\"description\": \"Coil +\"").count(), 1, "{json}");
+        // The other pin has no description: its object has no such key.
+        assert_eq!(
+            json.matches("\"description\"").count(),
+            2,
+            "the symbol's and one pin's: {json}"
+        );
+        let back: Symbol = serde_json::from_str(&json).map_err(|e| crate::Error::Invalid(e.to_string()))?;
+        assert_eq!(back, s);
+        assert_ne!(s.hash(), plain.hash());
+        Ok(())
     }
 }

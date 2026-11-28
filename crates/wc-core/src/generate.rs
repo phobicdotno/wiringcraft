@@ -756,6 +756,7 @@ mod tests {
                 name: "1".into(),
                 at: Point::new(400.0, 0.0),
                 dir: Default::default(),
+                ..Default::default()
             }],
             name: "Coil".into(),
             category: String::new(),

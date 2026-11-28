@@ -1170,6 +1170,7 @@ mod tests {
                 name: "X1".into(),
                 at: Point::new(0.0, 0.0),
                 dir: PinDir::Down,
+                ..Default::default()
             }],
             tag_at: Point::default(),
             description: String::new(),

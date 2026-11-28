@@ -139,6 +139,7 @@ pub(crate) fn make_symbol(
             name,
             at: fix(*at),
             dir,
+            ..Default::default()
         });
     }
     Ok(wc_core::Symbol {

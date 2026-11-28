@@ -117,6 +117,7 @@ mod tests {
             name: name.into(),
             at: Point::new(0.0, y),
             dir: PinDir::Up,
+            ..Default::default()
         };
         Symbol {
             id: "coil".into(),
@@ -169,6 +170,7 @@ mod tests {
             name: "A3".into(),
             at: Point::new(5.0, 10.0),
             dir: PinDir::Down,
+            ..Default::default()
         });
         new.graphics.push(Shape::Line {
             a: Point::new(-2.0, 5.0),
@@ -327,6 +329,7 @@ mod tests {
             name: "X".into(),
             at: Point::new(0.0, 0.0),
             dir: PinDir::Up,
+            ..Default::default()
         }];
         assert_eq!(
             diff_symbols(&old, &new),

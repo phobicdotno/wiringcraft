@@ -144,6 +144,7 @@ fn pin(name: &str, x: f64, y: f64, dir: PinDir) -> Pin {
         name: name.to_owned(),
         at: Point::new(x, y),
         dir,
+        ..Default::default()
     }
 }
 

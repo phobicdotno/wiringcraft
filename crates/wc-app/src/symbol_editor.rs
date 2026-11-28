@@ -566,6 +566,7 @@ impl SymbolEditor {
                     name: name.clone(),
                     at: p,
                     dir,
+                    ..Default::default()
                 });
                 self.selected = Some(Item::Pin(self.symbol.pins.len() - 1));
                 self.pin_name = next_name(&name);

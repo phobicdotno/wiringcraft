@@ -3491,6 +3491,7 @@ fn coil_with(pins: &[&str]) -> wc_core::Symbol {
             name: (*n).into(),
             at: Point::default(),
             dir: Default::default(),
+            ..Default::default()
         })
         .collect();
     s

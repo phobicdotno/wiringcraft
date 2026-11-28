@@ -1708,6 +1708,7 @@ fn lib_coil(id: &str, a2_at: f64) -> Symbol {
         name: name.into(),
         at: Point::new(0.0, y),
         dir,
+        ..Default::default()
     };
     Symbol {
         source: String::new(),
@@ -2127,6 +2128,7 @@ fn a_mirrored_block_fits_the_library_symbol_mirrored() {
         name: "X".into(),
         at: Point::new(-3.0, -5.0),
         dir: PinDir::Up,
+        ..Default::default()
     });
     let (built, _, _) = build_with(&read(&c).unwrap(), None, &choice(&[coil], &[("Coil", "my.coil")]));
     let k1 = page(&built, "01").symbols.iter().find(|s| s.id == "s1").unwrap();

@@ -2947,6 +2947,7 @@ mod tests {
                     name: (*name).into(),
                     at: wc_core::geom::Point::new(0.0, f64::from(k) * 10.0),
                     dir: Default::default(),
+                    ..Default::default()
                 })
                 .collect(),
             tag_at: Default::default(),
