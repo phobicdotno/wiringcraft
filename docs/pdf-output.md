@@ -43,7 +43,9 @@ whatever `--report` or the project's report choice says. A report page is printe
 its report is not chosen, since it is one of the pages; a PDF made with `--page` that leaves
 the report page out leaves its report out too. The sheets use the report sheet size, not the
 page's own. What is drawn on a report page is not printed, with a warning. The cover page
-cannot be a report page, and a page with symbols or wires is refused (move them first).
+cannot be a report page, and a page with symbols or wires is refused (move them first); symbols
+and wires are refused on a report page. A page whose report name (edited by hand) is no report
+prints as a normal page, with a warning.
 A report page holding the table of contents lists the sheets after the pages as the front one
 does. Topology pages and PLC card sheets still follow the pages when their report is on a
 report page.
