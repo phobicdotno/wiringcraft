@@ -595,7 +595,72 @@ pub struct Generated {
     pub macros: Vec<(String, usize)>,
     /// How many wires [`generate_joined`] drew between copies side by side.
     pub joins: usize,
+    /// How many rails [`generate_joined`] carried on over a row or page break, each with a
+    /// pair of interruption points ([`BREAK_SYMBOL`]).
+    pub breaks: usize,
 }
+
+/// The library symbol [`generate_joined`] places where a rail goes on over a row or page
+/// break: callers that join copies take it into the project with the macro's symbols.
+pub const BREAK_SYMBOL: &str = "wc.interruption";
+
+/// The room in mm [`generate_joined`] keeps free at each side of the drawing area beyond
+/// [`INSET`], for the interruption points at a break and their tags.
+pub const BREAK_ROOM: f64 = 10.0;
+
+/// A macro holding only a [`BREAK_SYMBOL`], for a caller that takes the symbols of a list of
+/// macros into the project: listed with the copies, it takes the break symbol too.
+pub fn break_macro() -> Macro {
+    Macro {
+        name: "Interruption point".into(),
+        symbols: vec![crate::project::PlacedSymbol {
+            id: "s1".into(),
+            symbol: BREAK_SYMBOL.into(),
+            at: Point::default(),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        }],
+        ..Default::default()
+    }
+}
+
+/// Put an interruption point tagged `tag` on the free wire end at `at` on `sheet`, turned so
+/// its arrow points `right` (away from a copy's right edge) or left, and end the wires there
+/// on its pin.
+fn put_break(sheet: &mut Page, at: Point, tag: &crate::DeviceTag, right: bool) {
+    let id = sheet.next_id("s");
+    for w in &mut sheet.wires {
+        for e in [&mut w.from, &mut w.to] {
+            if let Endpoint::Point { at: p } = e
+                && p.distance(at) < 1e-6
+            {
+                *e = Endpoint::Pin {
+                    item: id.clone(),
+                    pin: "1".into(),
+                };
+            }
+        }
+    }
+    // The symbol's arrow hangs down from its pin: a quarter turn the other way points it right.
+    let rotation = if right {
+        crate::geom::Rotation::R270
+    } else {
+        crate::geom::Rotation::R90
+    };
+    sheet.symbols.push(crate::project::PlacedSymbol {
+        id,
+        symbol: BREAK_SYMBOL.into(),
+        at,
+        rotation,
+        mirror: false,
+        tag: Some(tag.clone()),
+    });
+}
+
+/// A free wire end on a copy's right edge, on the page, and how far it lies below the copy's
+/// place.
+type RailEnd = (Point, f64);
 
 /// The free wire ends of `m` on its left and on its right edge: the ends on no pin that lie
 /// furthest left and furthest right of them all, where a rail a copy draws runs on into the
@@ -699,7 +764,11 @@ pub fn generate_titled(
 /// [`generate_titled`], with `join` drawing a wire between two copies side by side on a page
 /// row for each free wire end on the right edge of the first (its free ends furthest right) that has one at the
 /// same height on the left edge of the second: rails (L1, L2, L3, N, PE) a macro draws run on
-/// through the row. Copies on different rows or pages are not joined.
+/// through the row. Where the next copy starts a new row or page, each such pair of ends (at
+/// the same height in their copies) gets a pair of interruption points ([`BREAK_SYMBOL`]) with
+/// one tag per rail, `-JOIN1`, `-JOIN2`, ... (the first the project does not use), so the rail
+/// goes on there. The break symbol must be in the project when copies are joined; joined
+/// copies keep [`BREAK_ROOM`] more free at both sides of the page.
 pub fn generate_joined(
     project: &mut Project,
     copies: &[Macro],
@@ -714,8 +783,10 @@ pub fn generate_joined(
     };
     let (w, h) = size.mm();
     let band = project.meta.template.band_height();
-    let (x0, y0) = (FRAME_MARGIN + INSET, FRAME_MARGIN + INSET);
-    let (x1, y1) = (w - FRAME_MARGIN - INSET, h - FRAME_MARGIN - band - INSET);
+    // Joined copies keep room at the sides for the interruption points and their tags.
+    let side = if join { INSET + BREAK_ROOM } else { INSET };
+    let (x0, y0) = (FRAME_MARGIN + side, FRAME_MARGIN + INSET);
+    let (x1, y1) = (w - FRAME_MARGIN - side, h - FRAME_MARGIN - band - INSET);
     let area = (x1 - x0, y1 - y0);
     let too_large = |(min, max): (Point, Point), name: &str, which: String| {
         Error::Invalid(format!(
@@ -786,8 +857,18 @@ pub fn generate_joined(
     let mut page_id = String::new();
     let mut page_title = title;
     let mut slot = 0;
-    // The copy before: its page, its page row and its right edge's free ends on the page.
-    let mut before: Option<(String, usize, Vec<Point>)> = None;
+    // The copy before: its page, its page row, its right edge's free ends on the page and how
+    // far each lies below that copy's place.
+    let mut before: Option<(String, usize, Vec<RailEnd>)> = None;
+    // The tags already used, and the break tag of each rail by its height in its copy.
+    let mut used: BTreeSet<String> = work.devices.keys().map(|t| t.to_string()).collect();
+    used.extend(
+        work.pages
+            .iter()
+            .flat_map(|p| p.symbols.iter().filter_map(|s| s.tag.as_ref().map(|t| t.to_string()))),
+    );
+    let mut rail_tags: Vec<(f64, crate::DeviceTag)> = Vec::new();
+    let mut next_tag = 0usize;
     for (i, (m, &(dx, dy, step_x, step_y))) in copies.iter().zip(&offsets).enumerate() {
         if let Some(Some(asked)) = pages.get(i)
             && asked.as_str() != page_title
@@ -827,11 +908,43 @@ pub fn generate_joined(
             let on_page = |p: Point| Point::new(p.x - m.anchor.x + at.x, p.y - m.anchor.y + at.y);
             let (left, right) = open_ends(m);
             if let Some((page, before_row, ends)) = &before
-                && *page == page_id
-                && *before_row == row
+                && (*page != page_id || *before_row != row)
+            {
+                // A break: each rail that goes on gets an interruption point on both sides.
+                for (from, below) in ends {
+                    let Some(to) = left
+                        .iter()
+                        .map(|p| on_page(*p))
+                        .find(|p| (p.y - at.y - below).abs() < 1e-6)
+                    else {
+                        continue;
+                    };
+                    let tag = match rail_tags.iter().find(|(y, _)| (y - below).abs() < 1e-6) {
+                        Some((_, tag)) => tag.clone(),
+                        None => {
+                            let tag = loop {
+                                next_tag += 1;
+                                let text = format!("-JOIN{next_tag}");
+                                if !used.contains(&text) {
+                                    used.insert(text.clone());
+                                    break crate::DeviceTag::parse(&text)?;
+                                }
+                            };
+                            rail_tags.push((*below, tag.clone()));
+                            tag
+                        }
+                    };
+                    for (sheet_id, end, right) in [(page.as_str(), *from, true), (page_id.as_str(), to, false)] {
+                        if let Some(sheet) = work.pages.iter_mut().find(|p| p.id == sheet_id) {
+                            put_break(sheet, end, &tag, right);
+                        }
+                    }
+                    out.breaks += 1;
+                }
+            } else if let Some((_, _, ends)) = &before
                 && let Some(sheet) = work.pages.iter_mut().find(|p| p.id == page_id)
             {
-                for from in ends {
+                for (from, _) in ends {
                     let Some(to) = left
                         .iter()
                         .map(|p| on_page(*p))
@@ -854,7 +967,17 @@ pub fn generate_joined(
                     out.joins += 1;
                 }
             }
-            before = Some((page_id.clone(), row, right.into_iter().map(on_page).collect()));
+            before = Some((
+                page_id.clone(),
+                row,
+                right
+                    .into_iter()
+                    .map(|p| {
+                        let p = on_page(p);
+                        (p, p.y - at.y)
+                    })
+                    .collect(),
+            ));
         }
         out.copies += 1;
         match out.macros.iter_mut().find(|(name, _)| *name == m.name) {
@@ -1417,6 +1540,86 @@ mod tests {
         let mut mixed = Project::new("x");
         let done = generate_joined(&mut mixed, &[rail, low], &[], |_| None, PageSize::A3, "Rails", true)?;
         assert_eq!(done.joins, 0);
+        Ok(())
+    }
+
+    /// A rail goes on over a row or page break through a pair of interruption points per rail,
+    /// one tag per rail for all its breaks, the first tag the project does not use.
+    #[test]
+    fn joined_rails_go_on_over_a_row_break_through_interruption_points() -> Result<()> {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let wire = |id: &str, from: Endpoint, to: Endpoint| Wire {
+            id: id.into(),
+            from,
+            to,
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        // 250 mm rails: one copy to a row of an A3 page.
+        let rail = Macro {
+            name: "Rail".into(),
+            wires: vec![
+                wire("w1", free(0.0, 10.0), free(250.0, 10.0)),
+                wire("w2", free(0.0, 20.0), free(250.0, 20.0)),
+            ],
+            ..Default::default()
+        };
+        let mut project = Project::new("x");
+        project.devices.insert(DeviceTag::parse("-JOIN1")?, Device::default());
+        let done = generate_joined(
+            &mut project,
+            &vec![rail.clone(); 3],
+            &[],
+            |_| None,
+            PageSize::A3,
+            "Rails",
+            true,
+        )?;
+        assert_eq!((done.pages.len(), done.joins, done.breaks), (1, 0, 4));
+        let page = project
+            .page(&done.pages[0])
+            .ok_or_else(|| Error::Invalid("page".into()))?;
+        let breaks: Vec<&PlacedSymbol> = page.symbols.iter().filter(|s| s.symbol == BREAK_SYMBOL).collect();
+        assert_eq!(breaks.len(), 8);
+        let tags: BTreeMap<String, usize> = breaks.iter().fold(BTreeMap::new(), |mut n, s| {
+            *n.entry(s.tag.as_ref().map(|t| t.to_string()).unwrap_or_default())
+                .or_default() += 1;
+            n
+        });
+        assert_eq!(
+            tags,
+            BTreeMap::from([("-JOIN2".to_owned(), 4), ("-JOIN3".to_owned(), 4)])
+        );
+        // Every rail end at a break ends on its interruption point's pin; the outer ends stay free.
+        let on_pins = page
+            .wires
+            .iter()
+            .flat_map(|w| [&w.from, &w.to])
+            .filter(|e| matches!(e, Endpoint::Pin { pin, .. } if pin == "1"))
+            .count();
+        assert_eq!(on_pins, 8);
+        for b in &breaks {
+            let ends_here = page.wires.iter().any(|w| {
+                [&w.from, &w.to]
+                    .iter()
+                    .any(|e| matches!(e, Endpoint::Pin { item, .. } if *item == b.id))
+            });
+            assert!(ends_here, "{}", b.id);
+        }
+        // An arrow on a right edge points right; one on a left edge points left.
+        let right = breaks
+            .iter()
+            .filter(|s| s.rotation == crate::geom::Rotation::R270)
+            .count();
+        assert_eq!(right, 4);
+        // Without join no break is drawn.
+        let mut plain = Project::new("x");
+        let done = generate_titled(&mut plain, &vec![rail; 3], &[], |_| None, PageSize::A3, "Rails")?;
+        assert_eq!(done.breaks, 0);
         Ok(())
     }
 

@@ -1523,7 +1523,7 @@ fn joined_copies_get_a_wire_between_their_rails() -> TestResult {
     let table = table.to_str().ok_or("path")?;
     let out = wiringcraft(&dir, &["macro", "generate", "rail", "--table", table, "--join"])?;
     assert!(
-        out.ends_with("3 copies of Rail on 1 page\njoined by 2 wires\n"),
+        out.ends_with("3 copies of Rail on 1 page\njoined by 2 wires, 0 rails carried over a break\n"),
         "{out}"
     );
     let p = wc_core::store::load(&dir)?;
@@ -1535,6 +1535,43 @@ fn joined_copies_get_a_wire_between_their_rails() -> TestResult {
     let p = wc_core::store::load(&dir)?;
     let id = out.lines().next().ok_or("no page")?;
     assert_eq!(p.page(id).ok_or("page")?.wires.len(), 3);
+    // Copies a row apart carry the rail on through interruption points, which must be in a
+    // library then; without one nothing is generated.
+    std::fs::write(
+        lib.join("macros/long.json"),
+        r#"{
+  "name": "Long",
+  "wires": [{"id": "w1", "from": {"at": {"x": 0.0, "y": 10.0}}, "to": {"at": {"x": 250.0, "y": 10.0}}}]
+}"#,
+    )?;
+    let long = tmp.path().join("long.csv");
+    std::fs::write(&long, "macro\nlong\nlong\nlong\n")?;
+    let table = long.to_str().ok_or("path")?;
+    let pages = wc_core::store::load(&dir)?.pages.len();
+    let Err(err) = wiringcraft(&dir, &["macro", "generate", "long", "--table", table, "--join"]) else {
+        return Err("generated without an interruption point".into());
+    };
+    assert!(err.contains("wc.interruption"), "{err}");
+    assert_eq!(wc_core::store::load(&dir)?.pages.len(), pages);
+    let interruption = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.interruption.json");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::copy(interruption, lib.join("symbols/wc.interruption.json"))?;
+    let out = wiringcraft(&dir, &["macro", "generate", "long", "--table", table, "--join"])?;
+    assert!(
+        out.ends_with("joined by 0 wires, 2 rails carried over a break\n"),
+        "{out}"
+    );
+    let p = wc_core::store::load(&dir)?;
+    assert!(p.lock.symbols.contains_key("wc.interruption"));
+    let id = out.lines().next().ok_or("no page")?;
+    let points = p
+        .page(id)
+        .ok_or("page")?
+        .symbols
+        .iter()
+        .filter(|s| s.symbol == "wc.interruption")
+        .count();
+    assert_eq!(points, 4);
     Ok(())
 }
 

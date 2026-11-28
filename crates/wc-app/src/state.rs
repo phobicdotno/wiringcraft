@@ -4371,10 +4371,18 @@ impl Open {
         if copies.is_empty() {
             return Ok(generate::Generated::default());
         }
-        let ids: std::collections::BTreeSet<&str> = copies
+        let mut ids: std::collections::BTreeSet<&str> = copies
             .iter()
             .flat_map(|c| c.symbols.iter().map(|s| s.symbol.as_str()))
             .collect();
+        // Joined copies can need an interruption point at a row or page break: taken with the
+        // rest when a library has it; generating refuses a break without one below.
+        if self.table_join
+            && (self.symbols.contains_key(generate::BREAK_SYMBOL)
+                || self.library.iter().any(|e| e.id == generate::BREAK_SYMBOL))
+        {
+            ids.insert(generate::BREAK_SYMBOL);
+        }
         // The change before this one is settled first (its jumpers follow their terminals),
         // so neither the copy generated from nor the undo step loses it.
         self.follow_terminals();
@@ -4424,7 +4432,17 @@ impl Open {
             size,
             &m.name,
             self.table_join,
-        ) {
+        )
+        .and_then(|done| {
+            if done.breaks > 0 && !self.symbols.contains_key(generate::BREAK_SYMBOL) {
+                Err(wc_core::Error::Invalid(format!(
+                    "a rail goes on over a row or page break, and no library has the interruption point symbol {}",
+                    generate::BREAK_SYMBOL
+                )))
+            } else {
+                Ok(done)
+            }
+        }) {
             Ok(done) => {
                 // The undo step is the project as it was, taken as it is (nothing followed in
                 // it); the change in progress is then measured from the settled project.

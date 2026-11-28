@@ -259,8 +259,14 @@ Set;kW;Section
 - `--join` connects copies side by side on a page row: a wire runs from each free wire end on
   a copy's right edge (its free ends furthest right) to the free end at the same height on the
   next copy's left edge. So the rails a starter macro draws (L1, L2, L3, N, PE as short stubs
-  across it) run on through the row. Copies on another row or page, and ends at different
-  heights, are not joined; the output says how many wires were added.
+  across it) run on through the row. Where the next copy starts a new row or page (the page is
+  full, or a `page` cell starts one), each such pair of ends (at the same height in their
+  copies) gets a pair of interruption points (`wc.interruption`, taken from a library then),
+  arrows pointing out of the copies, with one tag per rail for all its breaks: `-JOIN1`,
+  `-JOIN2`, ..., the first the project does not use. So the rail goes on there, and the
+  interruption points show where. Ends at different heights are not joined. Joined copies keep
+  10 mm more free at both sides of the page for the interruption points. The output says how
+  many wires were added and how many rails were carried over a break.
 - An empty cell gives no value, so the value set's value or the placeholder's default applies.
 - Any other column name is an error that lists the placeholders, so a typo is not ignored.
 - Every row is checked before anything is placed. A row that cannot be filled (no value set, an

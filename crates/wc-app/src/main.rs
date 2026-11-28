@@ -2743,7 +2743,8 @@ impl App {
                         ui.checkbox(&mut open.table_join, "Join copies side by side").on_hover_text(
                             "From table… draws a wire from each free wire end on a copy's right edge to the \
                              free end at the same height on the next copy's left edge, so the rails run on \
-                             through the row.",
+                             through the row. Where the next copy starts a new row or page, each rail goes on \
+                             through a pair of interruption points with one tag per rail.",
                         );
                     }
                     if list.is_empty() {
@@ -5072,6 +5073,11 @@ impl App {
                     0 => String::new(),
                     1 => ", joined by 1 wire".to_owned(),
                     n => format!(", joined by {n} wires"),
+                };
+                let joined = match done.breaks {
+                    0 => joined,
+                    1 => format!("{joined}, 1 rail carried over a break"),
+                    n => format!("{joined}, {n} rails carried over a break"),
                 };
                 // Named by the macros placed: a table's macro column can pick others.
                 self.ed.message = format!(
