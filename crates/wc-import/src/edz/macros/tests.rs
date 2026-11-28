@@ -311,6 +311,40 @@ fn a_connection_point_description_is_kept_on_its_pin() -> TestResult {
 }
 
 #[test]
+fn a_terminals_descriptions_go_on_its_pins_in_order() -> TestResult {
+    // A terminal's descriptions follow its designations in order, not by name: these are out
+    // of order, one blank and one repeated. The third point has no description, and the fifth
+    // description has no point.
+    let terminal = r#"<EplanPxfRoot Name="X">
+ <MacroVariant VariantId="0" ReferencePoint="50/100" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="IEC_symbol" ID="1"/>
+  <O17 A1261="1" A1262="30" A1263="0" A1381="100" A1382="1" A185="b;;a;a" A186="In;Spare;;Out;Past">
+   <S40x1201 A762="60/90"/>
+   <P144 P20013="X" P20014="1"/>
+  </O17>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+    let m = read("terminal4.ema", terminal)?;
+    let s = &m.symbol;
+    let described: Vec<&str> = s.pins.iter().map(|p| p.description.as_str()).collect();
+    assert_eq!(described, ["In", "Spare", "", "Out"], "{:?}", s.pins);
+    // Each is still drawn beside its pin.
+    for (k, text) in [(0, "In"), (1, "Spare"), (3, "Out")] {
+        let (at, ..) = text_at(s, text)?;
+        let p = s.pins.get(k).ok_or("a pin is missing")?;
+        assert!(near(at, p.at.x + 1.0, p.at.y - 1.0), "{text}: {at:?} beside {p:?}");
+    }
+    assert!(text_at(s, "Past").is_err());
+    assert_eq!(
+        m.left_out.get("connection point descriptions of points without a pin"),
+        Some(&1),
+        "{:?}",
+        m.left_out
+    );
+    Ok(())
+}
+
+#[test]
 fn without_a_shown_device_tag_the_tag_goes_above_the_drawing() -> TestResult {
     let s = read("BES_contactor.ema", COIL)?.symbol;
     let mut pts: Vec<Point> = s.pins.iter().map(|p| p.at).collect();
