@@ -1858,8 +1858,13 @@ pub fn keep_before(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
             Ok(()) => Ok(kept),
             Err(x) => {
                 drop(file);
-                let _ = std::fs::remove_file(&kept);
-                Err(format!("{}: {x}", kept.display()))
+                match std::fs::remove_file(&kept) {
+                    Ok(()) => Err(format!("{}: {x}", kept.display())),
+                    Err(y) => Err(format!(
+                        "{}: {x}; the incomplete copy is left, removing it failed: {y}",
+                        kept.display()
+                    )),
+                }
             }
         };
     }
