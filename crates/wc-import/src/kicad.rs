@@ -599,14 +599,24 @@ fn convert(
 fn without_overbar(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut chars = name.chars().peekable();
-    let mut open = 0usize;
+    // Each open brace scope, true for an overbar: only an overbar's own `}` is left out, so a
+    // subscript inside one keeps its braces (`~{D_{0}/OE}` reads `D_{0}/OE`).
+    let mut scopes: Vec<bool> = Vec::new();
     while let Some(c) = chars.next() {
         match c {
             '~' if chars.peek() == Some(&'{') => {
                 chars.next();
-                open += 1;
+                scopes.push(true);
             }
-            '}' if open > 0 => open -= 1,
+            '{' => {
+                scopes.push(false);
+                out.push(c);
+            }
+            '}' => {
+                if scopes.pop() != Some(true) {
+                    out.push(c);
+                }
+            }
             _ => out.push(c),
         }
     }
@@ -1350,6 +1360,8 @@ mod tests {
         assert_eq!(without_overbar("~{CS}/~{WR}"), "CS/WR");
         assert_eq!(without_overbar("A~B"), "A~B");
         assert_eq!(without_overbar("{x}"), "{x}");
+        assert_eq!(without_overbar("~{D_{0}/OE}"), "D_{0}/OE");
+        assert_eq!(without_overbar("a}b"), "a}b");
         assert_eq!(without_overbar(" ~{} "), "");
     }
 
