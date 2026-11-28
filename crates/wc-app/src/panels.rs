@@ -1147,6 +1147,24 @@ fn committed(r: &egui::Response) -> bool {
     r.lost_focus() || (r.has_focus() && r.ctx.input(|i| i.key_pressed(egui::Key::Enter)))
 }
 
+/// How the Pins list of a placed symbol reads: the designations on one line, or, when a pin
+/// has a description, one pin a line with its description after the designation (#1875).
+fn pin_lines(pins: &[wc_core::symbol::Pin]) -> Vec<String> {
+    if pins.iter().all(|p| p.description.is_empty()) {
+        let names: Vec<&str> = pins.iter().map(|p| p.name.as_str()).collect();
+        return vec![names.join("  ")];
+    }
+    pins.iter()
+        .map(|p| {
+            if p.description.is_empty() {
+                p.name.clone()
+            } else {
+                format!("{}  {}", p.name, p.description)
+            }
+        })
+        .collect()
+}
+
 pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState) {
     let t = Theme::of(ui.ctx());
     section(ui, "Properties", None);
@@ -1344,8 +1362,9 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
             } else if let Some(sym) = open.symbols.get(&placed.symbol) {
                 ui.add_space(6.0);
                 subsection(ui, "Pins");
-                let names: Vec<&str> = sym.pins.iter().map(|p| p.name.as_str()).collect();
-                ui.label(names.join("  "));
+                for line in pin_lines(&sym.pins) {
+                    ui.label(line);
+                }
             }
         }
         Some(Selection::Cloud(i)) => {
@@ -2548,6 +2567,55 @@ mod tests {
         let plain = row_text_color(RichText::new("entry"));
         assert!(plain.is_some(), "the row draws its text");
         assert_ne!(plain, Some(red));
+    }
+
+    /// A placed symbol's Pins list shows each pin's description after its designation, once a
+    /// pin has one (#1875).
+    #[test]
+    fn the_pins_list_shows_pin_descriptions() -> Result<(), Box<dyn std::error::Error>> {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let page = o
+            .project
+            .pages
+            .iter()
+            .position(|p| p.id == "p0002")
+            .ok_or("no page p0002")?;
+        let id = o.place(page, "wc.coil", wc_core::geom::Point::new(50.0, 50.0))?;
+        let mut ed = Editor::default();
+        ed.page = page;
+        ed.selection = vec![Selection::Symbol(id)];
+        let mut ps = PanelState::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut texts = |o: &mut Open| {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, &mut ed, &mut ps));
+            });
+            let mut texts = Vec::new();
+            for clipped in out.shapes {
+                if let egui::Shape::Text(t) = clipped.shape {
+                    texts.push(t.galley.text().to_owned());
+                }
+            }
+            texts
+        };
+        let names: Vec<String> = o.symbols["wc.coil"].pins.iter().map(|p| p.name.clone()).collect();
+        let [first, second] = names.as_slice() else {
+            unreachable!("a coil has two pins: {names:?}");
+        };
+        let shown = texts(&mut o);
+        assert!(shown.iter().any(|t| *t == format!("{first}  {second}")), "{shown:?}");
+
+        if let Some(pin) = o.symbols.get_mut("wc.coil").and_then(|s| s.pins.first_mut()) {
+            pin.description = "Coil +".into();
+        }
+        let shown = texts(&mut o);
+        assert!(shown.iter().any(|t| *t == format!("{first}  Coil +")), "{shown:?}");
+        assert!(
+            shown.iter().any(|t| t == second),
+            "a pin without one shows its name: {shown:?}"
+        );
+        Ok(())
     }
 
     /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.
