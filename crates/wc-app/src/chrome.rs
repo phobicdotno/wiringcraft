@@ -127,6 +127,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::PageTemplate),
             Some(Action::DuplicatePage),
             Some(Action::PageProps),
+            Some(Action::RenumberPages),
             None,
             Some(Action::PageUp),
             Some(Action::PageDown),

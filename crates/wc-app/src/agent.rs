@@ -1968,7 +1968,7 @@ impl App {
             "duplicate_page" => {
                 let page = self.page_of(v, "page")?;
                 let open = need_open(self.open.as_mut())?;
-                let i = open.duplicate_page(page).ok_or("No such page.")?;
+                let i = open.duplicate_page(page)?;
                 let n = open.project.pages.get(i).map(|p| p.number.clone()).unwrap_or_default();
                 self.go_to(i);
                 Ok(format!("Copied as page {n}."))

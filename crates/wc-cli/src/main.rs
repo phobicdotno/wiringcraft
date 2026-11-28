@@ -803,8 +803,10 @@ enum MacroCmd {
     /// its first row: a placeholder's name fills that placeholder, a column `set` picks the
     /// row's value set (over `--set`), and an empty cell leaves the value set's or default
     /// value. A macro that declares a placeholder `set` takes that column as the placeholder,
-    /// and then `--set` alone picks the value set. The copies go on new pages after the last one, left to right and row below
-    /// row, each with the next free tags. Prints the new pages' ids and the number of copies.
+    /// and then `--set` alone picks the value set. A column `macro` names another macro for its
+    /// row (`--set` is then not used for that row). The copies go on new pages after the last
+    /// one, left to right and row below row, each with the next free tags. Prints the new pages'
+    /// ids and the number of copies.
     Generate {
         /// The macro's name or file name.
         name: String,
@@ -1263,6 +1265,22 @@ enum PageCmd {
     Remove {
         /// The page's id or number.
         id: String,
+    },
+    /// Copy a page as a new page, as the app's Duplicate page does: its devices get the next
+    /// free tags like theirs (with their data) and its wire numbers are cleared. Prints the new
+    /// page's id.
+    Copy {
+        /// The page to copy (id or number).
+        page: String,
+        /// The new page's id; the first free `p0001`, `p0002`, ... if left out.
+        #[arg(long)]
+        id: Option<String>,
+        /// The new page's number; one more than the largest plain number if left out.
+        #[arg(long)]
+        number: Option<String>,
+        /// The new page's title; the page's title and ` (copy)` if left out.
+        #[arg(long)]
+        title: Option<String>,
     },
     /// Number the pages again in their order: `--prefix`, then `--start`, `--start` +
     /// `--step`, ... From `--from` on (the first page if left out); the pages before it keep
@@ -3354,6 +3372,46 @@ fn run(mut cli: Cli) -> Res<()> {
                     }
                     p.pages.remove(i);
                 }
+                PageCmd::Copy {
+                    page,
+                    id,
+                    number,
+                    title,
+                } => {
+                    let i = page_index(&p, &page)?;
+                    let id = match id {
+                        Some(id) => {
+                            store::check_id(&id).map_err(e)?;
+                            if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
+                                return Err(format!("page {:?} exists; pick another id", escape_field(&id)));
+                            }
+                            id
+                        }
+                        None => p.free_page_id(),
+                    };
+                    let number = match number {
+                        Some(n) => p.free_page_number(&n, None).map_err(e)?,
+                        None => p.next_page_number(),
+                    };
+                    let title = title.map(|t| t.trim().to_owned());
+                    p.copy_page(i, id.clone(), number, title).map_err(e)?;
+                    // A save that fails half way puts the files back, so no page file of the
+                    // copy is left without its devices.
+                    let before = snapshot_project(dir, &[id.as_str()], &[])?;
+                    refuse_linked_files(dir, &before, "page copy")?;
+                    if let Err(err) = save(dir, &p) {
+                        let failed = put_files_back(&before);
+                        if failed.is_empty() {
+                            return Err(err);
+                        }
+                        return Err(format!(
+                            "{err}; putting the project's files back failed too: {}",
+                            failed.join("; ")
+                        ));
+                    }
+                    println!("{}", escape_field(&id));
+                    return Ok(());
+                }
                 PageCmd::Renumber {
                     from,
                     start,
@@ -3988,7 +4046,10 @@ fn run(mut cli: Cli) -> Res<()> {
                         Some(bytes) => bytes,
                         None => run::read_file(&table)?,
                     };
-                    let (copies, pages) = run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref())?;
+                    // A row's `macro` column names another macro, found as the one named here.
+                    let other = |n: &str| wc_core::macros::read_macro(&find_macro(&found, n)?.path).map_err(e);
+                    let (copies, pages) =
+                        run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref(), other)?;
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
@@ -4005,10 +4066,10 @@ fn run(mut cli: Cli) -> Res<()> {
                     vendored.save(dir, &p, &new_pages)?;
                     println!("{}", generated.pages.join(" "));
                     let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+                    // Named by the macros placed: a table's macro column can pick others.
                     println!(
-                        "{} of {} on {}",
-                        plural(generated.copies, "copy", "copies"),
-                        escape_field(&m.name),
+                        "{} on {}",
+                        generated.copies_text(escape_field),
                         plural(generated.pages.len(), "page", "pages")
                     );
                 }
@@ -7429,12 +7490,15 @@ fn page_fields(p: &Project, page: usize) -> String {
     let mut out = String::new();
     for k in keys {
         let value = pg.title_field(&p.meta, &k);
-        let from = if pg.title_block.get(&k).is_some_and(|v| !v.trim().is_empty()) {
-            "page"
-        } else if value.is_empty() {
-            "-"
-        } else {
-            "project"
+        // A revision of `auto` shows the page's latest revision; the listing says so.
+        let (set, own) = pg.title_field_set(&p.meta, &k);
+        let auto = k == "revision" && wc_core::project::is_auto_revision(set);
+        let from = match (own, auto, value.is_empty()) {
+            (true, true, _) => "page, auto",
+            (true, false, _) => "page",
+            (false, true, _) => "project, auto",
+            (false, false, true) => "-",
+            (false, false, false) => "project",
         };
         out.push_str(&format!(
             "{:<16} {:<24} ({from})\n",
@@ -11486,6 +11550,26 @@ mod tests {
             listed.contains("note\\nfake") && listed.contains("A\\u{1b}[2JB\\nrevision X"),
             "{listed}"
         );
+
+        // A revision of `auto` lists the revision the page shows, and says it is worked out.
+        let mut p = load(&dir).unwrap();
+        p.meta.title_block.insert("revision".into(), "auto".into());
+        p.add_revision("A", "", "", "").unwrap();
+        p.add_revision("B", "", "", "").unwrap();
+        let line = |p: &Project| {
+            page_fields(p, i)
+                .lines()
+                .find(|l| l.starts_with("revision"))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            line(&p).contains(" A ") && line(&p).ends_with("(project, auto)"),
+            "{}",
+            line(&p)
+        );
+        p.pages[i].set_title_field("revision", "AUTO");
+        assert!(line(&p).ends_with("(page, auto)"), "{}", line(&p));
 
         assert!(cli(&["page", "fields", "p9", "revision"]).is_err());
         assert!(cli(&["page", "fields", "p9", "bad key=x"]).is_err());

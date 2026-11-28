@@ -240,6 +240,14 @@ Set;kW;Section
   per area. An empty cell keeps the row on the page before; rows before the first named page go
   under `--title`. (A macro that declares a placeholder `page` takes the column as that
   placeholder.)
+- A column `macro` picks another macro for its row, named as `macro generate` takes it (its
+  name or file name); an empty cell places the macro given on the command line. So one table can
+  hold motors, valves and sensors, each row with the macro that draws it. With this column the
+  other columns may be placeholders of any of the macros, and a row with a value for a
+  placeholder its own macro does not have is an error naming its line. `--set` is for the rows of
+  the macro given only, as another macro has value sets of its own; a row of another macro picks
+  its value set in the `set` column. (A macro that declares a placeholder `macro` takes the column
+  as that placeholder.)
 - An empty cell gives no value, so the value set's value or the placeholder's default applies.
 - Any other column name is an error that lists the placeholders, so a typo is not ignored.
 - Every row is checked before anything is placed. A row that cannot be filled (no value set, an

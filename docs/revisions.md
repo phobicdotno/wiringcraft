@@ -78,9 +78,15 @@ The PDF draws clouds and the revision table from the same shapes as the editor, 
 prints as you see it. They go in the PDF's "Drawings and notes" layer. See
 [docs/pdf-output.md](pdf-output.md) for the rest of the page layout.
 
-The **Revision** box in the title block is a separate title-block field. It is not filled in
-from the revision list: set it in File > Project properties, or for one page with
-`page fields <page> revision=B`.
+The **Revision** box in the title block is a separate title-block field. Set it in File >
+Project properties, or for one page with `page fields <page> revision=B`.
+
+Set it to `auto` to have it follow the revision list instead. Each schematic page then shows
+the latest revision (latest in the list) that a cloud on that page is tagged with, and a page
+without such a cloud shows the first revision, the issue every page was part of. Report sheets,
+panel layouts, PLC cards and network pages that the PDF makes show the latest revision, as they
+are made from the project as it is now. `auto` set on one page works for that page only.
+`page fields` lists the revision a page shows, marked `(project, auto)` or `(page, auto)`.
 
 ## Example
 

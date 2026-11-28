@@ -248,11 +248,13 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
                     if page.title.trim().is_empty() {
                         page.title = table.title.clone();
                     }
+                    show_latest_revision(project, &mut page);
                     page
                 }
                 None => {
                     report_no += 1;
-                    wc_core::Page::new(
+                    sheet_page(
+                        project,
                         format!("report-{ti}-{part}"),
                         format!("R{report_no}"),
                         table.title.clone(),
@@ -337,7 +339,12 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     let after_pages = sheet;
     // Panel layouts follow the schematic pages, one sheet each.
     for (k, panel) in options.panels.iter().enumerate() {
-        let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
+        let mut page = sheet_page(
+            project,
+            format!("panel-{}", panel.id),
+            format!("P{}", k + 1),
+            panel.name.clone(),
+        );
         page.size = first_size;
         let mut drawn =
             layout::draw_panel_page(project, &page, sheet, total, panel, &options.footprints, &options.date);
@@ -356,7 +363,8 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         let Some(card) = options.plc_cards.get(ci) else {
             continue;
         };
-        let mut page = wc_core::Page::new(
+        let mut page = sheet_page(
+            project,
             format!("plc-card-{ci}-{part}"),
             format!("C{}", k + 1),
             format!("PLC card {}", card.card),
@@ -381,7 +389,8 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         // A sheet the whole topology fits on: the first page's size, or a larger one.
         let (size, warn) = topology::sheet(first_size, project.meta.template.band_height(), net);
         report.warnings.extend(warn);
-        let mut page = wc_core::Page::new(
+        let mut page = sheet_page(
+            project,
             format!("network-{}", net.name),
             format!("N{}", k + 1),
             format!("Network {}", net.name),
@@ -561,6 +570,35 @@ fn only_exported_rows(table: &wc_report::Table, pages: &[String]) -> wc_report::
         rows: kept.iter().filter_map(|&n| table.rows.get(n).cloned()).collect(),
         row_pages,
         ..table.clone()
+    }
+}
+
+/// A sheet the PDF makes itself (a report, panel layout, PLC card or network page): a page
+/// with nothing of its own, except that a revision field of [`wc_core::project::AUTO_REVISION`]
+/// shows the project's latest revision ([`show_latest_revision`]).
+fn sheet_page(
+    project: &Project,
+    id: impl Into<String>,
+    number: impl Into<String>,
+    title: impl Into<String>,
+) -> wc_core::Page {
+    let mut page = wc_core::Page::new(id, number, title);
+    show_latest_revision(project, &mut page);
+    page
+}
+
+/// A sheet made from the project as it is now (a generated sheet, or a report page's) shows the
+/// latest revision where its revision field is `auto`, not the one its clouds would give.
+fn show_latest_revision(project: &Project, page: &mut wc_core::Page) {
+    let auto = wc_core::project::is_auto_revision(page.title_field_set(&project.meta, "revision").0);
+    let latest = project
+        .meta
+        .revisions
+        .iter()
+        .rev()
+        .find(|r| !wc_core::project::is_auto_revision(&r.letter));
+    if auto && let Some(latest) = latest {
+        page.title_block.insert("revision".into(), latest.letter.clone());
     }
 }
 
