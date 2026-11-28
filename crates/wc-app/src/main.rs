@@ -2275,11 +2275,14 @@ impl App {
                 }
             }
             // Everything on the page, kept where it is: the dialog counts what it holds.
-            Action::SavePageMacro => match open.page_macro(page, "", "") {
-                Ok(m) => {
+            Action::SavePageMacro => match open
+                .page_macro(page, "", "")
+                .and_then(|m| Ok((m, open.project.pages.get(page).ok_or("No page is open.")?.id.clone())))
+            {
+                Ok((m, id)) => {
                     self.dialog = Some(Dialog::SaveMacro {
                         clip: m.into(),
-                        page: Some(open.project.pages[page].id.clone()),
+                        page: Some(id),
                         name: String::new(),
                         description: String::new(),
                         error: None,
