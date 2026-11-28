@@ -3328,11 +3328,26 @@ fn run(mut cli: Cli) -> Res<()> {
                         None => 0,
                     };
                     let changed = p.renumber_pages(from, &prefix, start, step).map_err(e)?;
+                    if changed > 0 {
+                        // Every page file is read first: a save that fails half way puts them
+                        // back, so no page keeps a new number its neighbours lack (a second
+                        // run numbers in the order the numbers give).
+                        let before = snapshot_project(dir, &[], &[])?;
+                        refuse_linked_files(dir, &before, "page renumber")?;
+                        if let Err(err) = save(dir, &p) {
+                            let failed = put_files_back(&before);
+                            if failed.is_empty() {
+                                return Err(err);
+                            }
+                            return Err(format!(
+                                "{err}; putting the page files back failed too: {}",
+                                failed.join("; ")
+                            ));
+                        }
+                    }
                     let n = p.pages.len() - from;
                     println!("{changed} of {n} {} renumbered", if n == 1 { "page" } else { "pages" });
-                    if changed == 0 {
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
                 PageCmd::Graphic { id, off } => {
                     let i = page_index(&p, &id)?;

@@ -81,5 +81,23 @@ fn pages_are_numbered_again_in_their_order() -> TestResult {
         .unwrap_or_default();
     assert!(!err.is_empty());
     assert_eq!(numbers(&dir)?, before);
+
+    // A save that fails half way puts back the pages already written, so a second run
+    // numbers them in the same order (the store writes `<file>.tmp` and renames it).
+    let files = |dir: &Path| -> Result<Vec<Vec<u8>>, std::io::Error> {
+        ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| std::fs::read(dir.join(format!("pages/{id}.page.json"))))
+            .collect()
+    };
+    let bytes = files(&dir)?;
+    for blocked in ["a", "d"] {
+        let blocker = dir.join(format!("pages/{blocked}.page.json.tmp"));
+        std::fs::create_dir_all(&blocker)?;
+        assert!(wiringcraft(&dir, &["page", "renumber", "--start", "10"]).is_err());
+        std::fs::remove_dir(&blocker)?;
+        assert_eq!(files(&dir)?, bytes, "blocked at {blocked}");
+    }
+    assert_eq!(numbers(&dir)?, before);
     Ok(())
 }

@@ -2221,7 +2221,7 @@ impl Project {
         if from > self.pages.len() {
             return bad(format!(
                 "there is no page {} (the project has {})",
-                from + 1,
+                from.saturating_add(1),
                 self.pages.len()
             ));
         }
@@ -2466,6 +2466,10 @@ mod tests {
         assert!(err(p.renumber_pages(0, "A1", 1, 1)).contains("ends in a digit"));
         assert!(err(p.renumber_pages(0, "", 1, 0)).contains("step"));
         assert!(err(p.renumber_pages(9, "", 1, 1)).contains("no page 10"));
+        assert!(matches!(
+            p.renumber_pages(usize::MAX, "", 1, 1),
+            Err(crate::Error::Invalid(_))
+        ));
         assert!(err(p.renumber_pages(0, "", u64::MAX, 1)).contains("no page number is left"));
         assert_eq!(p, before);
         Ok(())
