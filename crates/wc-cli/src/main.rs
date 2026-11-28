@@ -829,6 +829,11 @@ enum MacroCmd {
         /// placeholder of its name only.
         #[arg(long = "rule")]
         rules: Vec<String>,
+        /// Join copies side by side on a page row: a wire from each free wire end on a copy's
+        /// right edge to the free end at the same height on the next copy's left edge, so the
+        /// rails a macro draws run on through the row.
+        #[arg(long)]
+        join: bool,
     },
     /// Show a macro: its description, placeholders (name, default, description), value sets,
     /// the placeholders its texts use, and a problem `edit` would refuse to save.
@@ -4045,6 +4050,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     title,
                     size,
                     rules,
+                    join,
                 } => {
                     let path = find_macro(&found, &name)?.path.clone();
                     let size = PageSize::parse(&size)?;
@@ -4071,8 +4077,9 @@ fn run(mut cli: Cli) -> Res<()> {
                         .map_err(|x| vendored.undo(x))?;
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let symbol = |id: &str| store::read_vendored_symbol(dir, id).ok();
-                    let generated = wc_core::generate::generate_titled(&mut p, &copies, &pages, symbol, size, &title)
-                        .map_err(|x| vendored.undo(e(x)))?;
+                    let generated =
+                        wc_core::generate::generate_joined(&mut p, &copies, &pages, symbol, size, &title, join)
+                            .map_err(|x| vendored.undo(e(x)))?;
                     // A save that fails half way puts the project's files back, so a second run
                     // does not place the rows already written again.
                     let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
@@ -4085,6 +4092,9 @@ fn run(mut cli: Cli) -> Res<()> {
                         generated.copies_text(escape_field),
                         plural(generated.pages.len(), "page", "pages")
                     );
+                    if join {
+                        println!("joined by {}", plural(generated.joins, "wire", "wires"));
+                    }
                 }
                 MacroCmd::Place {
                     page,

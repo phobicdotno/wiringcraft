@@ -255,6 +255,11 @@ Set;kW;Section
   matches wins, and a row's own `macro` cell wins over every rule. A column a rule reads is taken
   as with a `macro` column, and its value goes only to a macro that has a placeholder of that
   name; a rule whose column the table lacks is an error.
+- `--join` connects copies side by side on a page row: a wire runs from each free wire end on
+  a copy's right edge (its free ends furthest right) to the free end at the same height on the
+  next copy's left edge. So the rails a starter macro draws (L1, L2, L3, N, PE as short stubs
+  across it) run on through the row. Copies on another row or page, and ends at different
+  heights, are not joined; the output says how many wires were added.
 - An empty cell gives no value, so the value set's value or the placeholder's default applies.
 - Any other column name is an error that lists the placeholders, so a typo is not ignored.
 - Every row is checked before anything is placed. A row that cannot be filled (no value set, an
