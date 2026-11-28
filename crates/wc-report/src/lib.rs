@@ -963,6 +963,24 @@ fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
     }
 }
 
+/// [`pin_label`] followed by the pin's description in brackets when its symbol gives one
+/// (`-K1:A1 (Coil +)`), for the lists that name a wire's ends (#1876).
+fn pin_label_described(i: &Inputs<'_>, page_id: &str, item: &str, pin: &str) -> String {
+    let label = pin_label(i.project, page_id, item, pin);
+    let description = i
+        .project
+        .page(page_id)
+        .and_then(|pg| pg.symbol(item))
+        .and_then(|s| i.symbols.get(&s.symbol))
+        .and_then(|sym| sym.pin(pin))
+        .map(|p| p.description.trim())
+        .filter(|d| !d.is_empty());
+    match description {
+        Some(d) => format!("{label} ({d})"),
+        None => label,
+    }
+}
+
 /// The net each pin belongs to, with its potential name (or a generated one).
 fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
     let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id));
@@ -1041,7 +1059,7 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
     for (pi, page) in i.project.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
         for (wi, w) in page.wires.iter().enumerate() {
             let end = |e: &Endpoint| match e {
-                Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
+                Endpoint::Pin { item, pin } => pin_label_described(i, &page.id, item, pin),
                 Endpoint::Point { at } => format!("junction {:.1},{:.1}", at.x, at.y),
             };
             // A blank name is no potential, as connectivity has it: the net's name shows.
@@ -1097,7 +1115,7 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
         for w in &page.wires {
             let Some(c) = &w.cable else { continue };
             let end = |e: &Endpoint| match e {
-                Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
+                Endpoint::Pin { item, pin } => pin_label_described(i, &page.id, item, pin),
                 Endpoint::Point { at } => format!("junction {:.1},{:.1}", at.x, at.y),
             };
             cores.entry(c.cable.clone()).or_default().push((
