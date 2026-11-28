@@ -9877,15 +9877,15 @@ mod nudge_tests {
         theme::install_fonts(&ctx);
         app.run(Action::RenumberPages);
         let shown = app.open.as_ref().unwrap().project.pages[app.ed.page].id.clone();
-        let Some(Dialog::RenumberPages {
-            shown: Some((id, _)),
-            from: None,
-            ..
-        }) = &app.dialog
-        else {
-            panic!("the dialog opens for every page, offering the page shown");
+        let opened = match &app.dialog {
+            Some(Dialog::RenumberPages { shown, from, .. }) => Some((shown.clone().map(|s| s.0), from.clone())),
+            _ => None,
         };
-        assert_eq!(*id, shown);
+        assert_eq!(
+            opened,
+            Some((Some(shown), None)),
+            "the dialog opens for every page, offering the page shown"
+        );
         let o = app.open.as_mut().unwrap();
         let before = o.project.clone();
         let n = o.project.pages.len();
