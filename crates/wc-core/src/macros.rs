@@ -425,9 +425,12 @@ pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -
         placeholders: Vec::new(),
         value_sets: Vec::new(),
     };
+    // One placeholder for names alike but for case, as `apply` fills them; the first spelling.
+    let mut seen = BTreeSet::new();
     m.placeholders = m
         .used_placeholders()
         .into_iter()
+        .filter(|name| seen.insert(key(name)))
         .map(|name| Placeholder {
             name,
             ..Default::default()
@@ -1016,7 +1019,7 @@ mod tests {
         });
         p.pages[0].graphics.push(Shape::Text {
             at: Point::new(10.0, 10.0),
-            text: "{{voltage}} V".into(),
+            text: "{{voltage}} V, {{Voltage }}".into(),
             height: 3.5,
             align: Default::default(),
             angle: 0.0,
