@@ -2798,6 +2798,25 @@ fn place_tool(
     }
 }
 
+/// How the wire tool names the pin under the pointer: `-K1:A1  Coil +`, the device tag (or
+/// the item id of an untagged symbol) and designation, then the pin's description when its
+/// symbol gives one.
+fn pin_hover_label(open: &Open, page: &Page, item: &str, pin: &str) -> String {
+    let placed = page.symbol(item);
+    let device = placed
+        .and_then(|s| s.tag.as_ref())
+        .map_or_else(|| item.to_owned(), ToString::to_string);
+    let description = placed
+        .and_then(|s| open.symbols.get(&s.symbol))
+        .and_then(|y| y.pin(pin))
+        .map(|p| p.description.trim())
+        .filter(|d| !d.is_empty());
+    match description {
+        Some(d) => format!("{device}:{pin}  {d}"),
+        None => format!("{device}:{pin}"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wire_tool(
     painter: &egui::Painter,
@@ -2815,8 +2834,19 @@ fn wire_tool(
         let raw = resp.hover_pos().map(|p| xf.mm(p)).unwrap_or(cur);
         let near = open.pin_near(page, raw, PIN_CATCH);
         let target = near.as_ref().map(|(_, _, p)| *p).unwrap_or(cur);
-        if let Some((_, _, p)) = &near {
-            painter.circle_stroke(xf.s(*p), 6.0, Stroke::new(1.5_f32, t.selection));
+        if let Some((item, pin, p)) = &near {
+            let at = xf.s(*p);
+            painter.circle_stroke(at, 6.0, Stroke::new(1.5_f32, t.selection));
+            // Which pin it is, and what it is for, before the wire is drawn (#1906).
+            let label = pin_hover_label(open, page, item, pin);
+            let font = FontId::proportional(12.0);
+            let galley = painter.layout_no_wrap(label, font, t.text);
+            let rect = Align2::LEFT_BOTTOM
+                .anchor_size(at + Vec2::new(8.0, -8.0), galley.size())
+                .expand(3.0);
+            painter.rect_filled(rect, 3.0, t.surface);
+            painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Inside);
+            painter.galley(rect.min + Vec2::splat(3.0), galley, t.text);
         }
         if let Some((start, via)) = &ed.wire {
             let mut pts = vec![open.end_pos(page, start).unwrap_or(target)];
@@ -4872,6 +4902,65 @@ mod tests {
         assert_eq!(ed.message, "A wire needs two different ends.");
         assert_eq!(ed.wire.as_ref().map(|(_, via)| via.clone()), drawn);
         assert!(o.project.pages[0].wires.is_empty());
+    }
+
+    /// With the wire tool, the pin under the pointer is named, with its description once its
+    /// symbol has one (#1906).
+    #[test]
+    fn the_wire_tool_names_the_pin_under_the_pointer_with_its_description() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        // Where the pointer at `at` is on the page, and a coil -K1 whose A1 is just there.
+        let at = egui::pos2(300.0, 300.0);
+        painted(&ctx, &mut o, &mut ed, 1.0, vec![egui::Event::PointerMoved(at)]);
+        let Some(spot) = ed.cursor else {
+            unreachable!("the pointer is on the canvas")
+        };
+        let probe = o.place(0, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let a1 = Endpoint::Pin {
+            item: probe.clone(),
+            pin: "A1".into(),
+        };
+        let off = o.end_pos(&o.project.pages[0], &a1).unwrap();
+        o.project.pages[0].symbols.retain(|s| s.id != probe);
+        let coil = o
+            .place(0, "wc.coil", Point::new(100.0 + spot.x - off.x, 60.0 + spot.y - off.y))
+            .unwrap();
+        if let Some(s) = o.project.pages[0].symbols.iter_mut().find(|s| s.id == coil) {
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+        }
+        let hover = |o: &mut Open, ed: &mut Editor, t: f64| -> Vec<String> {
+            painted(&ctx, o, ed, t, vec![egui::Event::PointerMoved(at)])
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect()
+        };
+        let texts = hover(&mut o, &mut ed, 2.0);
+        assert!(texts.iter().any(|t| t == "-K1:A1"), "{texts:?}");
+
+        if let Some(pin) = o
+            .symbols
+            .get_mut("wc.coil")
+            .and_then(|y| y.pins.iter_mut().find(|p| p.name == "A1"))
+        {
+            pin.description = "Coil +".into();
+        }
+        let texts = hover(&mut o, &mut ed, 3.0);
+        assert!(texts.iter().any(|t| t == "-K1:A1  Coil +"), "{texts:?}");
+
+        // Away from every pin, no pin is named.
+        let away = egui::pos2(600.0, 500.0);
+        let texts: Vec<String> = painted(&ctx, &mut o, &mut ed, 4.0, vec![egui::Event::PointerMoved(away)])
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(texts.iter().all(|t| !t.starts_with("-K1:")), "{texts:?}");
     }
 
     #[test]
