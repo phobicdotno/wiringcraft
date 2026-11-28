@@ -7411,12 +7411,15 @@ fn page_fields(p: &Project, page: usize) -> String {
     let mut out = String::new();
     for k in keys {
         let value = pg.title_field(&p.meta, &k);
-        let from = if pg.title_block.get(&k).is_some_and(|v| !v.trim().is_empty()) {
-            "page"
-        } else if value.is_empty() {
-            "-"
-        } else {
-            "project"
+        // A revision of `auto` shows the page's latest revision; the listing says so.
+        let (set, own) = pg.title_field_set(&p.meta, &k);
+        let auto = k == "revision" && wc_core::project::is_auto_revision(set);
+        let from = match (own, auto, value.is_empty()) {
+            (true, true, _) => "page, auto",
+            (true, false, _) => "page",
+            (false, true, _) => "project, auto",
+            (false, false, true) => "-",
+            (false, false, false) => "project",
         };
         out.push_str(&format!(
             "{:<16} {:<24} ({from})\n",
@@ -11468,6 +11471,26 @@ mod tests {
             listed.contains("note\\nfake") && listed.contains("A\\u{1b}[2JB\\nrevision X"),
             "{listed}"
         );
+
+        // A revision of `auto` lists the revision the page shows, and says it is worked out.
+        let mut p = load(&dir).unwrap();
+        p.meta.title_block.insert("revision".into(), "auto".into());
+        p.add_revision("A", "", "", "").unwrap();
+        p.add_revision("B", "", "", "").unwrap();
+        let line = |p: &Project| {
+            page_fields(p, i)
+                .lines()
+                .find(|l| l.starts_with("revision"))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            line(&p).contains(" A ") && line(&p).ends_with("(project, auto)"),
+            "{}",
+            line(&p)
+        );
+        p.pages[i].set_title_field("revision", "AUTO");
+        assert!(line(&p).ends_with("(page, auto)"), "{}", line(&p));
 
         assert!(cli(&["page", "fields", "p9", "revision"]).is_err());
         assert!(cli(&["page", "fields", "p9", "bad key=x"]).is_err());

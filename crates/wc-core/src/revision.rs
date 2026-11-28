@@ -378,6 +378,13 @@ impl Project {
         if self.revision(&letter).is_some() {
             return Err(Error::Invalid(format!("revision {letter} is already there")));
         }
+        // `auto` in a revision field asks for the revision worked out, so it names none.
+        if crate::project::is_auto_revision(&letter) {
+            return Err(Error::Invalid(format!(
+                "{letter} cannot be a revision letter: a revision field of {} has the page show its latest revision",
+                crate::project::AUTO_REVISION
+            )));
+        }
         self.meta.revisions.push(Revision {
             letter,
             date: field(date, MAX_FIELD),
@@ -518,6 +525,11 @@ mod tests {
         p.add_revision("B", "2026-11-18", "Motor M2 added", "OP").unwrap();
         assert!(p.add_revision("B", "", "", "").is_err(), "a letter is used once");
         assert!(p.add_revision("  ", "", "", "").is_err(), "a letter is needed");
+        // `auto` asks a title block for the revision worked out, so it is no letter (#1895).
+        for auto in ["auto", " AUTO "] {
+            let err = p.add_revision(auto, "", "", "").unwrap_err().to_string();
+            assert!(err.contains("cannot be a revision letter"), "{err}");
+        }
         assert_eq!(p.latest_revision().unwrap().letter, "B");
         assert_eq!(p.revision("A").unwrap().text, "First issue");
         assert!(p.edit_revision("A", "2026-11-02", "First issue", "OP").unwrap());
