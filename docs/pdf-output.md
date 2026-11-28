@@ -32,6 +32,25 @@ each gets its own `R` number and its bookmark shows `(1/3)`, `(2/3)` and so on. 
 out the PLC card overview in a project without racks and the network list in a project
 without networks, so it does not add empty sheets; naming the report prints it anyway.
 
+### Report pages
+
+A report can also sit among the pages, as in EPLAN: make a page a report page with
+`wiringcraft page report <page> parts` (any report name `--report` takes; `--off` makes it a
+normal page again). The PDF prints that report there, in the page's place, with the page's
+number and title on each of its sheets (the bookmarks show `(1/2)`, `(2/2)` for a long one),
+and the page's own title-block fields (a revision of `auto` shows the latest revision, as on
+the other sheets the PDF makes). That report is then not printed again after the pages,
+whatever `--report` or the project's report choice says. A report page is printed even when
+its report is not chosen, since it is one of the pages; a PDF made with `--page` that leaves
+the report page out leaves its report out too. The sheets use the report sheet size, not the
+page's own. What is drawn on a report page is not printed, with a warning. The cover page
+cannot be a report page, and a page with symbols or wires is refused (move them first); symbols
+and wires are refused on a report page. A page whose report name (edited by hand) is no report
+prints as a normal page, with a warning.
+A report page holding the table of contents lists the sheets after the pages as the front one
+does. Topology pages and PLC card sheets still follow the pages when their report is on a
+report page.
+
 The table of contents lists every schematic page and then every sheet after them (panel
 layouts, PLC cards, the other reports, networks) with its number. With `--page`, it lists only
 the pages in the file.

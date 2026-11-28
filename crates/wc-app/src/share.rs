@@ -323,8 +323,8 @@ fn fold_own_page(out: &mut Outgoing, base: &Project) {
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
 /// and wires are matched by id, title-block fields by name, the free graphics and texts (which
 /// carry no id) and the revision clouds item by item ([`merge_unordered`]); the title, size,
-/// underlay, the overview, cover and graphic marks and the revision table's place each count as one
-/// thing.
+/// underlay, the overview, cover and graphic marks, the report it holds and the revision table's
+/// place each count as one thing.
 /// A wire that ends at a symbol the other side took away is a clash too. The page number is
 /// left as the session's.
 fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
@@ -335,6 +335,7 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     page.overview = pick(&base.overview, &auth.overview, &local.overview)?;
     page.cover = pick(&base.cover, &auth.cover, &local.cover)?;
     page.graphic = pick(&base.graphic, &auth.graphic, &local.graphic)?;
+    page.report = pick(&base.report, &auth.report, &local.report)?;
     page.graphics = merge_unordered(&base.graphics, &auth.graphics, &local.graphics, |a, b| {
         std::mem::discriminant(a) == std::mem::discriminant(b)
     })?;
@@ -360,7 +361,11 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
         .flat_map(|w| [&w.from, &w.to])
         .any(|end| matches!(end, wc_core::Endpoint::Pin { item, .. } if !symbols.contains(item.as_str())));
     // A page cannot be both an overview and a graphic page: each side marking it one way is a clash.
-    (!dangling && !(page.graphic && page.overview)).then_some(page)
+    // Nor can a report page hold symbols or wires or be the cover, as `page report` refuses.
+    // A name no report has prints as a normal page, so it is not held to this.
+    let report_clash = page.report.as_deref().and_then(wc_report::report_named).is_some()
+        && (!page.symbols.is_empty() || !page.wires.is_empty() || page.cover);
+    (!dangling && !(page.graphic && page.overview) && !report_clash).then_some(page)
 }
 
 /// One thing in a three-way merge: the side that changed it, or `None` when both changed it
