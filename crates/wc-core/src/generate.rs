@@ -1375,33 +1375,32 @@ mod tests {
             .page(&done.pages[0])
             .ok_or_else(|| Error::Invalid("page".into()))?;
         assert_eq!(page.wires.len(), 3 * 3 + 4);
-        // Each join runs level from a copy's right end to the next copy's left end.
-        let ends: BTreeSet<(i64, i64)> = page
-            .wires
-            .iter()
-            .flat_map(|w| [&w.from, &w.to])
-            .filter_map(|e| match e {
-                Endpoint::Point { at } => Some(((at.x * 10.0) as i64, (at.y * 10.0) as i64)),
-                _ => None,
-            })
-            .collect();
         // The copies' own wires are 40 mm rails and a 20 mm drop; the joins are what is left.
         let length = |w: &Wire| match (&w.from, &w.to) {
             (Endpoint::Point { at: a }, Endpoint::Point { at: b }) => (b.x - a.x).abs() + (b.y - a.y).abs(),
             _ => 0.0,
         };
-        let joins: Vec<&Wire> = page
+        let is_join = |w: &&Wire| (length(w) - 40.0).abs() > 1e-9 && (length(w) - 20.0).abs() > 1e-9;
+        let joins: Vec<&Wire> = page.wires.iter().filter(is_join).collect();
+        assert_eq!(joins.len(), 4);
+        // Each join runs level from a rail end of one copy to a rail end of the next.
+        let key = |p: &Point| ((p.x * 10.0).round() as i64, (p.y * 10.0).round() as i64);
+        let ends: BTreeSet<(i64, i64)> = page
             .wires
             .iter()
-            .filter(|w| (length(w) - 40.0).abs() > 1e-9 && (length(w) - 20.0).abs() > 1e-9)
+            .filter(|w| !is_join(w))
+            .flat_map(|w| [&w.from, &w.to])
+            .filter_map(|e| match e {
+                Endpoint::Point { at } => Some(key(at)),
+                _ => None,
+            })
             .collect();
-        assert_eq!(joins.len(), 4);
         for j in &joins {
             let (Endpoint::Point { at: a }, Endpoint::Point { at: b }) = (&j.from, &j.to) else {
                 return Err(Error::Invalid("a join ends on a pin".into()));
             };
             assert!((a.y - b.y).abs() < 1e-9 && b.x - a.x >= GAP - 1e-9, "{a:?} {b:?}");
-            assert!(ends.contains(&((a.x * 10.0) as i64, (a.y * 10.0) as i64)));
+            assert!(ends.contains(&key(a)) && ends.contains(&key(b)), "{a:?} {b:?}");
         }
         // Without join nothing is added; a rail at another height is not joined.
         let mut plain = Project::new("x");
