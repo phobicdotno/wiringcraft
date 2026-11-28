@@ -81,6 +81,13 @@ fn the_project_s_report_choice_is_printed_when_none_is_asked_for() -> TestResult
     assert!(!done.status.success());
     let err = String::from_utf8_lossy(&done.stderr);
     assert!(err.contains("pdf_reports"), "{err}");
+    // Listed, a control character in a stored name is shown escaped.
+    std::fs::write(
+        dir.join("project.toml"),
+        toml.replace("pdf_reports = []", "pdf_reports = [\"bad\\u001b[2J\"]"),
+    )?;
+    let listed = ok(&dir, &["pdf-reports"])?;
+    assert!(!listed.contains('\u{1b}') && listed.contains("bad"), "{listed:?}");
 
     assert!(ok(&dir, &["pdf-reports", "--clear"])?.starts_with("no reports chosen"));
     assert!(!std::fs::read_to_string(dir.join("project.toml"))?.contains("pdf_reports"));

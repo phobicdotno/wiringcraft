@@ -5545,14 +5545,27 @@ fn run_check(open: &Open) -> Vec<wc_report::Finding> {
 /// `wiringcraft pdf-reports`) in its order, else every report. A name the app does not know is
 /// passed over. Only reports with rows are printed.
 fn pdf_report_kinds(meta: &wc_core::project::ProjectMeta) -> Vec<wc_report::Kind> {
+    pdf_report_choice(meta).0
+}
+
+/// The reports `meta.pdf_reports` names, as [`pdf_report_kinds`] takes them, and the names
+/// that are no report (a hand-edited `project.toml`), which Export PDF refuses.
+fn pdf_report_choice(meta: &wc_core::project::ProjectMeta) -> (Vec<wc_report::Kind>, Vec<String>) {
     let Some(names) = &meta.pdf_reports else {
-        return wc_report::Kind::ALL.to_vec();
+        return (wc_report::Kind::ALL.to_vec(), Vec::new());
     };
     let mut out = Vec::new();
+    let mut unknown = Vec::new();
     for n in names {
         let kinds = match n.trim() {
             "all" => wc_report::Kind::ALL.to_vec(),
-            n => wc_report::Kind::parse(n).into_iter().collect(),
+            n => match wc_report::Kind::parse(n) {
+                Some(k) => vec![k],
+                None => {
+                    unknown.push(format!("{n:?}"));
+                    Vec::new()
+                }
+            },
         };
         for k in kinds {
             if !out.contains(&k) {
@@ -5560,7 +5573,7 @@ fn pdf_report_kinds(meta: &wc_core::project::ProjectMeta) -> Vec<wc_report::Kind
             }
         }
     }
-    out
+    (out, unknown)
 }
 
 fn report_title(k: wc_report::Kind) -> &'static str {
@@ -5825,9 +5838,16 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
         symbols: &open.symbols,
         parts: &open.parts,
     };
+    let (kinds, unknown) = pdf_report_choice(&project.meta);
+    if !unknown.is_empty() {
+        return format!(
+            "Export failed: project.toml: pdf_reports names no report {} (choose the reports again in Project properties)",
+            unknown.join(", ")
+        );
+    }
     let pictures = wc_pdf::read_pictures(&open.dir, project);
     let options = wc_pdf::Options {
-        reports: pdf_report_kinds(&project.meta)
+        reports: kinds
             .into_iter()
             .map(|k| wc_report::build(k, &inputs))
             .filter(|t| !t.rows.is_empty())
@@ -9878,6 +9898,9 @@ mod nudge_tests {
         o.set_project_props_with(&name, &fields, None, None, Some(Some(chosen)))
             .unwrap();
         assert_eq!(pdf_report_kinds(&o.project.meta), [Kind::Terminals, Kind::Parts]);
+        // The name that is no report is what Export PDF refuses.
+        let (_, unknown) = pdf_report_choice(&o.project.meta);
+        assert_eq!(unknown, ["\"nonsense\""]);
         o.project.meta.pdf_reports = Some(vec!["all".into()]);
         assert_eq!(pdf_report_kinds(&o.project.meta), Kind::ALL.to_vec());
         o.project.meta.pdf_reports = Some(Vec::new());

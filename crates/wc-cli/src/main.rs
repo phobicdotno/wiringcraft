@@ -4439,7 +4439,11 @@ fn run(mut cli: Cli) -> Res<()> {
             match &p.meta.pdf_reports {
                 None => println!("no reports chosen: `pdf` prints only those named with --report"),
                 Some(names) if names.is_empty() => println!("none"),
-                Some(names) => println!("{}", names.join(" ")),
+                // Escaped: a hand-edited project.toml can hold control characters.
+                Some(names) => {
+                    let shown: Vec<String> = names.iter().map(|n| escape_field(n)).collect();
+                    println!("{}", shown.join(" "))
+                }
             }
         }
         Cmd::Translations { lang, edit } => {
@@ -6573,7 +6577,11 @@ fn pdf_report_names(names: &[String]) -> Result<Vec<String>, String> {
         let name = if n == "all" {
             "all".to_owned()
         } else {
-            report_kinds(&[n.to_owned()])?[0].name().to_owned()
+            let kinds = report_kinds(&[n.to_owned()])?;
+            let Some(k) = kinds.first() else {
+                return Err(format!("{n:?} is no report"));
+            };
+            k.name().to_owned()
         };
         if !out.contains(&name) {
             out.push(name);
