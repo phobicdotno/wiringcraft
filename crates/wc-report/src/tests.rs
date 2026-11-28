@@ -522,6 +522,44 @@ fn terminal_plan_and_plc_list_name_the_device_past_an_interruption_point() {
     assert_eq!(plc.rows[0][4], "-P2:X1, -X1.2:1");
 }
 
+/// The terminal plan's sides and the PLC I/O list's connections add a device pin's description
+/// as the wire list does (#1879).
+#[test]
+fn terminal_plan_and_plc_list_print_pin_descriptions() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    s.insert(input.id.clone(), input);
+    for (id, name, text) in [("coil", "A2", "Coil -"), ("lamp", "X1", "Lamp +")] {
+        if let Some(pin) = s.get_mut(id).and_then(|y| y.pins.iter_mut().find(|q| q.name == name)) {
+            pin.description = text.into();
+        }
+    }
+    // The input -A1 is wired to the lamp's described pin.
+    let page = &mut p.pages[0];
+    page.symbols.push(place("i1", "wc.plc.input", 220.0, Some("-A1")));
+    page.wires.push(wire("w5", pin("i1", "I"), pin("s6", "X1"), None, None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = terminal_plan(&i);
+    let row = |strip: &str, n: &str| t.rows.iter().find(|r| r[0] == strip && r[1] == n).cloned();
+    let Some(x11) = row("-X1", "1") else {
+        unreachable!("no -X1.1: {:?}", t.rows)
+    };
+    assert_eq!(x11[2], "=A+C1-K1:14", "a pin without a description reads as before");
+    assert!(x11[3].contains("-P1:X1 (Lamp +)"), "{x11:?}");
+    let Some(x2) = row("-X2", "1") else {
+        unreachable!("no -X2.1: {:?}", t.rows)
+    };
+    assert_eq!(x2[2], "=A+C1-K1:A2 (Coil -)");
+    let plc = plc_io_list(&i);
+    assert_eq!(plc.rows.len(), 1, "{:?}", plc.rows);
+    assert!(plc.rows[0][4].contains("-P1:X1 (Lamp +)"), "{:?}", plc.rows[0]);
+}
+
 #[test]
 fn terminal_plan_shows_jumpers() {
     let (mut p, s, parts) = fixture();

@@ -988,7 +988,8 @@ pub fn device_list(i: &Inputs<'_>) -> Table {
     t
 }
 
-/// The names of the pins a terminal or PLC point is wired to, sorted, each once. Interruption
+/// The names of the pins a terminal or PLC point is wired to, each with its description when
+/// its symbol gives one (`-K1:A1 (Coil +)`), sorted, each once. Interruption
 /// points are left out: they only mark where the connection goes on to another page, and the
 /// nets already join across pages, so the device on the other page is in the list. Only when the
 /// pins reach nothing but interruption points are those named, so the cell still says where
@@ -1003,7 +1004,8 @@ fn connected_labels<'a>(i: &Inputs<'_>, pins: impl Iterator<Item = &'a PinRef>) 
             .and_then(|p| p.symbol(item))
             .and_then(|s| i.symbols.get(&s.symbol))
             .is_some_and(|y| y.role == SymbolRole::Interruption);
-        let label = pin_label(i.project, pg, item, pin);
+        // A device pin's description goes with it, as in the wire list (#1879).
+        let label = pin_label_described(i, pg, item, pin);
         if interruption {
             breaks.insert(label);
         } else {
