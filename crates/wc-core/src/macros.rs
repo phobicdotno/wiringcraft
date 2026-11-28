@@ -388,7 +388,8 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
 /// placed wire is numbered afresh), its drawings and the device data of the tags its symbols
 /// carry and of the cables its wires are cores of, anchored at the page's top-left corner, so
 /// [`place`] at `(0, 0)` draws each item where it was. The `{{name}}` placeholders its texts
-/// use are declared, without defaults, so a placement fills them. A page with nothing on it is
+/// use are declared, each with its own `{{name}}` as its default: placed without values, the
+/// texts are as on the page; a value fills them. A page with nothing on it is
 /// refused, as no macro can be empty, and so is one whose macro [`Macro::check`] refuses.
 pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -> Result<Macro> {
     let Some(p) = project.page(page) else {
@@ -432,6 +433,7 @@ pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -
         .into_iter()
         .filter(|name| seen.insert(key(name)))
         .map(|name| Placeholder {
+            default: format!("{{{{{name}}}}}"),
             name,
             ..Default::default()
         })
@@ -1029,7 +1031,16 @@ mod tests {
         let names: Vec<&str> = saved.placeholders.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["voltage"]);
         let values = BTreeMap::from([("voltage".to_owned(), "24".to_owned())]);
-        assert!(saved.apply(None, &values).is_ok());
+        let text_of = |m: &Macro| {
+            m.graphics.iter().find_map(|g| match g {
+                Shape::Text { text, at, .. } if *at == Point::new(10.0, 10.0) => Some(text.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(text_of(&saved.apply(None, &values)?).as_deref(), Some("24 V, 24"));
+        // Placed without values, the texts are as on the page.
+        let plain = saved.apply(None, &BTreeMap::new())?;
+        assert_eq!(text_of(&plain).as_deref(), Some("{{voltage}} V, {{voltage}}"));
         // A text whose braces are not closed makes no macro.
         p.pages[0].graphics.push(Shape::Text {
             at: Point::new(10.0, 20.0),
