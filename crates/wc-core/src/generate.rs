@@ -511,6 +511,23 @@ pub struct Generated {
     pub pages: Vec<String>,
     /// How many copies were placed.
     pub copies: usize,
+    /// How many copies of each macro were placed, by the macro's name, in the order they came.
+    pub macros: Vec<(String, usize)>,
+}
+
+impl Generated {
+    /// `4 copies of Starter`, or with several macros `4 copies: 3 of Starter, 1 of Valve`; each
+    /// name as `show` gives it (escaped for a terminal, say).
+    pub fn copies_text(&self, show: impl Fn(&str) -> String) -> String {
+        let noun = if self.copies == 1 { "copy" } else { "copies" };
+        match self.macros.as_slice() {
+            [(name, _)] => format!("{} {noun} of {}", self.copies, show(name)),
+            many => {
+                let each: Vec<String> = many.iter().map(|(name, n)| format!("{n} of {}", show(name))).collect();
+                format!("{} {noun}: {}", self.copies, each.join(", "))
+            }
+        }
+    }
 }
 
 fn up(v: f64) -> f64 {
@@ -679,6 +696,10 @@ pub fn generate_titled(
         crate::macros::place(&mut work, &page_id, m, at)
             .map_err(|err| Error::Invalid(format!("copy {}: {err}", i + 1)))?;
         out.copies += 1;
+        match out.macros.iter_mut().find(|(name, _)| *name == m.name) {
+            Some((_, n)) => *n += 1,
+            None => out.macros.push((m.name.clone(), 1)),
+        }
         slot += 1;
     }
     work.sort_pages();

@@ -3940,10 +3940,10 @@ fn run(mut cli: Cli) -> Res<()> {
                     vendored.save(dir, &p, &new_pages)?;
                     println!("{}", generated.pages.join(" "));
                     let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+                    // Named by the macros placed: a table's macro column can pick others.
                     println!(
-                        "{} of {} on {}",
-                        plural(generated.copies, "copy", "copies"),
-                        escape_field(&m.name),
+                        "{} on {}",
+                        generated.copies_text(escape_field),
                         plural(generated.pages.len(), "page", "pages")
                     );
                 }

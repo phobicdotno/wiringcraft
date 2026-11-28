@@ -738,7 +738,10 @@ VALVE;;7
             ],
         )
     };
-    assert_eq!(generate(&mixed)?, "p0006\n4 copies of Motor starter on 1 page\n");
+    assert_eq!(
+        generate(&mixed)?,
+        "p0006\n4 copies: 2 of Motor starter, 2 of Valve on 1 page\n"
+    );
     let p = wc_core::store::load(&dir)?;
     let page = p.page("p0006").ok_or("page")?;
     let rows: Vec<String> = page
