@@ -2098,8 +2098,8 @@ impl App {
                 self.ed.selection.clear();
                 self.ed.view.fit = true;
             }
-            Action::DuplicatePage => {
-                if let Some(i) = open.duplicate_page(page) {
+            Action::DuplicatePage => match open.duplicate_page(page) {
+                Ok(i) => {
                     self.ed.page = i;
                     self.ed.panel = None;
                     self.ed.panel_pick = None;
@@ -2107,7 +2107,8 @@ impl App {
                     self.ed.selection.clear();
                     self.ed.view.fit = true;
                 }
-            }
+                Err(e) => self.ed.message = format!("The page was not copied: {e}"),
+            },
             Action::PageUp | Action::PageDown => {
                 if let Some(i) = open.move_page(page, a == Action::PageUp) {
                     self.ed.page = i;

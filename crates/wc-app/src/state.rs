@@ -3631,11 +3631,7 @@ impl Open {
     }
 
     fn free_page_id(&self) -> String {
-        let mut n = 1;
-        while self.project.pages.iter().any(|p| p.id == format!("p{n:04}")) {
-            n += 1;
-        }
-        format!("p{n:04}")
+        self.project.free_page_id()
     }
 
     fn index_of(&self, id: &str) -> usize {
@@ -4416,53 +4412,22 @@ impl Open {
         Ok(n)
     }
 
-    pub fn duplicate_page(&mut self, page: usize) -> Option<usize> {
-        let mut copy = self.project.pages.get(page)?.clone();
+    /// Page > Duplicate page: copy the page as a new last page ([`Project::copy_page`]), as
+    /// one undo step. Nothing changes when it is refused.
+    pub fn duplicate_page(&mut self, page: usize) -> Result<usize, String> {
+        // The change before this one is settled first (its jumpers follow their terminals), so
+        // neither the copy nor the undo step loses it.
+        self.follow_terminals();
+        let (id, number) = (self.free_page_id(), self.next_page_number());
+        let mut project = self.project.clone();
+        let i = project.copy_page(page, id, number, None).map_err(|e| e.to_string())?;
         self.checkpoint();
-        copy.id = self.free_page_id();
-        copy.number = self.next_page_number();
-        copy.title = format!("{} (copy)", copy.title);
-        // A project has one cover page; its copy is an ordinary page.
-        copy.cover = false;
-        let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
-        for s in &mut copy.symbols {
-            let Some(old) = s.tag.clone() else { continue };
-            let new = match renamed.get(&old) {
-                Some(t) => t.clone(),
-                None => {
-                    let Some(t) = self.free_tag_like(&old) else { continue };
-                    let device = self.project.devices.get(&old).cloned().unwrap_or_default();
-                    self.project.devices.insert(t.clone(), device);
-                    renamed.insert(old, t.clone());
-                    t
-                }
-            };
-            s.tag = Some(new);
-        }
-        for w in &mut copy.wires {
-            w.number = None;
-        }
-        let id = copy.id.clone();
-        self.project.pages.push(copy);
-        self.project.sort_pages();
-        Some(self.index_of(&id))
-    }
-
-    /// A free tag with the same function, location and letter code as `like`.
-    pub(crate) fn free_tag_like(&self, like: &DeviceTag) -> Option<DeviceTag> {
-        wc_core::placement::free_tag_like(&wc_core::placement::used_tags(&self.project), like)
+        self.project = project;
+        Ok(i)
     }
 
     fn next_page_number(&self) -> String {
-        let n = self
-            .project
-            .pages
-            .iter()
-            .filter_map(|p| p.number.parse::<u32>().ok())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        n.to_string()
+        self.project.next_page_number()
     }
 
     /// Set the project name, title-block fields and, when given, the whole list of locations as
@@ -10635,6 +10600,27 @@ pub(crate) mod tests {
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
         o.set_device_property(&x2, "note", "x");
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    /// Duplicate page settles a move made since the last change first, so the copy keeps the
+    /// followed jumper (review of #1891).
+    #[test]
+    fn duplicating_a_page_after_a_move_keeps_the_followed_jumper() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let (a, _b, _c) = (put(10.0), put(20.0), put(30.0));
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        o.checkpoint();
+        o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(40.0, 20.0);
+        o.duplicate_page(page).unwrap();
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
     }
 
     #[test]
