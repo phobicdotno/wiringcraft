@@ -127,10 +127,7 @@ impl PageKind {
     /// The kind `page` is marked as now. A report page whose report name is not one there is
     /// counts as a schematic page.
     pub fn of(page: &wc_core::Page) -> Self {
-        let report = page
-            .report
-            .as_deref()
-            .and_then(|n| wc_report::Kind::parse(&n.trim().to_ascii_lowercase()));
+        let report = page.report.as_deref().and_then(wc_report::report_named);
         match (page.overview, page.graphic, report) {
             (true, _, _) => PageKind::Overview,
             (false, true, _) => PageKind::Graphic,
@@ -3676,10 +3673,9 @@ impl Open {
         let report = match kind {
             PageKind::Report(k) => Some(k.name().to_owned()),
             // A report name that is no report stays as it is unless another type is chosen.
-            PageKind::Schematic if PageKind::of(current) == PageKind::Schematic => current
-                .report
-                .clone()
-                .filter(|n| wc_report::Kind::parse(&n.trim().to_ascii_lowercase()).is_none()),
+            PageKind::Schematic if PageKind::of(current) == PageKind::Schematic => {
+                current.report.clone().filter(|n| wc_report::report_named(n).is_none())
+            }
             _ => None,
         };
         if graphic && !current.graphic && (!current.symbols.is_empty() || !current.wires.is_empty()) {
