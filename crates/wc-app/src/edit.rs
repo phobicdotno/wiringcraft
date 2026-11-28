@@ -1530,6 +1530,23 @@ mod tests {
         let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
         assert!(err.contains("line 3: no macro \"nope\""), "{err}");
         assert_eq!(o.project, before);
+
+        // Insert > Macro's rules pick the macro from another column (#1900); a line that is no
+        // rule is named and nothing is placed.
+        std::fs::write(&table, "what;kind\nPump 1;\n;single\n").unwrap();
+        o.table_rules = "\n kind=Single:one coil \n".into();
+        let rules = o.parsed_table_rules().unwrap();
+        let done = o.generate_from_table_ruled(page, &path, &table, None, &rules).unwrap();
+        let new = o.project.page(&done.pages[0]).unwrap();
+        assert_eq!((done.copies, new.symbols.len()), (2, 3));
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        o.table_rules = "kind=single:one coil\nkind:one coil".into();
+        let err = o.parsed_table_rules().unwrap_err();
+        assert!(
+            err.contains("rule \"kind:one coil\": write it as column=value:macro"),
+            "{err}"
+        );
     }
 
     /// The table's path is shown escaped, as `macro generate` shows it (#1865). Unix only: a
