@@ -248,6 +248,13 @@ Set;kW;Section
   the macro given only, as another macro has value sets of its own; a row of another macro picks
   its value set in the `set` column. (A macro that declares a placeholder `macro` takes the column
   as that placeholder.)
+- `--rule column=value:macro` picks the macro of a row from another column, so a table that
+  already says what each row is needs no `macro` column: `--rule type=VFD:motor.vfd --rule
+  type=valve:valve` places `motor.vfd` for the rows whose `type` is `VFD` (case and spaces around
+  it ignored), `valve` for the valves and the macro given for the rest. The first rule a row
+  matches wins, and a row's own `macro` cell wins over every rule. A column a rule reads is taken
+  as with a `macro` column, and its value goes only to a macro that has a placeholder of that
+  name; a rule whose column the table lacks is an error.
 - An empty cell gives no value, so the value set's value or the placeholder's default applies.
 - Any other column name is an error that lists the placeholders, so a typo is not ignored.
 - Every row is checked before anything is placed. A row that cannot be filled (no value set, an

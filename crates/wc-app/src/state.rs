@@ -4268,7 +4268,7 @@ impl Open {
                 .ok_or_else(|| format!("no macro {name:?}"))?;
             wc_core::macros::read_macro(&entry.path).map_err(|e| e.to_string())
         };
-        let (copies, pages) = wc_import::run::macro_table(&m, &bytes, &shown, default_set, other)?;
+        let (copies, pages) = wc_import::run::macro_table(&m, &bytes, &shown, default_set, &[], other)?;
         if copies.is_empty() {
             return Ok(generate::Generated::default());
         }

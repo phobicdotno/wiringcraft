@@ -775,6 +775,32 @@ VALVE;;7
         assert!(err.contains(want), "{err}");
     }
     assert_eq!(wc_core::store::load(&dir)?.pages.len(), p.pages.len());
+
+    // A rule picks the valve for the rows whose type says so (#1900); the type column is given
+    // to neither macro, and a rule naming a column the table lacks places nothing.
+    std::fs::write(&mixed, "type;kW;bar\nDOL;1;\n Valve ;;6\n")?;
+    let table = mixed.to_str().ok_or("path")?;
+    let ruled = |rule: &str| {
+        wiringcraft(
+            &dir,
+            &[
+                "macro", "generate", "starter", "--table", table, "--set", "3 kW", "--rule", rule,
+            ],
+        )
+    };
+    assert_eq!(
+        ruled("type=valve:valve")?,
+        "p0007\n2 copies: 1 of Motor starter, 1 of Valve on 1 page\n"
+    );
+    let Err(err) = ruled("kind=valve:valve") else {
+        return Err("a rule on a missing column was taken".into());
+    };
+    assert!(err.contains("the table has no column \"kind\""), "{err}");
+    let Err(err) = ruled("type:valve") else {
+        return Err("a rule without a value was taken".into());
+    };
+    assert!(err.contains("write it as column=value:macro"), "{err}");
+    assert_eq!(wc_core::store::load(&dir)?.pages.len(), p.pages.len() + 1);
     Ok(())
 }
 

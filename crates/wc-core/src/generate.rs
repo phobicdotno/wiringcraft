@@ -9,6 +9,9 @@
 //! macro for its row; with it, the other columns may be placeholders of any macro, and a value
 //! for a placeholder the row's macro lacks is refused when the rows are applied. Without it any
 //! other column is refused, so a typo is not ignored.
+//! A [`MacroRule`] picks the macro of a row that names none from another column's value; a
+//! column a rule reads is taken like a [`MACRO_COLUMN`]'s other columns, and its value goes
+//! only to a macro that has a placeholder of that name.
 //! An empty cell gives no value: the value set's or the default applies.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,9 +44,46 @@ pub struct TableRow {
     pub set: Option<String>,
     /// The page title from the [`PAGE_COLUMN`]; `None` keeps the row on the page before.
     pub page: Option<String>,
-    /// The macro from the [`MACRO_COLUMN`]; `None` places the macro the table drives.
+    /// The macro from the [`MACRO_COLUMN`], or else from the first [`MacroRule`] it matches;
+    /// `None` places the macro the table drives.
     pub r#macro: Option<String>,
     pub values: BTreeMap<String, String>,
+    /// Values of the columns a [`MacroRule`] reads: a macro without a placeholder of that name
+    /// is not given them, as they are there to choose the macro.
+    pub chooses: BTreeSet<String>,
+}
+
+/// A rule picking the macro of a row that names none: the row places [`MacroRule::r#macro`]
+/// when its [`MacroRule::column`] holds [`MacroRule::value`] (case and spaces around both
+/// ignored). The first rule a row matches wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroRule {
+    pub column: String,
+    pub value: String,
+    pub r#macro: String,
+}
+
+impl MacroRule {
+    /// Read a rule written `column=value:macro` (the macro after the last `:`, the column
+    /// before the first `=`, so a value may hold either).
+    pub fn parse(text: &str) -> Result<Self> {
+        let bad = || {
+            Error::Invalid(format!(
+                "rule {text:?}: write it as column=value:macro, e.g. type=VFD:motor.vfd"
+            ))
+        };
+        let (when, r#macro) = text.rsplit_once(':').ok_or_else(bad)?;
+        let (column, value) = when.split_once('=').ok_or_else(bad)?;
+        let (column, value, r#macro) = (column.trim(), value.trim(), r#macro.trim());
+        if column.is_empty() || value.is_empty() || r#macro.is_empty() {
+            return Err(bad());
+        }
+        Ok(Self {
+            column: column.to_owned(),
+            value: value.to_owned(),
+            r#macro: r#macro.to_owned(),
+        })
+    }
 }
 
 /// What a column of the table fills.
@@ -63,6 +103,17 @@ enum Column {
 /// Read `cells` (the header row first) as the rows of a table driving `m`. `lines` gives the
 /// line or worksheet row of each of `cells` for messages (row `i` is line `i + 1` without it).
 pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Result<Vec<TableRow>> {
+    rows_from_table_ruled(m, cells, lines, &[])
+}
+
+/// [`rows_from_table`], with `rules` picking the macro of each row that names none in a
+/// [`MACRO_COLUMN`]. A rule whose column the table lacks is refused.
+pub fn rows_from_table_ruled(
+    m: &Macro,
+    cells: &[Vec<String>],
+    lines: &[usize],
+    rules: &[MacroRule],
+) -> Result<Vec<TableRow>> {
     let line = |i: usize| lines.get(i).copied().unwrap_or(i + 1);
     // Escaped: a macro's name comes from its file and could hold control characters.
     let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", m.name)));
@@ -70,7 +121,20 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
         return bad("the table is empty; its first row names the placeholders".into());
     };
     let placeholder = |name: &str| m.placeholders.iter().find(|p| key(&p.name) == key(name));
-    let picks_macros = placeholder(MACRO_COLUMN).is_none() && header.iter().any(|n| key(n.trim()) == MACRO_COLUMN);
+    let picks_macros = !rules.is_empty()
+        || placeholder(MACRO_COLUMN).is_none() && header.iter().any(|n| key(n.trim()) == MACRO_COLUMN);
+    // The column each rule reads, by its place in the header.
+    let mut ruled = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let Some(at) = header.iter().position(|n| key(n) == key(&rule.column)) else {
+            return bad(format!(
+                "rule {:?}: the table has no column {:?}",
+                format!("{}={}:{}", rule.column, rule.value, rule.r#macro),
+                rule.column
+            ));
+        };
+        ruled.push(at);
+    }
     let mut columns = Vec::with_capacity(header.len());
     let mut seen = BTreeSet::new();
     for name in header {
@@ -123,6 +187,9 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
             match columns.get(c) {
                 Some(Column::Placeholder(name) | Column::Other(name)) => {
                     row.values.insert(name.clone(), value.to_owned());
+                    if ruled.contains(&c) {
+                        row.chooses.insert(name.clone());
+                    }
                 }
                 Some(Column::Macro) => row.r#macro = Some(value.to_owned()),
                 Some(Column::Set) => row.set = Some(value.to_owned()),
@@ -134,6 +201,14 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
                     ));
                 }
             }
+        }
+        if row.r#macro.is_none() {
+            let cell = |at: usize| cells.get(at).map(|v| key(v)).unwrap_or_default();
+            row.r#macro = rules
+                .iter()
+                .zip(&ruled)
+                .find(|(rule, at)| cell(**at) == key(&rule.value))
+                .map(|(rule, _)| rule.r#macro.clone());
         }
         rows.push(row);
     }
@@ -181,7 +256,12 @@ pub fn apply_rows_with(
         } else {
             row.set.as_deref()
         };
-        out.push(picked.apply(set, &row.values).map_err(at)?);
+        // What only chooses the macro goes to one that has a placeholder of its name.
+        let mut values = row.values.clone();
+        values.retain(|name, _| {
+            !row.chooses.contains(name) || picked.placeholders.iter().any(|p| key(&p.name) == key(name))
+        });
+        out.push(picked.apply(set, &values).map_err(at)?);
     }
     Ok(out)
 }
@@ -883,6 +963,7 @@ mod tests {
                 values: BTreeMap::new(),
                 page: None,
                 r#macro: None,
+                chooses: BTreeSet::new(),
             })
             .collect();
         let copies = apply_rows(&m, &rows, None)?;
@@ -1087,6 +1168,75 @@ mod tests {
         // Without the column, a column that is no placeholder is still refused.
         assert!(
             err_of(rows_from_table(&m, &table(&[&["bar"], &["2"]]), &[])).contains("is not one of its placeholders")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rules_pick_the_macro_of_a_row_from_another_column() -> Result<()> {
+        let m = starter()?;
+        let find = |name: &str| {
+            if key(name) == "valve" {
+                valve()
+            } else {
+                Err(Error::Invalid(format!("no macro {name:?}")))
+            }
+        };
+        let rules = [MacroRule::parse("Type = Valve : valve")?];
+        let rows = rows_from_table_ruled(
+            &m,
+            &table(&[
+                &["macro", "type", "kW", "bar"],
+                &["", "dol", "1", ""],
+                &["", " VALVE ", "", "2"],
+                // The macro column wins over a rule.
+                &["Starter", "valve", "3", ""],
+            ]),
+            &[],
+            &rules,
+        )?;
+        let picked: Vec<Option<&str>> = rows.iter().map(|r| r.r#macro.as_deref()).collect();
+        assert_eq!(picked, [None, Some("valve"), Some("Starter")]);
+        // The type column only chooses: neither macro has a placeholder for it.
+        let both = |name: &str| if key(name) == "starter" { starter() } else { find(name) };
+        let copies = apply_rows_with(&m, &rows, Some("small"), both)?;
+        let descriptions: Vec<String> = copies
+            .iter()
+            .flat_map(|m| m.devices.values().map(|d| d.description.clone()))
+            .collect();
+        assert_eq!(descriptions, ["Motor 1 kW", "Valve 2 bar", "Motor 3 kW"]);
+        // A rule may read a placeholder's column too: its value still fills the placeholder
+        // of a macro that has it, and is not given to one that lacks it.
+        let rules = [MacroRule::parse("kW=0.5:valve")?];
+        let rows = rows_from_table_ruled(&m, &table(&[&["kW", "bar"], &["0.5", "2"], &["4", ""]]), &[], &rules)?;
+        let copies = apply_rows_with(&m, &rows, Some("small"), both)?;
+        let descriptions: Vec<String> = copies
+            .iter()
+            .flat_map(|m| m.devices.values().map(|d| d.description.clone()))
+            .collect();
+        assert_eq!(descriptions, ["Valve 2 bar", "Motor 4 kW"]);
+
+        // A rule's column must be in the table, and a rule is written column=value:macro.
+        assert_eq!(
+            err_of(rows_from_table_ruled(
+                &m,
+                &table(&[&["kW"], &["1"]]),
+                &[],
+                &[MacroRule::parse("type=x:valve")?]
+            )),
+            "macro \"Starter\": rule \"type=x:valve\": the table has no column \"type\""
+        );
+        for bad in ["type=x", "type:valve", "=x:valve", "type=:valve", "type=x:"] {
+            assert!(
+                err_of(MacroRule::parse(bad)).contains("write it as column=value:macro"),
+                "{bad}"
+            );
+        }
+        // A value may hold `=` and `:`; the macro is after the last `:`.
+        let rule = MacroRule::parse("ratio=1:2=a:valve")?;
+        assert_eq!(
+            (rule.column.as_str(), rule.value.as_str(), rule.r#macro.as_str()),
+            ("ratio", "1:2=a", "valve")
         );
         Ok(())
     }
