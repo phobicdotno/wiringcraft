@@ -155,8 +155,8 @@ pub fn apply_rows(m: &Macro, rows: &[TableRow], default_set: Option<&str>) -> Re
 
 /// [`apply_rows`], with a row's [`MACRO_COLUMN`] naming the macro it places, found by
 /// `find` (each name once; names alike but for case and spaces around them are one). A row
-/// that names no macro places `m`; `default_set` applies to those rows only, as another macro
-/// has value sets of its own. The first row that cannot be applied, or whose macro cannot be
+/// that names no macro places `m`; `default_set` applies to the rows that place `m` only, as
+/// another macro has value sets of its own. The first row that cannot be applied, or whose macro cannot be
 /// found, is an error naming its line.
 pub fn apply_rows_with(
     m: &Macro,
@@ -168,16 +168,18 @@ pub fn apply_rows_with(
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let at = |err: Error| Error::Invalid(format!("line {}: {err}", row.line));
-        let (picked, set) = match row.r#macro.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            Some(name) => {
-                let k = key(name);
-                if !found.contains_key(&k) {
-                    let other = find(name).map_err(at)?;
-                    found.insert(k.clone(), other);
-                }
-                (&found[&k], row.set.as_deref())
-            }
-            None => (m, row.set.as_deref().or(default_set)),
+        let picked = match row.r#macro.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(name) => match found.entry(key(name)) {
+                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::btree_map::Entry::Vacant(e) => e.insert(find(name).map_err(at)?),
+            },
+            None => m,
+        };
+        // A row that names the macro the table drives is one that names none.
+        let set = if picked == m {
+            row.set.as_deref().or(default_set)
+        } else {
+            row.set.as_deref()
         };
         out.push(picked.apply(set, &row.values).map_err(at)?);
     }
@@ -1040,6 +1042,11 @@ mod tests {
         assert_eq!(descriptions, ["Motor 1 kW", "Valve 2 bar", "Valve 3 bar"]);
         // Each name is looked up once.
         assert_eq!(*asked.borrow(), ["valve"]);
+        // A row naming the macro the table drives takes --set as a row naming none does.
+        let both = |name: &str| if key(name) == "starter" { starter() } else { find(name) };
+        let rows = rows_from_table(&m, &table(&[&["macro", "kW"], &["Starter", "1"], &["", "2"]]), &[])?;
+        let copies = apply_rows_with(&m, &rows, Some("big"), both)?;
+        assert_eq!(copies.len(), 2);
 
         // A value for a placeholder the row's macro lacks, and a macro that cannot be found,
         // are refused with the row's line.
