@@ -678,6 +678,10 @@ pub const TITLE_FIELDS: &[(&str, &str)] = &[
     ("date", "Date"),
 ];
 
+/// The value of a revision field (the project's or a page's) that has each page show the
+/// latest revision its clouds are tagged with ([`Page::auto_revision`]).
+pub const AUTO_REVISION: &str = "auto";
+
 /// The title-block fields that usually differ from page to page, which the page properties
 /// offer first: a page's own value wins over the project's ([`Page::title_field`]).
 pub const PAGE_TITLE_FIELDS: &[&str] = &["revision", "date", "drawn_by", "checked_by"];
@@ -1830,13 +1834,32 @@ impl Page {
     }
 
     /// A title-block field as this page shows it: the page's own value when it has one that
-    /// is not blank, else the project's. Empty when neither has it.
+    /// is not blank, else the project's. Empty when neither has it. A revision of
+    /// [`AUTO_REVISION`] shows [`Page::auto_revision`].
     pub fn title_field<'a>(&'a self, meta: &'a ProjectMeta, key: &str) -> &'a str {
-        self.title_block
+        let value = self
+            .title_block
             .get(key)
             .filter(|v| !v.trim().is_empty())
             .or_else(|| meta.title_block.get(key))
-            .map_or("", String::as_str)
+            .map_or("", String::as_str);
+        if key == "revision" && value.trim().eq_ignore_ascii_case(AUTO_REVISION) {
+            return self.auto_revision(meta);
+        }
+        value
+    }
+
+    /// The revision this page shows for a revision field of [`AUTO_REVISION`]: the latest
+    /// revision in the project's list that a cloud on this page is tagged with, else (no cloud
+    /// on the page names a listed revision) the first revision, the issue every page was part
+    /// of. Empty when the project lists no revisions.
+    pub fn auto_revision<'a>(&self, meta: &'a ProjectMeta) -> &'a str {
+        let revisions = &meta.revisions;
+        let latest = revisions
+            .iter()
+            .rev()
+            .find(|r| self.clouds.iter().any(|c| c.revision.trim() == r.letter));
+        latest.or(revisions.first()).map_or("", |r| r.letter.as_str())
     }
 
     pub fn symbol(&self, id: &str) -> Option<&PlacedSymbol> {
@@ -3181,6 +3204,37 @@ mod tests {
         for bad in ["XX", "BLUE", "B", "GNY", "sw", "1", "B/K", "G/N/YE", "/"] {
             assert!(!spec("", bad).colour_is_iec(), "{bad}");
         }
+    }
+
+    #[test]
+    fn an_auto_revision_shows_the_latest_revision_clouded_on_the_page() -> crate::Result<()> {
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("a", "1", ""));
+        let page = |p: &Project| p.pages.first().map(|pg| pg.title_field(&p.meta, "revision").to_owned());
+        // No revisions listed: nothing to show.
+        p.meta.title_block.insert("revision".into(), " Auto ".into());
+        assert_eq!(page(&p).as_deref(), Some(""));
+        for letter in ["A", "B", "C"] {
+            p.add_revision(letter, "", "", "")?;
+        }
+        // No cloud on the page: the first issue.
+        assert_eq!(page(&p).as_deref(), Some("A"));
+        // The latest revision in the list a cloud names, whatever order the clouds are in; a
+        // cloud naming no listed revision counts for nothing.
+        for letter in ["B", "Z", "A"] {
+            let cloud = crate::revision::RevisionCloud::new(Point::new(0.0, 0.0), Point::new(10.0, 10.0), letter);
+            p.pages[0].clouds.push(cloud);
+        }
+        assert_eq!(page(&p).as_deref(), Some("B"));
+        // A page's own value wins, and its own `auto` works the same way.
+        p.meta.title_block.insert("revision".into(), "C".into());
+        assert_eq!(page(&p).as_deref(), Some("C"));
+        p.pages[0].set_title_field("revision", "auto");
+        assert_eq!(page(&p).as_deref(), Some("B"));
+        // Only the revision field is worked out.
+        p.meta.title_block.insert("drawn_by".into(), "auto".into());
+        assert_eq!(p.pages[0].title_field(&p.meta, "drawn_by"), "auto");
+        Ok(())
     }
 
     #[test]

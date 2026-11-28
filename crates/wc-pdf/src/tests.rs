@@ -2428,6 +2428,55 @@ fn a_pages_own_title_block_fields_win_over_the_projects_on_that_page() {
     assert!(!on_plain.contains(&"Rev-C".to_owned()), "{on_plain:?}");
 }
 
+/// A revision of `auto` shows on each schematic page the latest revision clouded on it (the
+/// first issue on a page without clouds), and on the sheets the PDF makes the latest one.
+#[test]
+fn an_auto_revision_follows_the_clouds_and_reports_show_the_latest() -> Result<(), String> {
+    let mut project = Project::new("Plant 7");
+    for letter in ["A", "B", "C"] {
+        project.add_revision(letter, "", "", "").map_err(|e| e.to_string())?;
+    }
+    project.meta.title_block.insert("revision".into(), "auto".into());
+    let mut clouded = Page::new("p1", "1", "Mains");
+    clouded.clouds.push(wc_core::revision::RevisionCloud::new(
+        Point::new(50.0, 50.0),
+        Point::new(80.0, 70.0),
+        "B",
+    ));
+    project.pages = vec![clouded, Page::new("p2", "2", "Motors")];
+    let texts = |page: &Page| -> Vec<String> {
+        layout::frame_marks(&project, page, 0, 2, "2026-11-28")
+            .into_iter()
+            .filter_map(|m| match m.shape {
+                Shape::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    };
+    let (on_clouded, on_plain) = (texts(&project.pages[0]), texts(&project.pages[1]));
+    assert!(on_clouded.contains(&"B".to_owned()), "{on_clouded:?}");
+    assert!(!on_clouded.iter().any(|t| t == "auto"), "{on_clouded:?}");
+    assert!(on_plain.contains(&"A".to_owned()), "{on_plain:?}");
+    let mut table = wc_report::Table {
+        title: "Parts".into(),
+        columns: vec!["Part".into()],
+        rows: vec![vec!["X".into()]],
+        ..Default::default()
+    };
+    table.header = vec!["revision".into()];
+    let opts = Options {
+        reports: vec![table],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(
+        text.contains(&writer::pdf_text("Revision: C")),
+        "the report sheet shows the latest"
+    );
+    Ok(())
+}
+
 #[test]
 fn long_title_block_values_stay_inside_their_boxes() {
     let mut project = wc_core::Project::new("Pump station upgrade and refurbishment ".repeat(4));
