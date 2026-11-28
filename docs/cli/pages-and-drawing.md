@@ -38,6 +38,7 @@ number. Only `page add` takes the id alone, and `place`, `box`, `box-edit`, `wir
 | `page add <ID> --number <N>` | Add a page. `--title`, `--size` (default `A3`), `--overview`, `--cover`, `--graphic` |
 | `page list` | List the pages: id, number, title, symbol and wire counts, and the `cover`, `overview` or `graphic` mark |
 | `page edit <ID>` | Change the `--number` and `--title`. A number another page has is refused |
+| `page copy <ID>` | Copy a page, as the app's Duplicate page does: the copy's devices get the next free tags like theirs (with their description, part and other data) and its wire numbers are cleared. `--id` (the first free `p0001`, ... if left out), `--number` (one more than the largest plain number), `--title` (the title and ` (copy)`). Prints the new page's id |
 | `page size <ID> <SIZE>` | Change the sheet size. What is drawn stays where it is |
 | `page overview <ID>` | Mark it as an overview (line diagram); `--off` makes it a normal page |
 | `page graphic <ID>` | Mark it as a graphic page (drawings only; symbols and wires are refused on it). A page that has symbols or wires is refused; `--off` makes it a normal page |

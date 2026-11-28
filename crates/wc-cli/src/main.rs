@@ -1252,6 +1252,22 @@ enum PageCmd {
         /// The page's id or number.
         id: String,
     },
+    /// Copy a page as a new page, as the app's Duplicate page does: its devices get the next
+    /// free tags like theirs (with their data) and its wire numbers are cleared. Prints the new
+    /// page's id.
+    Copy {
+        /// The page to copy (id or number).
+        page: String,
+        /// The new page's id; the first free `p0001`, `p0002`, ... if left out.
+        #[arg(long)]
+        id: Option<String>,
+        /// The new page's number; one more than the largest plain number if left out.
+        #[arg(long)]
+        number: Option<String>,
+        /// The new page's title; the page's title and ` (copy)` if left out.
+        #[arg(long)]
+        title: Option<String>,
+    },
     /// Mark a page as a graphic page (free drawings only, no symbols or wires), or with `--off`
     /// as a normal page again. A page that still holds symbols or wires is refused.
     Graphic {
@@ -3297,6 +3313,47 @@ fn run(mut cli: Cli) -> Res<()> {
                         return Err("a project needs at least one page".into());
                     }
                     p.pages.remove(i);
+                }
+                PageCmd::Copy {
+                    page,
+                    id,
+                    number,
+                    title,
+                } => {
+                    let i = page_index(&p, &page)?;
+                    let id = match id {
+                        Some(id) => {
+                            store::check_id(&id).map_err(e)?;
+                            if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
+                                return Err(format!("page {:?} exists; pick another id", escape_field(&id)));
+                            }
+                            id
+                        }
+                        None => p.free_page_id(),
+                    };
+                    let number = match number {
+                        Some(n) => p.free_page_number(&n, None).map_err(e)?,
+                        None => p.next_page_number(),
+                    };
+                    let title = title.map(|t| t.trim().to_owned());
+                    p.copy_page(i, id.clone(), number, title)
+                        .ok_or_else(|| format!("no page {:?}", escape_field(&page)))?;
+                    // A save that fails half way puts the files back, so no page file of the
+                    // copy is left without its devices.
+                    let before = snapshot_project(dir, &[id.as_str()], &[])?;
+                    refuse_linked_files(dir, &before, "page copy")?;
+                    if let Err(err) = save(dir, &p) {
+                        let failed = put_files_back(&before);
+                        if failed.is_empty() {
+                            return Err(err);
+                        }
+                        return Err(format!(
+                            "{err}; putting the project's files back failed too: {}",
+                            failed.join("; ")
+                        ));
+                    }
+                    println!("{}", escape_field(&id));
+                    return Ok(());
                 }
                 PageCmd::Graphic { id, off } => {
                     let i = page_index(&p, &id)?;

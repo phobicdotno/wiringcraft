@@ -3631,11 +3631,7 @@ impl Open {
     }
 
     fn free_page_id(&self) -> String {
-        let mut n = 1;
-        while self.project.pages.iter().any(|p| p.id == format!("p{n:04}")) {
-            n += 1;
-        }
-        format!("p{n:04}")
+        self.project.free_page_id()
     }
 
     fn index_of(&self, id: &str) -> usize {
@@ -4410,52 +4406,14 @@ impl Open {
     }
 
     pub fn duplicate_page(&mut self, page: usize) -> Option<usize> {
-        let mut copy = self.project.pages.get(page)?.clone();
+        self.project.pages.get(page)?;
         self.checkpoint();
-        copy.id = self.free_page_id();
-        copy.number = self.next_page_number();
-        copy.title = format!("{} (copy)", copy.title);
-        // A project has one cover page; its copy is an ordinary page.
-        copy.cover = false;
-        let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
-        for s in &mut copy.symbols {
-            let Some(old) = s.tag.clone() else { continue };
-            let new = match renamed.get(&old) {
-                Some(t) => t.clone(),
-                None => {
-                    let Some(t) = self.free_tag_like(&old) else { continue };
-                    let device = self.project.devices.get(&old).cloned().unwrap_or_default();
-                    self.project.devices.insert(t.clone(), device);
-                    renamed.insert(old, t.clone());
-                    t
-                }
-            };
-            s.tag = Some(new);
-        }
-        for w in &mut copy.wires {
-            w.number = None;
-        }
-        let id = copy.id.clone();
-        self.project.pages.push(copy);
-        self.project.sort_pages();
-        Some(self.index_of(&id))
-    }
-
-    /// A free tag with the same function, location and letter code as `like`.
-    pub(crate) fn free_tag_like(&self, like: &DeviceTag) -> Option<DeviceTag> {
-        wc_core::placement::free_tag_like(&wc_core::placement::used_tags(&self.project), like)
+        let (id, number) = (self.free_page_id(), self.next_page_number());
+        self.project.copy_page(page, id, number, None)
     }
 
     fn next_page_number(&self) -> String {
-        let n = self
-            .project
-            .pages
-            .iter()
-            .filter_map(|p| p.number.parse::<u32>().ok())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        n.to_string()
+        self.project.next_page_number()
     }
 
     /// Set the project name, title-block fields and, when given, the whole list of locations as

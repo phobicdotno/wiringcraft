@@ -2200,6 +2200,71 @@ impl Project {
         }
     }
 
+    /// The first free page id of the form `p0001`.
+    pub fn free_page_id(&self) -> String {
+        let mut n = 1;
+        while self
+            .pages
+            .iter()
+            .any(|p| p.id.eq_ignore_ascii_case(&format!("p{n:04}")))
+        {
+            n += 1;
+        }
+        format!("p{n:04}")
+    }
+
+    /// One more than the largest page number that is a plain number (`1` when there is none).
+    pub fn next_page_number(&self) -> String {
+        let n = self
+            .pages
+            .iter()
+            .filter_map(|p| p.number.trim().parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        n.saturating_add(1).to_string()
+    }
+
+    /// Copy the page at `page` as a new page `id` numbered `number`, titled `title` (the
+    /// page's title and ` (copy)` when `None`). The copy is no cover page; its devices get the
+    /// next free tags like theirs (one new device per device, with its data: description,
+    /// part, ...) and its wire numbers are cleared, so `number-wires` numbers them anew. Returns
+    /// the copy's index once the pages are sorted, or `None` when there is no page at `page`.
+    /// The id and number are not checked here.
+    pub fn copy_page(&mut self, page: usize, id: String, number: String, title: Option<String>) -> Option<usize> {
+        let mut copy = self.pages.get(page)?.clone();
+        copy.title = title.unwrap_or_else(|| format!("{} (copy)", copy.title));
+        copy.id = id;
+        copy.number = number;
+        // A project has one cover page; its copy is an ordinary page.
+        copy.cover = false;
+        let mut used = crate::placement::used_tags(self);
+        let mut renamed: std::collections::BTreeMap<DeviceTag, DeviceTag> = std::collections::BTreeMap::new();
+        for s in &mut copy.symbols {
+            let Some(old) = s.tag.clone() else { continue };
+            let new = match renamed.get(&old) {
+                Some(t) => t.clone(),
+                None => {
+                    let Some(t) = crate::placement::free_tag_like(&used, &old) else {
+                        continue;
+                    };
+                    used.insert(t.clone());
+                    let device = self.devices.get(&old).cloned().unwrap_or_default();
+                    self.devices.insert(t.clone(), device);
+                    renamed.insert(old, t.clone());
+                    t
+                }
+            };
+            s.tag = Some(new);
+        }
+        for w in &mut copy.wires {
+            w.number = None;
+        }
+        let id = copy.id.clone();
+        self.pages.push(copy);
+        self.sort_pages();
+        self.pages.iter().position(|p| p.id == id)
+    }
+
     /// Sort pages by their display number, comparing numeric parts as numbers.
     /// Pages with the same number are ordered by their id.
     pub fn sort_pages(&mut self) {
@@ -2366,6 +2431,79 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copied_page_gets_new_tags_and_no_wire_numbers() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        let k1 = DeviceTag::parse("-K1")?;
+        let mut page = Page::new("p0001", "1", "Motor");
+        page.cover = true;
+        for (i, at) in [0.0, 20.0].into_iter().enumerate() {
+            // The coil and a contact of the same device.
+            page.symbols.push(PlacedSymbol {
+                id: format!("s{i}"),
+                symbol: "k".into(),
+                at: Point::new(at, 0.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(k1.clone()),
+            });
+        }
+        page.wires.push(Wire {
+            id: "w1".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+            via: Vec::new(),
+            number: Some("1.1".into()),
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        p.pages.push(page);
+        p.devices.insert(
+            k1.clone(),
+            crate::Device {
+                description: "Pump".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            (p.free_page_id(), p.next_page_number()),
+            ("p0002".to_owned(), "2".to_owned())
+        );
+        let i = p.copy_page(0, "p0002".into(), "2".into(), None).ok_or("copied")?;
+        let copy = p.pages.get(i).ok_or("page")?;
+        assert_eq!((copy.title.as_str(), copy.cover), ("Motor (copy)", false));
+        let k2 = DeviceTag::parse("-K2")?;
+        assert!(
+            copy.symbols.iter().all(|s| s.tag.as_ref() == Some(&k2)),
+            "one new device for both"
+        );
+        assert!(copy.wires.iter().all(|w| w.number.is_none()));
+        assert_eq!(p.devices.get(&k2).map(|d| d.description.as_str()), Some("Pump"));
+        assert_eq!(
+            p.pages
+                .first()
+                .and_then(|pg| pg.symbols.first())
+                .and_then(|s| s.tag.clone()),
+            Some(k1)
+        );
+        assert!(p.pages.first().is_some_and(|pg| pg.cover));
+        let j = p
+            .copy_page(0, "x".into(), "1.5".into(), Some("Spare".into()))
+            .ok_or("copied")?;
+        assert_eq!(
+            p.pages.get(j).map(|pg| (pg.number.as_str(), pg.title.as_str())),
+            Some(("1.5", "Spare"))
+        );
+        assert!(p.copy_page(9, "y".into(), "9".into(), None).is_none());
+        Ok(())
+    }
 
     #[test]
     fn dangling_pins_sort_pages_tags_and_pins_by_number() -> std::result::Result<(), Box<dyn std::error::Error>> {
