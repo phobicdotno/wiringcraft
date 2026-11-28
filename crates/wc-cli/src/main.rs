@@ -1268,6 +1268,24 @@ enum PageCmd {
         #[arg(long)]
         title: Option<String>,
     },
+    /// Number the pages again in their order: `--prefix`, then `--start`, `--start` +
+    /// `--step`, ... From `--from` on (the first page if left out); the pages before it keep
+    /// their numbers. New numbers that would change the page order or repeat a kept number are
+    /// refused.
+    Renumber {
+        /// The first page to number again (id or number); every page if left out.
+        #[arg(long)]
+        from: Option<String>,
+        /// The first number.
+        #[arg(long, default_value_t = 1)]
+        start: u64,
+        /// What each number adds to the one before.
+        #[arg(long, default_value_t = 1)]
+        step: u64,
+        /// Text before each number, such as `=A1/`.
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
     /// Mark a page as a graphic page (free drawings only, no symbols or wires), or with `--off`
     /// as a normal page again. A page that still holds symbols or wires is refused.
     Graphic {
@@ -3336,8 +3354,7 @@ fn run(mut cli: Cli) -> Res<()> {
                         None => p.next_page_number(),
                     };
                     let title = title.map(|t| t.trim().to_owned());
-                    p.copy_page(i, id.clone(), number, title)
-                        .ok_or_else(|| format!("no page {:?}", escape_field(&page)))?;
+                    p.copy_page(i, id.clone(), number, title).map_err(e)?;
                     // A save that fails half way puts the files back, so no page file of the
                     // copy is left without its devices.
                     let before = snapshot_project(dir, &[id.as_str()], &[])?;
@@ -3353,6 +3370,39 @@ fn run(mut cli: Cli) -> Res<()> {
                         ));
                     }
                     println!("{}", escape_field(&id));
+                    return Ok(());
+                }
+                PageCmd::Renumber {
+                    from,
+                    start,
+                    step,
+                    prefix,
+                } => {
+                    p.sort_pages();
+                    let from = match &from {
+                        Some(page) => page_index(&p, page)?,
+                        None => 0,
+                    };
+                    let changed = p.renumber_pages(from, &prefix, start, step).map_err(e)?;
+                    if changed > 0 {
+                        // Every page file is read first: a save that fails half way puts them
+                        // back, so no page keeps a new number its neighbours lack (a second
+                        // run numbers in the order the numbers give).
+                        let before = snapshot_project(dir, &[], &[])?;
+                        refuse_linked_files(dir, &before, "page renumber")?;
+                        if let Err(err) = save(dir, &p) {
+                            let failed = put_files_back(&before);
+                            if failed.is_empty() {
+                                return Err(err);
+                            }
+                            return Err(format!(
+                                "{err}; putting the page files back failed too: {}",
+                                failed.join("; ")
+                            ));
+                        }
+                    }
+                    let n = p.pages.len() - from;
+                    println!("{changed} of {n} {} renumbered", if n == 1 { "page" } else { "pages" });
                     return Ok(());
                 }
                 PageCmd::Graphic { id, off } => {
@@ -3924,7 +3974,7 @@ fn run(mut cli: Cli) -> Res<()> {
                         Some(bytes) => bytes,
                         None => run::read_file(&table)?,
                     };
-                    let copies = run::macro_table_copies(&m, &bytes, &table.display().to_string(), set.as_deref())?;
+                    let (copies, pages) = run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref())?;
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
@@ -3933,7 +3983,7 @@ fn run(mut cli: Cli) -> Res<()> {
                         .map_err(|x| vendored.undo(x))?;
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let symbol = |id: &str| store::read_vendored_symbol(dir, id).ok();
-                    let generated = wc_core::generate::generate(&mut p, &copies, symbol, size, &title)
+                    let generated = wc_core::generate::generate_titled(&mut p, &copies, &pages, symbol, size, &title)
                         .map_err(|x| vendored.undo(e(x)))?;
                     // A save that fails half way puts the project's files back, so a second run
                     // does not place the rows already written again.

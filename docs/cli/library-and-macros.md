@@ -235,6 +235,11 @@ Set;kW;Section
 - The first row names the columns. A column named like one of the macro's placeholders (case
   ignored) fills it. A column `set` picks the row's value set; rows without one use `--set`. (A
   macro that declares a placeholder `set` takes the column as that placeholder.)
+- A column `page` titles the pages: a row whose page differs from the row before starts a new
+  page with that title, so a table sorted by plant area gives a page (or more, when one is full)
+  per area. An empty cell keeps the row on the page before; rows before the first named page go
+  under `--title`. (A macro that declares a placeholder `page` takes the column as that
+  placeholder.)
 - An empty cell gives no value, so the value set's value or the placeholder's default applies.
 - Any other column name is an error that lists the placeholders, so a typo is not ignored.
 - Every row is checked before anything is placed. A row that cannot be filled (no value set, an
@@ -243,7 +248,7 @@ Set;kW;Section
   `;;`, is skipped like a blank line, as spreadsheets write those under the last row.
 - The copies go on new pages after the last page, numbered on from the last page's first number
   (`12.3` gives `13`, `A7` gives `A8`) and
-  titled `--title` (the macro's name if left out), in the `--size` given (A3 if left out). They
+  titled `--title` (the macro's name if left out) or the `page` column, in the `--size` given (A3 if left out). They
   are placed left to right, then row below row, inside the frame and above the title block,
   10 mm apart (counting the widest text any copy draws), with the macro's anchor on the 5 mm
   grid. A full page starts the next one. A

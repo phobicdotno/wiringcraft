@@ -2227,42 +2227,136 @@ impl Project {
     /// Copy the page at `page` as a new page `id` numbered `number`, titled `title` (the
     /// page's title and ` (copy)` when `None`). The copy is no cover page; its devices get the
     /// next free tags like theirs (one new device per device, with its data: description,
-    /// part, ...) and its wire numbers are cleared, so `number-wires` numbers them anew. Returns
-    /// the copy's index once the pages are sorted, or `None` when there is no page at `page`.
-    /// The id and number are not checked here.
-    pub fn copy_page(&mut self, page: usize, id: String, number: String, title: Option<String>) -> Option<usize> {
-        let mut copy = self.pages.get(page)?.clone();
+    /// part, ...), cables its wires' cores belong to included, and its wire numbers are cleared,
+    /// so `number-wires` numbers them anew. Returns the copy's index once the pages are sorted.
+    /// Refused, with nothing changed, when there is no page at `page` or a device has no free
+    /// tag like its own left. The id and number are not checked here.
+    pub fn copy_page(
+        &mut self,
+        page: usize,
+        id: String,
+        number: String,
+        title: Option<String>,
+    ) -> crate::Result<usize> {
+        let mut copy = self
+            .pages
+            .get(page)
+            .ok_or_else(|| crate::Error::Invalid(format!("there is no page {}", page.saturating_add(1))))?
+            .clone();
         copy.title = title.unwrap_or_else(|| format!("{} (copy)", copy.title));
         copy.id = id;
         copy.number = number;
         // A project has one cover page; its copy is an ordinary page.
         copy.cover = false;
+        // Every tag the copy draws, symbols' and cables', gets one new tag, all found before
+        // any device is added.
         let mut used = crate::placement::used_tags(self);
         let mut renamed: std::collections::BTreeMap<DeviceTag, DeviceTag> = std::collections::BTreeMap::new();
+        let tags = copy
+            .symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref())
+            .chain(copy.wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)));
+        for old in tags {
+            if renamed.contains_key(old) {
+                continue;
+            }
+            let new = crate::placement::free_tag_like(&used, old)
+                .ok_or_else(|| crate::Error::Invalid(format!("no free tag like {old} is left for the copy of it")))?;
+            used.insert(new.clone());
+            renamed.insert(old.clone(), new);
+        }
+        for (old, new) in &renamed {
+            let device = self.devices.get(old).cloned().unwrap_or_default();
+            self.devices.insert(new.clone(), device);
+        }
         for s in &mut copy.symbols {
-            let Some(old) = s.tag.clone() else { continue };
-            let new = match renamed.get(&old) {
-                Some(t) => t.clone(),
-                None => {
-                    let Some(t) = crate::placement::free_tag_like(&used, &old) else {
-                        continue;
-                    };
-                    used.insert(t.clone());
-                    let device = self.devices.get(&old).cloned().unwrap_or_default();
-                    self.devices.insert(t.clone(), device);
-                    renamed.insert(old, t.clone());
-                    t
-                }
-            };
-            s.tag = Some(new);
+            if let Some(new) = s.tag.as_ref().and_then(|t| renamed.get(t)) {
+                s.tag = Some(new.clone());
+            }
         }
         for w in &mut copy.wires {
             w.number = None;
+            if let Some(c) = &mut w.cable
+                && let Some(new) = renamed.get(&c.cable)
+            {
+                c.cable = new.clone();
+            }
         }
         let id = copy.id.clone();
         self.pages.push(copy);
         self.sort_pages();
-        self.pages.iter().position(|p| p.id == id)
+        self.pages
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| crate::Error::Invalid(format!("the copy {id:?} is not among the pages")))
+    }
+
+    /// Number the pages from index `from` on again, in the order they are in: `prefix` and
+    /// then `start`, `start + step`, ... (`prefix` `=A1/` and start 1 give `=A1/1`, `=A1/2`).
+    /// The pages before `from` keep their numbers. Returns how many pages got a number they did
+    /// not have. Refused, with nothing changed, when the step is 0, `prefix` ends in a digit
+    /// (`A1` and `2` would read as `A12`), a number runs past the largest one, or the new
+    /// numbers would not keep the pages in their order or would repeat a number a page before
+    /// `from` keeps. The pages are expected in page order ([`Project::sort_pages`]).
+    pub fn renumber_pages(&mut self, from: usize, prefix: &str, start: u64, step: u64) -> crate::Result<usize> {
+        let bad = |why: String| Err(crate::Error::Invalid(why));
+        if step == 0 {
+            return bad("the step must be 1 or more".into());
+        }
+        let prefix = prefix.trim_start();
+        if prefix.ends_with(|c: char| c.is_ascii_digit()) {
+            return bad(format!(
+                "the prefix {prefix:?} ends in a digit, so the page number would run into it; end it with a separator such as `.` or `/`"
+            ));
+        }
+        if from > self.pages.len() {
+            return bad(format!(
+                "there is no page {} (the project has {})",
+                from.saturating_add(1),
+                self.pages.len()
+            ));
+        }
+        let mut pages = self.pages.clone();
+        let mut n = start;
+        let mut changed = 0;
+        for (k, page) in pages.iter_mut().enumerate().skip(from) {
+            if k > from {
+                n = match n.checked_add(step) {
+                    Some(n) => n,
+                    None => return bad(format!("no page number is left after {prefix}{n}")),
+                };
+            }
+            let number = format!("{prefix}{n}");
+            if page.number != number {
+                page.number = number;
+                changed += 1;
+            }
+        }
+        let mut seen = std::collections::BTreeMap::new();
+        for page in &pages {
+            if let Some(other) = seen.insert(page.number.trim().to_owned(), page.id.clone()) {
+                return bad(format!(
+                    "pages {other:?} and {:?} would both be number {:?}; choose another start or prefix",
+                    page.id,
+                    page.number.trim()
+                ));
+            }
+        }
+        let order: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
+        let mut sorted = Project {
+            pages,
+            ..Project::new("")
+        };
+        sorted.sort_pages();
+        if let Some(k) = sorted.pages.iter().zip(&order).position(|(p, id)| p.id != *id) {
+            let page = sorted.pages.get(k).map_or("", |p| p.number.as_str());
+            return bad(format!(
+                "the new numbers would change the page order (page {page:?} would move); choose another start or prefix"
+            ));
+        }
+        self.pages = sorted.pages;
+        Ok(changed)
     }
 
     /// Sort pages by their display number, comparing numeric parts as numbers.
@@ -2476,7 +2570,7 @@ mod tests {
             (p.free_page_id(), p.next_page_number()),
             ("p0002".to_owned(), "2".to_owned())
         );
-        let i = p.copy_page(0, "p0002".into(), "2".into(), None).ok_or("copied")?;
+        let i = p.copy_page(0, "p0002".into(), "2".into(), None)?;
         let copy = p.pages.get(i).ok_or("page")?;
         assert_eq!((copy.title.as_str(), copy.cover), ("Motor (copy)", false));
         let k2 = DeviceTag::parse("-K2")?;
@@ -2494,14 +2588,155 @@ mod tests {
             Some(k1)
         );
         assert!(p.pages.first().is_some_and(|pg| pg.cover));
-        let j = p
-            .copy_page(0, "x".into(), "1.5".into(), Some("Spare".into()))
-            .ok_or("copied")?;
+        let j = p.copy_page(0, "x".into(), "1.5".into(), Some("Spare".into()))?;
         assert_eq!(
             p.pages.get(j).map(|pg| (pg.number.as_str(), pg.title.as_str())),
             Some(("1.5", "Spare"))
         );
-        assert!(p.copy_page(9, "y".into(), "9".into(), None).is_none());
+        assert!(p.copy_page(9, "y".into(), "9".into(), None).is_err());
+        Ok(())
+    }
+
+    /// A copied wire's cable gets the same new tag as a symbol of that cable, and a cable only
+    /// wires name gets one of its own, with the cable's data (review of #1891).
+    #[test]
+    fn a_copied_page_gets_new_cables_for_its_cores() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        let (w1, w5) = (DeviceTag::parse("-W1")?, DeviceTag::parse("-W5")?);
+        let mut page = Page::new("p0001", "1", "Motor");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "cable".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: Some(w1.clone()),
+        });
+        for (i, cable) in [&w1, &w1, &w5].into_iter().enumerate() {
+            page.wires.push(Wire {
+                id: format!("w{i}"),
+                from: Endpoint::Point {
+                    at: Point::new(0.0, i as f64),
+                },
+                to: Endpoint::Point {
+                    at: Point::new(5.0, i as f64),
+                },
+                via: Vec::new(),
+                number: None,
+                potential: None,
+                cable: Some(CableCore {
+                    cable: cable.clone(),
+                    core: format!("{i}"),
+                }),
+                route: Default::default(),
+                spec: Default::default(),
+            });
+        }
+        p.pages.push(page);
+        for (tag, part) in [(&w1, "LAPP.1"), (&w5, "LAPP.5")] {
+            p.devices.insert(
+                tag.clone(),
+                crate::Device {
+                    part: Some(part.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let before = p.pages.first().cloned();
+        let i = p.copy_page(0, "p0002".into(), "2".into(), None)?;
+        let copy = p.pages.get(i).ok_or("page")?;
+        let cables: Vec<String> = copy
+            .wires
+            .iter()
+            .filter_map(|w| w.cable.as_ref().map(|c| c.cable.to_string()))
+            .collect();
+        // -W1 is taken, and so are -W5 and the -W2 the symbol's cable gets.
+        assert_eq!(cables, ["-W2", "-W2", "-W3"]);
+        assert_eq!(
+            copy.symbols
+                .first()
+                .and_then(|s| s.tag.as_ref())
+                .map(ToString::to_string),
+            Some("-W2".into())
+        );
+        let part = |t: &str| -> std::result::Result<Option<String>, Box<dyn std::error::Error>> {
+            Ok(p.devices.get(&DeviceTag::parse(t)?).and_then(|d| d.part.clone()))
+        };
+        assert_eq!(
+            (part("-W2")?, part("-W3")?),
+            (Some("LAPP.1".into()), Some("LAPP.5".into()))
+        );
+        assert_eq!(p.pages.first().cloned(), before, "the page copied from is unchanged");
+        Ok(())
+    }
+
+    /// A device with no free tag like its own left refuses the copy, and nothing changes
+    /// (review of #1891).
+    #[test]
+    fn a_copy_without_a_free_tag_changes_nothing() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        let mut page = Page::new("p0001", "1", "Motor");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "k".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: Some(DeviceTag::parse("-K1")?),
+        });
+        p.pages.push(page);
+        for n in 1..=9999 {
+            p.devices
+                .insert(DeviceTag::parse(&format!("-K{n}"))?, crate::Device::default());
+        }
+        let before = p.clone();
+        let err = p
+            .copy_page(0, "p0002".into(), "2".into(), None)
+            .err()
+            .map(|e| e.to_string());
+        assert_eq!(err.as_deref(), Some("no free tag like -K1 is left for the copy of it"));
+        assert_eq!(p, before);
+        Ok(())
+    }
+
+    #[test]
+    fn pages_are_numbered_again_in_their_order() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        for (id, n) in [("a", "1"), ("b", "3"), ("c", "3.5"), ("d", "10")] {
+            p.pages.push(Page::new(id, n, ""));
+        }
+        p.sort_pages();
+        let numbers = |p: &Project| p.pages.iter().map(|p| p.number.clone()).collect::<Vec<_>>();
+        // Page `a` keeps its number, so only three change.
+        assert_eq!(p.renumber_pages(0, "", 1, 1)?, 3);
+        assert_eq!(numbers(&p), ["1", "2", "3", "4"]);
+        assert_eq!(p.renumber_pages(0, "", 1, 1)?, 0, "already so");
+        // From the third page on, in tens.
+        assert_eq!(p.renumber_pages(2, "", 10, 10)?, 2);
+        assert_eq!(numbers(&p), ["1", "2", "10", "20"]);
+        assert_eq!(p.renumber_pages(0, "=A1/", 1, 1)?, 4);
+        assert_eq!(numbers(&p), ["=A1/1", "=A1/2", "=A1/3", "=A1/4"]);
+
+        let before = p.clone();
+        let err = |r: crate::Result<usize>| r.err().map(|e| e.to_string()).unwrap_or_default();
+        // A number before the pages renumbered, or an order that would change, is refused.
+        let mut q = Project::new("t");
+        for (id, n) in [("a", "1"), ("b", "5"), ("c", "6")] {
+            q.pages.push(Page::new(id, n, ""));
+        }
+        let kept = q.clone();
+        assert!(err(q.renumber_pages(1, "", 1, 1)).contains("both be number \"1\""));
+        assert!(err(q.renumber_pages(2, "", 2, 1)).contains("page order"));
+        assert_eq!(q, kept);
+        assert!(err(p.renumber_pages(0, "A1", 1, 1)).contains("ends in a digit"));
+        assert!(err(p.renumber_pages(0, "", 1, 0)).contains("step"));
+        assert!(err(p.renumber_pages(9, "", 1, 1)).contains("no page 10"));
+        assert!(matches!(
+            p.renumber_pages(usize::MAX, "", 1, 1),
+            Err(crate::Error::Invalid(_))
+        ));
+        assert!(err(p.renumber_pages(0, "", u64::MAX, 1)).contains("no page number is left"));
+        assert_eq!(p, before);
         Ok(())
     }
 
