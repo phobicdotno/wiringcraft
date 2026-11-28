@@ -780,6 +780,22 @@ enum LocationCmd {
 enum MacroCmd {
     /// List the macros, project first, with their value sets.
     List,
+    /// Save everything on a page as a project macro (`macros/<id>.json`, the id made from the
+    /// name): its symbols, wires and drawings and the device data of its tags, anchored at the
+    /// page's top-left corner, so `macro place <page> <name> --at 0,0` draws each item where it
+    /// was. Prints the file written.
+    Save {
+        /// The page's id or number.
+        page: String,
+        /// The macro's name.
+        name: String,
+        /// The macro's description.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Replace a project macro of the same id.
+        #[arg(long)]
+        force: bool,
+    },
     /// Place a macro on a page with its top-left corner at `--at`. Its symbols get the next
     /// free tags and its devices the macro's data, placeholders filled from `--set`. Prints
     /// the new symbol and wire ids.
@@ -4000,6 +4016,29 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
             };
             match mc {
+                MacroCmd::Save {
+                    page,
+                    name,
+                    description,
+                    force,
+                } => {
+                    let page = p
+                        .pages
+                        .get(page_index(&p, &page)?)
+                        .map(|pg| pg.id.clone())
+                        .ok_or("no page")?;
+                    let m = wc_core::macros::from_page(&p, &page, &name, &description).map_err(e)?;
+                    if m.name.is_empty() {
+                        return Err("give the macro a name".into());
+                    }
+                    let id = wc_core::macros::macro_id(&m.name);
+                    let file = format!("{}/{id}.json", wc_core::macros::MACROS_DIR);
+                    if !force && dir.join(&file).symlink_metadata().is_ok() {
+                        return Err(format!("the project has a macro {file} already; --force replaces it"));
+                    }
+                    wc_core::macros::write_macro(dir, &id, &m).map_err(e)?;
+                    println!("{file}");
+                }
                 MacroCmd::List => {
                     for FoundMacro { source, id, path, .. } in &found {
                         match wc_core::macros::read_macro(path) {

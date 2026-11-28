@@ -1537,3 +1537,71 @@ fn joined_copies_get_a_wire_between_their_rails() -> TestResult {
     assert_eq!(p.page(id).ok_or("page")?.wires.len(), 3);
     Ok(())
 }
+
+/// `macro save` makes a project macro of a page, which places its items where they were on
+/// another page (#1912).
+#[test]
+fn a_page_is_saved_as_a_macro_and_placed_again() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let first = wc_core::store::load(&dir)?.pages[0].id.clone();
+    wiringcraft(&dir, &["place", &first, "wc.coil", "--at", "50,50", "--tag", "-K1"])?;
+    wiringcraft(&dir, &["wire", &first, "50,30", "80,30"])?;
+    let out = wiringcraft(
+        &dir,
+        &["macro", "save", &first, "Relay page", "--description", "One relay"],
+    )?;
+    assert_eq!(out, "macros/relay-page.json\n");
+    // Saved again, it is refused unless --force says to replace it; an empty page is refused.
+    let again = wiringcraft(&dir, &["macro", "save", &first, "Relay page"])
+        .err()
+        .ok_or("saved twice")?;
+    assert!(again.contains("--force replaces it"), "{again}");
+    wiringcraft(
+        &dir,
+        &[
+            "macro",
+            "save",
+            &first,
+            "Relay page",
+            "--force",
+            "--description",
+            "One relay",
+        ],
+    )?;
+    wiringcraft(&dir, &["page", "add", "copy", "--number", "9"])?;
+    let empty = wiringcraft(&dir, &["macro", "save", "copy", "Nothing"])
+        .err()
+        .ok_or("empty saved")?;
+    assert!(empty.contains("has no symbols, wires or drawings"), "{empty}");
+    assert!(wiringcraft(&dir, &["macro", "show", "relay-page"])?.contains("One relay"));
+    // Placed at the corner of another page, the coil and the wire are where they were.
+    wiringcraft(&dir, &["macro", "place", "copy", "relay-page", "--at", "0,0"])?;
+    let p = wc_core::store::load(&dir)?;
+    let page = |id: &str| p.page(id).ok_or("page");
+    let at = |id: &str| -> Result<Vec<(f64, f64)>, &str> {
+        Ok(page(id)?.symbols.iter().map(|s| (s.at.x, s.at.y)).collect())
+    };
+    assert_eq!(at(&first)?, at("copy")?);
+    assert_eq!(page("copy")?.wires.len(), 1);
+    assert_eq!(
+        page("copy")?.symbols[0]
+            .tag
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("-K2")
+    );
+    Ok(())
+}

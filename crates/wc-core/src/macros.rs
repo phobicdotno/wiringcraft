@@ -384,6 +384,62 @@ pub fn place(project: &mut Project, page: &str, m: &Macro, at: Point) -> Result<
     Ok(placed.symbols.into_iter().chain(placed.wires).collect())
 }
 
+/// A macro of everything on page `page`: its symbols, its wires (their numbers cleared, as a
+/// placed wire is numbered afresh), its drawings and the device data of the tags its symbols
+/// carry and of the cables its wires are cores of, anchored at the page's top-left corner, so
+/// [`place`] at `(0, 0)` draws each item where it was. The `{{name}}` placeholders its texts
+/// use are declared, without defaults, so a placement fills them. A page with nothing on it is
+/// refused, as no macro can be empty, and so is one whose macro [`Macro::check`] refuses.
+pub fn from_page(project: &Project, page: &str, name: &str, description: &str) -> Result<Macro> {
+    let Some(p) = project.page(page) else {
+        return Err(Error::Invalid(format!("no page {page}")));
+    };
+    if p.symbols.is_empty() && p.wires.is_empty() && p.graphics.is_empty() {
+        return Err(Error::Invalid(format!(
+            "page {page} has no symbols, wires or drawings to make a macro of"
+        )));
+    }
+    let devices = p
+        .symbols
+        .iter()
+        .filter_map(|s| s.tag.as_ref())
+        .chain(p.wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)))
+        .filter_map(|t| project.devices.get(t).map(|d| (t.clone(), d.clone())))
+        .collect();
+    let mut m = Macro {
+        name: name.trim().to_owned(),
+        description: description.trim().to_owned(),
+        symbols: p.symbols.clone(),
+        wires: p
+            .wires
+            .iter()
+            .cloned()
+            .map(|mut w| {
+                w.number = None;
+                w
+            })
+            .collect(),
+        graphics: p.graphics.clone(),
+        devices,
+        anchor: Point::new(0.0, 0.0),
+        placeholders: Vec::new(),
+        value_sets: Vec::new(),
+    };
+    // One placeholder for names alike but for case, as `apply` fills them; the first spelling.
+    let mut seen = BTreeSet::new();
+    m.placeholders = m
+        .used_placeholders()
+        .into_iter()
+        .filter(|name| seen.insert(key(name)))
+        .map(|name| Placeholder {
+            name,
+            ..Default::default()
+        })
+        .collect();
+    m.check()?;
+    Ok(m)
+}
+
 /// How placeholder and value set names are compared: trimmed, without regard to case.
 pub fn key(name: &str) -> String {
     name.trim().to_lowercase()
@@ -917,6 +973,79 @@ mod tests {
         assert!(err_of(write_macro_file(&path, &broken)).contains("{{power}} is used"));
         assert_eq!(read_macro(&path)?, m, "an unchecked macro is not written");
         assert!(write_macro_file(&tmp.path().join("starter.json"), &m).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_becomes_a_macro_that_places_its_items_where_they_were() -> Result<()> {
+        let m = starter()?.apply(Some("3 kW"), &BTreeMap::new())?;
+        let mut p = Project::new("x");
+        p.pages.push(crate::project::Page::new("p1", "1", "Motors"));
+        place(&mut p, "p1", &m, Point::new(50.0, 60.0))?;
+        p.pages[0].wires[0].number = Some("12".into());
+        let saved = from_page(&p, "p1", " Starter page ", " A whole page ")?;
+        assert_eq!(
+            (saved.name.as_str(), saved.description.as_str()),
+            ("Starter page", "A whole page")
+        );
+        assert_eq!(saved.anchor, Point::new(0.0, 0.0));
+        assert_eq!(saved.wires[0].number, None, "a placed wire is numbered afresh");
+        let tag = DeviceTag::parse("-Q1")?;
+        assert_eq!(saved.devices[&tag].description, "Motor starter 3 kW");
+        // Placed at the corner of another page, each item is where it was, with a new tag.
+        p.pages.push(crate::project::Page::new("p2", "2", "Copy"));
+        place(&mut p, "p2", &saved, Point::new(0.0, 0.0))?;
+        let at = |i: usize| -> Vec<Point> { p.pages[i].symbols.iter().map(|s| s.at).collect() };
+        assert_eq!(at(0), at(1));
+        let graphics = |i: usize| p.pages[i].graphics.clone();
+        assert_eq!(graphics(0), graphics(1));
+        assert_eq!(
+            p.pages[1].symbols[0].tag.as_ref().map(ToString::to_string).as_deref(),
+            Some("-Q2")
+        );
+        // The device data of a cable only a wire names is kept; a placeholder a text uses is
+        // declared, so the macro places with a value for it.
+        let w1 = DeviceTag::parse("-W1")?;
+        p.devices.insert(
+            w1.clone(),
+            Device {
+                description: "Feed cable".into(),
+                ..Default::default()
+            },
+        );
+        p.pages[0].wires[0].cable = Some(crate::project::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+        p.pages[0].graphics.push(Shape::Text {
+            at: Point::new(10.0, 10.0),
+            text: "{{voltage}} V, {{Voltage }}".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let saved = from_page(&p, "p1", "Fed", "")?;
+        assert_eq!(saved.devices[&w1].description, "Feed cable");
+        let names: Vec<&str> = saved.placeholders.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["voltage"]);
+        let values = BTreeMap::from([("voltage".to_owned(), "24".to_owned())]);
+        assert!(saved.apply(None, &values).is_ok());
+        // A text whose braces are not closed makes no macro.
+        p.pages[0].graphics.push(Shape::Text {
+            at: Point::new(10.0, 20.0),
+            text: "{{open".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        assert!(from_page(&p, "p1", "Open", "").is_err());
+        // An empty page and a missing one are refused.
+        p.pages.push(crate::project::Page::new("p3", "3", "Empty"));
+        assert_eq!(
+            err_of(from_page(&p, "p3", "x", "")),
+            "page p3 has no symbols, wires or drawings to make a macro of"
+        );
+        assert!(err_of(from_page(&p, "p9", "x", "")).contains("no page p9"));
         Ok(())
     }
 
