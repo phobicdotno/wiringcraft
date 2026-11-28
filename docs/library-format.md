@@ -56,7 +56,7 @@ A symbol is the drawing of one device function with named pins. It is read into
 | `letter_code` | no | Letter suggested for new devices, such as `K` for relays. |
 | `role` | no | `main`, `auxiliary`, `standalone` (default), `terminal` or `interruption`. |
 | `graphics` | yes | The drawing: a list of shapes (below). |
-| `pins` | yes | The connection points: `name`, `at` and `dir`. |
+| `pins` | yes | The connection points: `name`, `at`, `dir` and `description`. |
 | `tag_at` | no | Where the device tag is printed, relative to the origin. Default `0,0`. |
 | `description` | no | Longer text, also searched. |
 | `source` | no | Set by importers: the item's identity in the library it was imported from. |
@@ -69,6 +69,12 @@ A pin has a `name` (the designation printed next to it, such as `13`, `A1` or `L
 `at` relative to the symbol's origin, and `dir`, the way a wire leaves it: `up`, `down`
 (default), `left` or `right`. Pin names are what wires attach to (`s1:13`). The starter
 symbols draw their pin labels as `text` shapes in `graphics`.
+
+A pin may also have a `description`: what the connection point is for, such as `Coil +`, as the
+maker's symbol gives it. The EDZ import fills it from a macro's connection point descriptions.
+A pin without one has no such key, so a symbol without pin descriptions has the same file and
+the same content hash as before the key existed. The app and the reports do not show it yet
+(#1873).
 
 Each shape in `graphics` has a `kind`:
 

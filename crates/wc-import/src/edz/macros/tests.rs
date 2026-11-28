@@ -286,6 +286,31 @@ fn the_device_tag_and_connection_point_descriptions_go_where_the_macro_shows_the
 }
 
 #[test]
+fn a_connection_point_description_is_kept_on_its_pin() -> TestResult {
+    // The coil describes its second point only; each single point has a description.
+    let xml = SHOWN_TEXTS.replace(r#"A186="Coil;Return""#, r#"A186=";Coil -""#);
+    let s = read("coil.ema", &xml)?.symbol;
+    assert_eq!(pin(&s, "A1")?.description, "", "no description, an empty field");
+    assert_eq!(pin(&s, "A2")?.description, "Coil -");
+    assert_eq!(pin(&s, "1")?.description, "IN1");
+    assert_eq!(pin(&s, "2")?.description, "Loop");
+    // The text is still drawn, beside its pin.
+    assert!(text_at(&s, "Coil -").is_ok());
+    // A symbol whose macro describes no point has no description on any pin, so its file and
+    // hash are those of a symbol read before pins had the field.
+    let xml = SHOWN_TEXTS
+        .replace(r#" A186="Coil;Return""#, "")
+        .replace(r#" A186="IN1""#, "")
+        .replace(r#" A186="Loop""#, "");
+    let s = read("coil.ema", &xml)?.symbol;
+    assert_eq!(s.pins.len(), 4);
+    assert!(s.pins.iter().all(|p| p.description.is_empty()), "{:?}", s.pins);
+    // Only the symbol's own description is written.
+    assert_eq!(wc_core::store::to_json(&s)?.matches("\"description\"").count(), 1);
+    Ok(())
+}
+
+#[test]
 fn without_a_shown_device_tag_the_tag_goes_above_the_drawing() -> TestResult {
     let s = read("BES_contactor.ema", COIL)?.symbol;
     let mut pts: Vec<Point> = s.pins.iter().map(|p| p.at).collect();

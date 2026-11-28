@@ -20,11 +20,13 @@ fn sym(id: &str, role: SymbolRole, pins: [&str; 2]) -> Symbol {
                 name: pins[0].into(),
                 at: Point::new(0.0, 0.0),
                 dir: PinDir::Up,
+                ..Default::default()
             },
             Pin {
                 name: pins[1].into(),
                 at: Point::new(0.0, 15.0),
                 dir: PinDir::Down,
+                ..Default::default()
             },
         ],
         tag_at: Point::new(-5.0, 8.0),

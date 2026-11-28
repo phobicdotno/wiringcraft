@@ -17,11 +17,13 @@ fn sym(id: &str, pin_y: f64) -> Symbol {
                 name: "A1".into(),
                 at: Point::new(0.0, 0.0),
                 dir: PinDir::Up,
+                ..Default::default()
             },
             Pin {
                 name: "A2".into(),
                 at: Point::new(0.0, pin_y),
                 dir: PinDir::Down,
+                ..Default::default()
             },
         ],
         tag_at: Point::default(),

@@ -1001,6 +1001,7 @@ mod tests {
                     name: (*name).into(),
                     at: Point::new(0.0, 10.0 * n as f64),
                     dir: PinDir::Down,
+                    ..Default::default()
                 })
                 .collect(),
             tag_at: Point::default(),

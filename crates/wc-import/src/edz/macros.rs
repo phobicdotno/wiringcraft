@@ -35,7 +35,8 @@
 //!   offset is from, else the symbol's point. Its child `S54x505` has the text height `A961`,
 //!   the angle `A962` (radians) and the alignment `A966`, as for a text. The symbol's device tag
 //!   goes where the black box, else the device the letter comes from, shows its displayed device
-//!   tag; descriptions are drawn as texts where they are shown, else beside their pin.
+//!   tag; descriptions are drawn as texts where they are shown, else beside their pin, and
+//!   each is kept as the description of its pin.
 //!
 //! The multi-line representation, variant A, becomes the symbol: its graphics, black box
 //! outlines, and a pin for each connection point. A placement with one connection point is a
@@ -850,6 +851,8 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 name,
                 at: origin,
                 dir: turned(PinDir::Up, p.variant),
+                // A single point's description is its first, as it is drawn.
+                description: p.descriptions.first().cloned().unwrap_or_default(),
             });
             owners.push((p.letter.clone(), p.number.clone()));
             describe(p, &[Some(origin)], &page, &mut graphics, &mut left_out);
@@ -888,6 +891,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         for name in names.iter().take(s.pins.len()) {
             have.insert((p.letter.clone(), p.number.clone(), name.clone()));
         }
+        let first = pins.len();
         let mut points = Vec::with_capacity(s.pins.len());
         for (k, pin) in s.pins.iter().enumerate() {
             let at = origin + pin.at.transform(rotation, mirror);
@@ -896,24 +900,30 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 name: own(k).unwrap_or_else(|| pin.name.clone()),
                 at,
                 dir: turned(pin.dir, p.variant),
+                ..Default::default()
             });
             owners.push((p.letter.clone(), p.number.clone()));
         }
         // Each designation's pin: a terminal's in order, another symbol's by name, as the
         // symbol names its pins from the designations (blanks numbered, repeats made unique).
-        let by_designation: Vec<Option<Point>> = if p.kind == KIND_TERMINAL {
-            names.iter().enumerate().map(|(k, _)| points.get(k).copied()).collect()
+        let pin_of: Vec<Option<usize>> = if p.kind == KIND_TERMINAL {
+            (0..names.len()).map(|k| (k < s.pins.len()).then_some(k)).collect()
         } else {
             pin_names(&f)
                 .iter()
-                .map(|want| {
-                    s.pins
-                        .iter()
-                        .position(|pin| pin.name == *want)
-                        .and_then(|i| points.get(i).copied())
-                })
+                .map(|want| s.pins.iter().position(|pin| pin.name == *want))
                 .collect()
         };
+        let by_designation: Vec<Option<Point>> =
+            pin_of.iter().map(|i| i.and_then(|i| points.get(i).copied())).collect();
+        // Each description is kept on its designation's pin, the first of two for one pin.
+        for (text, i) in p.descriptions.iter().zip(&pin_of) {
+            if let Some(pin) = i.and_then(|i| pins.get_mut(first + i))
+                && pin.description.is_empty()
+            {
+                pin.description = text.clone();
+            }
+        }
         describe(p, &by_designation, &page, &mut graphics, &mut left_out);
         drawn_kinds.push(s.role);
         add(
@@ -945,6 +955,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
             name,
             at: Point::new(right, top + PIN_STEP * row as f64),
             dir: PinDir::Right,
+            ..Default::default()
         });
         owners.push((letter, number));
         if pins.len() > MAX_PINS {
@@ -1071,6 +1082,7 @@ fn more_terminal_points(s: &mut Symbol, count: usize) {
             name: (k + 1).to_string(),
             at: Point::new(x, y),
             dir,
+            ..Default::default()
         });
     }
 }

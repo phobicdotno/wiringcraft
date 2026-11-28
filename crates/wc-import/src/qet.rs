@@ -446,7 +446,12 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     let mut out_pins: Vec<Pin> = Vec::new();
     for (i, ((_, at, dir), name)) in pins.into_iter().zip(named).enumerate() {
         let name = name.unwrap_or_else(|| unique((i + 1).to_string()));
-        out_pins.push(Pin { name, at, dir });
+        out_pins.push(Pin {
+            name,
+            at,
+            dir,
+            ..Default::default()
+        });
     }
     // The first pin is the origin, as for the other importers.
     let origin = out_pins.first().map(|p| p.at).unwrap_or(Point::new(0.0, 0.0));

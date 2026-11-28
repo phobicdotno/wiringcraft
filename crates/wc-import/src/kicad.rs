@@ -478,6 +478,7 @@ fn convert(
                         name: pin_name,
                         at: tip,
                         dir,
+                        ..Default::default()
                     });
                 }
                 // KiCad 7+: a text with an optional border, `at` its top-left corner. Its lines

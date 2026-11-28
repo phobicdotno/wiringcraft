@@ -10282,6 +10282,7 @@ mod tests {
                     name: (*n).into(),
                     at: Default::default(),
                     dir: Default::default(),
+                    ..Default::default()
                 })
                 .collect(),
             tag_at: Default::default(),
@@ -13065,6 +13066,7 @@ mod tests {
                     name: (*n).into(),
                     at: wc_core::geom::Point::new(0.0, 10.0 * k as f64),
                     dir: wc_core::symbol::PinDir::Down,
+                    ..Default::default()
                 })
                 .collect(),
             tag_at: Default::default(),
@@ -13322,6 +13324,7 @@ mod tests {
                     name: (*n).into(),
                     at: wc_core::geom::Point::new(0.0, 10.0 * k as f64),
                     dir: wc_core::symbol::PinDir::Down,
+                    ..Default::default()
                 })
                 .collect(),
             tag_at: Default::default(),

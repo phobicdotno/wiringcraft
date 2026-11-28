@@ -229,11 +229,13 @@ mod tests {
                 name: "1".into(),
                 at: Point::new(0.0, 0.0),
                 dir: PinDir::Up,
+                ..Default::default()
             },
             Pin {
                 name: "2".into(),
                 at: Point::new(0.0, 15.0),
                 dir: PinDir::Down,
+                ..Default::default()
             },
         ];
         s.graphics = vec![

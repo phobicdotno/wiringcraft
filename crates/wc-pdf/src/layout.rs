@@ -2347,6 +2347,7 @@ mod template_tests {
                 name: "A1".into(),
                 at: Point::new(0.0, 0.0),
                 dir: PinDir::Up,
+                ..Default::default()
             }],
             tag_at: Point::new(0.0, 0.0),
             description: String::new(),

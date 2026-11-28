@@ -555,6 +555,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
                     name,
                     at: Point::new(px, 3.0),
                     dir: PinDir::Down,
+                    ..Default::default()
                 });
             }
             let description = d.path.join(" / ");
@@ -906,6 +907,7 @@ mod tests {
                     name: (*p).into(),
                     at: Point::default(),
                     dir: PinDir::Down,
+                    ..Default::default()
                 })
                 .collect(),
             tag_at: Point::default(),
