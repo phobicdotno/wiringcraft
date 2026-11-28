@@ -355,6 +355,30 @@ fn wire_list_names_both_ends_and_inherits_potentials() {
 }
 
 #[test]
+fn wire_list_prints_a_pins_description_next_to_its_designation() {
+    let (p, mut s, parts) = fixture();
+    let Some(coil) = s.get_mut("coil") else {
+        unreachable!("the fixture has a coil")
+    };
+    for pin in &mut coil.pins {
+        pin.description = match pin.name.as_str() {
+            "A1" => "Coil +".into(),
+            // Only spaces is no description.
+            _ => "  ".into(),
+        };
+    }
+    let t = wire_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][5], "=A+C1-K1:A1 (Coil +)");
+    assert_eq!(t.rows[3][4], "=A+C1-K1:A2");
+    // Pins of symbols without descriptions read as before.
+    assert_eq!(t.rows[1][4..6], ["=A+C1-K1:14", "-X1.1:1"]);
+}
+
+#[test]
 fn wire_list_names_the_potential_of_a_wire_between_two_junctions() {
     let (mut p, s, parts) = fixture();
     let at = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
@@ -633,6 +657,32 @@ fn cable_list_groups_cores_by_cable() {
     assert_eq!(t.rows[0], ["-W1", "", "Lamp cable", "1", "2", "=A+C1-K1:14", "-X1.1:1"]);
     assert_eq!(t.rows[1][..4], ["", "", "", "2"]);
     assert_eq!(wire_list(&i).rows[1][3], "-W1:1");
+}
+
+#[test]
+fn cable_list_prints_a_pins_description_next_to_its_designation() {
+    let (mut p, mut s, parts) = fixture();
+    let Some(coil) = s.get_mut("coil") else {
+        unreachable!("the fixture has a coil")
+    };
+    for pin in coil.pins.iter_mut().filter(|pin| pin.name == "A2") {
+        pin.description = "Coil -".into();
+    }
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    p.devices.insert(w1.clone(), Device::default());
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w4") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1,
+            core: "1".into(),
+        });
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows.len(), 1);
+    assert_eq!(t.rows[0][5..], ["=A+C1-K1:A2 (Coil -)", "-X2:1"]);
 }
 
 #[test]
