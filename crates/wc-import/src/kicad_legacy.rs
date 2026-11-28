@@ -170,6 +170,25 @@ fn text(word: &str, quoted_spaces: bool) -> String {
     }
 }
 
+/// An old pin name's overbar, where each `~` starts or ends one (`~RESET`, `~CS~/WR`), written
+/// the new way (`~{RESET}`, `~{CS}/WR`).
+fn overbar(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    let mut open = false;
+    for c in name.chars() {
+        if c == '~' {
+            out.push_str(if open { "}" } else { "~{" });
+            open = !open;
+        } else {
+            out.push(c);
+        }
+    }
+    if open {
+        out.push('}');
+    }
+    out
+}
+
 fn num(w: &[String], i: usize) -> Option<f64> {
     w.get(i)?.parse::<f64>().ok().filter(|v| v.is_finite())
 }
@@ -407,7 +426,7 @@ fn draw_item(w: &[String], quoted: &[bool]) -> std::result::Result<(i64, i64, St
         }
         "X" => {
             // X name number x y length orientation number_size name_size unit style type [shape]
-            let name = text(w.get(1).ok_or_else(bad)?, true);
+            let name = overbar(&text(w.get(1).ok_or_else(bad)?, true));
             let number = text(w.get(2).ok_or_else(bad)?, true);
             let (x, y, length) = (
                 num(w, 3).ok_or_else(bad)?,
@@ -835,6 +854,30 @@ ENDDEF
             symbols.iter().any(|i| i.symbol.id == "kicad.relays.relay_24v_a"),
             "the alias"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn an_old_librarys_pin_names_become_descriptions() -> Result<()> {
+        // `~` starts or ends an overbar in an old pin name.
+        let lib = RELAY
+            .replace("X A1 A1 0 200", "X ~COIL~+ A1 0 200")
+            .replace("X A2 A2 0 -200", "X ~RESET A2 0 -200");
+        let (sym, _) = to_kicad_sym(&lib)?;
+        let (symbols, _) = crate::kicad::symbols(&sym, "kicad.relays", 1.0)?;
+        let coil = symbols
+            .iter()
+            .find(|i| i.symbol.id == "kicad.relays.relay_a")
+            .ok_or(Error::Format("no coil".into()))?;
+        let pins: Vec<(&str, &str)> = coil
+            .symbol
+            .pins
+            .iter()
+            .map(|p| (p.name.as_str(), p.description.as_str()))
+            .collect();
+        assert_eq!(pins, [("A1", "COIL+"), ("A2", "RESET")]);
+        assert_eq!(overbar("~CS~/~WR~"), "~{CS}/~{WR}");
+        assert_eq!(overbar("A1"), "A1");
         Ok(())
     }
 
