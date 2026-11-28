@@ -4222,7 +4222,7 @@ impl Open {
         // control characters.
         let shown = table.display().to_string();
         let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", wc_import::run::escape_field(&shown)))?;
-        let copies = wc_import::run::macro_table_copies(&m, &bytes, &shown, default_set)?;
+        let (copies, pages) = wc_import::run::macro_table(&m, &bytes, &shown, default_set)?;
         if copies.is_empty() {
             return Ok(generate::Generated::default());
         }
@@ -4271,7 +4271,14 @@ impl Open {
         self.follow_terminals();
         let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
         let mut project = self.project.clone();
-        match generate::generate(&mut project, &copies, |id| self.symbols.get(id).cloned(), size, &m.name) {
+        match generate::generate_titled(
+            &mut project,
+            &copies,
+            &pages,
+            |id| self.symbols.get(id).cloned(),
+            size,
+            &m.name,
+        ) {
             Ok(done) => {
                 // The undo step is the project as it was, taken as it is (nothing followed in
                 // it); the change in progress is then measured from the settled project.

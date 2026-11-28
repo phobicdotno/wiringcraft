@@ -3,7 +3,9 @@
 //!
 //! The table's first row names its columns. A column named like a declared placeholder (case
 //! ignored) fills it; a column [`SET_COLUMN`] picks the row's value set, unless the macro
-//! declares a placeholder of that name. Any other column is refused, so a typo is not ignored.
+//! declares a placeholder of that name. A column [`PAGE_COLUMN`] (again unless a placeholder
+//! has that name) titles the pages: a row whose page differs from the row before starts a new
+//! page. Any other column is refused, so a typo is not ignored.
 //! An empty cell gives no value: the value set's or the default applies.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +19,8 @@ use crate::{Error, Result};
 
 /// The column that names a row's value set.
 pub const SET_COLUMN: &str = "set";
+/// The column that names the page a row goes on (its title).
+pub const PAGE_COLUMN: &str = "page";
 /// Distance kept from the page frame, in millimetres.
 pub const INSET: f64 = 10.0;
 /// Distance kept between two copies, in millimetres.
@@ -24,11 +28,14 @@ pub const GAP: f64 = 10.0;
 /// Copies are placed with their anchor on this grid, in millimetres.
 pub const GRID: f64 = 5.0;
 
-/// One row of the table: the line or worksheet row it came from, its value set and its values.
+/// One row of the table: the line or worksheet row it came from, its value set, the page
+/// title it goes under and its values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableRow {
     pub line: usize,
     pub set: Option<String>,
+    /// The page title from the [`PAGE_COLUMN`]; `None` keeps the row on the page before.
+    pub page: Option<String>,
     pub values: BTreeMap<String, String>,
 }
 
@@ -37,6 +44,7 @@ pub struct TableRow {
 enum Column {
     Placeholder(String),
     Set,
+    Page,
     /// A column without a name: its cells must be empty.
     Unnamed,
 }
@@ -61,6 +69,8 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
             Column::Placeholder(p.name.clone())
         } else if key(name) == SET_COLUMN {
             Column::Set
+        } else if key(name) == PAGE_COLUMN {
+            Column::Page
         } else {
             // Quoted as the column is, so a control character in a name is shown escaped.
             let known: Vec<String> = m.placeholders.iter().map(|p| format!("{:?}", p.name)).collect();
@@ -70,7 +80,7 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
                 format!("it has {}", known.join(", "))
             };
             return bad(format!(
-                "line {}: column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set)",
+                "line {}: column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set, a column \"{PAGE_COLUMN}\" the page)",
                 line(0)
             ));
         };
@@ -99,6 +109,7 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
                     row.values.insert(name.clone(), value.to_owned());
                 }
                 Some(Column::Set) => row.set = Some(value.to_owned()),
+                Some(Column::Page) => row.page = Some(value.to_owned()),
                 Some(Column::Unnamed) | None => {
                     return bad(format!(
                         "line {n}: cell {} has a value but its column has no name",
@@ -110,6 +121,11 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// The page title each row asks for ([`TableRow::page`]), as [`generate_titled`] takes them.
+pub fn row_pages(rows: &[TableRow]) -> Vec<Option<String>> {
+    rows.iter().map(|r| r.page.clone()).collect()
 }
 
 /// The macro as each row gives it ([`Macro::apply`]), with the row's value set or else
@@ -488,6 +504,21 @@ pub fn generate(
     size: PageSize,
     title: &str,
 ) -> Result<Generated> {
+    generate_titled(project, copies, &[], symbol, size, title)
+}
+
+/// [`generate`], with `pages[i]` the page title copy `i` asks for (a table's
+/// [`PAGE_COLUMN`]): a copy whose title differs from the one before starts a new page with
+/// that title; `None` (or no entry) keeps the copy with the copies before it, which go under
+/// `title` until a copy names one. A full page goes on to a new page with the same title.
+pub fn generate_titled(
+    project: &mut Project,
+    copies: &[Macro],
+    pages: &[Option<String>],
+    symbol: impl Fn(&str) -> Option<Symbol>,
+    size: PageSize,
+    title: &str,
+) -> Result<Generated> {
     let Some(first) = copies.first() else {
         return Ok(Generated::default());
     };
@@ -551,8 +582,20 @@ pub fn generate(
     let mut id_cursor = 0u64;
     let mut out = Generated::default();
     let mut page_id = String::new();
+    let mut page_title = title;
+    let mut slot = 0;
     for (i, (m, &(dx, dy, step_x, step_y))) in copies.iter().zip(&offsets).enumerate() {
-        let slot = i % per_page;
+        if let Some(Some(asked)) = pages.get(i)
+            && asked.as_str() != page_title
+        {
+            page_title = asked;
+            if i > 0 {
+                slot = 0;
+            }
+        }
+        if slot == per_page {
+            slot = 0;
+        }
         if slot == 0 {
             id_cursor += 1;
             while ids.contains(&format!("p{id_cursor:04}")) {
@@ -567,7 +610,7 @@ pub fn generate(
                     break;
                 }
             }
-            let mut page = Page::new(page_id.clone(), format!("{prefix}{next_number}"), title);
+            let mut page = Page::new(page_id.clone(), format!("{prefix}{next_number}"), page_title);
             page.size = size;
             work.pages.push(page);
             out.pages.push(page_id.clone());
@@ -577,6 +620,7 @@ pub fn generate(
         crate::macros::place(&mut work, &page_id, m, at)
             .map_err(|err| Error::Invalid(format!("copy {}: {err}", i + 1)))?;
         out.copies += 1;
+        slot += 1;
     }
     work.sort_pages();
     *project = work;
@@ -757,6 +801,7 @@ mod tests {
                 line: i + 2,
                 set: Some("small".into()),
                 values: BTreeMap::new(),
+                page: None,
             })
             .collect();
         let copies = apply_rows(&m, &rows, None)?;
@@ -784,6 +829,94 @@ mod tests {
         }
         assert_eq!(tags.len(), 60);
         assert!(project.devices.values().all(|d| d.description == "Motor 0.75 kW"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_column_titles_the_pages_and_a_new_title_starts_a_page() -> Result<()> {
+        let m = starter()?;
+        let mut cells = vec![vec!["set".to_owned(), "Page".to_owned()]];
+        let mut push = |page: &str, n: usize| {
+            for _ in 0..n {
+                cells.push(vec!["small".to_owned(), page.to_owned()]);
+            }
+        };
+        // Two rows under --title, three pumps (an empty cell stays on the pumps' page), 53
+        // fans (one more than an A4 page holds) and pumps again.
+        push("", 2);
+        push(" Pumps ", 2);
+        push("", 1);
+        push("Fans", 53);
+        push("Pumps", 1);
+        let rows = rows_from_table(&m, &cells, &[])?;
+        assert_eq!(rows.get(2).and_then(|r| r.page.as_deref()), Some("Pumps"));
+        let copies = apply_rows(&m, &rows, None)?;
+        let mut project = Project::new("x");
+        project.pages.push(Page::new("p0001", "1", "Overview"));
+        let done = generate_titled(
+            &mut project,
+            &copies,
+            &row_pages(&rows),
+            |_| None,
+            PageSize::A4,
+            "Motors",
+        )?;
+        assert_eq!(done.copies, 59);
+        let made: Vec<(&str, &str, usize)> = project
+            .pages
+            .iter()
+            .filter(|p| done.pages.contains(&p.id))
+            .map(|p| (p.number.as_str(), p.title.as_str(), p.symbols.len()))
+            .collect();
+        assert_eq!(
+            made,
+            [
+                ("2", "Motors", 2),
+                ("3", "Pumps", 3),
+                ("4", "Fans", 52),
+                ("5", "Fans", 1),
+                ("6", "Pumps", 1)
+            ]
+        );
+        // The first copy on each page sits in the first slot.
+        for p in project.pages.iter().filter(|p| done.pages.contains(&p.id)) {
+            let first = p.symbols.first().map(|s| s.at);
+            assert_eq!(
+                first,
+                project.pages.get(1).and_then(|p| p.symbols.first()).map(|s| s.at)
+            );
+        }
+
+        // A first row that names a page titles the first page; without the column every copy
+        // goes under the title given.
+        let rows = rows_from_table(
+            &m,
+            &table(&[&["set", "page"], &["small", "Pumps"], &["small", ""]]),
+            &[],
+        )?;
+        let mut project = Project::new("x");
+        let done = generate_titled(
+            &mut project,
+            &apply_rows(&m, &rows, None)?,
+            &row_pages(&rows),
+            |_| None,
+            PageSize::A4,
+            "Motors",
+        )?;
+        let titles: Vec<&str> = project.pages.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!((done.pages.len(), titles), (1, vec!["Pumps"]));
+
+        // A macro that declares a placeholder "page" takes the column as that placeholder.
+        let mut own = starter()?;
+        own.placeholders.push(Placeholder {
+            name: "Page".into(),
+            ..Default::default()
+        });
+        let rows = rows_from_table(&own, &table(&[&["set", "page"], &["small", "7"]]), &[])?;
+        assert_eq!(
+            rows.first().map(|r| (r.page.clone(), r.values.get("Page").cloned())),
+            Some((None, Some("7".into())))
+        );
         Ok(())
     }
 
