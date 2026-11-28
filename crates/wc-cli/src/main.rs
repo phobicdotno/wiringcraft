@@ -7276,13 +7276,10 @@ fn page_fields(p: &Project, page: usize) -> String {
     let mut out = String::new();
     for k in keys {
         let value = pg.title_field(&p.meta, &k);
-        let own = pg.title_block.get(&k).filter(|v| !v.trim().is_empty());
         // A revision of `auto` shows the page's latest revision; the listing says so.
-        let auto = k == "revision"
-            && own
-                .or_else(|| p.meta.title_block.get(&k))
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case(wc_core::project::AUTO_REVISION));
-        let from = match (own.is_some(), auto, value.is_empty()) {
+        let (set, own) = pg.title_field_set(&p.meta, &k);
+        let auto = k == "revision" && wc_core::project::is_auto_revision(set);
+        let from = match (own, auto, value.is_empty()) {
             (true, true, _) => "page, auto",
             (true, false, _) => "page",
             (false, true, _) => "project, auto",

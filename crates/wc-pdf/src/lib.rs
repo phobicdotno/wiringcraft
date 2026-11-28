@@ -536,12 +536,14 @@ fn sheet_page(
     title: impl Into<String>,
 ) -> wc_core::Page {
     let mut page = wc_core::Page::new(id, number, title);
-    let auto = project
+    let auto = wc_core::project::is_auto_revision(page.title_field_set(&project.meta, "revision").0);
+    let latest = project
         .meta
-        .title_block
-        .get("revision")
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case(wc_core::project::AUTO_REVISION));
-    if auto && let Some(latest) = project.latest_revision() {
+        .revisions
+        .iter()
+        .rev()
+        .find(|r| !wc_core::project::is_auto_revision(&r.letter));
+    if auto && let Some(latest) = latest {
         page.title_block.insert("revision".into(), latest.letter.clone());
     }
     page

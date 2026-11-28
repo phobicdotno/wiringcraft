@@ -682,6 +682,11 @@ pub const TITLE_FIELDS: &[(&str, &str)] = &[
 /// latest revision its clouds are tagged with ([`Page::auto_revision`]).
 pub const AUTO_REVISION: &str = "auto";
 
+/// Whether a revision field's `value` is [`AUTO_REVISION`] (case and spaces around it ignored).
+pub fn is_auto_revision(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(AUTO_REVISION)
+}
+
 /// The title-block fields that usually differ from page to page, which the page properties
 /// offer first: a page's own value wins over the project's ([`Page::title_field`]).
 pub const PAGE_TITLE_FIELDS: &[&str] = &["revision", "date", "drawn_by", "checked_by"];
@@ -1837,16 +1842,20 @@ impl Page {
     /// is not blank, else the project's. Empty when neither has it. A revision of
     /// [`AUTO_REVISION`] shows [`Page::auto_revision`].
     pub fn title_field<'a>(&'a self, meta: &'a ProjectMeta, key: &str) -> &'a str {
-        let value = self
-            .title_block
-            .get(key)
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| meta.title_block.get(key))
-            .map_or("", String::as_str);
-        if key == "revision" && value.trim().eq_ignore_ascii_case(AUTO_REVISION) {
+        let (value, _) = self.title_field_set(meta, key);
+        if key == "revision" && is_auto_revision(value) {
             return self.auto_revision(meta);
         }
         value
+    }
+
+    /// A title-block field as it is set for this page, before an [`AUTO_REVISION`] is worked
+    /// out, and whether it is the page's own value (else the project's, or empty).
+    pub fn title_field_set<'a>(&'a self, meta: &'a ProjectMeta, key: &str) -> (&'a str, bool) {
+        match self.title_block.get(key).filter(|v| !v.trim().is_empty()) {
+            Some(own) => (own, true),
+            None => (meta.title_block.get(key).map_or("", String::as_str), false),
+        }
     }
 
     /// The revision this page shows for a revision field of [`AUTO_REVISION`]: the latest
@@ -1855,11 +1864,12 @@ impl Page {
     /// of. Empty when the project lists no revisions.
     pub fn auto_revision<'a>(&self, meta: &'a ProjectMeta) -> &'a str {
         let revisions = &meta.revisions;
-        let latest = revisions
-            .iter()
+        // A letter saved as `auto` by hand names no revision here.
+        let listed = || revisions.iter().filter(|r| !is_auto_revision(&r.letter));
+        let latest = listed()
             .rev()
             .find(|r| self.clouds.iter().any(|c| c.revision.trim() == r.letter));
-        latest.or(revisions.first()).map_or("", |r| r.letter.as_str())
+        latest.or_else(|| listed().next()).map_or("", |r| r.letter.as_str())
     }
 
     pub fn symbol(&self, id: &str) -> Option<&PlacedSymbol> {
@@ -3230,6 +3240,19 @@ mod tests {
         p.meta.title_block.insert("revision".into(), "C".into());
         assert_eq!(page(&p).as_deref(), Some("C"));
         p.pages[0].set_title_field("revision", "auto");
+        assert_eq!(page(&p).as_deref(), Some("B"));
+        // A letter saved as `auto` by hand names no revision.
+        p.meta.revisions.push(crate::revision::Revision {
+            letter: "Auto".into(),
+            date: String::new(),
+            text: String::new(),
+            author: String::new(),
+        });
+        p.pages[0].clouds.push(crate::revision::RevisionCloud::new(
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 10.0),
+            "Auto",
+        ));
         assert_eq!(page(&p).as_deref(), Some("B"));
         // Only the revision field is worked out.
         p.meta.title_block.insert("drawn_by".into(), "auto".into());
