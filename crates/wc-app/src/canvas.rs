@@ -2860,7 +2860,9 @@ fn wire_tool(
             // Which pin it is, and what it is for, before the wire is drawn (#1906).
             let label = pin_hover_label(open, page, item, pin);
             let font = FontId::proportional(12.0);
-            let galley = painter.layout_no_wrap(label, font, t.text);
+            // A long description wraps to the canvas rather than running off it.
+            let wrap = (painter.clip_rect().width() - 6.0).max(40.0);
+            let galley = painter.layout(label, font, t.text, wrap);
             let rect = pin_label_rect(at, galley.size(), painter.clip_rect());
             painter.rect_filled(rect, 3.0, t.surface);
             painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Inside);
@@ -4979,6 +4981,45 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(texts.iter().all(|t| !t.starts_with("-K1:")), "{texts:?}");
+    }
+
+    /// Drawn on the canvas, the label of a pin near its right edge is painted left of the pin,
+    /// inside the canvas (#1906).
+    #[test]
+    fn the_painted_pin_label_near_the_right_edge_stays_on_the_canvas() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        // The pointer near the canvas's right edge, and a coil -K1 whose A1 is just there.
+        let at = egui::pos2(985.0, 300.0);
+        painted(&ctx, &mut o, &mut ed, 1.0, vec![egui::Event::PointerMoved(at)]);
+        let Some(spot) = ed.cursor else {
+            unreachable!("the pointer is on the canvas")
+        };
+        let probe = o.place(0, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let a1 = Endpoint::Pin {
+            item: probe.clone(),
+            pin: "A1".into(),
+        };
+        let off = o.end_pos(&o.project.pages[0], &a1).unwrap();
+        o.project.pages[0].symbols.retain(|s| s.id != probe);
+        let coil = o
+            .place(0, "wc.coil", Point::new(100.0 + spot.x - off.x, 60.0 + spot.y - off.y))
+            .unwrap();
+        if let Some(s) = o.project.pages[0].symbols.iter_mut().find(|s| s.id == coil) {
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+        }
+        let texts = painted(&ctx, &mut o, &mut ed, 2.0, vec![egui::Event::PointerMoved(at)]);
+        let Some((_, rect)) = texts.iter().find(|(t, _)| t == "-K1:A1") else {
+            unreachable!("the pin is named: {texts:?}")
+        };
+        assert!(rect.max.x < at.x, "left of the pin: {rect:?}");
+        assert!(rect.min.x >= 0.0 && rect.max.x <= 1000.0, "on the canvas: {rect:?}");
     }
 
     /// The pin label goes left of or below a pin near the canvas's right or top edge, and
