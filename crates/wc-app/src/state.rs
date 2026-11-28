@@ -4415,6 +4415,9 @@ impl Open {
     /// Page > Duplicate page: copy the page as a new last page ([`Project::copy_page`]), as
     /// one undo step. Nothing changes when it is refused.
     pub fn duplicate_page(&mut self, page: usize) -> Result<usize, String> {
+        // The change before this one is settled first (its jumpers follow their terminals), so
+        // neither the copy nor the undo step loses it.
+        self.follow_terminals();
         let (id, number) = (self.free_page_id(), self.next_page_number());
         let mut project = self.project.clone();
         let i = project.copy_page(page, id, number, None).map_err(|e| e.to_string())?;
@@ -10581,6 +10584,27 @@ pub(crate) mod tests {
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
         o.set_device_property(&x2, "note", "x");
         assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    /// Duplicate page settles a move made since the last change first, so the copy keeps the
+    /// followed jumper (review of #1891).
+    #[test]
+    fn duplicating_a_page_after_a_move_keeps_the_followed_jumper() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut put = |at: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let (a, _b, _c) = (put(10.0), put(20.0), put(30.0));
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        o.checkpoint();
+        o.project.pages[page].symbols.iter_mut().find(|s| s.id == a).unwrap().at = Point::new(40.0, 20.0);
+        o.duplicate_page(page).unwrap();
+        assert_eq!(o.project.meta.jumpers[0].terminals, ["1", "3"]);
     }
 
     #[test]
