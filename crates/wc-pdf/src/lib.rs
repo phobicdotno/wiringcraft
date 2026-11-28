@@ -289,7 +289,11 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     for page in &pages {
         index.insert(page.id.clone(), sheet);
         if let Some(list) = placed.get(page.id.as_str()) {
-            if !page.symbols.is_empty() || !page.wires.is_empty() || !page.graphics.is_empty() {
+            if !page.symbols.is_empty()
+                || !page.wires.is_empty()
+                || !page.graphics.is_empty()
+                || page.underlay.is_some()
+            {
                 report.warnings.push(format!(
                     "page {}: a report page; what is drawn on it is not printed",
                     page.number
