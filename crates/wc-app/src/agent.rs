@@ -622,7 +622,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "export",
-            "Export into the project's export folder: pdf (all pages and reports), drawings (SVG and DXF per page), aml (AutomationML), wago-marking (WAGO smartScript marker list CSV) or wago-configurator (terminal strips as a WAGO configurator article list CSV).",
+            "Export into the project's export folder: pdf (all pages and the reports the project chooses: every report with rows unless Project properties or `pdf-reports` sets a choice), drawings (SVG and DXF per page), aml (AutomationML), wago-marking (WAGO smartScript marker list CSV) or wago-configurator (terminal strips as a WAGO configurator article list CSV).",
             json!({
                 "format": {"type": "string", "enum": ["pdf", "drawings", "aml", "wago-marking", "wago-configurator"]},
                 "lang": {"type": "string", "description": "pdf: print the texts in this language from translations.toml, e.g. \"nb\", or two as \"nb,en\" (default: as drawn). wago-marking: language of the header row and type column: en (default), de or nb."},
@@ -669,7 +669,7 @@ pub fn specs() -> Vec<Value> {
              Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \
              Libraries: lib (add, sync, status, update, lock, search, propose). \
              Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
-             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, report-layout (show, set, reset: a report's columns, sorting, grouping and title-block values), nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
+             Output: pdf (--page, --report, --lang for a translated print), pdf-reports (the reports pdf prints without --report), drawing (SVG/DXF per page), report, report-layout (show, set, reset: a report's columns, sorting, grouping and title-block values), nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
              Checks and history: check, rules (list, set, off, on: the check rules and library rules the project turns off), inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
              Use [\"--help\"] or [\"<command>\", \"--help\"] for the arguments.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
@@ -4152,6 +4152,8 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         (Some("vcs"), Some("log" | "changes" | "page-log")) => true,
         // `rules set`, `off` and `on` change the project; only the listing reads it.
         (Some("rules"), Some("list")) => true,
+        // `pdf-reports` with names or `--clear` changes the choice; alone it prints it.
+        (Some("pdf-reports"), None) => true,
         (
             Some(
                 "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
@@ -11797,6 +11799,11 @@ mod tests {
                 unreachable!("{words:?} ran")
             };
             assert!(e.contains("Ola") && e.contains("shared session"), "{words:?}: {e}");
+        }
+        // The PDF report choice prints alone, but setting or clearing it is a change.
+        assert!(classify(&["pdf-reports"]).is_none());
+        for words in [&["pdf-reports", "parts"][..], &["pdf-reports", "--clear"]] {
+            assert!(classify(words).is_some(), "{words:?}");
         }
     }
 

@@ -74,6 +74,13 @@ enum Dialog {
         /// the locations are.
         revisions: Vec<state::RevisionRow>,
         loaded_revisions: Vec<state::RevisionRow>,
+        /// The reports Export PDF prints (`None`: every report), and as loaded; left alone on
+        /// OK while unchanged.
+        pdf_reports: Option<Vec<wc_report::Kind>>,
+        loaded_pdf_reports: Option<Vec<wc_report::Kind>>,
+        /// Names in the stored choice that are no report (a hand-edited `project.toml`): the
+        /// dialog says so, and OK saves the choice it shows in their place.
+        pdf_reports_unknown: Vec<String>,
     },
     /// The cover page form: changes show on the page as they are typed; `since` is the undo
     /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
@@ -2150,6 +2157,19 @@ impl App {
                     locations,
                     revisions: state::RevisionRow::of(&open.project.meta.revisions),
                     loaded_revisions: state::RevisionRow::of(&open.project.meta.revisions),
+                    pdf_reports: open
+                        .project
+                        .meta
+                        .pdf_reports
+                        .as_ref()
+                        .map(|_| pdf_report_kinds(&open.project.meta)),
+                    loaded_pdf_reports: open
+                        .project
+                        .meta
+                        .pdf_reports
+                        .as_ref()
+                        .map(|_| pdf_report_kinds(&open.project.meta)),
+                    pdf_reports_unknown: pdf_report_choice(&open.project.meta).1,
                 });
             }
             Action::CoverPage => {
@@ -3198,6 +3218,9 @@ impl App {
                     loaded_locations,
                     revisions,
                     loaded_revisions,
+                    pdf_reports,
+                    loaded_pdf_reports,
+                    pdf_reports_unknown,
                 } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
@@ -3288,6 +3311,40 @@ impl App {
                     if ui.button("Add revision").clicked() {
                         revisions.push(state::RevisionRow::default());
                     }
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Reports in the PDF").strong());
+                    let mut choose = pdf_reports.is_some();
+                    if ui
+                        .checkbox(&mut choose, "Print only these reports (otherwise every report with rows)")
+                        .changed()
+                    {
+                        *pdf_reports = choose.then(|| wc_report::Kind::ALL.to_vec());
+                    }
+                    if !pdf_reports_unknown.is_empty() {
+                        ui.colored_label(
+                            theme::Theme::of(ui.ctx()).error,
+                            format!(
+                                "project.toml names no report {}; OK saves the choice shown here instead.",
+                                pdf_reports_unknown.join(", ")
+                            ),
+                        );
+                    }
+                    if let Some(chosen) = pdf_reports.as_mut() {
+                        ui.horizontal_wrapped(|ui| {
+                            for k in wc_report::Kind::ALL {
+                                let mut on = chosen.contains(&k);
+                                if ui.checkbox(&mut on, report_title(k)).changed() {
+                                    if on {
+                                        chosen.push(k);
+                                        // Printed in the usual order.
+                                        chosen.sort_by_key(|c| wc_report::Kind::ALL.iter().position(|a| a == c));
+                                    } else {
+                                        chosen.retain(|c| *c != k);
+                                    }
+                                }
+                            }
+                        });
+                    }
                     let rev_bad = self
                         .open
                         .as_ref()
@@ -3307,6 +3364,7 @@ impl App {
                             let l = (locations != loaded_locations).then(|| locations.clone());
                             let r = (revisions != loaded_revisions).then(|| revisions.clone());
                             let loaded = loaded_revisions.clone();
+                            let pdf = pdf_choice_change(pdf_reports, loaded_pdf_reports, pdf_reports_unknown);
                             then = Some(Box::new(move |app: &mut App| {
                                 let Some(o) = app.open.as_mut() else {
                                     return;
@@ -3314,7 +3372,7 @@ impl App {
                                 // Checked again: a sync may have come in since the dialog was drawn.
                                 if let Some(why) = r.as_deref().and_then(|r| o.revision_draft_problem(&loaded, r)) {
                                     app.ed.message = why;
-                                } else if let Err(e) = o.set_project_props(&n, &f, l.as_deref(), r.as_deref()) {
+                                } else if let Err(e) = o.set_project_props_with(&n, &f, l.as_deref(), r.as_deref(), pdf) {
                                     app.ed.message = e;
                                 }
                             }));
@@ -5493,6 +5551,57 @@ fn run_check(open: &Open) -> Vec<wc_report::Finding> {
     )
 }
 
+/// The reports Export PDF prints: the project's choice (Project properties, or
+/// `wiringcraft pdf-reports`) in its order, else every report. A name the app does not know is
+/// passed over. Only reports with rows are printed.
+fn pdf_report_kinds(meta: &wc_core::project::ProjectMeta) -> Vec<wc_report::Kind> {
+    pdf_report_choice(meta).0
+}
+
+/// The reports `meta.pdf_reports` names, as [`pdf_report_kinds`] takes them, and the names
+/// that are no report (a hand-edited `project.toml`), which Export PDF refuses.
+fn pdf_report_choice(meta: &wc_core::project::ProjectMeta) -> (Vec<wc_report::Kind>, Vec<String>) {
+    let Some(names) = &meta.pdf_reports else {
+        return (wc_report::Kind::ALL.to_vec(), Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut unknown = Vec::new();
+    for n in names {
+        let kinds = match n.trim() {
+            "all" => wc_report::Kind::ALL.to_vec(),
+            n => match wc_report::Kind::parse(n) {
+                Some(k) => vec![k],
+                None => {
+                    unknown.push(format!("{n:?}"));
+                    Vec::new()
+                }
+            },
+        };
+        for k in kinds {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    (out, unknown)
+}
+
+/// What Project properties' OK passes for the PDF report choice
+/// ([`state::Open::set_project_props_with`]): `None` leaves the stored choice alone, which it
+/// does while the choice shown is the one loaded, unless the stored one names no report
+/// (`unknown`): that is replaced by the choice shown.
+fn pdf_choice_change(
+    shown: &Option<Vec<wc_report::Kind>>,
+    loaded: &Option<Vec<wc_report::Kind>>,
+    unknown: &[String],
+) -> Option<Option<Vec<String>>> {
+    (shown != loaded || !unknown.is_empty()).then(|| {
+        shown
+            .as_ref()
+            .map(|ks| ks.iter().map(|k| k.name().to_owned()).collect())
+    })
+}
+
 fn report_title(k: wc_report::Kind) -> &'static str {
     match k {
         wc_report::Kind::Parts => "Parts",
@@ -5755,9 +5864,22 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
         symbols: &open.symbols,
         parts: &open.parts,
     };
+    let (kinds, unknown) = pdf_report_choice(&project.meta);
+    if !unknown.is_empty() {
+        return format!(
+            "Export failed: project.toml: pdf_reports names no report {} (choose the reports again in Project properties)",
+            unknown.join(", ")
+        );
+    }
+    // Topology pages follow the network list, as `wiringcraft pdf` prints them.
+    let networks = if kinds.contains(&wc_report::Kind::Networks) {
+        project.meta.networks.clone()
+    } else {
+        Vec::new()
+    };
     let pictures = wc_pdf::read_pictures(&open.dir, project);
     let options = wc_pdf::Options {
-        reports: wc_report::Kind::ALL
+        reports: kinds
             .into_iter()
             .map(|k| wc_report::build(k, &inputs))
             .filter(|t| !t.rows.is_empty())
@@ -5765,7 +5887,7 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
         panels: project.panels.clone(),
-        networks: project.meta.networks.clone(),
+        networks,
         footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
@@ -9786,6 +9908,93 @@ mod nudge_tests {
         let open = app.open.as_ref().unwrap();
         assert_eq!(open.dir, first, "not joined while the Open waits");
         assert!(open.dirty, "nothing was saved without asking");
+    }
+
+    /// Project properties' report choice: Export PDF prints those reports in their order,
+    /// every report without one, and the choice is one undo step (#1882).
+    #[test]
+    fn the_project_s_report_choice_picks_the_reports_export_pdf_prints() {
+        use wc_report::Kind;
+        let (_tmp, mut app, _ctx) = app(Point::new(55.0, 60.0), false);
+        let o = app.open.as_mut().unwrap();
+        assert_eq!(pdf_report_kinds(&o.project.meta), Kind::ALL.to_vec());
+        let before = o.project.clone();
+        let name = o.project.meta.name.clone();
+        let fields = form_fields(&o.project.meta.title_block);
+        let chosen = vec![
+            "terminals".to_owned(),
+            "parts".to_owned(),
+            "terminals".to_owned(),
+            "nonsense".to_owned(),
+        ];
+        o.set_project_props_with(&name, &fields, None, None, Some(Some(chosen)))
+            .unwrap();
+        assert_eq!(pdf_report_kinds(&o.project.meta), [Kind::Terminals, Kind::Parts]);
+        // The name that is no report is what Export PDF refuses.
+        let (_, unknown) = pdf_report_choice(&o.project.meta);
+        assert_eq!(unknown, ["\"nonsense\""]);
+        o.project.meta.pdf_reports = Some(vec!["all".into()]);
+        assert_eq!(pdf_report_kinds(&o.project.meta), Kind::ALL.to_vec());
+        o.project.meta.pdf_reports = Some(Vec::new());
+        assert!(pdf_report_kinds(&o.project.meta).is_empty());
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        // Left out, the choice stays as it is.
+        o.project.meta.pdf_reports = Some(vec!["parts".into()]);
+        o.set_project_props(&name, &fields, None, None).unwrap();
+        assert_eq!(o.project.meta.pdf_reports, Some(vec!["parts".into()]));
+
+        // Export PDF prints a network's topology page only with the network list, and refuses
+        // a choice naming no report before writing anything.
+        o.project.meta.networks.push(wc_core::network::Network {
+            name: "Bus".into(),
+            ..Default::default()
+        });
+        let pdf = o.dir.join("out.pdf");
+        let pages = |o: &state::Open| {
+            let _ = std::fs::remove_file(&pdf);
+            let msg = export_pdf_to(o, &[], &pdf);
+            let n = msg
+                .strip_prefix("Exported ")
+                .and_then(|m| m.split(' ').next())
+                .and_then(|n| n.parse::<usize>().ok());
+            (msg.clone(), n.unwrap_or(0), pdf.exists())
+        };
+        o.project.meta.pdf_reports = Some(vec!["networks".into()]);
+        let (_, with, _) = pages(o);
+        o.project.meta.pdf_reports = Some(Vec::new());
+        let (_, without, _) = pages(o);
+        // No report chosen: the schematic pages alone, no topology page.
+        assert_eq!(without, o.project.pages.len());
+        assert!(with > without, "the topology page goes with the list: {with} {without}");
+        o.project.meta.pdf_reports = Some(vec!["nonsense".into()]);
+        let (msg, _, written) = pages(o);
+        assert!(msg.contains("pdf_reports") && !written, "{msg}");
+
+        // The dialog names the stored names that are no report.
+        app.run(Action::ProjectProps);
+        let Some(Dialog::ProjectProps {
+            pdf_reports_unknown, ..
+        }) = &app.dialog
+        else {
+            unreachable!("the dialog is open");
+        };
+        assert_eq!(pdf_reports_unknown, &["\"nonsense\""]);
+
+        // OK with the choice left as it shows replaces the stored names with the valid ones,
+        // in one undo step; a valid choice left alone is not written.
+        let o = app.open.as_mut().unwrap();
+        o.project.meta.pdf_reports = Some(vec!["parts".into(), "nonsense".into()]);
+        let before = o.project.clone();
+        let (shown, unknown) = pdf_report_choice(&o.project.meta);
+        let shown = Some(shown);
+        let change = pdf_choice_change(&shown, &shown, &unknown);
+        assert_eq!(change, Some(Some(vec!["parts".to_owned()])));
+        o.set_project_props_with(&name, &fields, None, None, change).unwrap();
+        assert_eq!(o.project.meta.pdf_reports, Some(vec!["parts".into()]));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.pdf_reports, before.meta.pdf_reports);
+        assert_eq!(pdf_choice_change(&shown, &shown, &[]), None);
     }
 
     /// A project with nothing unsaved still does not close over a dialog holding work of its
