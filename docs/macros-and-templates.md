@@ -106,7 +106,8 @@ The macro was drawn with `-K1`; it was placed as `-K2` because the page already 
 
 A table can drive a macro: `wiringcraft macro generate <macro> --table motors.csv` places one
 copy per row, each row's cells filling the placeholders (a column `set` picks the value set,
-a column `page` titles the pages), on new pages. In the app, Insert > Macro lists the macros with a From table… button: it asks for
+a column `page` titles the pages, unless the macro has placeholders of those names), on new
+pages. In the app, Insert > Macro lists the macros with a From table… button: it asks for
 the table (a CSV file or an Excel `.xlsx` workbook) and, for a macro with value sets, which one
 rows without a `set` column use. The new pages take the size of the page shown, the app shows
 the first of them, and one Undo takes them all back. See
