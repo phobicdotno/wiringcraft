@@ -83,5 +83,33 @@ fn a_report_page_holds_its_report_in_the_pdf() -> TestResult {
     assert!(!ok(&dir, &["page", "list"])?.contains("report"));
     let more: usize = bare.split(' ').next().ok_or("count")?.parse()?;
     assert_eq!(pages(&dir, &[])?, format!("{} pages)", more + 1));
+
+    // A report name written by hand that names no report prints the page as a normal one, with
+    // a warning; a closed stderr does not stop the export.
+    let file = dir.join("pages/bom.page.json");
+    let text = std::fs::read_to_string(&file)?;
+    let text = text.replacen("\"title\"", "\"report\": \"nonsense\",\n  \"title\"", 1);
+    std::fs::write(&file, text)?;
+    let out = dir.join("out.pdf");
+    let done = run(&dir, &["pdf", out.to_str().ok_or("path")?])?;
+    assert!(done.status.success());
+    let said = String::from_utf8_lossy(&done.stderr);
+    assert!(said.contains("names no report; it prints as a normal page"), "{said}");
+    assert_eq!(
+        String::from_utf8_lossy(&done.stdout)
+            .rsplit_once('(')
+            .map(|(_, n)| n.trim()),
+        Some(format!("{} pages)", more + 1).as_str())
+    );
+    let (reader, writer) = std::io::pipe()?;
+    drop(reader);
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["pdf", out.to_str().ok_or("path")?])
+        .stdout(std::process::Stdio::null())
+        .stderr(writer)
+        .status()?;
+    assert_eq!(status.code(), Some(0), "{status:?}");
     Ok(())
 }

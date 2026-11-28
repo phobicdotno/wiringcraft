@@ -4561,12 +4561,12 @@ fn run(mut cli: Cli) -> Res<()> {
             // `--report` says, and those reports are not printed again after the pages.
             let on_pages = wc_report::report_page_kinds(&p);
             let (mut tables, unknown) = wc_report::report_page_tables(&inputs);
-            for u in unknown {
-                eprintln!(
-                    "warning: {} names no report; it prints as a normal page",
-                    escape_field(&u)
-                );
-            }
+            // `warn`: a closed stderr must not stop the export.
+            warn(
+                unknown
+                    .iter()
+                    .map(|u| format!("{u} names no report; it prints as a normal page")),
+            );
             let mut kinds = kinds;
             for k in &on_pages {
                 if !kinds.contains(k) {
