@@ -2715,7 +2715,7 @@ impl App {
                                 ui.label(m.source.as_str());
                                 // A table places it once per row on new pages.
                                 let hint = "Pick a CSV or Excel table: one copy per row on new pages, its columns \
-                                            filling the placeholders (a column \"set\" picks the variant)";
+                                            filling the placeholders (a column \"set\" picks the variant, a column \"macro\" another macro)";
                                 if m.value_sets.is_empty() || m.error.is_some() {
                                     if ui
                                         .add_enabled(m.error.is_none(), egui::Button::new("From table…"))
@@ -2728,7 +2728,7 @@ impl App {
                                     }
                                 } else {
                                     ui.menu_button("From table…", |ui| {
-                                        ui.label("Variant for rows without a set column:");
+                                        ui.label("Variant for this macro's rows without a set column:");
                                         let choices = std::iter::once(None).chain(m.value_sets.iter().map(Some));
                                         for set in choices {
                                             if ui.button(set.map_or("None: every row names one", String::as_str)).clicked() {
@@ -5013,10 +5013,10 @@ impl App {
                 }
                 self.ed.selection.clear();
                 let pages = if done.pages.len() == 1 { "page" } else { "pages" };
-                let copies = if done.copies == 1 { "copy" } else { "copies" };
+                // Named by the macros placed: a table's macro column can pick others.
                 self.ed.message = format!(
-                    "{} {copies} of {name} on {} new {pages}.",
-                    done.copies,
+                    "{} on {} new {pages}.",
+                    done.copies_text(str::to_owned),
                     done.pages.len()
                 );
             }

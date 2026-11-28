@@ -4237,8 +4237,8 @@ impl Open {
     }
 
     /// Insert > Macro, From table…: place the macro once per row of `table` (CSV or `.xlsx`),
-    /// each row's cells filling its placeholders and a `set` column picking the row's value
-    /// set (else `default_set`), on new pages the size of page `page`, as `wiringcraft macro
+    /// each row's cells filling its placeholders, a `set` column picking the row's value set
+    /// (else `default_set`) and a `macro` column another macro for its row, on new pages the size of page `page`, as `wiringcraft macro
     /// generate` does. One undo step; nothing changes when a row or a copy cannot be placed.
     pub fn generate_from_table(
         &mut self,
@@ -4253,7 +4253,22 @@ impl Open {
         // control characters.
         let shown = table.display().to_string();
         let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", wc_import::run::escape_field(&shown)))?;
-        let (copies, pages) = wc_import::run::macro_table(&m, &bytes, &shown, default_set)?;
+        // A row's `macro` column names another macro: by its file name or its name, the
+        // project's own first, as `macro generate` finds it. Listed only when a row asks.
+        let mut listed: Option<Vec<MacroEntry>> = None;
+        let other = |name: &str| {
+            let entries = listed.get_or_insert_with(|| self.macros());
+            let file = name.trim();
+            let file = file.strip_suffix(".json").unwrap_or(file);
+            let stem = |e: &MacroEntry| e.path.file_stem().and_then(|s| s.to_str()).map(str::to_owned);
+            let entry = entries
+                .iter()
+                .find(|e| stem(e).is_some_and(|s| s.eq_ignore_ascii_case(file)))
+                .or_else(|| entries.iter().find(|e| e.name.eq_ignore_ascii_case(name.trim())))
+                .ok_or_else(|| format!("no macro {name:?}"))?;
+            wc_core::macros::read_macro(&entry.path).map_err(|e| e.to_string())
+        };
+        let (copies, pages) = wc_import::run::macro_table(&m, &bytes, &shown, default_set, other)?;
         if copies.is_empty() {
             return Ok(generate::Generated::default());
         }

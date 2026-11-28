@@ -706,6 +706,75 @@ fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
         .map(|page| (page.number.as_str(), page.title.as_str(), page.symbols.len()))
         .collect();
     assert_eq!(made, [("4", "Pumps", 2), ("5", "Fans", 1), ("6", "Pumps", 1)]);
+
+    // A macro column picks another macro per row (by its file name or its name); --set is for
+    // the starter's rows only.
+    std::fs::write(
+        lib.join("macros/valve.json"),
+        r#"{
+  "name": "Valve",
+  "symbols": [{"id": "v1", "symbol": "wc.coil", "at": {"x": 20.0, "y": 30.0}, "tag": "-Y1"}],
+  "devices": {"-Y1": {"description": "Valve {{bar}} bar"}},
+  "anchor": {"x": 20.0, "y": 30.0},
+  "placeholders": [{"name": "bar"}]
+}"#,
+    )?;
+    let mixed = tmp.path().join("mixed.csv");
+    std::fs::write(
+        &mixed,
+        "macro;kW;bar
+;1;
+valve;;6
+VALVE;;7
+;2;
+",
+    )?;
+    let generate = |table: &Path| {
+        let table = table.to_str().ok_or("path")?;
+        wiringcraft(
+            &dir,
+            &[
+                "macro", "generate", "starter", "--table", table, "--set", "3 kW", "--title", "Mixed",
+            ],
+        )
+    };
+    assert_eq!(
+        generate(&mixed)?,
+        "p0006\n4 copies: 2 of Motor starter, 2 of Valve on 1 page\n"
+    );
+    let p = wc_core::store::load(&dir)?;
+    let page = p.page("p0006").ok_or("page")?;
+    let rows: Vec<String> = page
+        .symbols
+        .iter()
+        .filter_map(|s| s.tag.as_ref())
+        .filter_map(|t| p.devices.get(t).map(|d| format!("{t} {}", d.description)))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "-Q8 Starter 1 kW",
+            "-Y1 Valve 6 bar",
+            "-Y2 Valve 7 bar",
+            "-Q9 Starter 2 kW"
+        ]
+    );
+    // A value for a placeholder the row's macro lacks, and an unknown macro, name the line
+    // and place nothing.
+    for (table, want) in [
+        (
+            "macro;kW;bar\n;1;5\n",
+            "line 2: macro \"Motor starter\": \"bar\" is not a placeholder",
+        ),
+        ("macro;kW\n;1\nnope;\n", "line 3: no macro \"nope\""),
+    ] {
+        std::fs::write(&mixed, table)?;
+        let Err(err) = generate(&mixed) else {
+            return Err(format!("generated from {table:?}").into());
+        };
+        assert!(err.contains(want), "{err}");
+    }
+    assert_eq!(wc_core::store::load(&dir)?.pages.len(), p.pages.len());
     Ok(())
 }
 

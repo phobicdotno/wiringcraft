@@ -1515,6 +1515,21 @@ mod tests {
         assert_eq!(made, [("Pumps", 4), ("Fans", 2)]);
         assert!(o.undo());
         assert_eq!(o.project, before);
+
+        // A macro column picks another of the project's macros for its row, by file name or
+        // name; one the project does not have changes nothing.
+        let one = o.copy(page, &sel[..1]);
+        o.save_macro(&one, "One coil", "").unwrap();
+        std::fs::write(&table, "what;macro\nPump 1;\n;one coil\n;One-Coil\n").unwrap();
+        let done = o.generate_from_table(page, &path, &table, None).unwrap();
+        let new = o.project.page(&done.pages[0]).unwrap();
+        assert_eq!((done.copies, new.symbols.len()), (3, 4));
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        std::fs::write(&table, "what;macro\nPump 1;\n;nope\n").unwrap();
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.contains("line 3: no macro \"nope\""), "{err}");
+        assert_eq!(o.project, before);
     }
 
     /// The table's path is shown escaped, as `macro generate` shows it (#1865). Unix only: a
