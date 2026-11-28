@@ -126,7 +126,8 @@ pub fn apply_rows(m: &Macro, rows: &[TableRow], default_set: Option<&str>) -> Re
 /// The box round everything the copies draw, so one pitch fits each of them: their symbols
 /// (through `symbol`, a missing one as [`Symbol::unknown_bounds`]) with their pins, their wires'
 /// free ends and bends, and their drawings, texts as wide as they are drawn (their filled-in
-/// values can differ from copy to copy).
+/// values can differ from copy to copy), and the cross-reference lines a coil lists its
+/// contacts on ([`xref_points`]).
 pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Point, Point) {
     let mut pts = Vec::new();
     for m in copies {
@@ -141,6 +142,7 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
                         drawn_points(&g.placed(s.at, s.rotation, s.mirror), &mut pts);
                     }
                     pts.extend(def.pins.iter().map(|pin| s.at + pin.at.transform(s.rotation, s.mirror)));
+                    xref_points(m, s, &def, &symbol, &mut pts);
                 }
                 None => {
                     let (a, b) = Symbol::unknown_bounds(s.at);
@@ -165,6 +167,53 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
         pts.extend(copies.first().map(|m| m.anchor));
     }
     bounds_of(&pts)
+}
+
+/// The widest location a contact line can show for a copy: the page number a generated page
+/// gets (counted up to four digits; a prefix such as `A` in `A7` is not), a two-digit reference
+/// column, and the widest row letter.
+const WIDEST_LOCATION: &str = "9999/99.W";
+
+/// Points round the cross-reference lines the PDF draws under `s` ([`crate::xref`]): a coil, or
+/// a breaker when the copy has no coil of its tag, lists one line per auxiliary contact of its
+/// tag. Placing gives the copy a fresh tag, so its contacts are those the copy brings; each line
+/// is measured with the contact's pins and the widest location ([`WIDEST_LOCATION`]), since
+/// the page and column the copy lands on are not known yet.
+fn xref_points(
+    m: &Macro,
+    s: &crate::project::PlacedSymbol,
+    def: &Symbol,
+    symbol: &impl Fn(&str) -> Option<Symbol>,
+    pts: &mut Vec<Point>,
+) {
+    use crate::symbol::SymbolRole;
+    let Some(tag) = &s.tag else { return };
+    let tagged = |role: SymbolRole| {
+        m.symbols
+            .iter()
+            .filter(move |o| o.tag.as_ref() == Some(tag))
+            .filter_map(|o| symbol(&o.symbol))
+            .filter(move |d| d.role == role)
+    };
+    let lists = match def.role {
+        SymbolRole::Main => true,
+        SymbolRole::Standalone => tagged(SymbolRole::Main).next().is_none(),
+        _ => false,
+    };
+    if !lists {
+        return;
+    }
+    let below = def
+        .graphics
+        .iter()
+        .map(|g| g.placed(s.at, s.rotation, s.mirror).bounds().1.y)
+        .fold(s.at.y, f64::max);
+    for (i, contact) in tagged(SymbolRole::Auxiliary).enumerate() {
+        let pins: Vec<String> = contact.pins.iter().map(|p| p.name.clone()).collect();
+        let text = crate::xref::contact_text(&pins, WIDEST_LOCATION);
+        let at = crate::xref::contact_line_at(s.at, below, i);
+        pts.extend(text_corners(at, &text, crate::xref::HEIGHT, Align::Left, 0.0));
+    }
 }
 
 /// The height the PDF and the canvas draw a device tag's lines at.
@@ -850,6 +899,69 @@ mod tests {
         let (min, _) = extent(std::slice::from_ref(&bare), |_| Some(def.clone()));
         let width = crate::font::text_width_mm("-K1000.1", TAG_HEIGHT);
         assert!(min.x <= s.at.x - 30.0 - width + 1e-9, "{min:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_coil_s_contact_lines_count_as_drawn() -> Result<()> {
+        use crate::symbol::{Pin, SymbolRole};
+        let mut one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let tag = DeviceTag::parse("-Q1")?;
+        // The coil at (20, 30) draws down to y = 40; three contacts of its tag sit far off to the
+        // right, so only the lines under the coil reach below and right of the coil.
+        for i in 0..3 {
+            one.symbols.push(PlacedSymbol {
+                id: format!("c{i}"),
+                symbol: "wc.no".into(),
+                at: Point::new(30.0 + 2.0 * i as f64, 30.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag.clone()),
+            });
+        }
+        let def = |id: &str, role: SymbolRole, pins: &[&str], bottom: f64| Symbol {
+            id: id.into(),
+            pins: pins
+                .iter()
+                .map(|n| Pin {
+                    name: (*n).into(),
+                    at: Point::new(0.0, 0.0),
+                    dir: Default::default(),
+                    description: String::new(),
+                })
+                .collect(),
+            name: id.into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role,
+            graphics: vec![Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, bottom),
+            }],
+            tag_at: Point::new(-5.0, 0.0),
+            description: String::new(),
+            source: String::new(),
+        };
+        let coil = def("wc.coil", SymbolRole::Main, &["A1", "A2"], 10.0);
+        let contact = def("wc.no", SymbolRole::Auxiliary, &["13", "14"], 1.0);
+        let lookup = |coil: &Symbol| {
+            let (coil, contact) = (coil.clone(), contact.clone());
+            move |id: &str| Some(if id == "wc.no" { contact.clone() } else { coil.clone() })
+        };
+        let (_, max) = extent(std::slice::from_ref(&one), lookup(&coil));
+        // Third line's baseline at 40 + 3.5 + 2 * 2.6, starting 5 mm right of the coil.
+        let last = crate::xref::contact_line_at(Point::new(20.0, 30.0), 40.0, 2);
+        assert!(max.y >= last.y - 1e-9, "{max:?}");
+        let width = crate::font::text_width_mm("13-14 9999/99.W", crate::xref::HEIGHT);
+        assert!(max.x >= 25.0 + width - 1e-9, "{max:?}");
+        // A breaker lists them too while the copy has no coil of its tag ...
+        let breaker = def("wc.coil", SymbolRole::Standalone, &[], 10.0);
+        let (_, max) = extent(std::slice::from_ref(&one), lookup(&breaker));
+        assert!(max.y >= last.y - 1e-9, "{max:?}");
+        // ... and a symbol that lists nothing reaches only as low as its own graphics.
+        let plain = def("wc.coil", SymbolRole::Auxiliary, &[], 10.0);
+        let (_, max) = extent(std::slice::from_ref(&one), lookup(&plain));
+        assert!(max.y < 41.0, "{max:?}");
         Ok(())
     }
 

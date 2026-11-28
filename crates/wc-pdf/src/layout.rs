@@ -83,7 +83,7 @@ pub struct XrefMark {
     pub target_page_id: String,
 }
 
-pub const XREF_HEIGHT: f64 = 1.8;
+pub use wc_core::xref::HEIGHT as XREF_HEIGHT;
 
 pub use wc_core::tag::tag_lines;
 
@@ -97,7 +97,6 @@ pub fn xref_marks(
     warnings: &mut Vec<String>,
 ) -> Vec<XrefMark> {
     let mut out = Vec::new();
-    let line_h = 2.6;
     for s in &page.symbols {
         let (Some(tag), Some(sym)) = (&s.tag, symbols.get(&s.symbol)) else {
             continue;
@@ -117,17 +116,10 @@ pub fn xref_marks(
                 if sym.role == SymbolRole::Main || !xref.mains.contains_key(tag) =>
             {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
-                    // Only named pins are listed; a contact without any shows its location alone.
-                    let pins: Vec<&str> = a.pins.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
-                    let text = if pins.is_empty() {
-                        a.location()
-                    } else {
-                        format!("{} {}", pins.join("-"), a.location())
-                    };
                     out.push(XrefMark {
-                        at: Point::new(s.at.x + 5.0, below + 3.5 + line_h * i as f64),
+                        at: wc_core::xref::contact_line_at(s.at, below, i),
                         align: Align::Left,
-                        text,
+                        text: wc_core::xref::contact_text(&a.pins, &a.location()),
                         target_page_id: a.page_id.clone(),
                     });
                 }
