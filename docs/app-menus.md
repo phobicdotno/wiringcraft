@@ -83,6 +83,7 @@ the schematic behind it.
 - **Page template**: edit the frame's reference columns and the title block's boxes, shared by every page.
 - **Duplicate page**: copy this page; its devices get the next free tags.
 - **Page properties**: edit this page's number, title, sheet size and its own title-block values.
+- **Renumber pages**: number the pages again in their order, with a prefix (such as `=A1/`), a first number and a step, optionally only from the page shown on. New numbers that would change the page order or repeat a kept number are refused. One undo step, like `wiringcraft page renumber`.
 - ---
 - **Move page up**: swap this page's number with the one before.
 - **Move page down**: swap this page's number with the one after.

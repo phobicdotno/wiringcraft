@@ -112,6 +112,16 @@ enum Dialog {
         /// worked out again only after a change.
         warnings: Option<(u64, Vec<String>)>,
     },
+    /// Page > Renumber pages: from the page with this id on (every page when `None`).
+    RenumberPages {
+        from: Option<String>,
+        /// The page shown when the dialog opened, which "from the page shown" picks.
+        shown: Option<(String, String)>,
+        prefix: String,
+        start: u64,
+        step: u64,
+        error: Option<String>,
+    },
     PageProps {
         /// The page the dialog edits, by id: in a shared session someone else can remove an
         /// earlier page while it is open, which moves every later page's index.
@@ -2142,6 +2152,16 @@ impl App {
                     });
                 }
             }
+            Action::RenumberPages => {
+                self.dialog = Some(Dialog::RenumberPages {
+                    from: None,
+                    shown: open.project.pages.get(page).map(|p| (p.id.clone(), p.number.clone())),
+                    prefix: String::new(),
+                    start: 1,
+                    step: 1,
+                    error: None,
+                });
+            }
             Action::DeletePage => self.dialog = Some(Dialog::DeletePage(page)),
             Action::ProjectProps => {
                 let locations: Vec<(String, String)> = open
@@ -2559,6 +2579,7 @@ impl App {
             Dialog::Template { .. } => "Page template",
             Dialog::Racks { .. } => "PLC racks",
             Dialog::PageProps { .. } => "Page properties",
+            Dialog::RenumberPages { .. } => "Renumber pages",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
             Dialog::Comment(..) => "Comment",
@@ -3665,6 +3686,66 @@ impl App {
                                 Ok(i) => {
                                     self.ed.page = i;
                                     self.ed.view.fit = true;
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::RenumberPages {
+                    from,
+                    shown,
+                    prefix,
+                    start,
+                    step,
+                    error,
+                } => {
+                    egui::Grid::new("renumber")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Prefix");
+                            ui.add(
+                                egui::TextEdit::singleline(prefix)
+                                    .hint_text("such as =A1/")
+                                    .desired_width(120.0),
+                            );
+                            ui.end_row();
+                            ui.label("First number");
+                            ui.add(egui::DragValue::new(start));
+                            ui.end_row();
+                            ui.label("Step");
+                            ui.add(egui::DragValue::new(step).range(1..=1000));
+                            ui.end_row();
+                        });
+                    if let Some((id, number)) = shown {
+                        let mut only = from.is_some();
+                        if ui
+                            .checkbox(&mut only, format!("Only from page {number} on"))
+                            .on_hover_text("The pages before it keep their numbers.")
+                            .changed()
+                        {
+                            *from = only.then(|| id.clone());
+                        }
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked()
+                            && let Some(o) = self.open.as_mut()
+                        {
+                            let id = o.project.pages.get(self.ed.page).map(|p| p.id.clone());
+                            match o.renumber_pages(from.as_deref(), prefix, *start, *step) {
+                                Ok(_) => {
+                                    // The page shown stays shown under its new number.
+                                    if let Some(i) = id.and_then(|id| o.project.pages.iter().position(|p| p.id == id)) {
+                                        self.ed.page = i;
+                                    }
                                     keep = false;
                                 }
                                 Err(e) => *error = Some(e),
@@ -9909,6 +9990,81 @@ mod nudge_tests {
         let open = app.open.as_ref().unwrap();
         assert_eq!(open.dir, first, "not joined while the Open waits");
         assert!(open.dirty, "nothing was saved without asking");
+    }
+
+    /// Page > Renumber pages numbers the pages again in their order, in one undo step, and a
+    /// refused numbering changes nothing (#1886).
+    #[test]
+    fn renumber_pages_numbers_the_pages_again_in_one_undo_step() {
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        app.run(Action::RenumberPages);
+        let shown = app.open.as_ref().unwrap().project.pages[app.ed.page].id.clone();
+        let opened = match &app.dialog {
+            Some(Dialog::RenumberPages { shown, from, .. }) => Some((shown.clone().map(|s| s.0), from.clone())),
+            _ => None,
+        };
+        assert_eq!(
+            opened,
+            Some((Some(shown), None)),
+            "the dialog opens for every page, offering the page shown"
+        );
+        let o = app.open.as_mut().unwrap();
+        let before = o.project.clone();
+        let n = o.project.pages.len();
+        let changed = o.renumber_pages(None, "=A1/", 1, 1).unwrap();
+        assert_eq!(changed, n);
+        let numbers: Vec<String> = o.project.pages.iter().map(|p| p.number.clone()).collect();
+        let want: Vec<String> = (1..=n).map(|k| format!("=A1/{k}")).collect();
+        assert_eq!(numbers, want);
+        let ids: Vec<&str> = o.project.pages.iter().map(|p| p.id.as_str()).collect();
+        let was: Vec<&str> = before.pages.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, was, "the order stays");
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        let err = o.renumber_pages(None, "A1", 1, 1).unwrap_err();
+        assert!(err.contains("ends in a digit"), "{err}");
+        assert_eq!(o.project, before);
+        // The dialog itself draws.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(matches!(app.dialog, Some(Dialog::RenumberPages { .. })));
+
+        // Through the dialog's OK: a refusal keeps the dialog with its draft and the reason.
+        app.ed.page = 1;
+        app.run(Action::RenumberPages);
+        if let Some(Dialog::RenumberPages { prefix, .. }) = &mut app.dialog {
+            *prefix = "A1".into();
+        }
+        click_button(&mut app, &ctx, "OK");
+        match &app.dialog {
+            Some(Dialog::RenumberPages { prefix, error, .. }) => {
+                assert_eq!(prefix, "A1");
+                assert!(
+                    error.as_deref().is_some_and(|e| e.contains("ends in a digit")),
+                    "{error:?}"
+                );
+            }
+            _ => unreachable!("a refused numbering keeps the dialog open"),
+        }
+        assert_eq!(app.open.as_ref().unwrap().project, before);
+        // Only from the page shown on: the pages before keep their numbers, and the page shown
+        // stays shown.
+        if let Some(Dialog::RenumberPages {
+            prefix, from, shown, ..
+        }) = &mut app.dialog
+        {
+            *prefix = "=B/".into();
+            *from = shown.as_ref().map(|s| s.0.clone());
+        }
+        let shown = app.open.as_ref().unwrap().project.pages[1].id.clone();
+        click_button(&mut app, &ctx, "OK");
+        assert!(app.dialog.is_none(), "OK closes the dialog");
+        let o = app.open.as_ref().unwrap();
+        assert_eq!(o.project.pages[0].number, before.pages[0].number);
+        let want: Vec<String> = (1..n).map(|k| format!("=B/{k}")).collect();
+        let numbers: Vec<String> = o.project.pages[1..].iter().map(|p| p.number.clone()).collect();
+        assert_eq!(numbers, want);
+        assert_eq!(o.project.pages[app.ed.page].id, shown);
     }
 
     /// Project properties' report choice: Export PDF prints those reports in their order,

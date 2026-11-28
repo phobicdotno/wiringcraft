@@ -3995,6 +3995,41 @@ impl Open {
         Some(self.index_of(&id))
     }
 
+    /// Page > Renumber pages: number the pages from the one with id `from` on (every page when
+    /// `None`) again in their order, `prefix` then `start`, `start + step`, ... as `wiringcraft
+    /// page renumber` does ([`wc_core::Project::renumber_pages`]). One undo step; returns how
+    /// many pages got a new number. Refused, with nothing changed, when the numbers do not keep
+    /// the page order, or someone else has one of the pages open.
+    pub fn renumber_pages(&mut self, from: Option<&str>, prefix: &str, start: u64, step: u64) -> Result<usize, String> {
+        let from = match from {
+            Some(id) => self
+                .project
+                .pages
+                .iter()
+                .position(|p| p.id == id)
+                .ok_or("that page is no longer in the project")?,
+            None => 0,
+        };
+        let mut project = self.project.clone();
+        let changed = project
+            .renumber_pages(from, prefix, start, step)
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Ok(0);
+        }
+        // A page whose number changes is refused when someone else has it open.
+        for (i, (old, new)) in self.project.pages.iter().zip(&project.pages).enumerate() {
+            if old.number != new.number
+                && let Some(why) = self.held_reason(i)
+            {
+                return Err(format!("page {}: {why}", old.number));
+            }
+        }
+        self.checkpoint();
+        self.project.pages = project.pages;
+        Ok(changed)
+    }
+
     /// Copy a page as a new last page. Devices on the copy get the next free tags (one new device
     /// per original device, keeping description and part) and wire numbers are cleared.
     /// Macros of the project (`macros/`) and of its library sources, project first.
