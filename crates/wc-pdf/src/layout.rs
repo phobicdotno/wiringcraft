@@ -2368,3 +2368,51 @@ mod template_tests {
         assert_eq!(merged, vec![(1.0, 0.0, 1.0), (5.0, 0.0, 3.0), (5.0, 4.0, 6.0)]);
     }
 }
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    /// Pin descriptions make the terminal plan's and the PLC I/O list's connection cells long
+    /// (#1879): the columns still add up to the frame, and each cell is cut to its column.
+    #[test]
+    fn long_described_connection_cells_still_fit_the_table() {
+        let mut t = wc_report::Table {
+            title: "Terminal plan".into(),
+            columns: [
+                "Strip",
+                "Terminal",
+                "Upper (pin 1)",
+                "Lower (pin 2)",
+                "Potential",
+                "Page",
+                "Jumpered with",
+                "Level",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            ..wc_report::Table::default()
+        };
+        let side = "=A+C1-K1:A1 (Coil + of the main contactor), -P1:X1 (Lamp + of the running lamp)";
+        for n in 1..=3 {
+            t.rows.push(
+                ["-X1", &n.to_string(), side, side, "24V", "2", "", ""]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
+        }
+        let avail = 180.0;
+        let widths = column_widths(&t, avail);
+        let total: f64 = widths.iter().sum();
+        assert!(total <= avail + 1e-6, "{total} mm in {avail} mm: {widths:?}");
+        for r in &t.rows {
+            for (c, w) in r.iter().zip(&widths) {
+                let shown = fit(c, w - 2.0 * CELL_PAD);
+                assert!(
+                    text_width_mm(&shown, TABLE_TEXT) <= w - 2.0 * CELL_PAD + 1e-6,
+                    "{shown:?} in {w} mm"
+                );
+            }
+        }
+    }
+}
