@@ -127,7 +127,7 @@ pub fn apply_rows(m: &Macro, rows: &[TableRow], default_set: Option<&str>) -> Re
 /// (through `symbol`, a missing one as [`Symbol::unknown_bounds`]) with their pins, their wires'
 /// free ends and bends, and their drawings, texts as wide as they are drawn (their filled-in
 /// values can differ from copy to copy), and the cross-reference lines a coil lists its
-/// contacts on ([`xref_points`]).
+/// contacts on ([`crate::xref`]).
 pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Point, Point) {
     extent_with(copies, &symbol, WIDEST_LOCATION)
 }
