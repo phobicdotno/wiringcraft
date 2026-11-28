@@ -126,8 +126,15 @@ pub fn apply_rows(m: &Macro, rows: &[TableRow], default_set: Option<&str>) -> Re
 /// The box round everything the copies draw, so one pitch fits each of them: their symbols
 /// (through `symbol`, a missing one as [`Symbol::unknown_bounds`]) with their pins, their wires'
 /// free ends and bends, and their drawings, texts as wide as they are drawn (their filled-in
-/// values can differ from copy to copy).
+/// values can differ from copy to copy), and the cross-reference lines a coil lists its
+/// contacts on ([`crate::xref`]).
 pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Point, Point) {
+    extent_with(copies, &symbol, WIDEST_LOCATION)
+}
+
+/// [`extent`], with contact lines measured as showing `location` (the widest location the
+/// copies' pages can give).
+fn extent_with(copies: &[Macro], symbol: &impl Fn(&str) -> Option<Symbol>, location: &str) -> (Point, Point) {
     let mut pts = Vec::new();
     for m in copies {
         for s in &m.symbols {
@@ -141,6 +148,7 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
                         drawn_points(&g.placed(s.at, s.rotation, s.mirror), &mut pts);
                     }
                     pts.extend(def.pins.iter().map(|pin| s.at + pin.at.transform(s.rotation, s.mirror)));
+                    xref_points(m, s, &def, symbol, location, &mut pts);
                 }
                 None => {
                     let (a, b) = Symbol::unknown_bounds(s.at);
@@ -155,7 +163,7 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
                 }
             }
             pts.extend(w.via.iter().copied());
-            wire_label_points(m, w, &symbol, &mut pts);
+            wire_label_points(m, w, symbol, &mut pts);
         }
         for g in &m.graphics {
             drawn_points(g, &mut pts);
@@ -165,6 +173,71 @@ pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Poi
         pts.extend(copies.first().map(|m| m.anchor));
     }
     bounds_of(&pts)
+}
+
+/// The widest location a contact line can show for a copy when the pages it lands on are not
+/// known: a four-digit page number, a two-digit reference column and the widest row letter.
+/// [`generate`] measures with the prefix and number width its new pages get instead
+/// ([`widest_location`]).
+const WIDEST_LOCATION: &str = "9999/99.W";
+
+/// A bound on the numbers [`generate`] gives its new pages after `last`: one number per copy,
+/// plus one per existing page for the numbers it skips because a page has them (a page ` 4 `
+/// takes `4`), with a digit to spare.
+fn number_reach(last: u64, pages: usize, copies: usize) -> u64 {
+    last.saturating_add(pages as u64)
+        .saturating_add(copies as u64)
+        .saturating_mul(10)
+}
+
+/// The widest location on pages numbered `prefix` and a number up to `last`: the prefix, as
+/// many nines as `last` has digits (at least four), then a two-digit column and the widest row.
+fn widest_location(prefix: &str, last: u64) -> String {
+    let digits = last.to_string().len().max(4);
+    format!("{prefix}{}/99.W", "9".repeat(digits))
+}
+
+/// Points round the cross-reference lines the PDF draws under `s` ([`crate::xref`]): a coil, or
+/// a breaker when the copy has no coil of its tag, lists one line per auxiliary contact of its
+/// tag. Placing gives the copy a fresh tag, so its contacts are those the copy brings; each line
+/// is measured with the contact's pins and `location`, the widest location its page can give,
+/// since the page and column the copy lands on are not known yet.
+fn xref_points(
+    m: &Macro,
+    s: &crate::project::PlacedSymbol,
+    def: &Symbol,
+    symbol: &impl Fn(&str) -> Option<Symbol>,
+    location: &str,
+    pts: &mut Vec<Point>,
+) {
+    use crate::symbol::SymbolRole;
+    let Some(tag) = &s.tag else { return };
+    let tagged = |role: SymbolRole| {
+        m.symbols
+            .iter()
+            .filter(move |o| o.tag.as_ref() == Some(tag))
+            .filter_map(|o| symbol(&o.symbol))
+            .filter(move |d| d.role == role)
+    };
+    let lists = match def.role {
+        SymbolRole::Main => true,
+        SymbolRole::Standalone => tagged(SymbolRole::Main).next().is_none(),
+        _ => false,
+    };
+    if !lists {
+        return;
+    }
+    let below = def
+        .graphics
+        .iter()
+        .map(|g| g.placed(s.at, s.rotation, s.mirror).bounds().1.y)
+        .fold(s.at.y, f64::max);
+    for (i, contact) in tagged(SymbolRole::Auxiliary).enumerate() {
+        let pins: Vec<String> = contact.pins.iter().map(|p| p.name.clone()).collect();
+        let text = crate::xref::contact_text(&pins, location);
+        let at = crate::xref::contact_line_at(s.at, below, i);
+        pts.extend(text_corners(at, &text, crate::xref::HEIGHT, Align::Left, 0.0));
+    }
 }
 
 /// The height the PDF and the canvas draw a device tag's lines at.
@@ -434,7 +507,20 @@ pub fn generate(
             size.label()
         ))
     };
-    let shared = extent(copies, &symbol);
+    // After the last page in page order (see `Project::sort_pages`): its first number, one up.
+    // `12.3` gives `13`, `A7` gives `A8`, so every new page sorts after every page there is.
+    // Numbers are taken as `sort_pages` takes them, untrimmed: ` 4 ` gives ` 5`.
+    let last = project
+        .pages
+        .iter()
+        .map(|p| natural_key(&p.number))
+        .max()
+        .and_then(|key| key.into_iter().next());
+    let (prefix, mut next_number) = last.unwrap_or_default();
+    // Contact lines show the new pages' numbers: the prefix and a number no larger than
+    // `number_reach` gives.
+    let location = widest_location(&prefix, number_reach(next_number, project.pages.len(), copies.len()));
+    let shared = extent_with(copies, &symbol, &location);
     // Where each copy's anchor goes from its slot's corner, and how many slots a page has.
     let (offsets, across, per_page) = match fit(shared, first.anchor, area) {
         Some(f) => {
@@ -448,7 +534,7 @@ pub fn generate(
         None => {
             let mut offsets = Vec::with_capacity(copies.len());
             for (i, m) in copies.iter().enumerate() {
-                let own = extent(std::slice::from_ref(m), &symbol);
+                let own = extent_with(std::slice::from_ref(m), &symbol, &location);
                 let f = fit(own, m.anchor, area).ok_or_else(|| too_large(own, format!(" (copy {})", i + 1)))?;
                 offsets.push((f.dx, f.dy, 0.0, 0.0));
             }
@@ -457,16 +543,6 @@ pub fn generate(
     };
 
     let mut work = project.clone();
-    // After the last page in page order (see `Project::sort_pages`): its first number, one up.
-    // `12.3` gives `13`, `A7` gives `A8`, so every new page sorts after every page there is.
-    // Numbers are taken as `sort_pages` takes them, untrimmed: ` 4 ` gives ` 5`.
-    let last = work
-        .pages
-        .iter()
-        .map(|p| natural_key(&p.number))
-        .max()
-        .and_then(|key| key.into_iter().next());
-    let (prefix, mut next_number) = last.unwrap_or_default();
     // A new number must not be one there is once spaces are trimmed (` 4 ` and `5` give ` 6`, not
     // ` 5`), as `page add` tells numbers apart.
     let numbers: BTreeSet<String> = work.pages.iter().map(|p| p.number.trim().to_owned()).collect();
@@ -854,6 +930,82 @@ mod tests {
     }
 
     #[test]
+    fn a_coil_s_contact_lines_count_as_drawn() -> Result<()> {
+        use crate::symbol::{Pin, SymbolRole};
+        let mut one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let tag = DeviceTag::parse("-Q1")?;
+        // The coil at (20, 30) draws down to y = 40; three contacts of its tag sit far off to the
+        // right, so only the lines under the coil reach below and right of the coil.
+        for i in 0..3 {
+            one.symbols.push(PlacedSymbol {
+                id: format!("c{i}"),
+                symbol: "wc.no".into(),
+                at: Point::new(30.0 + 2.0 * i as f64, 30.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag.clone()),
+            });
+        }
+        let def = |id: &str, role: SymbolRole, pins: &[&str], bottom: f64| Symbol {
+            id: id.into(),
+            pins: pins
+                .iter()
+                .map(|n| Pin {
+                    name: (*n).into(),
+                    at: Point::new(0.0, 0.0),
+                    dir: Default::default(),
+                    description: String::new(),
+                })
+                .collect(),
+            name: id.into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role,
+            graphics: vec![Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, bottom),
+            }],
+            tag_at: Point::new(-5.0, 0.0),
+            description: String::new(),
+            source: String::new(),
+        };
+        let coil = def("wc.coil", SymbolRole::Main, &["A1", "A2"], 10.0);
+        let contact = def("wc.no", SymbolRole::Auxiliary, &["13", "14"], 1.0);
+        let lookup = |coil: &Symbol| {
+            let (coil, contact) = (coil.clone(), contact.clone());
+            move |id: &str| Some(if id == "wc.no" { contact.clone() } else { coil.clone() })
+        };
+        let (_, max) = extent(std::slice::from_ref(&one), lookup(&coil));
+        // Third line's baseline at 40 + 3.5 + 2 * 2.6, starting 5 mm right of the coil.
+        let last = crate::xref::contact_line_at(Point::new(20.0, 30.0), 40.0, 2);
+        assert!(max.y >= last.y - 1e-9, "{max:?}");
+        let width = crate::font::text_width_mm("13-14 9999/99.W", crate::xref::HEIGHT);
+        assert!(max.x >= 25.0 + width - 1e-9, "{max:?}");
+        // A breaker lists them too while the copy has no coil of its tag ...
+        let breaker = def("wc.coil", SymbolRole::Standalone, &[], 10.0);
+        let (_, max) = extent(std::slice::from_ref(&one), lookup(&breaker));
+        assert!(max.y >= last.y - 1e-9, "{max:?}");
+        // ... and a symbol that lists nothing reaches only as low as its own graphics.
+        let plain = def("wc.coil", SymbolRole::Auxiliary, &[], 10.0);
+        let (_, max) = extent(std::slice::from_ref(&one), lookup(&plain));
+        assert!(max.y < 41.0, "{max:?}");
+        // Pages after `PNL-3` are numbered `PNL-4` on: the prefix counts in each line's width,
+        // as do more digits than four once the numbers run that high.
+        assert_eq!(widest_location("PNL-", 4), "PNL-9999/99.W");
+        assert_eq!(widest_location("", 123_456), "999999/99.W");
+        // Pages ` 0` and `1` to `9999`: the next page after ` 0` skips every used number and
+        // becomes ` 10000`, five digits, which the bound must hold.
+        let reach = number_reach(0, 10_000, 1);
+        assert!(reach >= 10_000, "{reach}");
+        assert!(widest_location("", reach).len() >= "10000/99.W".len());
+        let location = widest_location("PNL-", 4);
+        let (_, max) = extent_with(std::slice::from_ref(&one), &lookup(&coil), &location);
+        let width = crate::font::text_width_mm("13-14 PNL-9999/99.W", crate::xref::HEIGHT);
+        assert!(max.x >= 25.0 + width - 1e-9, "{max:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_dimension_s_label_counts_as_wide_as_it_is_drawn() -> Result<()> {
         let mut c = starter()?.apply(Some("small"), &BTreeMap::new())?;
         // A 1 mm dimension whose label is wider than its line.
@@ -1104,6 +1256,76 @@ mod tests {
         let err = err_of(generate(&mut project, &[small, m], |_| None, PageSize::A4, "Motors"));
         assert!(err.contains("does not fit") && err.contains("(copy 2)"), "{err}");
         assert_eq!(project, before);
+        Ok(())
+    }
+
+    #[test]
+    fn the_new_pages_prefix_counts_in_whether_contact_lines_fit() -> Result<()> {
+        use crate::symbol::{Pin, SymbolRole};
+        let def = |id: &str, role: SymbolRole| Symbol {
+            id: id.into(),
+            pins: vec![Pin {
+                name: "13".into(),
+                at: Point::new(0.0, 0.0),
+                dir: Default::default(),
+                description: String::new(),
+            }],
+            name: id.into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role,
+            graphics: vec![Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, 5.0),
+            }],
+            tag_at: Point::new(-1.0, 0.0),
+            description: String::new(),
+            source: String::new(),
+        };
+        let (coil, contact) = (def("wc.coil", SymbolRole::Main), def("wc.no", SymbolRole::Auxiliary));
+        let symbol = |id: &str| Some(if id == "wc.no" { contact.clone() } else { coil.clone() });
+        // The coil's contact line ends 1 mm inside the A3 drawing area when its location is
+        // measured without a prefix; `PAGE-` makes it several millimetres wider.
+        let area = PageSize::A3.mm().0 - 2.0 * (FRAME_MARGIN + INSET);
+        let plain = crate::font::text_width_mm(&format!("13 {WIDEST_LOCATION}"), crate::xref::HEIGHT);
+        let prefixed = crate::font::text_width_mm("13 PAGE-9999/99.W", crate::xref::HEIGHT);
+        assert!(prefixed - plain > 2.0, "{plain} {prefixed}");
+        let cx = area - 1.0 - crate::xref::INDENT - plain;
+        let tag = DeviceTag::parse("-K1")?;
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 20.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag.clone()),
+        };
+        let m = Macro {
+            name: "Relay".into(),
+            symbols: vec![placed("k", "wc.coil", cx), placed("c", "wc.no", 20.0)],
+            anchor: Point::new(0.0, 0.0),
+            graphics: vec![Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, 1.0),
+            }],
+            ..Default::default()
+        };
+        let with_last = |number: &str| {
+            let mut project = Project::new("x");
+            project.pages.push(Page::new("p0001", number, "Old"));
+            project
+        };
+        let mut fits = with_last("1");
+        generate(&mut fits, std::slice::from_ref(&m), symbol, PageSize::A3, "New")?;
+        let mut too_wide = with_last("PAGE-1");
+        let err = err_of(generate(
+            &mut too_wide,
+            std::slice::from_ref(&m),
+            symbol,
+            PageSize::A3,
+            "New",
+        ));
+        assert!(err.contains("does not fit"), "{err}");
         Ok(())
     }
 

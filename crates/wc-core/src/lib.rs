@@ -33,6 +33,7 @@ pub mod symbol;
 pub mod tag;
 pub mod template;
 pub mod translate;
+pub mod xref;
 
 pub use error::{Error, Result};
 pub use geom::{Point, Shape};
