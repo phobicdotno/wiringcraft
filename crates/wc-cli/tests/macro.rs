@@ -1494,3 +1494,46 @@ fn a_macro_run_opens_the_library_once() -> TestResult {
     assert_eq!(library_opens(&dir, &place)?, 1);
     Ok(())
 }
+
+/// `--join` runs the rails a macro draws on through a page row: a wire from each copy's right
+/// edge to the next copy's left edge (#1909).
+#[test]
+fn joined_copies_get_a_wire_between_their_rails() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::write(
+        lib.join("macros/rail.json"),
+        r#"{
+  "name": "Rail",
+  "wires": [{"id": "w1", "from": {"at": {"x": 0.0, "y": 10.0}}, "to": {"at": {"x": 40.0, "y": 10.0}}}],
+  "anchor": {"x": 0.0, "y": 10.0}
+}"#,
+    )?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let table = tmp.path().join("rails.csv");
+    std::fs::write(&table, "macro\nrail\nrail\nrail\n")?;
+    let table = table.to_str().ok_or("path")?;
+    let out = wiringcraft(&dir, &["macro", "generate", "rail", "--table", table, "--join"])?;
+    assert!(
+        out.ends_with("3 copies of Rail on 1 page\njoined by 2 wires\n"),
+        "{out}"
+    );
+    let p = wc_core::store::load(&dir)?;
+    let id = out.lines().next().ok_or("no page")?;
+    assert_eq!(p.page(id).ok_or("page")?.wires.len(), 5);
+    // Without --join no wire is added, and nothing is said of joins.
+    let out = wiringcraft(&dir, &["macro", "generate", "rail", "--table", table])?;
+    assert!(!out.contains("joined"), "{out}");
+    let p = wc_core::store::load(&dir)?;
+    let id = out.lines().next().ok_or("no page")?;
+    assert_eq!(p.page(id).ok_or("page")?.wires.len(), 3);
+    Ok(())
+}

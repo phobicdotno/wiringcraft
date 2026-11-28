@@ -593,6 +593,36 @@ pub struct Generated {
     pub copies: usize,
     /// How many copies of each macro were placed, by the macro's name, in the order they came.
     pub macros: Vec<(String, usize)>,
+    /// How many wires [`generate_joined`] drew between copies side by side.
+    pub joins: usize,
+}
+
+/// The free wire ends of `m` on its left and on its right edge: the ends on no pin that lie
+/// furthest left and furthest right of them all, where a rail a copy draws runs on into the
+/// copy next to it.
+fn open_ends(m: &Macro) -> (Vec<Point>, Vec<Point>) {
+    let ends: Vec<Point> = m
+        .wires
+        .iter()
+        .flat_map(|w| [&w.from, &w.to])
+        .filter_map(|e| match e {
+            Endpoint::Point { at } => Some(*at),
+            _ => None,
+        })
+        .collect();
+    let (Some(left), Some(right)) = (
+        ends.iter().map(|p| p.x).reduce(f64::min),
+        ends.iter().map(|p| p.x).reduce(f64::max),
+    ) else {
+        return (Vec::new(), Vec::new());
+    };
+    let at = |x: f64| {
+        let mut out: Vec<Point> = ends.iter().copied().filter(|p| (p.x - x).abs() < 1e-6).collect();
+        out.sort_by(|a, b| a.y.total_cmp(&b.y));
+        out.dedup_by(|a, b| (a.y - b.y).abs() < 1e-6);
+        out
+    };
+    (at(left), at(right))
 }
 
 impl Generated {
@@ -662,6 +692,22 @@ pub fn generate_titled(
     symbol: impl Fn(&str) -> Option<Symbol>,
     size: PageSize,
     title: &str,
+) -> Result<Generated> {
+    generate_joined(project, copies, pages, symbol, size, title, false)
+}
+
+/// [`generate_titled`], with `join` drawing a wire between two copies side by side on a page
+/// row for each free wire end on the right edge of the first (its free ends furthest right) that has one at the
+/// same height on the left edge of the second: rails (L1, L2, L3, N, PE) a macro draws run on
+/// through the row. Copies on different rows or pages are not joined.
+pub fn generate_joined(
+    project: &mut Project,
+    copies: &[Macro],
+    pages: &[Option<String>],
+    symbol: impl Fn(&str) -> Option<Symbol>,
+    size: PageSize,
+    title: &str,
+    join: bool,
 ) -> Result<Generated> {
     let Some(first) = copies.first() else {
         return Ok(Generated::default());
@@ -740,6 +786,8 @@ pub fn generate_titled(
     let mut page_id = String::new();
     let mut page_title = title;
     let mut slot = 0;
+    // The copy before: its page, its page row and its right edge's free ends on the page.
+    let mut before: Option<(String, usize, Vec<Point>)> = None;
     for (i, (m, &(dx, dy, step_x, step_y))) in copies.iter().zip(&offsets).enumerate() {
         if let Some(Some(asked)) = pages.get(i)
             && asked.as_str() != page_title
@@ -775,6 +823,39 @@ pub fn generate_titled(
         let at = Point::new(x0 + dx + col as f64 * step_x, y0 + dy + row as f64 * step_y);
         crate::macros::place(&mut work, &page_id, m, at)
             .map_err(|err| Error::Invalid(format!("copy {}: {err}", i + 1)))?;
+        if join {
+            let on_page = |p: Point| Point::new(p.x - m.anchor.x + at.x, p.y - m.anchor.y + at.y);
+            let (left, right) = open_ends(m);
+            if let Some((page, before_row, ends)) = &before
+                && *page == page_id
+                && *before_row == row
+                && let Some(sheet) = work.pages.iter_mut().find(|p| p.id == page_id)
+            {
+                for from in ends {
+                    let Some(to) = left
+                        .iter()
+                        .map(|p| on_page(*p))
+                        .find(|p| (p.y - from.y).abs() < 1e-6 && p.x > from.x)
+                    else {
+                        continue;
+                    };
+                    let id = sheet.next_id("w");
+                    sheet.wires.push(crate::project::Wire {
+                        id,
+                        from: Endpoint::Point { at: *from },
+                        to: Endpoint::Point { at: to },
+                        via: Vec::new(),
+                        number: None,
+                        potential: None,
+                        cable: None,
+                        route: Default::default(),
+                        spec: Default::default(),
+                    });
+                    out.joins += 1;
+                }
+            }
+            before = Some((page_id.clone(), row, right.into_iter().map(on_page).collect()));
+        }
         out.copies += 1;
         match out.macros.iter_mut().find(|(name, _)| *name == m.name) {
             Some((_, n)) => *n += 1,
@@ -1247,6 +1328,95 @@ mod tests {
             (rule.column.as_str(), rule.value.as_str(), rule.r#macro.as_str()),
             ("ratio", "1:2=a", "valve")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn joined_copies_run_their_rails_on_through_a_page_row() -> Result<()> {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let wire = |id: &str, from: Endpoint, to: Endpoint| Wire {
+            id: id.into(),
+            from,
+            to,
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        // Two rails 40 mm long, and a drop from the upper one whose free end is no edge.
+        let rail = Macro {
+            name: "Rail".into(),
+            wires: vec![
+                wire("w1", free(0.0, 10.0), free(40.0, 10.0)),
+                wire("w2", free(0.0, 20.0), free(40.0, 20.0)),
+                wire("w3", free(20.0, 10.0), free(20.0, 30.0)),
+            ],
+            anchor: Point::new(0.0, 10.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            open_ends(&rail),
+            (
+                vec![Point::new(0.0, 10.0), Point::new(0.0, 20.0)],
+                vec![Point::new(40.0, 10.0), Point::new(40.0, 20.0)]
+            )
+        );
+        let copies = vec![rail.clone(); 3];
+        let mut project = Project::new("x");
+        let done = generate_joined(&mut project, &copies, &[], |_| None, PageSize::A3, "Rails", true)?;
+        assert_eq!(
+            (done.pages.len(), done.joins),
+            (1, 4),
+            "two joins between each two copies"
+        );
+        let page = project
+            .page(&done.pages[0])
+            .ok_or_else(|| Error::Invalid("page".into()))?;
+        assert_eq!(page.wires.len(), 3 * 3 + 4);
+        // The copies' own wires are 40 mm rails and a 20 mm drop; the joins are what is left.
+        let length = |w: &Wire| match (&w.from, &w.to) {
+            (Endpoint::Point { at: a }, Endpoint::Point { at: b }) => (b.x - a.x).abs() + (b.y - a.y).abs(),
+            _ => 0.0,
+        };
+        let is_join = |w: &&Wire| (length(w) - 40.0).abs() > 1e-9 && (length(w) - 20.0).abs() > 1e-9;
+        let joins: Vec<&Wire> = page.wires.iter().filter(is_join).collect();
+        assert_eq!(joins.len(), 4);
+        // Each join runs level from a rail end of one copy to a rail end of the next.
+        let key = |p: &Point| ((p.x * 10.0).round() as i64, (p.y * 10.0).round() as i64);
+        let ends: BTreeSet<(i64, i64)> = page
+            .wires
+            .iter()
+            .filter(|w| !is_join(w))
+            .flat_map(|w| [&w.from, &w.to])
+            .filter_map(|e| match e {
+                Endpoint::Point { at } => Some(key(at)),
+                _ => None,
+            })
+            .collect();
+        for j in &joins {
+            let (Endpoint::Point { at: a }, Endpoint::Point { at: b }) = (&j.from, &j.to) else {
+                return Err(Error::Invalid("a join ends on a pin".into()));
+            };
+            assert!((a.y - b.y).abs() < 1e-9 && b.x - a.x >= GAP - 1e-9, "{a:?} {b:?}");
+            assert!(ends.contains(&key(a)) && ends.contains(&key(b)), "{a:?} {b:?}");
+        }
+        // Without join nothing is added; a rail at another height is not joined.
+        let mut plain = Project::new("x");
+        let done = generate_titled(&mut plain, &copies, &[], |_| None, PageSize::A3, "Rails")?;
+        assert_eq!(done.joins, 0);
+        let mut low = rail.clone();
+        for w in &mut low.wires {
+            for e in [&mut w.from, &mut w.to] {
+                if let Endpoint::Point { at } = e {
+                    at.y += 5.0;
+                }
+            }
+        }
+        let mut mixed = Project::new("x");
+        let done = generate_joined(&mut mixed, &[rail, low], &[], |_| None, PageSize::A3, "Rails", true)?;
+        assert_eq!(done.joins, 0);
         Ok(())
     }
 
