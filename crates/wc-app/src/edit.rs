@@ -1541,6 +1541,39 @@ mod tests {
         assert_eq!((done.copies, new.symbols.len()), (2, 3));
         assert!(o.undo());
         assert_eq!(o.project, before);
+        // Joined, two copies side by side get a wire between the free ends of a rail drawn
+        // across them (#1909).
+        let mut railed = wc_core::macros::read_macro(&path).unwrap();
+        let free = |x: f64| Endpoint::Point {
+            at: Point::new(x, 40.0),
+        };
+        railed.wires.push(wc_core::Wire {
+            id: "rail".into(),
+            from: free(40.0),
+            to: free(100.0),
+            via: Vec::new(),
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        let rail_path = wc_core::macros::write_macro(&o.dir, "railed", &railed).unwrap();
+        o.table_rules.clear();
+        o.table_join = true;
+        std::fs::write(&table, "what\nPump 1\nPump 2\n").unwrap();
+        let done = o
+            .generate_from_table_ruled(page, &rail_path, &table, None, &[])
+            .unwrap();
+        assert_eq!((done.copies, done.joins), (2, 1));
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        o.table_join = false;
+        let done = o
+            .generate_from_table_ruled(page, &rail_path, &table, None, &[])
+            .unwrap();
+        assert_eq!(done.joins, 0);
+        assert!(o.undo());
         o.table_rules = "kind=single:one coil\nkind:one coil".into();
         let err = o.parsed_table_rules().unwrap_err();
         assert!(

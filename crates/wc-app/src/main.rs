@@ -2711,6 +2711,11 @@ impl App {
                         if let Err(e) = open.parsed_table_rules() {
                             ui.colored_label(theme::Theme::of(ui.ctx()).error, e);
                         }
+                        ui.checkbox(&mut open.table_join, "Join copies side by side").on_hover_text(
+                            "From table… draws a wire from each free wire end on a copy's right edge to the \
+                             free end at the same height on the next copy's left edge, so the rails run on \
+                             through the row.",
+                        );
                     }
                     if list.is_empty() {
                         ui.label(
@@ -5034,9 +5039,14 @@ impl App {
                 }
                 self.ed.selection.clear();
                 let pages = if done.pages.len() == 1 { "page" } else { "pages" };
+                let joined = match done.joins {
+                    0 => String::new(),
+                    1 => ", joined by 1 wire".to_owned(),
+                    n => format!(", joined by {n} wires"),
+                };
                 // Named by the macros placed: a table's macro column can pick others.
                 self.ed.message = format!(
-                    "{} on {} new {pages}.",
+                    "{} on {} new {pages}{joined}.",
                     done.copies_text(str::to_owned),
                     done.pages.len()
                 );

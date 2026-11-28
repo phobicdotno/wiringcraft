@@ -676,6 +676,8 @@ pub struct Open {
     /// Insert > Macro's rules for From table…, one `column=value:macro` a line, as
     /// `macro generate --rule` takes them; kept while the project is open.
     pub table_rules: String,
+    /// Insert > Macro's "Join copies side by side" for From table…, as `macro generate --join`.
+    pub table_join: bool,
     /// The undo mark of the assistant turn running ([`Open::start_turn`]): while its first
     /// step is the oldest, a full history folds the steps after it into it instead of
     /// dropping it, so [`Open::squash_undo`] still makes the turn one step (#641).
@@ -768,6 +770,7 @@ impl Open {
             mark_edits: Vec::new(),
             command_translations: None,
             table_rules: String::new(),
+            table_join: false,
             marks: 0,
             turn: None,
             #[cfg(test)]
@@ -4313,7 +4316,8 @@ impl Open {
     }
 
     /// Insert > Macro, From table…, with `rules` picking the macro of each row that names
-    /// none in a `macro` column, as `macro generate --rule` does.
+    /// none in a `macro` column, as `macro generate --rule` does, and the copies side by side
+    /// joined when [`Open::table_join`] is set.
     pub fn generate_from_table_ruled(
         &mut self,
         page: usize,
@@ -4392,13 +4396,14 @@ impl Open {
         self.follow_terminals();
         let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
         let mut project = self.project.clone();
-        match generate::generate_titled(
+        match generate::generate_joined(
             &mut project,
             &copies,
             &pages,
             |id| self.symbols.get(id).cloned(),
             size,
             &m.name,
+            self.table_join,
         ) {
             Ok(done) => {
                 // The undo step is the project as it was, taken as it is (nothing followed in
