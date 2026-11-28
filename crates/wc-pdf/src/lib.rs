@@ -168,7 +168,9 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     let card_rows = layout::card_rows_per_page(card_size, project.meta.template.band_height());
     // The contents also lists the sheets that follow the schematic pages, each row linked to
     // its sheet (#693).
-    let (reports, extra_ids) = list_extra_sheets(reports, options, per_page, card_rows);
+    let (reports, extra_ids) = list_extra_sheets(reports, options, per_page, card_rows, |t| {
+        t.at_page.as_deref().is_none_or(|at| pages.iter().any(|p| p.id == at))
+    });
     // The lines of each report table's pages.
     let paged: Vec<Vec<Vec<layout::TableLine>>> = reports.iter().map(|t| layout::table_pages(t, per_page)).collect();
     // Each report page: (table, its page, part, parts). Front tables (the table of contents)
@@ -178,7 +180,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .reports
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.front == front)
+            .filter(|(_, t)| t.front == front && t.at_page.is_none())
             .flat_map(|(ti, _)| {
                 let n = paged.get(ti).map_or(1, Vec::len);
                 (0..n).map(move |k| (ti, k, k + 1, n))
@@ -186,6 +188,22 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .collect()
     };
     let (front_pages, back_pages) = (split(true), split(false));
+    // The report pages' tables (`Table::at_page`), each printed in its page's place: for each
+    // exported page, the sheets (table, its page, part, parts) that stand for it. A table for a
+    // page this PDF leaves out is not printed.
+    let mut placed: BTreeMap<&str, Vec<(usize, usize, usize, usize)>> = BTreeMap::new();
+    for (ti, t) in options.reports.iter().enumerate() {
+        let Some(at) = t.at_page.as_deref() else { continue };
+        if !pages.iter().any(|p| p.id == at) {
+            continue;
+        }
+        let n = paged.get(ti).map_or(1, Vec::len);
+        placed.entry(at).or_default().extend((0..n).map(|k| (ti, k, k + 1, n)));
+    }
+    let page_sheets: usize = pages
+        .iter()
+        .map(|p| placed.get(p.id.as_str()).map_or(1, |s| s.len().max(1)))
+        .sum();
     // Each drawn card sheet: (card, first row, part, parts).
     let card_pages: Vec<(usize, usize, usize, usize)> = options
         .plc_cards
@@ -197,7 +215,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         })
         .collect();
     let total = front_pages.len()
-        + pages.len()
+        + page_sheets
         + options.panels.len()
         + card_pages.len()
         + back_pages.len()
@@ -215,20 +233,34 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     doc.set_info("Subject", field("description"));
     let mut sheet = 0;
     let mut report_no = 0;
+    // `on` is the report page the sheets stand for: they take its number, title and fields.
     let mut add_reports = |doc: &mut writer::Doc,
                            list: Vec<(usize, usize, usize, usize)>,
+                           on: Option<&wc_core::Page>,
                            sheet: &mut usize,
                            warnings: &mut Vec<String>| {
         for (ti, k, part, parts) in list {
             let Some(table) = reports.get(ti) else { continue };
             let lines = paged.get(ti).and_then(|p| p.get(k)).map_or(&[][..], Vec::as_slice);
-            report_no += 1;
-            let mut page = sheet_page(
-                project,
-                format!("report-{ti}-{part}"),
-                format!("R{report_no}"),
-                table.title.clone(),
-            );
+            let mut page = match on {
+                Some(on) => {
+                    let mut page = on.clone();
+                    if page.title.trim().is_empty() {
+                        page.title = table.title.clone();
+                    }
+                    show_latest_revision(project, &mut page);
+                    page
+                }
+                None => {
+                    report_no += 1;
+                    sheet_page(
+                        project,
+                        format!("report-{ti}-{part}"),
+                        format!("R{report_no}"),
+                        table.title.clone(),
+                    )
+                }
+            };
             page.size = size;
             let mut drawn = layout::draw_table_page(
                 project,
@@ -242,18 +274,34 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             );
             place_logo(&mut drawn, &page);
             let title = if parts > 1 {
-                format!("{} {} ({part}/{parts})", page.number, table.title)
+                format!("{} {} ({part}/{parts})", page.number, page.title)
             } else {
-                format!("{} {}", page.number, table.title)
+                format!("{} {}", page.number, page.title)
             };
             warnings.extend(unprintable(&page.number, &drawn));
             doc.add_page(size.mm(), &page.number, &title, drawn);
             *sheet += 1;
         }
     };
-    add_reports(&mut doc, front_pages, &mut sheet, &mut report.warnings);
-    let offset = sheet;
+    add_reports(&mut doc, front_pages, None, &mut sheet, &mut report.warnings);
+    // Where each exported page starts in the document, for links.
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
     for page in &pages {
+        index.insert(page.id.clone(), sheet);
+        if let Some(list) = placed.get(page.id.as_str()) {
+            if !page.symbols.is_empty()
+                || !page.wires.is_empty()
+                || !page.graphics.is_empty()
+                || page.underlay.is_some()
+            {
+                report.warnings.push(format!(
+                    "page {}: a report page; what is drawn on it is not printed",
+                    page.number
+                ));
+            }
+            add_reports(&mut doc, list.clone(), Some(page), &mut sheet, &mut report.warnings);
+            continue;
+        }
         let mut drawn = layout::draw_page(
             project,
             page,
@@ -291,6 +339,8 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         );
         sheet += 1;
     }
+    // The sheets after the pages start here, in the order the contents lists them.
+    let after_pages = sheet;
     // Panel layouts follow the schematic pages, one sheet each.
     for (k, panel) in options.panels.iter().enumerate() {
         let mut page = sheet_page(
@@ -335,7 +385,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         );
         sheet += 1;
     }
-    add_reports(&mut doc, back_pages, &mut sheet, &mut report.warnings);
+    add_reports(&mut doc, back_pages, None, &mut sheet, &mut report.warnings);
     // Network topologies close the document, after the network list.
     // A topology box links to a page this PDF holds.
     let exported: std::collections::BTreeSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
@@ -372,13 +422,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     }
     // Links resolve against the exported page list, so links to pages left out are dropped.
     // The sheets after the schematic pages follow them in the order the contents lists them.
-    let index: BTreeMap<String, usize> = pages
-        .iter()
-        .map(|p| p.id.clone())
-        .chain(extra_ids)
-        .enumerate()
-        .map(|(i, id)| (id, offset + i))
-        .collect();
+    index.extend(extra_ids.into_iter().enumerate().map(|(i, id)| (id, after_pages + i)));
     (doc.finish(&index), report)
 }
 
@@ -414,19 +458,24 @@ fn extra_sheet_id(n: usize) -> String {
 }
 
 /// `reports` with a row per sheet that follows the schematic pages (panel layouts, PLC cards,
-/// the report pages after them and network topologies, in that order) added to the first
-/// front table (the table of contents), and the link targets of those sheets in that order.
-/// A front table that grows onto another page moves the report numbers, which count from the
-/// first front page.
+/// the report pages after them and network topologies, in that order) added to each front
+/// table (table of contents) that `printed` says the PDF prints, and the link targets of those
+/// sheets in that order. A front table that grows onto another page moves the report numbers,
+/// which count from the first front page.
 fn list_extra_sheets<'a>(
     mut reports: Vec<std::borrow::Cow<'a, wc_report::Table>>,
     options: &Options,
     per_page: usize,
     card_rows: usize,
+    printed: impl Fn(&wc_report::Table) -> bool,
 ) -> (Vec<std::borrow::Cow<'a, wc_report::Table>>, Vec<String>) {
-    let Some(first) = reports.iter().position(|t| t.front) else {
+    // A contents on a report page the PDF leaves out is not printed, so it lists nothing.
+    let contents: Vec<usize> = (0..reports.len())
+        .filter(|&i| reports.get(i).is_some_and(|t| t.front && printed(t)))
+        .collect();
+    if contents.is_empty() {
         return (reports, Vec::new());
-    };
+    }
     let parted = |title: &str, part: usize, parts: usize| {
         if parts > 1 {
             format!("{title} ({part}/{parts})")
@@ -450,7 +499,7 @@ fn list_extra_sheets<'a>(
             ));
         }
     }
-    for t in reports.iter().filter(|t| !t.front) {
+    for t in reports.iter().filter(|t| !t.front && t.at_page.is_none()) {
         let n = layout::table_pages(t, per_page).len();
         for part in 1..=n {
             rows.push((None, parted(&t.title, part, n)));
@@ -465,10 +514,10 @@ fn list_extra_sheets<'a>(
     let ids: Vec<String> = (0..rows.len()).map(extra_sheet_id).collect();
     // The built-in columns may be reordered, renamed or left out by the project's layout for
     // the contents: the values go where the "Page" and "Title" columns are, if shown.
-    let mut page_col = None;
-    if let Some(t) = reports.get_mut(first) {
+    for &i in &contents {
+        let Some(t) = reports.get_mut(i) else { continue };
         let t = t.to_mut();
-        page_col = t.column_of("Page");
+        let page_col = t.column_of("Page");
         let title_col = t.column_of("Title");
         // Every earlier row describes a page or none; the new ones each describe a sheet.
         t.row_pages.resize(t.rows.len(), String::new());
@@ -489,14 +538,16 @@ fn list_extra_sheets<'a>(
     }
     let front: usize = reports
         .iter()
-        .filter(|t| t.front)
+        .filter(|t| t.front && t.at_page.is_none())
         .map(|t| layout::table_pages(t, per_page).len())
         .sum();
-    let mut report_no = front;
-    if let (Some(t), Some(c)) = (reports.get_mut(first), page_col) {
+    for &i in &contents {
+        let Some(t) = reports.get_mut(i) else { continue };
         let t = t.to_mut();
+        let Some(c) = t.column_of("Page") else { continue };
+        let mut report_no = front;
         let start = t.rows.len() - rows.len();
-        for ((number, _), row) in rows.into_iter().zip(t.rows.iter_mut().skip(start)) {
+        for ((number, _), row) in rows.iter().zip(t.rows.iter_mut().skip(start)) {
             if number.is_none() {
                 report_no += 1;
                 if let Some(cell) = row.get_mut(c) {
@@ -528,7 +579,7 @@ fn only_exported_rows(table: &wc_report::Table, pages: &[String]) -> wc_report::
 
 /// A sheet the PDF makes itself (a report, panel layout, PLC card or network page): a page
 /// with nothing of its own, except that a revision field of [`wc_core::project::AUTO_REVISION`]
-/// shows the project's latest revision, as such a sheet is made from the project as it is now.
+/// shows the project's latest revision ([`show_latest_revision`]).
 fn sheet_page(
     project: &Project,
     id: impl Into<String>,
@@ -536,6 +587,13 @@ fn sheet_page(
     title: impl Into<String>,
 ) -> wc_core::Page {
     let mut page = wc_core::Page::new(id, number, title);
+    show_latest_revision(project, &mut page);
+    page
+}
+
+/// A sheet made from the project as it is now (a generated sheet, or a report page's) shows the
+/// latest revision where its revision field is `auto`, not the one its clouds would give.
+fn show_latest_revision(project: &Project, page: &mut wc_core::Page) {
     let auto = wc_core::project::is_auto_revision(page.title_field_set(&project.meta, "revision").0);
     let latest = project
         .meta
@@ -546,7 +604,6 @@ fn sheet_page(
     if auto && let Some(latest) = latest {
         page.title_block.insert("revision".into(), latest.letter.clone());
     }
-    page
 }
 
 #[cfg(test)]
@@ -633,12 +690,12 @@ mod helper_tests {
             panels: vec![panel("Main")],
             ..Options::default()
         };
-        let (out, ids) = list_extra_sheets(reports.clone(), &options, 40, 20);
+        let (out, ids) = list_extra_sheets(reports.clone(), &options, 40, 20, |_| true);
         assert!(ids.is_empty());
         assert_eq!(out, reports);
 
         let reports = vec![Cow::Owned(table("Contents", &["Page", "Title"], 2, true))];
-        let (out, ids) = list_extra_sheets(reports.clone(), &Options::default(), 40, 20);
+        let (out, ids) = list_extra_sheets(reports.clone(), &Options::default(), 40, 20, |_| true);
         assert!(ids.is_empty());
         assert_eq!(out, reports);
     }
@@ -660,7 +717,7 @@ mod helper_tests {
             }],
             ..Options::default()
         };
-        let (out, ids) = list_extra_sheets(reports, &options, 2, 20);
+        let (out, ids) = list_extra_sheets(reports, &options, 2, 20, |_| true);
         assert_eq!(ids, (0..6).map(extra_sheet_id).collect::<Vec<_>>());
         let Some(front) = out.first() else { unreachable!() };
         let added: Vec<(&str, &str)> = front
@@ -697,13 +754,13 @@ mod helper_tests {
             panels: vec![panel("Main")],
             ..Options::default()
         };
-        let (out, _) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20);
+        let (out, _) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20, |_| true);
         let rows = out.first().map(|t| t.rows.clone());
         assert_eq!(rows, Some(vec![vec!["Main".to_owned(), "P1".to_owned()]]));
 
         // Without a page column only the title is filled in.
         let contents = table("Contents", &["Title", "Notes"], 0, true);
-        let (out, ids) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20);
+        let (out, ids) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20, |_| true);
         let rows = out.first().map(|t| t.rows.clone());
         assert_eq!(rows, Some(vec![vec!["Main".to_owned(), String::new()]]));
         assert_eq!(ids, [extra_sheet_id(0)]);

@@ -48,6 +48,9 @@ pub struct Table {
     pub row_pages: Vec<String>,
     /// Printed before the schematic pages in a PDF, like the table of contents of a drawing set.
     pub front: bool,
+    /// The id of the report page ([`wc_core::Page::report`]) a PDF prints this table in place
+    /// of, among the pages, over [`Table::front`]; `None` prints it before or after them.
+    pub at_page: Option<String>,
     /// The column the rows are grouped by ([`ReportLayout::group`]): rows of one value come
     /// together, and a PDF prints the value once as a heading above them.
     pub group: Option<usize>,
@@ -166,6 +169,7 @@ impl Table {
             rows,
             row_pages,
             front,
+            at_page,
             ..
         } = self;
         let mut rows: Vec<(Vec<String>, String)> = rows
@@ -217,6 +221,7 @@ impl Table {
                 .collect(),
             row_pages,
             front,
+            at_page,
             group: shown_group,
             header: layout.header.clone(),
             sources,
@@ -524,9 +529,68 @@ impl Kind {
         }
     }
 
+    /// The report's title, as its table is built with the built-in layout.
+    pub fn title(self) -> &'static str {
+        match self {
+            Kind::Parts => "Parts list",
+            Kind::Devices => "Device list",
+            Kind::Wires => "Wire list",
+            Kind::Nets => "Net list",
+            Kind::Terminals => "Terminal plan",
+            Kind::Cables => "Cable list",
+            Kind::Plc => "PLC I/O list",
+            Kind::PlcCards => "PLC cards",
+            Kind::Contents => "Table of contents",
+            Kind::Locations => "Locations",
+            Kind::Networks => "Networks",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|k| k.name() == s)
     }
+}
+
+/// The report a report page's name ([`wc_core::Page::report`]) or a typed name means: spaces
+/// around it and case do not count. `None` when it names no report.
+pub fn report_named(name: &str) -> Option<Kind> {
+    Kind::parse(&name.trim().to_ascii_lowercase())
+}
+
+/// The reports the project's report pages hold ([`wc_core::Page::report`]), in page order,
+/// each built as [`build`] builds it with [`Table::at_page`] its page's id; and for each
+/// report page that names no report, its number and the name (quoted).
+pub fn report_page_tables(i: &Inputs<'_>) -> (Vec<Table>, Vec<String>) {
+    let (mut tables, mut unknown) = (Vec::new(), Vec::new());
+    for page in &i.project.pages {
+        let Some(name) = &page.report else { continue };
+        match report_named(name) {
+            Some(kind) => {
+                let mut t = build(kind, i);
+                t.at_page = Some(page.id.clone());
+                tables.push(t);
+            }
+            None => unknown.push(format!("page {}: {name:?}", page.number)),
+        }
+    }
+    (tables, unknown)
+}
+
+/// The kinds of report the project's report pages hold: printed there, so not again before or
+/// after the pages.
+pub fn report_page_kinds(project: &Project) -> Vec<Kind> {
+    let mut out = Vec::new();
+    for k in project
+        .pages
+        .iter()
+        .filter_map(|p| p.report.as_deref())
+        .filter_map(report_named)
+    {
+        if !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    out
 }
 
 /// Everything a report may need besides the project.

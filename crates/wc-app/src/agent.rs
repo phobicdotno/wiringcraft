@@ -233,7 +233,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, graphic, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, graphic, report, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
             json!({}),
             &[],
         ),
@@ -662,7 +662,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "run_command",
             "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
-             Project and pages: new (a project folder, --template), page (add, list, remove, overview, graphic, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
+             Project and pages: new (a project folder, --template), page (add, list, remove, renumber, overview, graphic, report, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
              Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, delete (symbols and wires by id), device (part, description), number-wires, macro (list, place, show, edit: a project macro's placeholders and value sets), find (text in pages, --replace, --match-case). \
              Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
              Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
@@ -1092,7 +1092,7 @@ impl Open {
         let (w, h) = p.size.mm();
         json!({
             "id": p.id, "number": p.number, "title": p.title, "size": p.size,
-            "overview": p.overview, "graphic": p.graphic, "cover": p.cover,
+            "overview": p.overview, "graphic": p.graphic, "report": p.report, "cover": p.cover,
             "title_block": p.title_block,
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
@@ -1930,7 +1930,11 @@ impl App {
                     }
                     (true, false) => PageKind::Overview,
                     (false, true) => PageKind::Graphic,
-                    (false, false) => PageKind::Schematic,
+                    // A report page stays one.
+                    (false, false) => match PageKind::of(&cur) {
+                        k @ PageKind::Report(_) => k,
+                        _ => PageKind::Schematic,
+                    },
                 };
                 let i = open.set_page_props(
                     page,
@@ -2470,7 +2474,7 @@ impl App {
             .map(|p| {
                 json!({
                     "id": p.id, "number": p.number, "title": p.title, "size": p.size,
-                    "overview": p.overview, "graphic": p.graphic, "cover": p.cover,
+                    "overview": p.overview, "graphic": p.graphic, "report": p.report, "cover": p.cover,
                     "symbols": p.symbols.len(), "wires": p.wires.len(), "graphics": p.graphics.len()
                 })
             })

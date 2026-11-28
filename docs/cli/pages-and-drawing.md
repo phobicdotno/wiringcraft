@@ -42,6 +42,7 @@ number. Only `page add` takes the id alone, and `place`, `box`, `box-edit`, `wir
 | `page renumber` | Number the pages again in their order: `--prefix` (such as `=A1/`), then `--start` (1), `--start` + `--step` (1), ... `--from <ID>` starts at that page, and the pages before it keep their numbers. New numbers that would change the page order or repeat a kept number are refused. Prints how many pages changed |
 | `page size <ID> <SIZE>` | Change the sheet size. What is drawn stays where it is |
 | `page overview <ID>` | Mark it as an overview (line diagram); `--off` makes it a normal page |
+| `page report <ID> <REPORT>` | Make it a report page: the PDF prints that report (`parts`, `terminals`, ... as `pdf --report` names them) in the page's place among the pages, and not again after them. A page with symbols or wires, and the cover page, are refused; `--off` makes it a normal page. `page list` marks it `report <name>` |
 | `page graphic <ID>` | Mark it as a graphic page (drawings only; symbols and wires are refused on it). A page that has symbols or wires is refused; `--off` makes it a normal page |
 | `page cover <ID>` | Make it the cover page (any other page loses the mark); `--off` takes the mark off |
 | `page fields <ID> [key=value]...` | List the page's title-block fields, or set the page's own values |

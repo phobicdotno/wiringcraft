@@ -3653,13 +3653,13 @@ impl App {
                             egui::ComboBox::from_id_salt("pagekind")
                                 .selected_text(kind.label())
                                 .show_ui(ui, |ui| {
-                                    for k in state::PageKind::ALL {
+                                    for k in state::PageKind::all() {
                                         ui.selectable_value(kind, k, k.label());
                                     }
                                 })
                                 .response
                                 .on_hover_text(
-                                    "A line diagram shows devices again that schematic pages draw in detail; its symbols do not count as drawings in the project check. A graphic page holds drawings only: symbols and wires are refused on it.",
+                                    "A line diagram shows devices again that schematic pages draw in detail; its symbols do not count as drawings in the project check. A graphic page holds drawings only: symbols and wires are refused on it. A report page is where the PDF prints that report, among the pages, instead of after them.",
                                 );
                             ui.end_row();
                         });
@@ -5974,19 +5974,26 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
             unknown.join(", ")
         );
     }
+    // Report pages print their reports in their place among the pages (an empty one too, as
+    // the page is there), and those reports are not printed again after the pages.
+    let on_pages = wc_report::report_page_kinds(project);
+    let (mut reports, unknown) = wc_report::report_page_tables(&inputs);
+    reports.extend(
+        kinds
+            .iter()
+            .filter(|k| !on_pages.contains(k))
+            .map(|k| wc_report::build(*k, &inputs))
+            .filter(|t| !t.rows.is_empty()),
+    );
     // Topology pages follow the network list, as `wiringcraft pdf` prints them.
-    let networks = if kinds.contains(&wc_report::Kind::Networks) {
+    let networks = if kinds.contains(&wc_report::Kind::Networks) || on_pages.contains(&wc_report::Kind::Networks) {
         project.meta.networks.clone()
     } else {
         Vec::new()
     };
     let pictures = wc_pdf::read_pictures(&open.dir, project);
     let options = wc_pdf::Options {
-        reports: kinds
-            .into_iter()
-            .map(|k| wc_report::build(k, &inputs))
-            .filter(|t| !t.rows.is_empty())
-            .collect(),
+        reports,
         underlays: pictures.files,
         unreadable: pictures.unreadable,
         panels: project.panels.clone(),
@@ -5999,6 +6006,11 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
         return format!("Export failed: {}", wc_pdf::NOTHING_TO_EXPORT);
     }
     let mut warnings = report.warnings;
+    warnings.extend(
+        unknown
+            .into_iter()
+            .map(|u| format!("{u} names no report; it prints as a normal page")),
+    );
     // The text itself stays out: this message goes to the diagnostic log, which never holds
     // drawing content. File, Translations, "Only missing" lists the texts.
     warnings.extend(missing.iter().map(|m| {
