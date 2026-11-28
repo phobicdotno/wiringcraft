@@ -673,6 +673,9 @@ pub struct Open {
     /// `translations.toml` as it was when a command of the assistant started
     /// ([`Open::before_translations_command`]); the inner `None` is no file.
     command_translations: Option<Result<Option<String>, String>>,
+    /// Insert > Macro's rules for From table…, one `column=value:macro` a line, as
+    /// `macro generate --rule` takes them; kept while the project is open.
+    pub table_rules: String,
     /// The undo mark of the assistant turn running ([`Open::start_turn`]): while its first
     /// step is the oldest, a full history folds the steps after it into it instead of
     /// dropping it, so [`Open::squash_undo`] still makes the turn one step (#641).
@@ -764,6 +767,7 @@ impl Open {
             symbol_repairs: BTreeMap::new(),
             mark_edits: Vec::new(),
             command_translations: None,
+            table_rules: String::new(),
             marks: 0,
             turn: None,
             #[cfg(test)]
@@ -4265,6 +4269,17 @@ impl Open {
     /// placeholders filled from the value set named `value_set` (a macro with value sets needs
     /// one). Its devices get the macro's data, values filled in. Returns the inserted items,
     /// selected so they can be moved into place.
+    /// [`Open::table_rules`] read, a rule a non-empty line; the first line that is no rule is
+    /// an error naming it.
+    pub fn parsed_table_rules(&self) -> Result<Vec<wc_core::generate::MacroRule>, String> {
+        self.table_rules
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| wc_core::generate::MacroRule::parse(l).map_err(|e| e.to_string()))
+            .collect()
+    }
+
     pub fn insert_macro(
         &mut self,
         page: usize,
@@ -4286,6 +4301,7 @@ impl Open {
     /// each row's cells filling its placeholders, a `set` column picking the row's value set
     /// (else `default_set`) and a `macro` column another macro for its row, on new pages the size of page `page`, as `wiringcraft macro
     /// generate` does. One undo step; nothing changes when a row or a copy cannot be placed.
+    #[cfg(test)]
     pub fn generate_from_table(
         &mut self,
         page: usize,
@@ -4293,13 +4309,26 @@ impl Open {
         table: &Path,
         default_set: Option<&str>,
     ) -> Result<wc_core::generate::Generated, String> {
+        self.generate_from_table_ruled(page, path, table, default_set, &[])
+    }
+
+    /// Insert > Macro, From table…, with `rules` picking the macro of each row that names
+    /// none in a `macro` column, as `macro generate --rule` does.
+    pub fn generate_from_table_ruled(
+        &mut self,
+        page: usize,
+        path: &Path,
+        table: &Path,
+        default_set: Option<&str>,
+        rules: &[wc_core::generate::MacroRule],
+    ) -> Result<wc_core::generate::Generated, String> {
         use wc_core::generate;
         let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
         // The path is shown escaped, as `macro generate` shows it: a file name can hold
         // control characters.
         let shown = table.display().to_string();
         let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", wc_import::run::escape_field(&shown)))?;
-        // A row's `macro` column names another macro: by its file name or its name, the
+        // A row's `macro` column or a rule names another macro: by its file name or its name, the
         // project's own first, as `macro generate` finds it. Listed only when a row asks.
         let mut listed: Option<Vec<MacroEntry>> = None;
         let other = |name: &str| {
@@ -4314,7 +4343,7 @@ impl Open {
                 .ok_or_else(|| format!("no macro {name:?}"))?;
             wc_core::macros::read_macro(&entry.path).map_err(|e| e.to_string())
         };
-        let (copies, pages) = wc_import::run::macro_table(&m, &bytes, &shown, default_set, &[], other)?;
+        let (copies, pages) = wc_import::run::macro_table(&m, &bytes, &shown, default_set, rules, other)?;
         if copies.is_empty() {
             return Ok(generate::Generated::default());
         }

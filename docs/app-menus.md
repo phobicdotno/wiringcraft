@@ -197,4 +197,4 @@ Right-click a terminal under **Devices**:
 ## Other menus
 
 - **Insert…** in the Macro window: shown for a macro with variants instead of Insert. It asks which variant to insert and lists them.
-- **From table…** in the Macro window: asks for a CSV or Excel table and places the macro once per row on new pages. For a macro with variants it is a menu that first asks which variant rows without a `set` column use. A `macro` column places another macro on its row.
+- **From table…** in the Macro window: asks for a CSV or Excel table and places the macro once per row on new pages. For a macro with variants it is a menu that first asks which variant rows without a `set` column use. A `macro` column places another macro on its row. **Rules for From table…** at the top of the window take one `column=value:macro` a line, as `macro generate --rule` does: a row with no `macro` cell whose column holds the value places that macro. The rules stay while the project is open.

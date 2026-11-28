@@ -2694,6 +2694,24 @@ impl App {
                     });
                 }
                 Dialog::Macros(list) => {
+                    // Rules for From table…: a row naming no macro takes one from another column.
+                    if let Some(open) = &mut self.open {
+                        ui.horizontal(|ui| {
+                            ui.label("Rules for From table…:").on_hover_text(
+                                "One a line, column=value:macro (e.g. type=VFD:motor.vfd): a row with no \
+                                 macro cell whose column holds the value places that macro. The first \
+                                 rule a row matches wins.",
+                            );
+                            ui.add(
+                                egui::TextEdit::multiline(&mut open.table_rules)
+                                    .desired_rows(2)
+                                    .hint_text("type=VFD:motor.vfd"),
+                            );
+                        });
+                        if let Err(e) = open.parsed_table_rules() {
+                            ui.colored_label(theme::Theme::of(ui.ctx()).error, e);
+                        }
+                    }
                     if list.is_empty() {
                         ui.label(
                             "No macros yet. Select symbols and wires, then Insert > Save as macro. Library \
@@ -5004,7 +5022,10 @@ impl App {
                 return;
             }
         };
-        match open.generate_from_table(page, path, &table, default_set) {
+        let generated = open
+            .parsed_table_rules()
+            .and_then(|rules| open.generate_from_table_ruled(page, path, &table, default_set, &rules));
+        match generated {
             Ok(done) => {
                 if let Some(first) = done.pages.first()
                     && let Some(i) = open.project.pages.iter().position(|p| &p.id == first)
