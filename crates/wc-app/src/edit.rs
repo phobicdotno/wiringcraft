@@ -1574,6 +1574,41 @@ mod tests {
             .unwrap();
         assert_eq!(done.joins, 0);
         assert!(o.undo());
+        // Copies a row apart carry the rail on through a pair of interruption points.
+        let long = wc_core::macros::Macro {
+            name: "Long rail".into(),
+            wires: vec![wc_core::Wire {
+                id: "rail".into(),
+                from: free(0.0),
+                to: free(250.0),
+                via: Vec::new(),
+                number: None,
+                potential: None,
+                cable: None,
+                route: Default::default(),
+                spec: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let long_path = wc_core::macros::write_macro(&o.dir, "long", &long).unwrap();
+        o.table_join = true;
+        std::fs::write(&table, "macro\nlong\nlong\n").unwrap();
+        let done = o
+            .generate_from_table_ruled(page, &long_path, &table, None, &[])
+            .unwrap();
+        assert_eq!((done.copies, done.joins, done.breaks), (2, 0, 1));
+        assert!(o.symbols.contains_key(wc_core::generate::BREAK_SYMBOL));
+        let placed = o
+            .project
+            .pages
+            .iter()
+            .flat_map(|p| &p.symbols)
+            .filter(|s| s.symbol == wc_core::generate::BREAK_SYMBOL)
+            .count();
+        assert_eq!(placed, 2);
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        o.table_join = false;
         o.table_rules = "kind=single:one coil\nkind:one coil".into();
         let err = o.parsed_table_rules().unwrap_err();
         assert!(

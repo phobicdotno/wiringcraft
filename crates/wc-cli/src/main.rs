@@ -4111,7 +4111,14 @@ fn run(mut cli: Cli) -> Res<()> {
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
-                    let vendored = MacroCopies::read(dir, &copies, "macro generate")?;
+                    // Joined copies can need an interruption point at a row or page break: its
+                    // copy is read with the rest, and taken only when a rail breaks.
+                    let breaks = [wc_core::generate::break_macro()];
+                    let vendored = MacroCopies::read(
+                        dir,
+                        copies.iter().chain(breaks.iter().filter(|_| join)),
+                        "macro generate",
+                    )?;
                     take_macro_items(dir, &mut p, &copies, "generate the pages again", listed)
                         .map_err(|x| vendored.undo(x))?;
                     let title = title.unwrap_or_else(|| m.name.clone());
@@ -4119,6 +4126,10 @@ fn run(mut cli: Cli) -> Res<()> {
                     let generated =
                         wc_core::generate::generate_joined(&mut p, &copies, &pages, symbol, size, &title, join)
                             .map_err(|x| vendored.undo(e(x)))?;
+                    if generated.breaks > 0 {
+                        take_macro_items(dir, &mut p, &breaks, "generate the pages again", None)
+                            .map_err(|x| vendored.undo(x))?;
+                    }
                     // A save that fails half way puts the project's files back, so a second run
                     // does not place the rows already written again.
                     let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
@@ -4132,7 +4143,11 @@ fn run(mut cli: Cli) -> Res<()> {
                         plural(generated.pages.len(), "page", "pages")
                     );
                     if join {
-                        println!("joined by {}", plural(generated.joins, "wire", "wires"));
+                        println!(
+                            "joined by {}, {} carried over a break",
+                            plural(generated.joins, "wire", "wires"),
+                            plural(generated.breaks, "rail", "rails")
+                        );
                     }
                 }
                 MacroCmd::Place {
