@@ -1197,6 +1197,15 @@ mod tests {
         )?;
         let picked: Vec<Option<&str>> = rows.iter().map(|r| r.r#macro.as_deref()).collect();
         assert_eq!(picked, [None, Some("valve"), Some("Starter")]);
+        // Of two rules a row matches, the first wins.
+        for (first, second) in [("valve", "Starter"), ("Starter", "valve")] {
+            let both = [
+                MacroRule::parse(&format!("type=valve:{first}"))?,
+                MacroRule::parse(&format!("TYPE=Valve:{second}"))?,
+            ];
+            let rows = rows_from_table_ruled(&m, &table(&[&["type"], &["valve"]]), &[], &both)?;
+            assert_eq!(rows.first().and_then(|r| r.r#macro.as_deref()), Some(first));
+        }
         // The type column only chooses: neither macro has a placeholder for it.
         let both = |name: &str| if key(name) == "starter" { starter() } else { find(name) };
         let copies = apply_rows_with(&m, &rows, Some("small"), both)?;
