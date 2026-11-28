@@ -660,6 +660,32 @@ fn cable_list_groups_cores_by_cable() {
 }
 
 #[test]
+fn cable_list_prints_a_pins_description_next_to_its_designation() {
+    let (mut p, mut s, parts) = fixture();
+    let Some(coil) = s.get_mut("coil") else {
+        unreachable!("the fixture has a coil")
+    };
+    for pin in coil.pins.iter_mut().filter(|pin| pin.name == "A2") {
+        pin.description = "Coil -".into();
+    }
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    p.devices.insert(w1.clone(), Device::default());
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w4") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1,
+            core: "1".into(),
+        });
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows.len(), 1);
+    assert_eq!(t.rows[0][5..], ["=A+C1-K1:A2 (Coil -)", "-X2:1"]);
+}
+
+#[test]
 fn cable_list_names_a_part_missing_from_the_library_copy_by_its_id() {
     let (mut p, s, parts) = fixture();
     let w1 = DeviceTag::parse("-W1").unwrap();
