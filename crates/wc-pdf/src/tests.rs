@@ -828,6 +828,34 @@ fn a_report_page_prints_its_report_in_its_place() {
     };
     let (_, report) = export(&project, &BTreeMap::new(), &opts);
     assert_eq!(report.pages, 4, "contents, 1, 3, the wire list");
+
+    // An empty report page prints without a warning; an underlay on it is not printed, and says so.
+    let only = |project: &Project| {
+        let opts = Options {
+            reports: vec![wc_report::Table {
+                title: "Bill of materials".into(),
+                columns: vec!["Part".into()],
+                at_page: Some("p2".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        export(project, &BTreeMap::new(), &opts).1.warnings
+    };
+    assert!(!only(&project).iter().any(|w| w.contains("a report page")));
+    let mut under = project.clone();
+    under.pages[1].underlay = Some(wc_core::Underlay {
+        file: "underlays/p2.png".into(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    let warnings = only(&under);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w == "page 2: a report page; what is drawn on it is not printed"),
+        "{warnings:?}"
+    );
 }
 
 /// The page objects the PDF's links go to, in the order the links are written.

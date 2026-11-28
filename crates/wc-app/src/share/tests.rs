@@ -1381,6 +1381,26 @@ fn a_report_page_with_a_wire_or_the_cover_mark_from_the_other_side_is_a_clash() 
     local.pages[0].report = Some("parts".into());
     assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
     assert_eq!(local.pages[0].report.as_deref(), Some("parts"));
+    // A name no report has is a normal page: its wire merges beside a title from the session.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    for p in [&mut base, &mut auth, &mut local] {
+        p.pages[0].report = Some("nonsense".into());
+    }
+    local.pages[0].wires.push(wc_core::Wire {
+        id: "wfree".into(),
+        from: free(0.0),
+        to: free(10.0),
+        via: Vec::new(),
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    });
+    auth.pages[0].title = "Restored".into();
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+    assert_eq!(local.pages[0].title, "Restored");
+    assert!(local.pages[0].wires.iter().any(|w| w.id == "wfree"));
     Ok(())
 }
 

@@ -362,7 +362,9 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
         .any(|end| matches!(end, wc_core::Endpoint::Pin { item, .. } if !symbols.contains(item.as_str())));
     // A page cannot be both an overview and a graphic page: each side marking it one way is a clash.
     // Nor can a report page hold symbols or wires or be the cover, as `page report` refuses.
-    let report_clash = page.report.is_some() && (!page.symbols.is_empty() || !page.wires.is_empty() || page.cover);
+    // A name no report has prints as a normal page, so it is not held to this.
+    let report_clash = page.report.as_deref().and_then(wc_report::report_named).is_some()
+        && (!page.symbols.is_empty() || !page.wires.is_empty() || page.cover);
     (!dangling && !(page.graphic && page.overview) && !report_clash).then_some(page)
 }
 
