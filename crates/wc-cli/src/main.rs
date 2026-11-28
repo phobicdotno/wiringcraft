@@ -1252,6 +1252,24 @@ enum PageCmd {
         /// The page's id or number.
         id: String,
     },
+    /// Number the pages again in their order: `--prefix`, then `--start`, `--start` +
+    /// `--step`, ... From `--from` on (the first page if left out); the pages before it keep
+    /// their numbers. New numbers that would change the page order or repeat a kept number are
+    /// refused.
+    Renumber {
+        /// The first page to number again (id or number); every page if left out.
+        #[arg(long)]
+        from: Option<String>,
+        /// The first number.
+        #[arg(long, default_value_t = 1)]
+        start: u64,
+        /// What each number adds to the one before.
+        #[arg(long, default_value_t = 1)]
+        step: u64,
+        /// Text before each number, such as `=A1/`.
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
     /// Mark a page as a graphic page (free drawings only, no symbols or wires), or with `--off`
     /// as a normal page again. A page that still holds symbols or wires is refused.
     Graphic {
@@ -3297,6 +3315,24 @@ fn run(mut cli: Cli) -> Res<()> {
                         return Err("a project needs at least one page".into());
                     }
                     p.pages.remove(i);
+                }
+                PageCmd::Renumber {
+                    from,
+                    start,
+                    step,
+                    prefix,
+                } => {
+                    p.sort_pages();
+                    let from = match &from {
+                        Some(page) => page_index(&p, page)?,
+                        None => 0,
+                    };
+                    let changed = p.renumber_pages(from, &prefix, start, step).map_err(e)?;
+                    let n = p.pages.len() - from;
+                    println!("{changed} of {n} {} renumbered", if n == 1 { "page" } else { "pages" });
+                    if changed == 0 {
+                        return Ok(());
+                    }
                 }
                 PageCmd::Graphic { id, off } => {
                     let i = page_index(&p, &id)?;

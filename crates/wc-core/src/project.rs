@@ -2200,6 +2200,73 @@ impl Project {
         }
     }
 
+    /// Number the pages from index `from` on again, in the order they are in: `prefix` and
+    /// then `start`, `start + step`, ... (`prefix` `=A1/` and start 1 give `=A1/1`, `=A1/2`).
+    /// The pages before `from` keep their numbers. Returns how many pages got a number they did
+    /// not have. Refused, with nothing changed, when the step is 0, `prefix` ends in a digit
+    /// (`A1` and `2` would read as `A12`), a number runs past the largest one, or the new
+    /// numbers would not keep the pages in their order or would repeat a number a page before
+    /// `from` keeps. The pages are expected in page order ([`Project::sort_pages`]).
+    pub fn renumber_pages(&mut self, from: usize, prefix: &str, start: u64, step: u64) -> crate::Result<usize> {
+        let bad = |why: String| Err(crate::Error::Invalid(why));
+        if step == 0 {
+            return bad("the step must be 1 or more".into());
+        }
+        let prefix = prefix.trim_start();
+        if prefix.ends_with(|c: char| c.is_ascii_digit()) {
+            return bad(format!(
+                "the prefix {prefix:?} ends in a digit, so the page number would run into it; end it with a separator such as `.` or `/`"
+            ));
+        }
+        if from > self.pages.len() {
+            return bad(format!(
+                "there is no page {} (the project has {})",
+                from + 1,
+                self.pages.len()
+            ));
+        }
+        let mut pages = self.pages.clone();
+        let mut n = start;
+        let mut changed = 0;
+        for (k, page) in pages.iter_mut().enumerate().skip(from) {
+            if k > from {
+                n = match n.checked_add(step) {
+                    Some(n) => n,
+                    None => return bad(format!("no page number is left after {prefix}{n}")),
+                };
+            }
+            let number = format!("{prefix}{n}");
+            if page.number != number {
+                page.number = number;
+                changed += 1;
+            }
+        }
+        let mut seen = std::collections::BTreeMap::new();
+        for page in &pages {
+            if let Some(other) = seen.insert(page.number.trim().to_owned(), page.id.clone()) {
+                return bad(format!(
+                    "pages {other:?} and {:?} would both be number {:?}; choose another start or prefix",
+                    page.id,
+                    page.number.trim()
+                ));
+            }
+        }
+        let order: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
+        let mut sorted = Project {
+            pages,
+            ..Project::new("")
+        };
+        sorted.sort_pages();
+        if let Some(k) = sorted.pages.iter().zip(&order).position(|(p, id)| p.id != *id) {
+            let page = sorted.pages.get(k).map_or("", |p| p.number.as_str());
+            return bad(format!(
+                "the new numbers would change the page order (page {page:?} would move); choose another start or prefix"
+            ));
+        }
+        self.pages = sorted.pages;
+        Ok(changed)
+    }
+
     /// Sort pages by their display number, comparing numeric parts as numbers.
     /// Pages with the same number are ordered by their id.
     pub fn sort_pages(&mut self) {
@@ -2366,6 +2433,43 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pages_are_numbered_again_in_their_order() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        for (id, n) in [("a", "1"), ("b", "3"), ("c", "3.5"), ("d", "10")] {
+            p.pages.push(Page::new(id, n, ""));
+        }
+        p.sort_pages();
+        let numbers = |p: &Project| p.pages.iter().map(|p| p.number.clone()).collect::<Vec<_>>();
+        // Page `a` keeps its number, so only three change.
+        assert_eq!(p.renumber_pages(0, "", 1, 1)?, 3);
+        assert_eq!(numbers(&p), ["1", "2", "3", "4"]);
+        assert_eq!(p.renumber_pages(0, "", 1, 1)?, 0, "already so");
+        // From the third page on, in tens.
+        assert_eq!(p.renumber_pages(2, "", 10, 10)?, 2);
+        assert_eq!(numbers(&p), ["1", "2", "10", "20"]);
+        assert_eq!(p.renumber_pages(0, "=A1/", 1, 1)?, 4);
+        assert_eq!(numbers(&p), ["=A1/1", "=A1/2", "=A1/3", "=A1/4"]);
+
+        let before = p.clone();
+        let err = |r: crate::Result<usize>| r.err().map(|e| e.to_string()).unwrap_or_default();
+        // A number before the pages renumbered, or an order that would change, is refused.
+        let mut q = Project::new("t");
+        for (id, n) in [("a", "1"), ("b", "5"), ("c", "6")] {
+            q.pages.push(Page::new(id, n, ""));
+        }
+        let kept = q.clone();
+        assert!(err(q.renumber_pages(1, "", 1, 1)).contains("both be number \"1\""));
+        assert!(err(q.renumber_pages(2, "", 2, 1)).contains("page order"));
+        assert_eq!(q, kept);
+        assert!(err(p.renumber_pages(0, "A1", 1, 1)).contains("ends in a digit"));
+        assert!(err(p.renumber_pages(0, "", 1, 0)).contains("step"));
+        assert!(err(p.renumber_pages(9, "", 1, 1)).contains("no page 10"));
+        assert!(err(p.renumber_pages(0, "", u64::MAX, 1)).contains("no page number is left"));
+        assert_eq!(p, before);
+        Ok(())
+    }
 
     #[test]
     fn dangling_pins_sort_pages_tags_and_pins_by_number() -> std::result::Result<(), Box<dyn std::error::Error>> {
