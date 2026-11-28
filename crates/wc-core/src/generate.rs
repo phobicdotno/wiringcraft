@@ -53,7 +53,7 @@ pub struct TableRow {
     pub chooses: BTreeSet<String>,
 }
 
-/// A rule picking the macro of a row that names none: the row places [`MacroRule::r#macro`]
+/// A rule picking the macro of a row that names none: the row places `MacroRule::macro`
 /// when its [`MacroRule::column`] holds [`MacroRule::value`] (case and spaces around both
 /// ignored). The first rule a row matches wins.
 #[derive(Debug, Clone, PartialEq, Eq)]
