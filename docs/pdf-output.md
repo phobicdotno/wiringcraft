@@ -38,7 +38,8 @@ A report can also sit among the pages, as in EPLAN: make a page a report page wi
 `wiringcraft page report <page> parts` (any report name `--report` takes; `--off` makes it a
 normal page again). The PDF prints that report there, in the page's place, with the page's
 number and title on each of its sheets (the bookmarks show `(1/2)`, `(2/2)` for a long one),
-and the page's own title-block fields. That report is then not printed again after the pages,
+and the page's own title-block fields (a revision of `auto` shows the latest revision, as on
+the other sheets the PDF makes). That report is then not printed again after the pages,
 whatever `--report` or the project's report choice says. A report page is printed even when
 its report is not chosen, since it is one of the pages; a PDF made with `--page` that leaves
 the report page out leaves its report out too. The sheets use the report sheet size, not the
