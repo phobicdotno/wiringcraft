@@ -3364,12 +3364,7 @@ impl App {
                             let l = (locations != loaded_locations).then(|| locations.clone());
                             let r = (revisions != loaded_revisions).then(|| revisions.clone());
                             let loaded = loaded_revisions.clone();
-                            // A stored choice naming no report is replaced by the one shown.
-                            let pdf = (pdf_reports != loaded_pdf_reports || !pdf_reports_unknown.is_empty()).then(|| {
-                                pdf_reports
-                                    .as_ref()
-                                    .map(|ks| ks.iter().map(|k| k.name().to_owned()).collect::<Vec<_>>())
-                            });
+                            let pdf = pdf_choice_change(pdf_reports, loaded_pdf_reports, pdf_reports_unknown);
                             then = Some(Box::new(move |app: &mut App| {
                                 let Some(o) = app.open.as_mut() else {
                                     return;
@@ -5589,6 +5584,22 @@ fn pdf_report_choice(meta: &wc_core::project::ProjectMeta) -> (Vec<wc_report::Ki
         }
     }
     (out, unknown)
+}
+
+/// What Project properties' OK passes for the PDF report choice
+/// ([`state::Open::set_project_props_with`]): `None` leaves the stored choice alone, which it
+/// does while the choice shown is the one loaded, unless the stored one names no report
+/// (`unknown`): that is replaced by the choice shown.
+fn pdf_choice_change(
+    shown: &Option<Vec<wc_report::Kind>>,
+    loaded: &Option<Vec<wc_report::Kind>>,
+    unknown: &[String],
+) -> Option<Option<Vec<String>>> {
+    (shown != loaded || !unknown.is_empty()).then(|| {
+        shown
+            .as_ref()
+            .map(|ks| ks.iter().map(|k| k.name().to_owned()).collect())
+    })
 }
 
 fn report_title(k: wc_report::Kind) -> &'static str {
@@ -9953,6 +9964,8 @@ mod nudge_tests {
         let (_, with, _) = pages(o);
         o.project.meta.pdf_reports = Some(Vec::new());
         let (_, without, _) = pages(o);
+        // No report chosen: the schematic pages alone, no topology page.
+        assert_eq!(without, o.project.pages.len());
         assert!(with > without, "the topology page goes with the list: {with} {without}");
         o.project.meta.pdf_reports = Some(vec!["nonsense".into()]);
         let (msg, _, written) = pages(o);
@@ -9967,6 +9980,21 @@ mod nudge_tests {
             unreachable!("the dialog is open");
         };
         assert_eq!(pdf_reports_unknown, &["\"nonsense\""]);
+
+        // OK with the choice left as it shows replaces the stored names with the valid ones,
+        // in one undo step; a valid choice left alone is not written.
+        let o = app.open.as_mut().unwrap();
+        o.project.meta.pdf_reports = Some(vec!["parts".into(), "nonsense".into()]);
+        let before = o.project.clone();
+        let (shown, unknown) = pdf_report_choice(&o.project.meta);
+        let shown = Some(shown);
+        let change = pdf_choice_change(&shown, &shown, &unknown);
+        assert_eq!(change, Some(Some(vec!["parts".to_owned()])));
+        o.set_project_props_with(&name, &fields, None, None, change).unwrap();
+        assert_eq!(o.project.meta.pdf_reports, Some(vec!["parts".into()]));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.pdf_reports, before.meta.pdf_reports);
+        assert_eq!(pdf_choice_change(&shown, &shown, &[]), None);
     }
 
     /// A project with nothing unsaved still does not close over a dialog holding work of its
