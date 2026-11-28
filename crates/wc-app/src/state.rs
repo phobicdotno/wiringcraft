@@ -4266,7 +4266,7 @@ impl Open {
         self.generate_from_table_ruled(page, path, table, default_set, &[])
     }
 
-    /// [`Open::generate_from_table`], with `rules` picking the macro of each row that names
+    /// Insert > Macro, From table…, with `rules` picking the macro of each row that names
     /// none in a `macro` column, as `macro generate --rule` does.
     pub fn generate_from_table_ruled(
         &mut self,
