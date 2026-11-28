@@ -181,6 +181,15 @@ fn extent_with(copies: &[Macro], symbol: &impl Fn(&str) -> Option<Symbol>, locat
 /// ([`widest_location`]).
 const WIDEST_LOCATION: &str = "9999/99.W";
 
+/// A bound on the numbers [`generate`] gives its new pages after `last`: one number per copy,
+/// plus one per existing page for the numbers it skips because a page has them (a page ` 4 `
+/// takes `4`), with a digit to spare.
+fn number_reach(last: u64, pages: usize, copies: usize) -> u64 {
+    last.saturating_add(pages as u64)
+        .saturating_add(copies as u64)
+        .saturating_mul(10)
+}
+
 /// The widest location on pages numbered `prefix` and a number up to `last`: the prefix, as
 /// many nines as `last` has digits (at least four), then a two-digit column and the widest row.
 fn widest_location(prefix: &str, last: u64) -> String {
@@ -508,10 +517,9 @@ pub fn generate(
         .max()
         .and_then(|key| key.into_iter().next());
     let (prefix, mut next_number) = last.unwrap_or_default();
-    // Contact lines show the new pages' numbers: the prefix and, skipping used numbers, at most
-    // one more digit than one page per copy past the last number gives.
-    let reach = next_number.saturating_add(copies.len() as u64).saturating_mul(10);
-    let location = widest_location(&prefix, reach);
+    // Contact lines show the new pages' numbers: the prefix and a number no larger than
+    // `number_reach` gives.
+    let location = widest_location(&prefix, number_reach(next_number, project.pages.len(), copies.len()));
     let shared = extent_with(copies, &symbol, &location);
     // Where each copy's anchor goes from its slot's corner, and how many slots a page has.
     let (offsets, across, per_page) = match fit(shared, first.anchor, area) {
@@ -985,6 +993,11 @@ mod tests {
         // as do more digits than four once the numbers run that high.
         assert_eq!(widest_location("PNL-", 4), "PNL-9999/99.W");
         assert_eq!(widest_location("", 123_456), "999999/99.W");
+        // Pages ` 0` and `1` to `9999`: the next page after ` 0` skips every used number and
+        // becomes ` 10000`, five digits, which the bound must hold.
+        let reach = number_reach(0, 10_000, 1);
+        assert!(reach >= 10_000, "{reach}");
+        assert!(widest_location("", reach).len() >= "10000/99.W".len());
         let location = widest_location("PNL-", 4);
         let (_, max) = extent_with(std::slice::from_ref(&one), &lookup(&coil), &location);
         let width = crate::font::text_width_mm("13-14 PNL-9999/99.W", crate::xref::HEIGHT);
