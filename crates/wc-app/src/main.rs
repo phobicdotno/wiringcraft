@@ -211,10 +211,11 @@ enum Dialog {
         include: bool,
     },
     /// Name and description for a macro made from the copied selection, or from the whole
-    /// page `page` (Page > Save page as macro).
+    /// page with id `page` (Page > Save page as macro), kept by id so a page moved meanwhile
+    /// is still the one saved.
     SaveMacro {
         clip: edit::Clipboard,
-        page: Option<usize>,
+        page: Option<String>,
         name: String,
         description: String,
         error: Option<String>,
@@ -2278,7 +2279,7 @@ impl App {
                 Ok(m) => {
                     self.dialog = Some(Dialog::SaveMacro {
                         clip: m.into(),
-                        page: Some(page),
+                        page: Some(open.project.pages[page].id.clone()),
                         name: String::new(),
                         description: String::new(),
                         error: None,
@@ -2699,7 +2700,10 @@ impl App {
                             && let Some(open) = &mut self.open
                         {
                             let saved = match page {
-                                Some(i) => open.save_page_macro(*i, name, description),
+                                Some(id) => match open.project.pages.iter().position(|p| p.id == *id) {
+                                    Some(i) => open.save_page_macro(i, name, description),
+                                    None => Err("The page was removed.".to_owned()),
+                                },
                                 None => open.save_macro(clip, name, description),
                             };
                             match saved {
@@ -11154,10 +11158,11 @@ mod menu_action_tests {
         a.ed.menu_action = Some(Action::SavePageMacro);
         a.run_menu_action();
         let shown = match &a.dialog {
-            Some(Dialog::SaveMacro { clip, page, .. }) => Some((clip.symbols.len(), *page)),
+            Some(Dialog::SaveMacro { clip, page, .. }) => Some((clip.symbols.len(), page.clone())),
             _ => None,
         };
-        assert_eq!(shown, Some((1, Some(0))), "{}", a.ed.message);
+        let page_id = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        assert_eq!(shown, Some((1, Some(page_id))), "{}", a.ed.message);
         let path = a.open.as_mut().unwrap().save_page_macro(0, "Whole page", "").unwrap();
         let m = wc_core::macros::read_macro(&path).unwrap();
         assert_eq!(m.anchor, wc_core::Point::new(0.0, 0.0));
