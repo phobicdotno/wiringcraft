@@ -78,6 +78,9 @@ enum Dialog {
         /// OK while unchanged.
         pdf_reports: Option<Vec<wc_report::Kind>>,
         loaded_pdf_reports: Option<Vec<wc_report::Kind>>,
+        /// Names in the stored choice that are no report (a hand-edited `project.toml`): the
+        /// dialog says so, and OK saves the choice it shows in their place.
+        pdf_reports_unknown: Vec<String>,
     },
     /// The cover page form: changes show on the page as they are typed; `since` is the undo
     /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
@@ -2166,6 +2169,7 @@ impl App {
                         .pdf_reports
                         .as_ref()
                         .map(|_| pdf_report_kinds(&open.project.meta)),
+                    pdf_reports_unknown: pdf_report_choice(&open.project.meta).1,
                 });
             }
             Action::CoverPage => {
@@ -3216,6 +3220,7 @@ impl App {
                     loaded_revisions,
                     pdf_reports,
                     loaded_pdf_reports,
+                    pdf_reports_unknown,
                 } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
@@ -3315,6 +3320,15 @@ impl App {
                     {
                         *pdf_reports = choose.then(|| wc_report::Kind::ALL.to_vec());
                     }
+                    if !pdf_reports_unknown.is_empty() {
+                        ui.colored_label(
+                            theme::Theme::of(ui.ctx()).error,
+                            format!(
+                                "project.toml names no report {}; OK saves the choice shown here instead.",
+                                pdf_reports_unknown.join(", ")
+                            ),
+                        );
+                    }
                     if let Some(chosen) = pdf_reports.as_mut() {
                         ui.horizontal_wrapped(|ui| {
                             for k in wc_report::Kind::ALL {
@@ -3350,7 +3364,8 @@ impl App {
                             let l = (locations != loaded_locations).then(|| locations.clone());
                             let r = (revisions != loaded_revisions).then(|| revisions.clone());
                             let loaded = loaded_revisions.clone();
-                            let pdf = (pdf_reports != loaded_pdf_reports).then(|| {
+                            // A stored choice naming no report is replaced by the one shown.
+                            let pdf = (pdf_reports != loaded_pdf_reports || !pdf_reports_unknown.is_empty()).then(|| {
                                 pdf_reports
                                     .as_ref()
                                     .map(|ks| ks.iter().map(|k| k.name().to_owned()).collect::<Vec<_>>())
@@ -5845,6 +5860,12 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
             unknown.join(", ")
         );
     }
+    // Topology pages follow the network list, as `wiringcraft pdf` prints them.
+    let networks = if kinds.contains(&wc_report::Kind::Networks) {
+        project.meta.networks.clone()
+    } else {
+        Vec::new()
+    };
     let pictures = wc_pdf::read_pictures(&open.dir, project);
     let options = wc_pdf::Options {
         reports: kinds
@@ -5855,7 +5876,7 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
         panels: project.panels.clone(),
-        networks: project.meta.networks.clone(),
+        networks,
         footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
@@ -9911,6 +9932,41 @@ mod nudge_tests {
         o.project.meta.pdf_reports = Some(vec!["parts".into()]);
         o.set_project_props(&name, &fields, None, None).unwrap();
         assert_eq!(o.project.meta.pdf_reports, Some(vec!["parts".into()]));
+
+        // Export PDF prints a network's topology page only with the network list, and refuses
+        // a choice naming no report before writing anything.
+        o.project.meta.networks.push(wc_core::network::Network {
+            name: "Bus".into(),
+            ..Default::default()
+        });
+        let pdf = o.dir.join("out.pdf");
+        let pages = |o: &state::Open| {
+            let _ = std::fs::remove_file(&pdf);
+            let msg = export_pdf_to(o, &[], &pdf);
+            let n = msg
+                .strip_prefix("Exported ")
+                .and_then(|m| m.split(' ').next())
+                .and_then(|n| n.parse::<usize>().ok());
+            (msg.clone(), n.unwrap_or(0), pdf.exists())
+        };
+        o.project.meta.pdf_reports = Some(vec!["networks".into()]);
+        let (_, with, _) = pages(o);
+        o.project.meta.pdf_reports = Some(Vec::new());
+        let (_, without, _) = pages(o);
+        assert!(with > without, "the topology page goes with the list: {with} {without}");
+        o.project.meta.pdf_reports = Some(vec!["nonsense".into()]);
+        let (msg, _, written) = pages(o);
+        assert!(msg.contains("pdf_reports") && !written, "{msg}");
+
+        // The dialog names the stored names that are no report.
+        app.run(Action::ProjectProps);
+        let Some(Dialog::ProjectProps {
+            pdf_reports_unknown, ..
+        }) = &app.dialog
+        else {
+            unreachable!("the dialog is open");
+        };
+        assert_eq!(pdf_reports_unknown, &["\"nonsense\""]);
     }
 
     /// A project with nothing unsaved still does not close over a dialog holding work of its
