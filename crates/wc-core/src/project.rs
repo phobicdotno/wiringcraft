@@ -1755,6 +1755,11 @@ pub struct Page {
     /// and nothing on it evaluated electrically. `check` warns about a symbol or wire on one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub graphic: bool,
+    /// A report page: the name of the report (`parts`, `terminals`, ... as `wiringcraft pdf
+    /// --report` names them) that the PDF prints here, in this page's place among the pages,
+    /// instead of after them. What is drawn on the page itself is not printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
     /// Title-block fields of this page alone (its revision, date, checked by, ...). On this
     /// page's title block they win over the project's fields of the same name
     /// ([`ProjectMeta::title_block`]); fields the page does not set come from the project.
@@ -1804,6 +1809,7 @@ impl Page {
             overview: false,
             cover: false,
             graphic: false,
+            report: None,
             title_block: BTreeMap::new(),
             clouds: Vec::new(),
             revision_table: None,

@@ -2,7 +2,8 @@
 
 WiringCraft builds its reports from the schematic each time you ask for one. They are never
 stored in the project, so they cannot be out of date. The same reports show in the desktop app,
-in `wiringcraft report` and on the report pages of a PDF. The commands and their options are in
+in `wiringcraft report` and on the report pages of a PDF, after the schematic pages or in a
+page's place among them ([report pages](pdf-output.md#report-pages)). The commands and their options are in
 [docs/cli/reports-and-export.md](cli/reports-and-export.md).
 
 This page lists each report with its columns in their built-in order. A project can pick,

@@ -323,8 +323,8 @@ fn fold_own_page(out: &mut Outgoing, base: &Project) {
 /// page with the local changes on top, or `None` when the two touched the same thing. Symbols
 /// and wires are matched by id, title-block fields by name, the free graphics and texts (which
 /// carry no id) and the revision clouds item by item ([`merge_unordered`]); the title, size,
-/// underlay, the overview, cover and graphic marks and the revision table's place each count as one
-/// thing.
+/// underlay, the overview, cover and graphic marks, the report it holds and the revision table's
+/// place each count as one thing.
 /// A wire that ends at a symbol the other side took away is a clash too. The page number is
 /// left as the session's.
 fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
@@ -335,6 +335,7 @@ fn merge_page(base: &Page, auth: &Page, local: &Page) -> Option<Page> {
     page.overview = pick(&base.overview, &auth.overview, &local.overview)?;
     page.cover = pick(&base.cover, &auth.cover, &local.cover)?;
     page.graphic = pick(&base.graphic, &auth.graphic, &local.graphic)?;
+    page.report = pick(&base.report, &auth.report, &local.report)?;
     page.graphics = merge_unordered(&base.graphics, &auth.graphics, &local.graphics, |a, b| {
         std::mem::discriminant(a) == std::mem::discriminant(b)
     })?;

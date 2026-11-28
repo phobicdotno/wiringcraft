@@ -178,7 +178,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .reports
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.front == front)
+            .filter(|(_, t)| t.front == front && t.at_page.is_none())
             .flat_map(|(ti, _)| {
                 let n = paged.get(ti).map_or(1, Vec::len);
                 (0..n).map(move |k| (ti, k, k + 1, n))
@@ -186,6 +186,22 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .collect()
     };
     let (front_pages, back_pages) = (split(true), split(false));
+    // The report pages' tables (`Table::at_page`), each printed in its page's place: for each
+    // exported page, the sheets (table, its page, part, parts) that stand for it. A table for a
+    // page this PDF leaves out is not printed.
+    let mut placed: BTreeMap<&str, Vec<(usize, usize, usize, usize)>> = BTreeMap::new();
+    for (ti, t) in options.reports.iter().enumerate() {
+        let Some(at) = t.at_page.as_deref() else { continue };
+        if !pages.iter().any(|p| p.id == at) {
+            continue;
+        }
+        let n = paged.get(ti).map_or(1, Vec::len);
+        placed.entry(at).or_default().extend((0..n).map(|k| (ti, k, k + 1, n)));
+    }
+    let page_sheets: usize = pages
+        .iter()
+        .map(|p| placed.get(p.id.as_str()).map_or(1, |s| s.len().max(1)))
+        .sum();
     // Each drawn card sheet: (card, first row, part, parts).
     let card_pages: Vec<(usize, usize, usize, usize)> = options
         .plc_cards
@@ -197,7 +213,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         })
         .collect();
     let total = front_pages.len()
-        + pages.len()
+        + page_sheets
         + options.panels.len()
         + card_pages.len()
         + back_pages.len()
@@ -215,19 +231,32 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     doc.set_info("Subject", field("description"));
     let mut sheet = 0;
     let mut report_no = 0;
+    // `on` is the report page the sheets stand for: they take its number, title and fields.
     let mut add_reports = |doc: &mut writer::Doc,
                            list: Vec<(usize, usize, usize, usize)>,
+                           on: Option<&wc_core::Page>,
                            sheet: &mut usize,
                            warnings: &mut Vec<String>| {
         for (ti, k, part, parts) in list {
             let Some(table) = reports.get(ti) else { continue };
             let lines = paged.get(ti).and_then(|p| p.get(k)).map_or(&[][..], Vec::as_slice);
-            report_no += 1;
-            let mut page = wc_core::Page::new(
-                format!("report-{ti}-{part}"),
-                format!("R{report_no}"),
-                table.title.clone(),
-            );
+            let mut page = match on {
+                Some(on) => {
+                    let mut page = on.clone();
+                    if page.title.trim().is_empty() {
+                        page.title = table.title.clone();
+                    }
+                    page
+                }
+                None => {
+                    report_no += 1;
+                    wc_core::Page::new(
+                        format!("report-{ti}-{part}"),
+                        format!("R{report_no}"),
+                        table.title.clone(),
+                    )
+                }
+            };
             page.size = size;
             let mut drawn = layout::draw_table_page(
                 project,
@@ -241,18 +270,30 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             );
             place_logo(&mut drawn, &page);
             let title = if parts > 1 {
-                format!("{} {} ({part}/{parts})", page.number, table.title)
+                format!("{} {} ({part}/{parts})", page.number, page.title)
             } else {
-                format!("{} {}", page.number, table.title)
+                format!("{} {}", page.number, page.title)
             };
             warnings.extend(unprintable(&page.number, &drawn));
             doc.add_page(size.mm(), &page.number, &title, drawn);
             *sheet += 1;
         }
     };
-    add_reports(&mut doc, front_pages, &mut sheet, &mut report.warnings);
-    let offset = sheet;
+    add_reports(&mut doc, front_pages, None, &mut sheet, &mut report.warnings);
+    // Where each exported page starts in the document, for links.
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
     for page in &pages {
+        index.insert(page.id.clone(), sheet);
+        if let Some(list) = placed.get(page.id.as_str()) {
+            if !page.symbols.is_empty() || !page.wires.is_empty() || !page.graphics.is_empty() {
+                report.warnings.push(format!(
+                    "page {}: a report page; what is drawn on it is not printed",
+                    page.number
+                ));
+            }
+            add_reports(&mut doc, list.clone(), Some(page), &mut sheet, &mut report.warnings);
+            continue;
+        }
         let mut drawn = layout::draw_page(
             project,
             page,
@@ -290,6 +331,8 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         );
         sheet += 1;
     }
+    // The sheets after the pages start here, in the order the contents lists them.
+    let after_pages = sheet;
     // Panel layouts follow the schematic pages, one sheet each.
     for (k, panel) in options.panels.iter().enumerate() {
         let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
@@ -328,7 +371,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         );
         sheet += 1;
     }
-    add_reports(&mut doc, back_pages, &mut sheet, &mut report.warnings);
+    add_reports(&mut doc, back_pages, None, &mut sheet, &mut report.warnings);
     // Network topologies close the document, after the network list.
     // A topology box links to a page this PDF holds.
     let exported: std::collections::BTreeSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
@@ -364,13 +407,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     }
     // Links resolve against the exported page list, so links to pages left out are dropped.
     // The sheets after the schematic pages follow them in the order the contents lists them.
-    let index: BTreeMap<String, usize> = pages
-        .iter()
-        .map(|p| p.id.clone())
-        .chain(extra_ids)
-        .enumerate()
-        .map(|(i, id)| (id, offset + i))
-        .collect();
+    index.extend(extra_ids.into_iter().enumerate().map(|(i, id)| (id, after_pages + i)));
     (doc.finish(&index), report)
 }
 
@@ -442,7 +479,7 @@ fn list_extra_sheets<'a>(
             ));
         }
     }
-    for t in reports.iter().filter(|t| !t.front) {
+    for t in reports.iter().filter(|t| !t.front && t.at_page.is_none()) {
         let n = layout::table_pages(t, per_page).len();
         for part in 1..=n {
             rows.push((None, parted(&t.title, part, n)));
@@ -481,7 +518,7 @@ fn list_extra_sheets<'a>(
     }
     let front: usize = reports
         .iter()
-        .filter(|t| t.front)
+        .filter(|t| t.front && t.at_page.is_none())
         .map(|t| layout::table_pages(t, per_page).len())
         .sum();
     let mut report_no = front;

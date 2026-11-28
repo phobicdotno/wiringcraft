@@ -732,6 +732,84 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
     assert_eq!(text.matches("/Subtype /Link").count(), 3);
 }
 
+/// A report page prints its report in its place among the pages, every sheet of it, and the
+/// contents' row for it jumps to its first sheet (#1897).
+#[test]
+fn a_report_page_prints_its_report_in_its_place() {
+    let mut project = Project::new("x");
+    let mut report_page = Page::new("p2", "2", "Parts list");
+    report_page.report = Some("parts".into());
+    project.pages = vec![
+        Page::new("p1", "1", "Mains"),
+        report_page,
+        Page::new("p3", "3", "Control"),
+    ];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows: vec![
+            vec!["1".into(), "Mains".into()],
+            vec!["2".into(), "Parts list".into()],
+            vec!["3".into(), "Control".into()],
+        ],
+        row_pages: vec!["p1".into(), "p2".into(), "p3".into()],
+        front: true,
+        ..Default::default()
+    };
+    // Rows for two sheets.
+    let parts = wc_report::Table {
+        title: "Bill of materials".into(),
+        columns: vec!["Part".into()],
+        rows: vec![vec!["X".into()]; per_page + 1],
+        at_page: Some("p2".into()),
+        ..Default::default()
+    };
+    let wires = wc_report::Table {
+        title: "Wire list".into(),
+        columns: vec!["Wire".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts, wires],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 6, "contents, 1, two sheets for 2, 3, the wire list");
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    let order = [
+        "R1 Table of contents",
+        "1 Mains",
+        "2 Parts list (1/2)",
+        "2 Parts list (2/2)",
+        "3 Control",
+        "R2 Wire list",
+    ];
+    for w in order.windows(2) {
+        assert!(at(w[0]) < at(w[1]), "{} before {}", w[0], w[1]);
+    }
+    assert!(at("R2 Wire list") < usize::MAX);
+    // The bookmarks name the page by its own title; the sheet's heading stays the table's.
+    assert_eq!(at("2 Bill of materials (1/2)"), usize::MAX);
+    // The contents rows jump to pages 2, 3 and 5 of the document (page objects 6 + 3i).
+    for dest in ["/Dest [9 0 R /Fit]", "/Dest [12 0 R /Fit]", "/Dest [18 0 R /Fit]"] {
+        assert!(text.contains(dest), "{dest}");
+    }
+
+    // A PDF that leaves the report page out leaves its report out too.
+    let opts = Options {
+        pages: vec!["p1".into(), "p3".into()],
+        ..opts
+    };
+    let (_, report) = export(&project, &BTreeMap::new(), &opts);
+    assert_eq!(report.pages, 4, "contents, 1, 3, the wire list");
+}
+
 #[test]
 fn table_of_contents_lists_the_sheets_after_the_schematic_pages() {
     let mut project = Project::new("x");

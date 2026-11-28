@@ -1291,6 +1291,19 @@ enum PageCmd {
         #[arg(long)]
         off: bool,
     },
+    /// Make a page a report page: the PDF prints the report there, in the page's place among
+    /// the pages, instead of after them (`parts`, `terminals`, ... as `pdf --report` names
+    /// them). With `--off` a normal page again. A page with symbols or wires is refused.
+    Report {
+        /// The page's id or number.
+        id: String,
+        /// The report it holds.
+        #[arg(required_unless_present = "off")]
+        report: Option<String>,
+        /// Make it a normal page again.
+        #[arg(long, conflicts_with = "report")]
+        off: bool,
+    },
     /// Mark a page as an overview (line diagram), or with `--off` as a normal page again.
     Overview {
         /// The page's id or number.
@@ -3316,6 +3329,11 @@ fn run(mut cli: Cli) -> Res<()> {
                             .filter(|(on, _)| *on)
                             .map(|(_, label)| *label)
                             .collect::<String>()
+                                + &pg
+                                    .report
+                                    .as_deref()
+                                    .map(|r| format!(", report {}", escape_field(r)))
+                                    .unwrap_or_default()
                         );
                     }
                     return Ok(());
@@ -3379,6 +3397,38 @@ fn run(mut cli: Cli) -> Res<()> {
                             ));
                         }
                         page.graphic = !off;
+                    }
+                }
+                PageCmd::Report { id, report, off } => {
+                    let i = page_index(&p, &id)?;
+                    let report = match report.as_deref().map(str::trim) {
+                        _ if off => None,
+                        Some(name) => match wc_report::Kind::parse(&name.to_ascii_lowercase()) {
+                            Some(k) => Some(k.name().to_owned()),
+                            None => {
+                                return Err(format!(
+                                    "unknown report {name:?}: use contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations or networks"
+                                ));
+                            }
+                        },
+                        None => None,
+                    };
+                    if let Some(page) = p.pages.get_mut(i) {
+                        if report.is_some() && (!page.symbols.is_empty() || !page.wires.is_empty()) {
+                            return Err(format!(
+                                "page {:?} has {} symbol(s) and {} wire(s); a report page prints its report instead, so move or remove them first",
+                                escape_field(&page.id),
+                                page.symbols.len(),
+                                page.wires.len()
+                            ));
+                        }
+                        if report.is_some() && page.cover {
+                            return Err(format!(
+                                "page {:?} is the cover page; it cannot be a report page",
+                                escape_field(&page.id)
+                            ));
+                        }
+                        page.report = report;
                     }
                 }
                 PageCmd::Overview { id, off } => {
@@ -4438,6 +4488,22 @@ fn run(mut cli: Cli) -> Res<()> {
                     _ => true,
                 })
                 .collect();
+            // Report pages print their reports in their place among the pages, whatever
+            // `--report` says, and those reports are not printed again after the pages.
+            let on_pages = wc_report::report_page_kinds(&p);
+            let (mut tables, unknown) = wc_report::report_page_tables(&inputs);
+            for u in unknown {
+                eprintln!(
+                    "warning: {} names no report; it prints as an empty page",
+                    escape_field(&u)
+                );
+            }
+            let mut kinds = kinds;
+            for k in &on_pages {
+                if !kinds.contains(k) {
+                    kinds.push(*k);
+                }
+            }
             warn_levels(&p, &kinds);
             // The network list is followed by a topology page per network.
             let networks = if kinds.contains(&wc_report::Kind::Networks) {
@@ -4451,7 +4517,12 @@ fn run(mut cli: Cli) -> Res<()> {
             } else {
                 Vec::new()
             };
-            let tables = kinds.into_iter().map(|k| wc_report::build(k, &inputs)).collect();
+            tables.extend(
+                kinds
+                    .into_iter()
+                    .filter(|k| !on_pages.contains(k))
+                    .map(|k| wc_report::build(k, &inputs)),
+            );
             let pictures = wc_pdf::read_pictures(dir, &p);
             let (bytes, report) = wc_pdf::export(
                 &p,
