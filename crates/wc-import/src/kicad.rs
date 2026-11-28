@@ -457,6 +457,13 @@ fn convert(
                             .filter(|v| !v.is_empty() && *v != "~")
                     };
                     let pin_name = text("number").or_else(|| text("name")).unwrap_or("").to_owned();
+                    // A numbered pin's name ("IN1", "~{RESET}") is what the maker calls the
+                    // connection point: it becomes the pin's description (#1873).
+                    let description = text("number")
+                        .and(text("name"))
+                        .map(without_overbar)
+                        .filter(|d| !d.is_empty() && *d != pin_name)
+                        .unwrap_or_default();
                     if g.items().iter().any(|i| i.atom() == Some("hide"))
                         || g.first("hide").and_then(|h| h.arg(1)) == Some("yes")
                     {
@@ -478,7 +485,7 @@ fn convert(
                         name: pin_name,
                         at: tip,
                         dir,
-                        ..Default::default()
+                        description,
                     });
                 }
                 // KiCad 7+: a text with an optional border, `at` its top-left corner. Its lines
@@ -588,6 +595,24 @@ fn convert(
 /// the pin's shape, the word after its type: `inverted` draws a circle at the body end (radius
 /// half the pin number's text size), `clock` a triangle into the body (half the pin name's
 /// size), `inverted_clock` both. Other shapes draw the plain line.
+/// A KiCad pin name without its overbar markup: `~{RESET}` reads `RESET`, the rest stays.
+fn without_overbar(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    let mut open = 0usize;
+    while let Some(c) = chars.next() {
+        match c {
+            '~' if chars.peek() == Some(&'{') => {
+                chars.next();
+                open += 1;
+            }
+            '}' if open > 0 => open -= 1,
+            _ => out.push(c),
+        }
+    }
+    out.trim().to_owned()
+}
+
 fn pin_shapes(pin: &Sexp, tip: Point, inward: Point, length: f64, scale: f64) -> Vec<Shape> {
     let font = |head: &str| {
         pin.first(head)
@@ -1293,6 +1318,39 @@ mod tests {
             "{warnings:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_numbered_pins_name_becomes_its_description() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "U" (property "Reference" "U" (at 0 0 0))
+    (symbol "U_1_1"
+      (pin input line (at 0 0 0) (length 1) (name "IN1") (number "1"))
+      (pin input line (at 0 5 0) (length 1) (name "~{RESET}") (number "2"))
+      (pin passive line (at 0 10 0) (length 1) (name "3") (number "3"))
+      (pin passive line (at 0 15 0) (length 1) (name "~") (number "4"))
+      (pin passive line (at 0 20 0) (length 1) (name "OUT") (number "~")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let pins: Vec<(&str, &str)> = syms[0]
+            .symbol
+            .pins
+            .iter()
+            .map(|p| (p.name.as_str(), p.description.as_str()))
+            .collect();
+        // A name equal to the number, a blank name and an unnumbered pin (named by its name)
+        // give no description.
+        assert_eq!(pins, [("1", "IN1"), ("2", "RESET"), ("3", ""), ("4", ""), ("OUT", "")]);
+        Ok(())
+    }
+
+    #[test]
+    fn overbar_markup_is_left_out_of_a_pin_name() {
+        assert_eq!(without_overbar("~{RESET}"), "RESET");
+        assert_eq!(without_overbar("~{CS}/~{WR}"), "CS/WR");
+        assert_eq!(without_overbar("A~B"), "A~B");
+        assert_eq!(without_overbar("{x}"), "{x}");
+        assert_eq!(without_overbar(" ~{} "), "");
     }
 
     #[test]

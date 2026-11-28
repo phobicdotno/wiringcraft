@@ -30,6 +30,12 @@ pub fn diff_symbols(old: &Symbol, new: &Symbol) -> Vec<String> {
         if n.dir != p.dir {
             out.push(format!("pin {} turned {:?} -> {:?}", p.name, p.dir, n.dir));
         }
+        if n.description != p.description {
+            out.push(format!(
+                "pin {} description: {:?} -> {:?}",
+                p.name, p.description, n.description
+            ));
+        }
     }
     for p in &new.pins {
         if old.pin(&p.name).is_none() {
@@ -199,6 +205,22 @@ mod tests {
         let mut new = coil();
         new.pins[1].at = Point::new(0.0, 15.0);
         assert_eq!(diff_symbols(&coil(), &new), vec!["pin A2 moved (0, 10) -> (0, 15)"]);
+    }
+
+    #[test]
+    fn a_changed_pin_description_gets_its_line() {
+        let mut new = coil();
+        new.pins[0].description = "Coil +".into();
+        assert_eq!(
+            diff_symbols(&coil(), &new),
+            vec![r#"pin A1 description: "" -> "Coil +""#]
+        );
+        let old = new.clone();
+        new.pins[0].description = "Coil -".into();
+        assert_eq!(
+            diff_symbols(&old, &new),
+            vec![r#"pin A1 description: "Coil +" -> "Coil -""#]
+        );
     }
 
     #[test]
