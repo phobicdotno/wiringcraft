@@ -210,9 +210,11 @@ enum Dialog {
         log: String,
         include: bool,
     },
-    /// Name and description for a macro made from the copied selection.
+    /// Name and description for a macro made from the copied selection, or from the whole
+    /// page `page` (Page > Save page as macro).
     SaveMacro {
         clip: edit::Clipboard,
+        page: Option<usize>,
         name: String,
         description: String,
         error: Option<String>,
@@ -2264,12 +2266,26 @@ impl App {
                 if !clip.is_empty() {
                     self.dialog = Some(Dialog::SaveMacro {
                         clip,
+                        page: None,
                         name: String::new(),
                         description: String::new(),
                         error: None,
                     });
                 }
             }
+            // Everything on the page, kept where it is: the dialog counts what it holds.
+            Action::SavePageMacro => match open.page_macro(page, "", "") {
+                Ok(m) => {
+                    self.dialog = Some(Dialog::SaveMacro {
+                        clip: m.into(),
+                        page: Some(page),
+                        name: String::new(),
+                        description: String::new(),
+                        error: None,
+                    })
+                }
+                Err(e) => self.ed.message = e,
+            },
             Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.pending = Some(Pending::Export(Export::Drawings)),
             a if imports::Kind::of(a).is_some() => {
@@ -2600,6 +2616,7 @@ impl App {
             Dialog::ChangedOutside(_) => "Save",
             Dialog::Unsaved(_) => "Unsaved changes",
             Dialog::Fetching(_) => "New project",
+            Dialog::SaveMacro { page: Some(_), .. } => "Save page as macro",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
             Dialog::MacroEdit { .. } => "Macro placeholders",
@@ -2640,6 +2657,7 @@ impl App {
             .show(ctx, |ui| match &mut dialog {
                 Dialog::SaveMacro {
                     clip,
+                    page,
                     name,
                     description,
                     error,
@@ -2680,7 +2698,11 @@ impl App {
                             && !name.trim().is_empty()
                             && let Some(open) = &mut self.open
                         {
-                            match open.save_macro(clip, name, description) {
+                            let saved = match page {
+                                Some(i) => open.save_page_macro(*i, name, description),
+                                None => open.save_macro(clip, name, description),
+                            };
+                            match saved {
                                 Ok(path) => {
                                     self.ed.message = format!("Saved macro {}", path.display());
                                     keep = false;
@@ -9096,6 +9118,7 @@ mod nudge_tests {
             },
             || Dialog::SaveMacro {
                 clip: Default::default(),
+                page: None,
                 name: "M".into(),
                 description: String::new(),
                 error: None,
@@ -9135,6 +9158,7 @@ mod nudge_tests {
             },
             || Dialog::SaveMacro {
                 clip: Default::default(),
+                page: None,
                 name: "M".into(),
                 description: String::new(),
                 error: None,
@@ -9200,6 +9224,7 @@ mod nudge_tests {
             assert!(!clip.is_empty());
             app.dialog = Some(Dialog::SaveMacro {
                 clip,
+                page: None,
                 name: name.into(),
                 description: String::new(),
                 error: None,
@@ -11117,6 +11142,41 @@ mod menu_action_tests {
         a.ed.menu_action = Some(Action::Undo);
         a.run_menu_action();
         assert_eq!(a.ed.page, 1);
+    }
+
+    /// Page > Save page as macro saves the whole page, kept where it is (#1912); an empty page
+    /// says why nothing opens.
+    #[test]
+    fn save_page_as_macro_saves_every_item_on_the_page() {
+        let (_tmp, mut a, id) = app();
+        a.ed.selection.clear();
+        a.ed.page = 0;
+        a.ed.menu_action = Some(Action::SavePageMacro);
+        a.run_menu_action();
+        let shown = match &a.dialog {
+            Some(Dialog::SaveMacro { clip, page, .. }) => Some((clip.symbols.len(), *page)),
+            _ => None,
+        };
+        assert_eq!(shown, Some((1, Some(0))), "{}", a.ed.message);
+        let path = a.open.as_mut().unwrap().save_page_macro(0, "Whole page", "").unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.anchor, wc_core::Point::new(0.0, 0.0));
+        let open = a.open.as_ref().unwrap();
+        let on_page = open.project.pages[0].symbols.iter().find(|s| s.id == id).unwrap().at;
+        assert_eq!(m.symbols[0].at, on_page);
+        assert!(a.open.as_mut().unwrap().save_page_macro(0, "  ", "").is_err());
+        // A page with nothing on it opens no dialog and says why.
+        a.dialog = None;
+        a.ed.menu_action = Some(Action::AddPage);
+        a.run_menu_action();
+        a.ed.menu_action = Some(Action::SavePageMacro);
+        a.run_menu_action();
+        assert!(a.dialog.is_none());
+        assert!(
+            a.ed.message.contains("has no symbols, wires or drawings"),
+            "{}",
+            a.ed.message
+        );
     }
 
     #[test]

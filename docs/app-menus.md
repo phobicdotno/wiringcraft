@@ -82,6 +82,7 @@ the schematic behind it.
 - **Cover page**: open the cover page and edit the project's name and fields; they show on the cover and every title block.
 - **Page template**: edit the frame's reference columns and the title block's boxes, shared by every page.
 - **Duplicate page**: copy this page; its devices get the next free tags.
+- **Save page as macro**: save everything on this page as a project macro, kept where it is: Insert > Macro places it at the page's top-left corner, so each item lands where it was, with the next free tags. The `{{placeholders}}` its texts use are declared, as `wiringcraft macro save` does.
 - **Page properties**: edit this page's number, title, sheet size, page type and its own title-block values. The page type is schematic, line diagram, graphic, or a report page (Report: Parts list, ...), where the PDF prints that report among the pages ([report pages](pdf-output.md#report-pages)); the canvas shows which report it holds.
 - **Renumber pages**: number the pages again in their order, with a prefix (such as `=A1/`), a first number and a step, optionally only from the page shown on. New numbers that would change the page order or repeat a kept number are refused. One undo step, like `wiringcraft page renumber`.
 - ---

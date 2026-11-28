@@ -4135,6 +4135,26 @@ impl Open {
         Ok(path)
     }
 
+    /// A macro of everything on page `page` ([`wc_core::macros::from_page`]), anchored at its
+    /// top-left corner so it places each item where it is.
+    pub fn page_macro(&self, page: usize, name: &str, description: &str) -> Result<wc_core::macros::Macro, String> {
+        let id = &self.project.pages.get(page).ok_or("No such page.")?.id;
+        wc_core::macros::from_page(&self.project, id, name, description).map_err(|e| e.to_string())
+    }
+
+    /// Page > Save page as macro: [`Open::page_macro`] saved in the project's macros folder,
+    /// as [`Open::save_macro`] saves a selection's.
+    pub fn save_page_macro(&mut self, page: usize, name: &str, description: &str) -> Result<PathBuf, String> {
+        if name.trim().is_empty() {
+            return Err("Give the macro a name.".into());
+        }
+        let m = self.page_macro(page, name, description)?;
+        let id = wc_core::macros::macro_id(name);
+        let path = wc_core::macros::write_macro(&self.dir, &id, &m).map_err(|e| e.to_string())?;
+        self.written_on_purpose(&path);
+        Ok(path)
+    }
+
     /// Why a project macro's placeholders and value sets are not saved in a shared session: its
     /// Undo and Redo go through the session's history, which does not hold project files.
     pub(crate) const MACRO_SAVE_SHARED: &str = "Macros are not edited in a shared session: the session's Undo \
