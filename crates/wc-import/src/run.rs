@@ -1815,13 +1815,58 @@ pub fn wired_pins_lost(p: &Project, symbol: &wc_core::Symbol) -> Vec<String> {
 }
 
 /// Put each file back as it was ([`put_file_back`]), the last written first. Returns why each
-/// one that could not be put back failed.
+/// one that could not be put back failed. The bytes of a file that could not be put back are
+/// kept next to it ([`keep_before`]), and the reason names where (#1889).
 pub fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
     files
         .iter()
         .rev()
-        .filter_map(|(path, before)| put_file_back(path, before.as_deref()).err())
+        .filter_map(|(path, before)| {
+            let err = put_file_back(path, before.as_deref()).err()?;
+            let Some(bytes) = before else { return Some(err) };
+            Some(match keep_before(path, bytes) {
+                Ok(kept) => format!("{err}; its content from before is kept in {}", kept.display()),
+                Err(x) => format!("{err}; keeping its content from before failed too: {x}"),
+            })
+        })
         .collect()
+}
+
+/// Write `bytes` to a new file next to `path`: `<file>.before`, or `<file>.before-2`, ... when
+/// that name is taken (a file already there is never replaced). On Unix it is readable by its
+/// owner only, as the staging file of [`put_file_back`] is. Gives the file's path.
+pub fn keep_before(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    for n in 1..=100u32 {
+        let mut name = path.as_os_str().to_owned();
+        name.push(if n == 1 {
+            ".before".to_string()
+        } else {
+            format!(".before-{n}")
+        });
+        let kept = PathBuf::from(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = match options.open(&kept) {
+            Ok(file) => file,
+            Err(x) if x.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(x) => return Err(format!("{}: {x}", kept.display())),
+        };
+        return match file.write_all(bytes).and_then(|()| file.sync_all()) {
+            Ok(()) => Ok(kept),
+            Err(x) => {
+                drop(file);
+                let _ = std::fs::remove_file(&kept);
+                Err(format!("{}: {x}", kept.display()))
+            }
+        };
+    }
+    Err(format!(
+        "{}: no free name to keep its content from before",
+        path.display()
+    ))
 }
 
 /// Add an import to `p` (not saved yet), giving the vendored files it wrote and how many
@@ -2255,6 +2300,37 @@ mod tests {
         );
         // A file that is not there is an error of its own, not a refusal.
         assert!(read_dwg(&t.path().join("missing.dwg"), limit).is_err());
+    }
+
+    /// A file that cannot be put back keeps its bytes from before next to it, under a name not
+    /// taken yet, and the reason names that file (#1889).
+    #[test]
+    fn a_file_that_cannot_be_put_back_keeps_its_content_from_before() {
+        let t = tmp();
+        let path = t.path().join("p1.page.json");
+        // A folder where the file was: putting the file back cannot replace it.
+        assert!(std::fs::create_dir(&path).is_ok());
+        assert!(std::fs::write(t.path().join("p1.page.json.before"), "older").is_ok());
+        let failed = put_files_back(&[(path.clone(), Some(b"before".to_vec()))]);
+        let kept = t.path().join("p1.page.json.before-2");
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].ends_with(&format!("; its content from before is kept in {}", kept.display())),
+            "{failed:?}"
+        );
+        assert_eq!(std::fs::read(&kept).ok().as_deref(), Some(&b"before"[..]));
+        // The name already taken is left as it was.
+        assert_eq!(
+            std::fs::read(t.path().join("p1.page.json.before")).ok().as_deref(),
+            Some(&b"older"[..])
+        );
+        // A file that was not there before has nothing to keep.
+        let new = t.path().join("p2.page.json");
+        assert!(std::fs::create_dir(&new).is_ok());
+        assert!(std::fs::write(new.join("x"), "x").is_ok());
+        let failed = put_files_back(&[(new.clone(), None)]);
+        assert_eq!(failed.len(), 1);
+        assert!(!failed[0].contains("before"), "{failed:?}");
     }
 
     /// A file put back keeps the permissions it has, not the default ones of a new file (#664).
