@@ -4510,6 +4510,19 @@ impl Open {
         locations: Option<&[(String, String)]>,
         revisions: Option<&[RevisionRow]>,
     ) -> Result<(), String> {
+        self.set_project_props_with(name, fields, locations, revisions, None)
+    }
+
+    /// [`Open::set_project_props`], also setting the reports Export PDF prints when
+    /// `pdf_reports` is given (its `None` leaves the choice to the export: every report).
+    pub fn set_project_props_with(
+        &mut self,
+        name: &str,
+        fields: &[(String, String)],
+        locations: Option<&[(String, String)]>,
+        revisions: Option<&[RevisionRow]>,
+        pdf_reports: Option<Option<Vec<String>>>,
+    ) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("The project name cannot be empty.".into());
@@ -4525,6 +4538,9 @@ impl Open {
         }
         if let Some(revisions) = revisions {
             meta.revisions = revisions;
+        }
+        if let Some(pdf_reports) = pdf_reports {
+            meta.pdf_reports = pdf_reports;
         }
         if meta == self.project.meta {
             return Ok(());

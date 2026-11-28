@@ -92,7 +92,8 @@ Writes the schematic pages to one PDF, followed by the panel layouts (`wiringcra
 - `--date`: the date for the title block where neither the page nor the project sets one. It is
   printed as given.
 - `--report`: append report pages. Repeat it for more than one report, or give `all`. The kinds
-  are those of `report`.
+  are those of `report`. Without `--report` the project's own choice is printed (see
+  `pdf-reports` below), if it has one. `--report none` prints no report.
 - `--lang`: print the project's texts in a language from `translations.toml` (`nb`), or in two
   (`nb,en`, each text with the second language after it). Texts without a translation are
   printed as drawn and listed as warnings.
@@ -102,6 +103,28 @@ wiringcraft pdf pump-station.pdf --date 2026-11-27 --report all
 wiringcraft pdf control.pdf --page p0003
 wiringcraft pdf lists.pdf --page p0002 --page p0003 --report parts --report terminals
 wiringcraft pdf pump-nb.pdf --lang nb
+```
+
+## pdf-reports
+
+```
+wiringcraft pdf-reports [<kind>...] [--clear]
+```
+
+The report pages `pdf` prints when no `--report` is given, kept as `pdf_reports` in
+`project.toml`. File → Export PDF in the app prints the same choice, and Project properties sets
+it there under "Reports in the PDF".
+
+- No argument: print the choice, or say that there is none.
+- Kinds (those of `report`, `all`, or `none` for no report): replace the choice. Each is checked
+  first; a wrong name changes nothing.
+- `--clear`: remove the choice, so `pdf` prints only the reports it is asked for and the app
+  prints every report that has rows.
+
+```
+wiringcraft pdf-reports contents parts terminals
+wiringcraft pdf drawings.pdf
+# the same as --report contents --report parts --report terminals
 ```
 
 ## drawing

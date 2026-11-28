@@ -17,7 +17,7 @@ shown highlighted. Hover over an item to see a longer note on what it does.
 - **Save**: save all changed pages.
 - **Save as**: save the project as a copy in a new folder and go on working in the copy.
 - ---
-- **Project properties**: edit the project's name, title-block fields, locations and revisions.
+- **Project properties**: edit the project's name, title-block fields, locations and revisions, and choose the reports Export PDF prints (every report that has rows unless a choice is made).
 - **Translations**: translate the project's texts into other languages (`translations.toml`).
 - ---
 - **Check**: check the project for problems such as devices drawn twice, contacts without a coil, shorts and open pins.
