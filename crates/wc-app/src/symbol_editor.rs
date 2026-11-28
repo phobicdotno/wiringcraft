@@ -874,6 +874,8 @@ impl SymbolEditor {
         self.symbol.id = self.symbol.id.trim().to_owned();
         for p in &mut self.symbol.pins {
             p.name = p.name.trim().to_owned();
+            // Only spaces is no description: the pin is saved without one.
+            p.description = p.description.trim().to_owned();
         }
         let id = self.symbol.id.clone();
         let file = root.join("symbols").join(format!("{id}.json"));
@@ -1080,6 +1082,7 @@ impl SymbolEditor {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut pin.name);
             });
+            pin_description(ui, pin);
             ui.horizontal(|ui| {
                 ui.label("Wire leaves");
                 for (d, l) in [
@@ -1250,6 +1253,16 @@ impl SymbolEditor {
 }
 
 /// The properties box of the selected shape: what can be changed after drawing it.
+/// The selected pin's description field, e.g. `Coil +`; returns the field's response.
+fn pin_description(ui: &mut egui::Ui, pin: &mut Pin) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.label("Description");
+        ui.text_edit_singleline(&mut pin.description)
+            .on_hover_text("What the connection point is, e.g. Coil +; shown next to its name in the app")
+    })
+    .inner
+}
+
 fn shape_properties(ui: &mut egui::Ui, shape: &mut Shape) {
     fn mm(v: &mut f64, min: f64) -> egui::DragValue<'_> {
         egui::DragValue::new(v)
@@ -1611,6 +1624,72 @@ mod tests {
         let mut dup = SymbolEditor::new(vec![("mine".into(), lib)]);
         draw_coil(&mut dup);
         assert!(dup.save().is_err_and(|m| m.contains("already has")));
+        Ok(())
+    }
+
+    /// A pin's description is typed in its field, saved with the symbol and read back when the
+    /// symbol is opened again; cleared, it is left out of the file (#1875).
+    #[test]
+    fn a_pin_description_is_typed_saved_and_left_out_when_empty() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let lib = tmp.path().join("lib");
+        let mut e = SymbolEditor::new(vec![("mine".into(), lib.clone())]);
+        draw_coil(&mut e);
+        e.save()?;
+        let file = lib.join("symbols").join("test.coil.json");
+        assert!(!std::fs::read_to_string(&file)?.contains("\"description\""));
+
+        // Click into the first pin's description field and type.
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let mut field = egui::Rect::NOTHING;
+        let mut frame = |events: Vec<egui::Event>, pin: &mut Pin| {
+            t += 0.05;
+            let raw = egui::RawInput {
+                events,
+                time: Some(t),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    field = pin_description(ui, pin).rect;
+                });
+            });
+            field.center()
+        };
+        let Some(pin) = e.symbol.pins.get_mut(0) else {
+            unreachable!("the coil has two pins");
+        };
+        let at = frame(vec![], pin);
+        frame(vec![egui::Event::PointerMoved(at)], pin);
+        frame(vec![press(at, true)], pin);
+        frame(vec![press(at, false)], pin);
+        frame(vec![egui::Event::Text(" Coil + ".into())], pin);
+        assert_eq!(pin.description, " Coil + ");
+
+        let saved = e.save()?;
+        let descriptions: Vec<&str> = saved.symbol.pins.iter().map(|p| p.description.as_str()).collect();
+        assert_eq!(descriptions, ["Coil +", ""], "trimmed when saved");
+        let text = std::fs::read_to_string(&file)?;
+        assert_eq!(text.matches("\"description\": \"Coil +\"").count(), 1, "{text}");
+        assert_eq!(
+            text.matches("\"description\"").count(),
+            1,
+            "the other pin has none: {text}"
+        );
+
+        // Opened again, the field shows it; only spaces is saved as no description.
+        let back: Symbol = serde_json::from_str(&text)?;
+        let mut again = SymbolEditor::edit("test.coil", back, "mine", vec![("mine".into(), lib)]);
+        assert_eq!(
+            again.symbol.pins.first().map(|p| p.description.as_str()),
+            Some("Coil +")
+        );
+        if let Some(pin) = again.symbol.pins.get_mut(0) {
+            pin.description = "   ".into();
+        }
+        again.save()?;
+        assert!(!std::fs::read_to_string(&file)?.contains("\"description\""));
         Ok(())
     }
 
