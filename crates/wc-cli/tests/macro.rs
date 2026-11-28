@@ -792,6 +792,24 @@ VALVE;;7
         ruled("type=valve:valve")?,
         "p0007\n2 copies: 1 of Motor starter, 1 of Valve on 1 page\n"
     );
+    // Of two --rule options a row matches, the first given wins: the starter has no "bar".
+    let valves = tmp.path().join("valves.csv");
+    std::fs::write(&valves, "type;bar\nvalve;6\n")?;
+    let out = wiringcraft(
+        &dir,
+        &[
+            "macro",
+            "generate",
+            "starter",
+            "--table",
+            valves.to_str().ok_or("path")?,
+            "--rule",
+            "type=valve:valve",
+            "--rule",
+            "type=valve:starter",
+        ],
+    )?;
+    assert!(out.starts_with("p0008\n") && out.contains("Valve"), "{out}");
     let Err(err) = ruled("kind=valve:valve") else {
         return Err("a rule on a missing column was taken".into());
     };
@@ -800,7 +818,7 @@ VALVE;;7
         return Err("a rule without a value was taken".into());
     };
     assert!(err.contains("write it as column=value:macro"), "{err}");
-    assert_eq!(wc_core::store::load(&dir)?.pages.len(), p.pages.len() + 1);
+    assert_eq!(wc_core::store::load(&dir)?.pages.len(), p.pages.len() + 2);
     Ok(())
 }
 
