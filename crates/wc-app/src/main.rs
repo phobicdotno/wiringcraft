@@ -10027,6 +10027,43 @@ mod nudge_tests {
         // The dialog itself draws.
         app_frame(&mut app, &ctx, Vec::new(), false);
         assert!(matches!(app.dialog, Some(Dialog::RenumberPages { .. })));
+
+        // Through the dialog's OK: a refusal keeps the dialog with its draft and the reason.
+        app.ed.page = 1;
+        app.run(Action::RenumberPages);
+        if let Some(Dialog::RenumberPages { prefix, .. }) = &mut app.dialog {
+            *prefix = "A1".into();
+        }
+        click_button(&mut app, &ctx, "OK");
+        match &app.dialog {
+            Some(Dialog::RenumberPages { prefix, error, .. }) => {
+                assert_eq!(prefix, "A1");
+                assert!(
+                    error.as_deref().is_some_and(|e| e.contains("ends in a digit")),
+                    "{error:?}"
+                );
+            }
+            _ => unreachable!("a refused numbering keeps the dialog open"),
+        }
+        assert_eq!(app.open.as_ref().unwrap().project, before);
+        // Only from the page shown on: the pages before keep their numbers, and the page shown
+        // stays shown.
+        if let Some(Dialog::RenumberPages {
+            prefix, from, shown, ..
+        }) = &mut app.dialog
+        {
+            *prefix = "=B/".into();
+            *from = shown.as_ref().map(|s| s.0.clone());
+        }
+        let shown = app.open.as_ref().unwrap().project.pages[1].id.clone();
+        click_button(&mut app, &ctx, "OK");
+        assert!(app.dialog.is_none(), "OK closes the dialog");
+        let o = app.open.as_ref().unwrap();
+        assert_eq!(o.project.pages[0].number, before.pages[0].number);
+        let want: Vec<String> = (1..n).map(|k| format!("=B/{k}")).collect();
+        let numbers: Vec<String> = o.project.pages[1..].iter().map(|p| p.number.clone()).collect();
+        assert_eq!(numbers, want);
+        assert_eq!(o.project.pages[app.ed.page].id, shown);
     }
 
     /// Project properties' report choice: Export PDF prints those reports in their order,
