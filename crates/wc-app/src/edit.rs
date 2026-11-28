@@ -1502,6 +1502,19 @@ mod tests {
         );
         assert!(o.undo());
         assert_eq!(o.project, before, "one undo step takes it all back");
+
+        // A page column titles the new pages, a new title starting a page.
+        std::fs::write(&table, "what;page\nPump 1;Pumps\nPump 2;\nFan;Fans\n").unwrap();
+        let done = o.generate_from_table(page, &path, &table, None).unwrap();
+        let made: Vec<(&str, usize)> = done
+            .pages
+            .iter()
+            .map(|id| o.project.page(id).unwrap())
+            .map(|p| (p.title.as_str(), p.symbols.len()))
+            .collect();
+        assert_eq!(made, [("Pumps", 4), ("Fans", 2)]);
+        assert!(o.undo());
+        assert_eq!(o.project, before);
     }
 
     /// The table's path is shown escaped, as `macro generate` shows it (#1865). Unix only: a

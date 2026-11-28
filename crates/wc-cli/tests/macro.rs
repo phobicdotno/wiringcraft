@@ -673,6 +673,39 @@ fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
     assert!(ys.windows(2).all(|w| w[0] == w[1]), "{ys:?}");
     assert!(xs.iter().chain(&ys).all(|v| v % 5.0 == 0.0), "{xs:?} {ys:?}");
     assert!(p.lock.symbols.contains_key("wc.coil"));
+
+    // A page column titles the pages: a change of title starts a new page, an empty cell
+    // stays on the page before.
+    let areas = tmp.path().join("areas.csv");
+    std::fs::write(
+        &areas,
+        "kW;Page
+1;Pumps
+2;
+3;Fans
+4;Pumps
+",
+    )?;
+    let out = wiringcraft(
+        &dir,
+        &[
+            "macro",
+            "generate",
+            "starter",
+            "--table",
+            areas.to_str().ok_or("path")?,
+            "--set",
+            "3 kW",
+        ],
+    )?;
+    assert_eq!(out, "p0003 p0004 p0005\n4 copies of Motor starter on 3 pages\n");
+    let p = wc_core::store::load(&dir)?;
+    let made: Vec<(&str, &str, usize)> = ["p0003", "p0004", "p0005"]
+        .iter()
+        .filter_map(|id| p.page(id))
+        .map(|page| (page.number.as_str(), page.title.as_str(), page.symbols.len()))
+        .collect();
+    assert_eq!(made, [("4", "Pumps", 2), ("5", "Fans", 1), ("6", "Pumps", 1)]);
     Ok(())
 }
 

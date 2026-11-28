@@ -3867,7 +3867,7 @@ fn run(mut cli: Cli) -> Res<()> {
                         Some(bytes) => bytes,
                         None => run::read_file(&table)?,
                     };
-                    let copies = run::macro_table_copies(&m, &bytes, &table.display().to_string(), set.as_deref())?;
+                    let (copies, pages) = run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref())?;
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
@@ -3876,7 +3876,7 @@ fn run(mut cli: Cli) -> Res<()> {
                         .map_err(|x| vendored.undo(x))?;
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let symbol = |id: &str| store::read_vendored_symbol(dir, id).ok();
-                    let generated = wc_core::generate::generate(&mut p, &copies, symbol, size, &title)
+                    let generated = wc_core::generate::generate_titled(&mut p, &copies, &pages, symbol, size, &title)
                         .map_err(|x| vendored.undo(e(x)))?;
                     // A save that fails half way puts the project's files back, so a second run
                     // does not place the rows already written again.
