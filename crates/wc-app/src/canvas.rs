@@ -2798,6 +2798,26 @@ fn place_tool(
     }
 }
 
+/// Where the label of the pin at `at` goes, `size` its text: up and right of the pin, or to its
+/// left or below where that would leave the canvas `clip`, and kept inside it (#1906).
+fn pin_label_rect(at: Pos2, size: Vec2, clip: Rect) -> Rect {
+    let full = size + Vec2::splat(6.0);
+    let x = if at.x + 8.0 + full.x > clip.max.x {
+        at.x - 8.0 - full.x
+    } else {
+        at.x + 8.0
+    };
+    let y = if at.y - 8.0 - full.y < clip.min.y {
+        at.y + 8.0
+    } else {
+        at.y - 8.0 - full.y
+    };
+    // A canvas smaller than the label shows its start.
+    let x = x.min(clip.max.x - full.x).max(clip.min.x);
+    let y = y.min(clip.max.y - full.y).max(clip.min.y);
+    Rect::from_min_size(Pos2::new(x, y), full)
+}
+
 /// How the wire tool names the pin under the pointer: `-K1:A1  Coil +`, the device tag (or
 /// the item id of an untagged symbol) and designation, then the pin's description when its
 /// symbol gives one.
@@ -2841,9 +2861,7 @@ fn wire_tool(
             let label = pin_hover_label(open, page, item, pin);
             let font = FontId::proportional(12.0);
             let galley = painter.layout_no_wrap(label, font, t.text);
-            let rect = Align2::LEFT_BOTTOM
-                .anchor_size(at + Vec2::new(8.0, -8.0), galley.size())
-                .expand(3.0);
+            let rect = pin_label_rect(at, galley.size(), painter.clip_rect());
             painter.rect_filled(rect, 3.0, t.surface);
             painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Inside);
             painter.galley(rect.min + Vec2::splat(3.0), galley, t.text);
@@ -4961,6 +4979,28 @@ mod tests {
             .map(|(text, _)| text)
             .collect();
         assert!(texts.iter().all(|t| !t.starts_with("-K1:")), "{texts:?}");
+    }
+
+    /// The pin label goes left of or below a pin near the canvas's right or top edge, and
+    /// always stays inside the canvas (#1906).
+    #[test]
+    fn a_pin_label_near_an_edge_stays_on_the_canvas() {
+        let clip = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let size = Vec2::new(80.0, 14.0);
+        let inside = |r: Rect| clip.contains_rect(r);
+        // Room up and right: there.
+        let r = pin_label_rect(egui::pos2(100.0, 100.0), size, clip);
+        assert!(inside(r) && r.min.x > 100.0 && r.max.y < 100.0, "{r:?}");
+        // Near the right edge: to the left.
+        let r = pin_label_rect(egui::pos2(396.0, 100.0), size, clip);
+        assert!(inside(r) && r.max.x < 396.0, "{r:?}");
+        // Near the top edge: below.
+        let r = pin_label_rect(egui::pos2(100.0, 4.0), size, clip);
+        assert!(inside(r) && r.min.y > 4.0, "{r:?}");
+        // A canvas narrower than the label: its start shows.
+        let narrow = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(50.0, 300.0));
+        let r = pin_label_rect(egui::pos2(25.0, 100.0), size, narrow);
+        assert_eq!(r.min.x, 0.0, "{r:?}");
     }
 
     #[test]
