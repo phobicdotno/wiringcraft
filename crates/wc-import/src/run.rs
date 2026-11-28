@@ -809,16 +809,21 @@ pub fn macro_table_copies(
     name: &str,
     default_set: Option<&str>,
 ) -> Res<Vec<wc_core::macros::Macro>> {
-    macro_table(m, bytes, name, default_set).map(|(copies, _)| copies)
+    macro_table(m, bytes, name, default_set, |other| {
+        Err(format!("no macro {other:?} to pick"))
+    })
+    .map(|(copies, _)| copies)
 }
 
 /// [`macro_table_copies`], with the page title each copy asks for (the table's `page`
-/// column), as [`wc_core::generate::generate_titled`] takes them.
+/// column), as [`wc_core::generate::generate_titled`] takes them. A row of the table's
+/// `macro` column places the macro `find` gives for its name instead of `m`.
 pub fn macro_table(
     m: &wc_core::macros::Macro,
     bytes: &[u8],
     name: &str,
     default_set: Option<&str>,
+    mut find: impl FnMut(&str) -> Res<wc_core::macros::Macro>,
 ) -> Res<(Vec<wc_core::macros::Macro>, Vec<Option<String>>)> {
     let shown = escape_field(name);
     let rows = crate::csv::file_rows(bytes).map_err(|err| format!("{shown}: {err}"))?;
@@ -828,7 +833,10 @@ pub fn macro_table(
         ));
     }
     let rows = wc_core::generate::rows_from_table(m, &rows.cells, &rows.numbers).map_err(e)?;
-    let copies = wc_core::generate::apply_rows(m, &rows, default_set).map_err(e)?;
+    let copies = wc_core::generate::apply_rows_with(m, &rows, default_set, |name| {
+        find(name).map_err(wc_core::Error::Invalid)
+    })
+    .map_err(e)?;
     Ok((copies, wc_core::generate::row_pages(&rows)))
 }
 

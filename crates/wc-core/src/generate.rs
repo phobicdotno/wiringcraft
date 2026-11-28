@@ -5,7 +5,10 @@
 //! ignored) fills it; a column [`SET_COLUMN`] picks the row's value set, unless the macro
 //! declares a placeholder of that name. A column [`PAGE_COLUMN`] (again unless a placeholder
 //! has that name) titles the pages: a row whose page differs from the row before starts a new
-//! page. Any other column is refused, so a typo is not ignored.
+//! page. A column [`MACRO_COLUMN`] (again unless a placeholder has that name) picks another
+//! macro for its row; with it, the other columns may be placeholders of any macro, and a value
+//! for a placeholder the row's macro lacks is refused when the rows are applied. Without it any
+//! other column is refused, so a typo is not ignored.
 //! An empty cell gives no value: the value set's or the default applies.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +24,8 @@ use crate::{Error, Result};
 pub const SET_COLUMN: &str = "set";
 /// The column that names the page a row goes on (its title).
 pub const PAGE_COLUMN: &str = "page";
+/// The column that names the macro a row places, instead of the one the table drives.
+pub const MACRO_COLUMN: &str = "macro";
 /// Distance kept from the page frame, in millimetres.
 pub const INSET: f64 = 10.0;
 /// Distance kept between two copies, in millimetres.
@@ -36,6 +41,8 @@ pub struct TableRow {
     pub set: Option<String>,
     /// The page title from the [`PAGE_COLUMN`]; `None` keeps the row on the page before.
     pub page: Option<String>,
+    /// The macro from the [`MACRO_COLUMN`]; `None` places the macro the table drives.
+    pub r#macro: Option<String>,
     pub values: BTreeMap<String, String>,
 }
 
@@ -45,6 +52,10 @@ enum Column {
     Placeholder(String),
     Set,
     Page,
+    Macro,
+    /// With a [`MACRO_COLUMN`]: a column that is not a placeholder of the macro the table
+    /// drives, perhaps one of a macro a row names.
+    Other(String),
     /// A column without a name: its cells must be empty.
     Unnamed,
 }
@@ -59,6 +70,7 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
         return bad("the table is empty; its first row names the placeholders".into());
     };
     let placeholder = |name: &str| m.placeholders.iter().find(|p| key(&p.name) == key(name));
+    let picks_macros = placeholder(MACRO_COLUMN).is_none() && header.iter().any(|n| key(n.trim()) == MACRO_COLUMN);
     let mut columns = Vec::with_capacity(header.len());
     let mut seen = BTreeSet::new();
     for name in header {
@@ -71,6 +83,10 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
             Column::Set
         } else if key(name) == PAGE_COLUMN {
             Column::Page
+        } else if key(name) == MACRO_COLUMN {
+            Column::Macro
+        } else if picks_macros {
+            Column::Other(name.to_owned())
         } else {
             // Quoted as the column is, so a control character in a name is shown escaped.
             let known: Vec<String> = m.placeholders.iter().map(|p| format!("{:?}", p.name)).collect();
@@ -80,7 +96,7 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
                 format!("it has {}", known.join(", "))
             };
             return bad(format!(
-                "line {}: column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set, a column \"{PAGE_COLUMN}\" the page)",
+                "line {}: column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set, a column \"{PAGE_COLUMN}\" the page, a column \"{MACRO_COLUMN}\" another macro)",
                 line(0)
             ));
         };
@@ -105,9 +121,10 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
                 continue;
             }
             match columns.get(c) {
-                Some(Column::Placeholder(name)) => {
+                Some(Column::Placeholder(name) | Column::Other(name)) => {
                     row.values.insert(name.clone(), value.to_owned());
                 }
+                Some(Column::Macro) => row.r#macro = Some(value.to_owned()),
                 Some(Column::Set) => row.set = Some(value.to_owned()),
                 Some(Column::Page) => row.page = Some(value.to_owned()),
                 Some(Column::Unnamed) | None => {
@@ -131,12 +148,40 @@ pub fn row_pages(rows: &[TableRow]) -> Vec<Option<String>> {
 /// The macro as each row gives it ([`Macro::apply`]), with the row's value set or else
 /// `default_set`. The first row that cannot be applied is an error naming its line.
 pub fn apply_rows(m: &Macro, rows: &[TableRow], default_set: Option<&str>) -> Result<Vec<Macro>> {
-    rows.iter()
-        .map(|row| {
-            m.apply(row.set.as_deref().or(default_set), &row.values)
-                .map_err(|err| Error::Invalid(format!("line {}: {err}", row.line)))
-        })
-        .collect()
+    apply_rows_with(m, rows, default_set, |name| {
+        Err(Error::Invalid(format!("no macro {name:?} to pick")))
+    })
+}
+
+/// [`apply_rows`], with a row's [`MACRO_COLUMN`] naming the macro it places, found by
+/// `find` (each name once; names alike but for case and spaces around them are one). A row
+/// that names no macro places `m`; `default_set` applies to those rows only, as another macro
+/// has value sets of its own. The first row that cannot be applied, or whose macro cannot be
+/// found, is an error naming its line.
+pub fn apply_rows_with(
+    m: &Macro,
+    rows: &[TableRow],
+    default_set: Option<&str>,
+    mut find: impl FnMut(&str) -> Result<Macro>,
+) -> Result<Vec<Macro>> {
+    let mut found: BTreeMap<String, Macro> = BTreeMap::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let at = |err: Error| Error::Invalid(format!("line {}: {err}", row.line));
+        let (picked, set) = match row.r#macro.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(name) => {
+                let k = key(name);
+                if !found.contains_key(&k) {
+                    let other = find(name).map_err(at)?;
+                    found.insert(k.clone(), other);
+                }
+                (&found[&k], row.set.as_deref())
+            }
+            None => (m, row.set.as_deref().or(default_set)),
+        };
+        out.push(picked.apply(set, &row.values).map_err(at)?);
+    }
+    Ok(out)
 }
 
 /// The box round everything the copies draw, so one pitch fits each of them: their symbols
@@ -489,8 +534,8 @@ fn fit((min, max): (Point, Point), anchor: Point, area: (f64, f64)) -> Option<Fi
     (w <= area.0 && h <= area.1).then_some(Fit { dx, dy, w, h })
 }
 
-/// Place each of `copies` (macros already [applied](Macro::apply), all drawing the same group)
-/// on new pages of `size` titled `title`, added after the last page: left to right, then row
+/// Place each of `copies` (macros already [applied](Macro::apply): copies of one macro, or of
+/// several when a table picks them) on new pages of `size` titled `title`, added after the last page: left to right, then row
 /// below row, inside the frame and above the title block, a new page when one is full. The
 /// pitch is the box round all copies ([`extent`], symbols through `symbol`); when that box does
 /// not fit the drawing area but each copy's own box does (copies sticking out on different
@@ -527,10 +572,9 @@ pub fn generate_titled(
     let (x0, y0) = (FRAME_MARGIN + INSET, FRAME_MARGIN + INSET);
     let (x1, y1) = (w - FRAME_MARGIN - INSET, h - FRAME_MARGIN - band - INSET);
     let area = (x1 - x0, y1 - y0);
-    let too_large = |(min, max): (Point, Point), which: String| {
+    let too_large = |(min, max): (Point, Point), name: &str, which: String| {
         Error::Invalid(format!(
-            "macro {:?}{which} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
-            first.name,
+            "macro {name:?}{which} is {:.0} x {:.0} mm; it does not fit the {:.0} x {:.0} mm drawing area of a {} page (choose a larger size)",
             max.x - min.x,
             max.y - min.y,
             area.0.max(0.0),
@@ -551,9 +595,21 @@ pub fn generate_titled(
     // Contact lines show the new pages' numbers: the prefix and a number no larger than
     // `number_reach` gives.
     let location = widest_location(&prefix, number_reach(next_number, project.pages.len(), copies.len()));
-    let shared = extent_with(copies, &symbol, &location);
+    // Copies of different macros (a table's macro column) can have their anchors in different
+    // places: their boxes are then taken round their own anchors, which go to one point.
+    let (shared, anchor) = if copies.iter().all(|c| c.anchor == first.anchor) {
+        (extent_with(copies, &symbol, &location), first.anchor)
+    } else {
+        let mut pts = Vec::with_capacity(copies.len() * 2);
+        for c in copies {
+            let (min, max) = extent_with(std::slice::from_ref(c), &symbol, &location);
+            pts.push(Point::new(min.x - c.anchor.x, min.y - c.anchor.y));
+            pts.push(Point::new(max.x - c.anchor.x, max.y - c.anchor.y));
+        }
+        (bounds_of(&pts), Point::default())
+    };
     // Where each copy's anchor goes from its slot's corner, and how many slots a page has.
-    let (offsets, across, per_page) = match fit(shared, first.anchor, area) {
+    let (offsets, across, per_page) = match fit(shared, anchor, area) {
         Some(f) => {
             let (step_x, step_y) = (up(f.w + GAP), up(f.h + GAP));
             let across = 1 + ((area.0 - f.w) / step_x).floor() as usize;
@@ -561,12 +617,13 @@ pub fn generate_titled(
             let offsets = vec![(f.dx, f.dy, step_x, step_y); copies.len()];
             (offsets, across, across.saturating_mul(down).max(1))
         }
-        None if copies.len() == 1 => return Err(too_large(shared, String::new())),
+        None if copies.len() == 1 => return Err(too_large(shared, &first.name, String::new())),
         None => {
             let mut offsets = Vec::with_capacity(copies.len());
             for (i, m) in copies.iter().enumerate() {
                 let own = extent_with(std::slice::from_ref(m), &symbol, &location);
-                let f = fit(own, m.anchor, area).ok_or_else(|| too_large(own, format!(" (copy {})", i + 1)))?;
+                let f =
+                    fit(own, m.anchor, area).ok_or_else(|| too_large(own, &m.name, format!(" (copy {})", i + 1)))?;
                 offsets.push((f.dx, f.dy, 0.0, 0.0));
             }
             (offsets, 1, 1)
@@ -802,6 +859,7 @@ mod tests {
                 set: Some("small".into()),
                 values: BTreeMap::new(),
                 page: None,
+                r#macro: None,
             })
             .collect();
         let copies = apply_rows(&m, &rows, None)?;
@@ -917,6 +975,127 @@ mod tests {
             rows.first().map(|r| (r.page.clone(), r.values.get("Page").cloned())),
             Some((None, Some("7".into())))
         );
+        Ok(())
+    }
+
+    /// A valve: a coil with its anchor on it, not beside it as the starter's is, and a
+    /// placeholder of its own.
+    fn valve() -> Result<Macro> {
+        let tag = DeviceTag::parse("-Y1")?;
+        Ok(Macro {
+            name: "Valve".into(),
+            symbols: vec![PlacedSymbol {
+                id: "v1".into(),
+                symbol: "wc.coil".into(),
+                at: Point::new(20.0, 30.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag.clone()),
+            }],
+            devices: BTreeMap::from([(
+                tag,
+                Device {
+                    description: "Valve {{Bar}} bar".into(),
+                    ..Default::default()
+                },
+            )]),
+            anchor: Point::new(20.0, 30.0),
+            placeholders: vec![Placeholder {
+                name: "Bar".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_macro_column_picks_the_macro_of_each_row() -> Result<()> {
+        let m = starter()?;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let find = |name: &str| {
+            asked.borrow_mut().push(name.to_owned());
+            if key(name) == "valve" {
+                valve()
+            } else {
+                Err(Error::Invalid(format!("no macro {name:?}")))
+            }
+        };
+        let rows = rows_from_table(
+            &m,
+            &table(&[
+                &["Macro", "kW", "bar"],
+                &["", "1", ""],
+                &["valve", "", "2"],
+                &[" VALVE ", "", "3"],
+            ]),
+            &[],
+        )?;
+        assert_eq!(rows.get(1).and_then(|r| r.r#macro.as_deref()), Some("valve"));
+        // --set is for the rows of the macro given: the valve has no value sets to choose.
+        let copies = apply_rows_with(&m, &rows, Some("small"), &find)?;
+        let descriptions: Vec<String> = copies
+            .iter()
+            .flat_map(|m| m.devices.values().map(|d| d.description.clone()))
+            .collect();
+        assert_eq!(descriptions, ["Motor 1 kW", "Valve 2 bar", "Valve 3 bar"]);
+        // Each name is looked up once.
+        assert_eq!(*asked.borrow(), ["valve"]);
+
+        // A value for a placeholder the row's macro lacks, and a macro that cannot be found,
+        // are refused with the row's line.
+        let rows = rows_from_table(&m, &table(&[&["macro", "bar"], &["", "2"]]), &[1, 5])?;
+        assert_eq!(
+            err_of(apply_rows_with(&m, &rows, Some("small"), &find)),
+            "line 5: macro \"Starter\": \"bar\" is not a placeholder"
+        );
+        let rows = rows_from_table(&m, &table(&[&["macro", "set"], &["Nope", ""]]), &[1, 3])?;
+        assert_eq!(
+            err_of(apply_rows_with(&m, &rows, None, &find)),
+            "line 3: no macro \"Nope\""
+        );
+        // apply_rows finds no other macro.
+        let rows = rows_from_table(&m, &table(&[&["macro"], &["valve"]]), &[])?;
+        assert!(err_of(apply_rows(&m, &rows, None)).starts_with("line 2: no macro \"valve\""));
+        // Without the column, a column that is no placeholder is still refused.
+        assert!(
+            err_of(rows_from_table(&m, &table(&[&["bar"], &["2"]]), &[])).contains("is not one of its placeholders")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copies_of_macros_anchored_differently_do_not_overlap() -> Result<()> {
+        let (m, v) = (
+            starter()?.apply(Some("small"), &BTreeMap::new())?,
+            valve()?.apply(None, &BTreeMap::from([("Bar".to_owned(), "2".to_owned())]))?,
+        );
+        let copies: Vec<Macro> = (0..30)
+            .map(|i| if i % 2 == 0 { m.clone() } else { v.clone() })
+            .collect();
+        let mut project = Project::new("x");
+        let done = generate(&mut project, &copies, |_| None, PageSize::A4, "Mixed")?;
+        assert_eq!(done.copies, 30);
+        let (w, h) = PageSize::A4.mm();
+        let band = project.meta.template.band_height();
+        for page in &project.pages {
+            let boxes: Vec<(Point, Point)> = page.symbols.iter().map(|s| Symbol::unknown_bounds(s.at)).collect();
+            for (i, (a, b)) in boxes.iter().enumerate() {
+                assert!(a.x >= FRAME_MARGIN + INSET && b.x <= w - FRAME_MARGIN - INSET, "{a:?}");
+                assert!(
+                    a.y >= FRAME_MARGIN + INSET && b.y <= h - FRAME_MARGIN - band - INSET,
+                    "{a:?}"
+                );
+                for (c, d) in boxes.iter().skip(i + 1) {
+                    let apart = b.x <= c.x || d.x <= a.x || b.y <= c.y || d.y <= a.y;
+                    assert!(apart, "{a:?} {b:?} overlaps {c:?} {d:?}");
+                }
+            }
+        }
+        // The anchors of a row are lined up: the starter's coil is 20 mm below its anchor,
+        // the valve's on it.
+        let page = project.pages.first().ok_or(Error::Invalid("no page".into()))?;
+        let at: Vec<Point> = page.symbols.iter().take(2).map(|s| s.at).collect();
+        assert_eq!(at.first().map(|p| p.y - 20.0), at.get(1).map(|p| p.y));
         Ok(())
     }
 

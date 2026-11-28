@@ -2673,7 +2673,7 @@ impl App {
                                 ui.label(m.source.as_str());
                                 // A table places it once per row on new pages.
                                 let hint = "Pick a CSV or Excel table: one copy per row on new pages, its columns \
-                                            filling the placeholders (a column \"set\" picks the variant)";
+                                            filling the placeholders (a column \"set\" picks the variant, a column \"macro\" another macro)";
                                 if m.value_sets.is_empty() || m.error.is_some() {
                                     if ui
                                         .add_enabled(m.error.is_none(), egui::Button::new("From table…"))

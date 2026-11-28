@@ -791,8 +791,10 @@ enum MacroCmd {
     /// its first row: a placeholder's name fills that placeholder, a column `set` picks the
     /// row's value set (over `--set`), and an empty cell leaves the value set's or default
     /// value. A macro that declares a placeholder `set` takes that column as the placeholder,
-    /// and then `--set` alone picks the value set. The copies go on new pages after the last one, left to right and row below
-    /// row, each with the next free tags. Prints the new pages' ids and the number of copies.
+    /// and then `--set` alone picks the value set. A column `macro` names another macro for its
+    /// row (`--set` is then not used for that row). The copies go on new pages after the last
+    /// one, left to right and row below row, each with the next free tags. Prints the new pages'
+    /// ids and the number of copies.
     Generate {
         /// The macro's name or file name.
         name: String,
@@ -3918,7 +3920,10 @@ fn run(mut cli: Cli) -> Res<()> {
                         Some(bytes) => bytes,
                         None => run::read_file(&table)?,
                     };
-                    let (copies, pages) = run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref())?;
+                    // A row's `macro` column names another macro, found as the one named here.
+                    let other = |n: &str| wc_core::macros::read_macro(&find_macro(&found, n)?.path).map_err(e);
+                    let (copies, pages) =
+                        run::macro_table(&m, &bytes, &table.display().to_string(), set.as_deref(), other)?;
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
