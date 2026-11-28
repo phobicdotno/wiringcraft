@@ -3635,13 +3635,13 @@ impl App {
                             egui::ComboBox::from_id_salt("pagekind")
                                 .selected_text(kind.label())
                                 .show_ui(ui, |ui| {
-                                    for k in state::PageKind::ALL {
+                                    for k in state::PageKind::all() {
                                         ui.selectable_value(kind, k, k.label());
                                     }
                                 })
                                 .response
                                 .on_hover_text(
-                                    "A line diagram shows devices again that schematic pages draw in detail; its symbols do not count as drawings in the project check. A graphic page holds drawings only: symbols and wires are refused on it.",
+                                    "A line diagram shows devices again that schematic pages draw in detail; its symbols do not count as drawings in the project check. A graphic page holds drawings only: symbols and wires are refused on it. A report page is where the PDF prints that report, among the pages, instead of after them.",
                                 );
                             ui.end_row();
                         });
