@@ -106,32 +106,45 @@ pub enum Selection {
 }
 
 /// What a page is for, as the page dialog sets it: a schematic page, an overview (line
-/// diagram) or a graphic page (drawings only).
+/// diagram), a graphic page (drawings only) or a report page (the PDF prints that report there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageKind {
     #[default]
     Schematic,
     Overview,
     Graphic,
+    Report(wc_report::Kind),
 }
 
 impl PageKind {
-    pub const ALL: [PageKind; 3] = [PageKind::Schematic, PageKind::Overview, PageKind::Graphic];
+    /// Every kind, as the page dialog offers them: a report page once for each report.
+    pub fn all() -> Vec<PageKind> {
+        let mut out = vec![PageKind::Schematic, PageKind::Overview, PageKind::Graphic];
+        out.extend(wc_report::Kind::ALL.into_iter().map(PageKind::Report));
+        out
+    }
 
-    /// The kind `page` is marked as now.
+    /// The kind `page` is marked as now. A report page whose report name is not one there is
+    /// counts as a schematic page.
     pub fn of(page: &wc_core::Page) -> Self {
-        match (page.overview, page.graphic) {
-            (true, _) => PageKind::Overview,
-            (false, true) => PageKind::Graphic,
-            (false, false) => PageKind::Schematic,
+        let report = page
+            .report
+            .as_deref()
+            .and_then(|n| wc_report::Kind::parse(&n.trim().to_ascii_lowercase()));
+        match (page.overview, page.graphic, report) {
+            (true, _, _) => PageKind::Overview,
+            (false, true, _) => PageKind::Graphic,
+            (false, false, Some(k)) => PageKind::Report(k),
+            (false, false, None) => PageKind::Schematic,
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            PageKind::Schematic => "Schematic",
-            PageKind::Overview => "Line diagram",
-            PageKind::Graphic => "Graphic (drawings only)",
+            PageKind::Schematic => "Schematic".into(),
+            PageKind::Overview => "Line diagram".into(),
+            PageKind::Graphic => "Graphic (drawings only)".into(),
+            PageKind::Report(k) => format!("Report: {}", k.title()),
         }
     }
 }
@@ -3660,6 +3673,15 @@ impl Open {
             return Err("No such page.".into());
         };
         let (overview, graphic) = (kind == PageKind::Overview, kind == PageKind::Graphic);
+        let report = match kind {
+            PageKind::Report(k) => Some(k.name().to_owned()),
+            // A report name that is no report stays as it is unless another type is chosen.
+            PageKind::Schematic if PageKind::of(current) == PageKind::Schematic => current
+                .report
+                .clone()
+                .filter(|n| wc_report::Kind::parse(&n.trim().to_ascii_lowercase()).is_none()),
+            _ => None,
+        };
         if graphic && !current.graphic && (!current.symbols.is_empty() || !current.wires.is_empty()) {
             return Err(format!(
                 "Page {} has {} symbol(s) and {} wire(s). A graphic page holds drawings only, so move or delete them first.",
@@ -3667,6 +3689,22 @@ impl Open {
                 current.symbols.len(),
                 current.wires.len()
             ));
+        }
+        if report.is_some() && current.report != report {
+            if !current.symbols.is_empty() || !current.wires.is_empty() {
+                return Err(format!(
+                    "Page {} has {} symbol(s) and {} wire(s). A report page prints its report instead, so move or delete them first.",
+                    current.number,
+                    current.symbols.len(),
+                    current.wires.len()
+                ));
+            }
+            if current.cover {
+                return Err(format!(
+                    "Page {} is the cover page; it cannot be a report page.",
+                    current.number
+                ));
+            }
         }
         let id = current.id.clone();
         let number = match self.project.free_page_number(number, Some(&id)) {
@@ -3684,6 +3722,7 @@ impl Open {
             && current.size == size
             && current.overview == overview
             && current.graphic == graphic
+            && current.report == report
             && current.title_block == own.title_block
         {
             return Ok(page);
@@ -3695,6 +3734,7 @@ impl Open {
             p.size = size;
             p.overview = overview;
             p.graphic = graphic;
+            p.report = report;
             p.title_block = own.title_block;
         }
         self.project.sort_pages();
@@ -3704,11 +3744,21 @@ impl Open {
     /// Why `what` (symbols, wires, ...) cannot go on `page`: it is a graphic page, which holds
     /// drawings only.
     pub fn graphic_reason(&self, page: usize, what: &str) -> Option<String> {
-        let pg = self.project.pages.get(page).filter(|pg| pg.graphic)?;
-        Some(format!(
-            "Page {} is a graphic page, for drawings only. {what} go on a schematic page.",
-            pg.number
-        ))
+        let pg = self.project.pages.get(page)?;
+        if pg.graphic {
+            return Some(format!(
+                "Page {} is a graphic page, for drawings only. {what} go on a schematic page.",
+                pg.number
+            ));
+        }
+        if let PageKind::Report(k) = PageKind::of(pg) {
+            return Some(format!(
+                "Page {} is a report page: the PDF prints the {} there. {what} go on a schematic page.",
+                pg.number,
+                k.title().to_lowercase()
+            ));
+        }
+        None
     }
 
     /// Why `page` cannot be changed here: in a shared session someone else has it open.
@@ -10140,6 +10190,54 @@ pub(crate) mod tests {
         assert!(o.undo());
         assert_eq!(o.project.pages[i].title, p.title);
         assert!(o.project.pages[i].title_block.is_empty());
+    }
+
+    /// Page properties make a page a report page and back, in one undo step each; a report
+    /// page refuses symbols, and a page with symbols or the cover cannot become one (#1897).
+    #[test]
+    fn a_page_becomes_a_report_page_and_refuses_symbols() {
+        let (_tmp, mut o) = project();
+        let p = o.project.pages[1].clone();
+        assert!(p.symbols.is_empty() && p.wires.is_empty() && !p.cover);
+        let parts = PageKind::Report(wc_report::Kind::Parts);
+        assert!(PageKind::all().contains(&parts));
+        assert_eq!(parts.label(), "Report: Parts list");
+        let i = o.set_page_props(1, &p.number, &p.title, p.size, parts, None).unwrap();
+        assert_eq!(o.project.pages[i].report.as_deref(), Some("parts"));
+        assert_eq!(PageKind::of(&o.project.pages[i]), parts);
+        let placed = o.place(i, "wc.coil", Point::new(20.0, 20.0)).unwrap_err();
+        assert!(
+            placed.contains("report page") && placed.contains("parts list"),
+            "{placed}"
+        );
+        // Left as it is when the type is not changed; back to schematic clears it.
+        let q = o.project.pages[i].clone();
+        o.set_page_props(i, &q.number, "Bill of materials", q.size, PageKind::of(&q), None)
+            .unwrap();
+        assert_eq!(o.project.pages[i].report.as_deref(), Some("parts"));
+        o.set_page_props(i, &q.number, &q.title, q.size, PageKind::Schematic, None)
+            .unwrap();
+        assert_eq!(o.project.pages[i].report, None);
+        assert!(o.undo());
+        assert_eq!(o.project.pages[i].report.as_deref(), Some("parts"));
+
+        // A page with a symbol, and the cover page, are refused.
+        let other = o.add_page();
+        o.place(other, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let r = o.project.pages[other].clone();
+        let err = o
+            .set_page_props(other, &r.number, &r.title, r.size, parts, None)
+            .unwrap_err();
+        assert!(err.contains("A report page prints its report instead"), "{err}");
+        if let Some(cover) = o.project.pages.iter().position(|pg| pg.cover) {
+            let c = o.project.pages[cover].clone();
+            if c.symbols.is_empty() && c.wires.is_empty() {
+                let err = o
+                    .set_page_props(cover, &c.number, &c.title, c.size, parts, None)
+                    .unwrap_err();
+                assert!(err.contains("cover page"), "{err}");
+            }
+        }
     }
 
     #[test]

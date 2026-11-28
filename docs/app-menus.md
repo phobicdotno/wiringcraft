@@ -82,7 +82,7 @@ the schematic behind it.
 - **Cover page**: open the cover page and edit the project's name and fields; they show on the cover and every title block.
 - **Page template**: edit the frame's reference columns and the title block's boxes, shared by every page.
 - **Duplicate page**: copy this page; its devices get the next free tags.
-- **Page properties**: edit this page's number, title, sheet size and its own title-block values.
+- **Page properties**: edit this page's number, title, sheet size, page type and its own title-block values. The page type is schematic, line diagram, graphic, or a report page (Report: Parts list, ...), where the PDF prints that report among the pages ([report pages](pdf-output.md#report-pages)); the canvas shows which report it holds.
 - ---
 - **Move page up**: swap this page's number with the one before.
 - **Move page down**: swap this page's number with the one after.

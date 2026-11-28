@@ -851,6 +851,18 @@ fn paint_frame(p: &egui::Painter, xf: &Xf, open: &Open, page: &Page, c: Color32,
         };
         paint_shape(p, xf, &m.shape, stroke);
     }
+    // A report page shows what the PDF prints on it.
+    if let crate::state::PageKind::Report(k) = crate::state::PageKind::of(page) {
+        let (w, h) = page.size.mm();
+        let size = xf.len(6.0).max(MIN_TEXT_PX);
+        p.text(
+            xf.s(Point::new(w / 2.0, h / 2.0)),
+            Align2::CENTER_CENTER,
+            format!("Report page: {}\nThe PDF prints this report here.", k.title()),
+            FontId::proportional(size),
+            faint,
+        );
+    }
 }
 
 /// Texts smaller than this on screen (px) are not drawn: they would only smear.

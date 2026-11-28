@@ -36,7 +36,7 @@ without networks, so it does not add empty sheets; naming the report prints it a
 
 A report can also sit among the pages, as in EPLAN: make a page a report page with
 `wiringcraft page report <page> parts` (any report name `--report` takes; `--off` makes it a
-normal page again). The PDF prints that report there, in the page's place, with the page's
+normal page again), or in the app with Page properties, Page type, Report: ... . The PDF prints that report there, in the page's place, with the page's
 number and title on each of its sheets (the bookmarks show `(1/2)`, `(2/2)` for a long one),
 and the page's own title-block fields. That report is then not printed again after the pages,
 whatever `--report` or the project's report choice says. A report page is printed even when

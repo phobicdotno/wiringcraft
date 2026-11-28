@@ -529,6 +529,23 @@ impl Kind {
         }
     }
 
+    /// The report's title, as its table is built with the built-in layout.
+    pub fn title(self) -> &'static str {
+        match self {
+            Kind::Parts => "Parts list",
+            Kind::Devices => "Device list",
+            Kind::Wires => "Wire list",
+            Kind::Nets => "Net list",
+            Kind::Terminals => "Terminal plan",
+            Kind::Cables => "Cable list",
+            Kind::Plc => "PLC I/O list",
+            Kind::PlcCards => "PLC cards",
+            Kind::Contents => "Table of contents",
+            Kind::Locations => "Locations",
+            Kind::Networks => "Networks",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|k| k.name() == s)
     }
