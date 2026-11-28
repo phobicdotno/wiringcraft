@@ -5020,6 +5020,22 @@ mod tests {
         };
         assert!(rect.max.x < at.x, "left of the pin: {rect:?}");
         assert!(rect.min.x >= 0.0 && rect.max.x <= 1000.0, "on the canvas: {rect:?}");
+
+        // A description longer than the canvas is wide wraps onto more lines, on the canvas.
+        let long = "Coil of the main contactor of the north pump, fed from the safety relay ".repeat(3);
+        if let Some(pin) = o
+            .symbols
+            .get_mut("wc.coil")
+            .and_then(|y| y.pins.iter_mut().find(|p| p.name == "A1"))
+        {
+            pin.description = long.trim().to_owned();
+        }
+        let texts = painted(&ctx, &mut o, &mut ed, 3.0, vec![egui::Event::PointerMoved(at)]);
+        let Some((_, rect)) = texts.iter().find(|(t, _)| t.starts_with("-K1:A1  Coil of")) else {
+            unreachable!("the pin is named with its description: {texts:?}")
+        };
+        assert!(rect.height() > 20.0, "wrapped onto more than one line: {rect:?}");
+        assert!(rect.min.x >= 0.0 && rect.max.x <= 1000.0, "on the canvas: {rect:?}");
     }
 
     /// The pin label goes left of or below a pin near the canvas's right or top edge, and
