@@ -1331,6 +1331,59 @@ fn a_page_marked_graphic_on_one_side_and_overview_on_the_other_is_a_clash() -> T
     Ok(())
 }
 
+/// A report page holds no symbols or wires and is not the cover: one side making it a report
+/// page while the other draws on it or marks it the cover is a clash (#1897).
+#[test]
+fn a_report_page_with_a_wire_or_the_cover_mark_from_the_other_side_is_a_clash() -> TestResult {
+    let (mut base, mut auth, mut local) = three_copies()?;
+    for p in [&mut base, &mut auth, &mut local] {
+        p.pages[0].symbols.clear();
+        p.pages[0].wires.clear();
+        p.pages[0].cover = false;
+    }
+    // A wire from the session, the report here.
+    let free = |x: f64| wc_core::Endpoint::Point {
+        at: wc_core::Point::new(x, 0.0),
+    };
+    auth.pages[0].wires.push(wc_core::Wire {
+        id: "wfree".into(),
+        from: free(0.0),
+        to: free(10.0),
+        via: Vec::new(),
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    });
+    local.pages[0].report = Some("parts".into());
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    assert!(local.pages[0].report.is_none(), "the session's page is kept");
+
+    // The cover mark from the session, the report here.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    for p in [&mut base, &mut auth, &mut local] {
+        p.pages[0].symbols.clear();
+        p.pages[0].wires.clear();
+        p.pages[0].cover = false;
+    }
+    auth.pages[0].cover = true;
+    local.pages[0].report = Some("parts".into());
+    assert_eq!(yield_to_session(&mut local, &mut base, &auth), ["page 1"]);
+    // One side's report alone is merged.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    for p in [&mut base, &mut auth, &mut local] {
+        p.pages[0].symbols.clear();
+        p.pages[0].wires.clear();
+        p.pages[0].cover = false;
+    }
+    auth.pages[0].title = "Restored".into();
+    local.pages[0].report = Some("parts".into());
+    assert!(yield_to_session(&mut local, &mut base, &auth).is_empty());
+    assert_eq!(local.pages[0].report.as_deref(), Some("parts"));
+    Ok(())
+}
+
 #[test]
 fn a_cloud_and_the_revision_table_drawn_here_are_kept_beside_the_sessions_edit() -> TestResult {
     use wc_core::geom::Point;

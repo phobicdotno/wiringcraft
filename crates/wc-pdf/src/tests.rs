@@ -796,10 +796,10 @@ fn a_report_page_prints_its_report_in_its_place() {
     assert!(at("R2 Wire list") < usize::MAX);
     // The bookmarks name the page by its own title; the sheet's heading stays the table's.
     assert_eq!(at("2 Bill of materials (1/2)"), usize::MAX);
-    // The contents rows jump to pages 2, 3 and 5 of the document (page objects 6 + 3i).
-    for dest in ["/Dest [9 0 R /Fit]", "/Dest [12 0 R /Fit]", "/Dest [18 0 R /Fit]"] {
-        assert!(text.contains(dest), "{dest}");
-    }
+    // The contents rows jump, in row order, to pages 2, 3 and 5 of the document (page objects
+    // 6 + 3i), and its added row for the wire list to the 6th: the links are the contents' only
+    // ones.
+    assert_eq!(link_targets(&text), [9, 12, 18, 21]);
 
     // A PDF that leaves the report page out leaves its report out too.
     let opts = Options {
@@ -808,6 +808,51 @@ fn a_report_page_prints_its_report_in_its_place() {
     };
     let (_, report) = export(&project, &BTreeMap::new(), &opts);
     assert_eq!(report.pages, 4, "contents, 1, 3, the wire list");
+}
+
+/// The page objects the PDF's links go to, in the order the links are written.
+fn link_targets(text: &str) -> Vec<usize> {
+    text.split("/Subtype /Link")
+        .skip(1)
+        .filter_map(|after| {
+            let dest = after.split_once("/Dest [")?.1;
+            dest.split(' ').next()?.parse().ok()
+        })
+        .collect()
+}
+
+/// With a contents on two report pages, the one the PDF prints lists the later sheets, even
+/// when the first is left out (review of #1898).
+#[test]
+fn a_contents_on_a_report_page_left_out_lists_nothing_and_the_printed_one_lists_the_panel() {
+    let mut project = Project::new("x");
+    let mut first = Page::new("p1", "1", "Contents");
+    first.report = Some("contents".into());
+    let mut second = Page::new("p3", "3", "Contents again");
+    second.report = Some("contents".into());
+    project.pages = vec![first, Page::new("p2", "2", "Mains"), second];
+    let contents = |at: &str| wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows: vec![vec!["2".into(), "Mains".into()]],
+        row_pages: vec!["p2".into()],
+        front: true,
+        at_page: Some(at.into()),
+        ..Default::default()
+    };
+    let opts = Options {
+        pages: vec!["p2".into(), "p3".into()],
+        reports: vec![contents("p1"), contents("p3")],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 3, "2, the contents on 3, the panel");
+    let shows = |s: &str| text.contains(&format!("{} Tj", writer::pdf_text(s)));
+    assert!(shows("P1") && shows("Cabinet"), "the printed contents lists the panel");
+    // Its rows go to page 2 (the first sheet) and the panel (the third).
+    assert_eq!(link_targets(&text), [6, 12]);
 }
 
 #[test]

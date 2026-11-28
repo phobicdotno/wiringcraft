@@ -5906,7 +5906,7 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
     warnings.extend(
         unknown
             .into_iter()
-            .map(|u| format!("{u} names no report; it prints as an empty page")),
+            .map(|u| format!("{u} names no report; it prints as a normal page")),
     );
     // The text itself stays out: this message goes to the diagnostic log, which never holds
     // drawing content. File, Translations, "Only missing" lists the texts.

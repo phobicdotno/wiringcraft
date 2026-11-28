@@ -168,7 +168,9 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     let card_rows = layout::card_rows_per_page(card_size, project.meta.template.band_height());
     // The contents also lists the sheets that follow the schematic pages, each row linked to
     // its sheet (#693).
-    let (reports, extra_ids) = list_extra_sheets(reports, options, per_page, card_rows);
+    let (reports, extra_ids) = list_extra_sheets(reports, options, per_page, card_rows, |t| {
+        t.at_page.as_deref().is_none_or(|at| pages.iter().any(|p| p.id == at))
+    });
     // The lines of each report table's pages.
     let paged: Vec<Vec<Vec<layout::TableLine>>> = reports.iter().map(|t| layout::table_pages(t, per_page)).collect();
     // Each report page: (table, its page, part, parts). Front tables (the table of contents)
@@ -443,19 +445,24 @@ fn extra_sheet_id(n: usize) -> String {
 }
 
 /// `reports` with a row per sheet that follows the schematic pages (panel layouts, PLC cards,
-/// the report pages after them and network topologies, in that order) added to the first
-/// front table (the table of contents), and the link targets of those sheets in that order.
-/// A front table that grows onto another page moves the report numbers, which count from the
-/// first front page.
+/// the report pages after them and network topologies, in that order) added to each front
+/// table (table of contents) that `printed` says the PDF prints, and the link targets of those
+/// sheets in that order. A front table that grows onto another page moves the report numbers,
+/// which count from the first front page.
 fn list_extra_sheets<'a>(
     mut reports: Vec<std::borrow::Cow<'a, wc_report::Table>>,
     options: &Options,
     per_page: usize,
     card_rows: usize,
+    printed: impl Fn(&wc_report::Table) -> bool,
 ) -> (Vec<std::borrow::Cow<'a, wc_report::Table>>, Vec<String>) {
-    let Some(first) = reports.iter().position(|t| t.front) else {
+    // A contents on a report page the PDF leaves out is not printed, so it lists nothing.
+    let contents: Vec<usize> = (0..reports.len())
+        .filter(|&i| reports.get(i).is_some_and(|t| t.front && printed(t)))
+        .collect();
+    if contents.is_empty() {
         return (reports, Vec::new());
-    };
+    }
     let parted = |title: &str, part: usize, parts: usize| {
         if parts > 1 {
             format!("{title} ({part}/{parts})")
@@ -494,10 +501,10 @@ fn list_extra_sheets<'a>(
     let ids: Vec<String> = (0..rows.len()).map(extra_sheet_id).collect();
     // The built-in columns may be reordered, renamed or left out by the project's layout for
     // the contents: the values go where the "Page" and "Title" columns are, if shown.
-    let mut page_col = None;
-    if let Some(t) = reports.get_mut(first) {
+    for &i in &contents {
+        let Some(t) = reports.get_mut(i) else { continue };
         let t = t.to_mut();
-        page_col = t.column_of("Page");
+        let page_col = t.column_of("Page");
         let title_col = t.column_of("Title");
         // Every earlier row describes a page or none; the new ones each describe a sheet.
         t.row_pages.resize(t.rows.len(), String::new());
@@ -521,11 +528,13 @@ fn list_extra_sheets<'a>(
         .filter(|t| t.front && t.at_page.is_none())
         .map(|t| layout::table_pages(t, per_page).len())
         .sum();
-    let mut report_no = front;
-    if let (Some(t), Some(c)) = (reports.get_mut(first), page_col) {
+    for &i in &contents {
+        let Some(t) = reports.get_mut(i) else { continue };
         let t = t.to_mut();
+        let Some(c) = t.column_of("Page") else { continue };
+        let mut report_no = front;
         let start = t.rows.len() - rows.len();
-        for ((number, _), row) in rows.into_iter().zip(t.rows.iter_mut().skip(start)) {
+        for ((number, _), row) in rows.iter().zip(t.rows.iter_mut().skip(start)) {
             if number.is_none() {
                 report_no += 1;
                 if let Some(cell) = row.get_mut(c) {
@@ -639,12 +648,12 @@ mod helper_tests {
             panels: vec![panel("Main")],
             ..Options::default()
         };
-        let (out, ids) = list_extra_sheets(reports.clone(), &options, 40, 20);
+        let (out, ids) = list_extra_sheets(reports.clone(), &options, 40, 20, |_| true);
         assert!(ids.is_empty());
         assert_eq!(out, reports);
 
         let reports = vec![Cow::Owned(table("Contents", &["Page", "Title"], 2, true))];
-        let (out, ids) = list_extra_sheets(reports.clone(), &Options::default(), 40, 20);
+        let (out, ids) = list_extra_sheets(reports.clone(), &Options::default(), 40, 20, |_| true);
         assert!(ids.is_empty());
         assert_eq!(out, reports);
     }
@@ -666,7 +675,7 @@ mod helper_tests {
             }],
             ..Options::default()
         };
-        let (out, ids) = list_extra_sheets(reports, &options, 2, 20);
+        let (out, ids) = list_extra_sheets(reports, &options, 2, 20, |_| true);
         assert_eq!(ids, (0..6).map(extra_sheet_id).collect::<Vec<_>>());
         let Some(front) = out.first() else { unreachable!() };
         let added: Vec<(&str, &str)> = front
@@ -703,13 +712,13 @@ mod helper_tests {
             panels: vec![panel("Main")],
             ..Options::default()
         };
-        let (out, _) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20);
+        let (out, _) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20, |_| true);
         let rows = out.first().map(|t| t.rows.clone());
         assert_eq!(rows, Some(vec![vec!["Main".to_owned(), "P1".to_owned()]]));
 
         // Without a page column only the title is filled in.
         let contents = table("Contents", &["Title", "Notes"], 0, true);
-        let (out, ids) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20);
+        let (out, ids) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20, |_| true);
         let rows = out.first().map(|t| t.rows.clone());
         assert_eq!(rows, Some(vec![vec!["Main".to_owned(), String::new()]]));
         assert_eq!(ids, [extra_sheet_id(0)]);

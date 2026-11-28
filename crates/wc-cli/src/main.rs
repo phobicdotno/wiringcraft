@@ -1857,6 +1857,14 @@ fn refuse_graphic(pg: &Page, what: &str) -> Res<()> {
             pg.id
         ));
     }
+    // A report page prints its report instead of what is drawn on it.
+    if let Some(kind) = pg.report.as_deref().and_then(wc_report::report_named) {
+        return Err(format!(
+            "page {:?} is a report page (the PDF prints the {} report there); {what} goes on a schematic page",
+            escape_field(&pg.id),
+            kind.name()
+        ));
+    }
     Ok(())
 }
 
@@ -3403,7 +3411,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let i = page_index(&p, &id)?;
                     let report = match report.as_deref().map(str::trim) {
                         _ if off => None,
-                        Some(name) => match wc_report::Kind::parse(&name.to_ascii_lowercase()) {
+                        Some(name) => match wc_report::report_named(name) {
                             Some(k) => Some(k.name().to_owned()),
                             None => {
                                 return Err(format!(
@@ -4494,7 +4502,7 @@ fn run(mut cli: Cli) -> Res<()> {
             let (mut tables, unknown) = wc_report::report_page_tables(&inputs);
             for u in unknown {
                 eprintln!(
-                    "warning: {} names no report; it prints as an empty page",
+                    "warning: {} names no report; it prints as a normal page",
                     escape_field(&u)
                 );
             }

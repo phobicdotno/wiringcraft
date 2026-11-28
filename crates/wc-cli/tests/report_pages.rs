@@ -64,6 +64,17 @@ fn a_report_page_holds_its_report_in_the_pdf() -> TestResult {
         list.contains("Bill of materials (0 symbols, 0 wires), report parts"),
         "{list}"
     );
+    // Nothing is drawn on a report page.
+    for args in [
+        &["place", "bom", "wc.coil", "--at", "50,50"][..],
+        &["wire", "bom", "10,10", "20,10"][..],
+    ] {
+        let why = err(&dir, args)?;
+        assert!(
+            why.contains("is a report page") && why.contains("parts report"),
+            "{why}"
+        );
+    }
     // The report page is the parts list's sheet: asked for again it is not printed twice.
     assert_eq!(pages(&dir, &[])?, with_parts);
     assert_eq!(pages(&dir, &["--report", "parts"])?, with_parts);

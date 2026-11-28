@@ -551,6 +551,12 @@ impl Kind {
     }
 }
 
+/// The report a report page's name ([`wc_core::Page::report`]) or a typed name means: spaces
+/// around it and case do not count. `None` when it names no report.
+pub fn report_named(name: &str) -> Option<Kind> {
+    Kind::parse(&name.trim().to_ascii_lowercase())
+}
+
 /// The reports the project's report pages hold ([`wc_core::Page::report`]), in page order,
 /// each built as [`build`] builds it with [`Table::at_page`] its page's id; and for each
 /// report page that names no report, its number and the name (quoted).
@@ -558,7 +564,7 @@ pub fn report_page_tables(i: &Inputs<'_>) -> (Vec<Table>, Vec<String>) {
     let (mut tables, mut unknown) = (Vec::new(), Vec::new());
     for page in &i.project.pages {
         let Some(name) = &page.report else { continue };
-        match Kind::parse(&name.trim().to_ascii_lowercase()) {
+        match report_named(name) {
             Some(kind) => {
                 let mut t = build(kind, i);
                 t.at_page = Some(page.id.clone());
@@ -578,7 +584,7 @@ pub fn report_page_kinds(project: &Project) -> Vec<Kind> {
         .pages
         .iter()
         .filter_map(|p| p.report.as_deref())
-        .filter_map(|n| Kind::parse(&n.trim().to_ascii_lowercase()))
+        .filter_map(report_named)
     {
         if !out.contains(&k) {
             out.push(k);
