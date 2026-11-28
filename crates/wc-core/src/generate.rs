@@ -1260,6 +1260,76 @@ mod tests {
     }
 
     #[test]
+    fn the_new_pages_prefix_counts_in_whether_contact_lines_fit() -> Result<()> {
+        use crate::symbol::{Pin, SymbolRole};
+        let def = |id: &str, role: SymbolRole| Symbol {
+            id: id.into(),
+            pins: vec![Pin {
+                name: "13".into(),
+                at: Point::new(0.0, 0.0),
+                dir: Default::default(),
+                description: String::new(),
+            }],
+            name: id.into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role,
+            graphics: vec![Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, 5.0),
+            }],
+            tag_at: Point::new(-1.0, 0.0),
+            description: String::new(),
+            source: String::new(),
+        };
+        let (coil, contact) = (def("wc.coil", SymbolRole::Main), def("wc.no", SymbolRole::Auxiliary));
+        let symbol = |id: &str| Some(if id == "wc.no" { contact.clone() } else { coil.clone() });
+        // The coil's contact line ends 1 mm inside the A3 drawing area when its location is
+        // measured without a prefix; `PAGE-` makes it several millimetres wider.
+        let area = PageSize::A3.mm().0 - 2.0 * (FRAME_MARGIN + INSET);
+        let plain = crate::font::text_width_mm(&format!("13 {WIDEST_LOCATION}"), crate::xref::HEIGHT);
+        let prefixed = crate::font::text_width_mm("13 PAGE-9999/99.W", crate::xref::HEIGHT);
+        assert!(prefixed - plain > 2.0, "{plain} {prefixed}");
+        let cx = area - 1.0 - crate::xref::INDENT - plain;
+        let tag = DeviceTag::parse("-K1")?;
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 20.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag.clone()),
+        };
+        let m = Macro {
+            name: "Relay".into(),
+            symbols: vec![placed("k", "wc.coil", cx), placed("c", "wc.no", 20.0)],
+            anchor: Point::new(0.0, 0.0),
+            graphics: vec![Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, 1.0),
+            }],
+            ..Default::default()
+        };
+        let with_last = |number: &str| {
+            let mut project = Project::new("x");
+            project.pages.push(Page::new("p0001", number, "Old"));
+            project
+        };
+        let mut fits = with_last("1");
+        generate(&mut fits, std::slice::from_ref(&m), symbol, PageSize::A3, "New")?;
+        let mut too_wide = with_last("PAGE-1");
+        let err = err_of(generate(
+            &mut too_wide,
+            std::slice::from_ref(&m),
+            symbol,
+            PageSize::A3,
+            "New",
+        ));
+        assert!(err.contains("does not fit"), "{err}");
+        Ok(())
+    }
+
+    #[test]
     fn copies_that_stick_out_on_different_sides_get_a_page_each() -> Result<()> {
         let m = starter()?;
         // A long text left of the coil on one copy and right of it on the other: each copy fits
