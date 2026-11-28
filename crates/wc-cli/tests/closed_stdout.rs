@@ -55,3 +55,31 @@ fn a_closed_stdout_reader_ends_the_program_quietly_after_its_save() -> TestResul
     assert_eq!(out.status.code(), Some(0), "{:?}: {stderr}", out.status);
     Ok(())
 }
+
+/// The library-open count a test asks for (`WIRINGCRAFT_COUNT_LIBRARY_OPENS`) is written after
+/// the command ended: a stderr nobody reads leaves the run's result as it was.
+#[test]
+fn the_library_open_count_on_a_closed_stderr_keeps_the_runs_success() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .stdout(Stdio::null())
+        .status()?;
+    assert!(status.success());
+
+    let (reader, writer) = std::io::pipe()?;
+    drop(reader);
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["page", "list"])
+        .env("WIRINGCRAFT_COUNT_LIBRARY_OPENS", "1")
+        .stdout(Stdio::piped())
+        .stderr(writer)
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.status);
+    Ok(())
+}
